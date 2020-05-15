@@ -332,6 +332,7 @@ static void smbd_smb2_request_create_done(struct tevent_req *tsubreq)
 				       &out_context_blobs);
 	if (!NT_STATUS_IS_OK(status)) {
 		error = smbd_smb2_request_error(smb2req, status);
+		smb2req->compound_create_err = status;
 		if (!NT_STATUS_IS_OK(error)) {
 			smbd_server_connection_terminate(smb2req->xconn,
 							 nt_errstr(error));
@@ -340,6 +341,7 @@ static void smbd_smb2_request_create_done(struct tevent_req *tsubreq)
 		return;
 	}
 
+	smb2req->compound_create_err = status;
 	status = smb2_create_blob_push(smb2req, &out_context_buffer, out_context_blobs);
 	if (!NT_STATUS_IS_OK(status)) {
 		error = smbd_smb2_request_error(smb2req, status);
