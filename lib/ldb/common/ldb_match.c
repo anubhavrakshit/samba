@@ -241,9 +241,13 @@ static int ldb_wildcard_compare(struct ldb_context *ldb,
 	struct ldb_val val;
 	struct ldb_val cnk;
 	struct ldb_val *chunk;
-	char *p, *g;
 	uint8_t *save_p = NULL;
 	unsigned int c = 0;
+
+	if (tree->operation != LDB_OP_SUBSTRING) {
+		*matched = false;
+		return LDB_ERR_INAPPROPRIATE_MATCHING;
+	}
 
 	a = ldb_schema_attribute_by_name(ldb, tree->u.substring.attr);
 	if (!a) {
@@ -271,6 +275,14 @@ static int ldb_wildcard_compare(struct ldb_context *ldb,
 		if (cnk.length > val.length) {
 			goto mismatch;
 		}
+		/*
+		 * Empty strings are returned as length 0. Ensure
+		 * we can cope with this.
+		 */
+		if (cnk.length == 0) {
+			goto mismatch;
+		}
+
 		if (memcmp((char *)val.data, (char *)cnk.data, cnk.length) != 0) goto mismatch;
 		val.length -= cnk.length;
 		val.data += cnk.length;
@@ -280,20 +292,60 @@ static int ldb_wildcard_compare(struct ldb_context *ldb,
 	}
 
 	while (tree->u.substring.chunks[c]) {
+		uint8_t *p;
 
 		chunk = tree->u.substring.chunks[c];
 		if(a->syntax->canonicalise_fn(ldb, ldb, chunk, &cnk) != 0) goto mismatch;
 
-		/* FIXME: case of embedded nulls */
-		p = strstr((char *)val.data, (char *)cnk.data);
+		/*
+		 * Empty strings are returned as length 0. Ensure
+		 * we can cope with this.
+		 */
+		if (cnk.length == 0) {
+			goto mismatch;
+		}
+		/*
+		 * Values might be binary blobs. Don't use string
+		 * search, but memory search instead.
+		 */
+		p = memmem((const void *)val.data,val.length,
+			   (const void *)cnk.data, cnk.length);
 		if (p == NULL) goto mismatch;
+
+		/*
+		 * At this point we know cnk.length <= val.length as
+		 * otherwise there could be no match
+		 */
+
 		if ( (! tree->u.substring.chunks[c + 1]) && (! tree->u.substring.end_with_wildcard) ) {
+			uint8_t *g;
+			uint8_t *end = val.data + val.length;
 			do { /* greedy */
-				g = strstr((char *)p + cnk.length, (char *)cnk.data);
-				if (g) p = g;
+
+				/*
+				 * haystack is a valid pointer in val
+				 * because the memmem() can only
+				 * succeed if the needle (cnk.length)
+				 * is <= haystacklen
+				 *
+				 * p will be a pointer at least
+				 * cnk.length from the end of haystack
+				 */
+				uint8_t *haystack
+					= p + cnk.length;
+				size_t haystacklen
+					= end - (haystack);
+
+				g = memmem(haystack,
+					   haystacklen,
+					   (const uint8_t *)cnk.data,
+					   cnk.length);
+				if (g) {
+					p = g;
+				}
 			} while(g);
 		}
-		val.length = val.length - (p - (char *)(val.data)) - cnk.length;
+		val.length = val.length - (p - (uint8_t *)(val.data)) - cnk.length;
 		val.data = (uint8_t *)(p + cnk.length);
 		c++;
 		talloc_free(cnk.data);
@@ -301,7 +353,7 @@ static int ldb_wildcard_compare(struct ldb_context *ldb,
 	}
 
 	/* last chunk may not have reached end of string */
-	if ( (! tree->u.substring.end_with_wildcard) && (*(val.data) != 0) ) goto mismatch;
+	if ( (! tree->u.substring.end_with_wildcard) && (val.length != 0) ) goto mismatch;
 	talloc_free(save_p);
 	*matched = true;
 	return LDB_SUCCESS;
@@ -480,9 +532,10 @@ static int ldb_match_extended(struct ldb_context *ldb,
 
 	rule = ldb_find_extended_match_rule(ldb, tree->u.extended.rule_id);
 	if (rule == NULL) {
+		*matched = false;
 		ldb_debug(ldb, LDB_DEBUG_ERROR, "ldb: unknown extended rule_id %s",
 			  tree->u.extended.rule_id);
-		return LDB_ERR_INAPPROPRIATE_MATCHING;
+		return LDB_SUCCESS;
 	}
 
 	return rule->callback(ldb, rule->oid, msg,
@@ -491,17 +544,18 @@ static int ldb_match_extended(struct ldb_context *ldb,
 }
 
 /*
-  return 0 if the given parse tree matches the given message. Assumes
-  the message is in sorted order
+  Check if a particular message will match the given filter
 
-  return 1 if it matches, and 0 if it doesn't match
+  set *matched to true if it matches, false otherwise
+
+  returns LDB_SUCCESS or an error
 
   this is a recursive function, and does short-circuit evaluation
  */
-static int ldb_match_message(struct ldb_context *ldb, 
-			     const struct ldb_message *msg,
-			     const struct ldb_parse_tree *tree,
-			     enum ldb_scope scope, bool *matched)
+int ldb_match_message(struct ldb_context *ldb,
+		      const struct ldb_message *msg,
+		      const struct ldb_parse_tree *tree,
+		      enum ldb_scope scope, bool *matched)
 {
 	unsigned int i;
 	int ret;
@@ -562,6 +616,13 @@ static int ldb_match_message(struct ldb_context *ldb,
 
 	return LDB_ERR_INAPPROPRIATE_MATCHING;
 }
+
+/*
+  return 0 if the given parse tree matches the given message. Assumes
+  the message is in sorted order
+
+  return 1 if it matches, and 0 if it doesn't match
+*/
 
 int ldb_match_msg(struct ldb_context *ldb,
 		  const struct ldb_message *msg,
@@ -669,9 +730,7 @@ _PRIVATE_ int ldb_register_extended_match_rules(struct ldb_context *ldb)
 }
 
 /*
-  register a new ldb backend
-
-  if override is true, then override any existing backend for this prefix
+  register a new ldb extended matching rule
 */
 int ldb_register_extended_match_rule(struct ldb_context *ldb,
 				     const struct ldb_extended_match_rule *rule)
@@ -689,7 +748,7 @@ int ldb_register_extended_match_rule(struct ldb_context *ldb,
 		return LDB_ERR_OPERATIONS_ERROR;
 	}
 	entry->rule = rule;
-	DLIST_ADD_END(ldb->extended_match_rules, entry, struct ldb_extended_match_entry);
+	DLIST_ADD_END(ldb->extended_match_rules, entry);
 
 	return LDB_SUCCESS;
 }

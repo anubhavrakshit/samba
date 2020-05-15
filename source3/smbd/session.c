@@ -139,6 +139,10 @@ static int gather_sessioninfo(const char *key, struct sessionid *session,
 		return 0;
 	}
 
+	if (!process_exists(session->pid)) {
+		return 0;
+	}
+
 	sesslist->sessions = talloc_realloc(
 		sesslist->mem_ctx, sesslist->sessions, struct sessionid,
 		sesslist->count+1);
@@ -175,8 +179,8 @@ int list_sessions(TALLOC_CTX *mem_ctx, struct sessionid **session_list)
 
 	status = sessionid_traverse_read(gather_sessioninfo, (void *) &sesslist);
 	if (!NT_STATUS_IS_OK(status)) {
-		DEBUG(3, ("Session traverse failed\n"));
-		SAFE_FREE(sesslist.sessions);
+		DBG_ERR("Session traverse failed: %s\n", nt_errstr(status));
+		TALLOC_FREE(sesslist.sessions);
 		*session_list = NULL;
 		return 0;
 	}

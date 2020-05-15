@@ -19,6 +19,7 @@
 
 #include <Python.h>
 #include "includes.h"
+#include "python/py3compat.h"
 #include "libcli/util/pyerrors.h"
 #include "python/modules.h"
 #include "../libcli/nbt/libnbt.h"
@@ -37,7 +38,7 @@ typedef struct {
 static void py_nbt_node_dealloc(nbt_node_Object *self)
 {
 	talloc_free(self->mem_ctx);
-	self->ob_type->tp_free(self);
+	Py_TYPE(self)->tp_free(self);
 }
 
 static PyObject *py_nbt_node_init(PyTypeObject *self, PyObject *args, PyObject *kwargs)
@@ -56,8 +57,8 @@ static PyObject *py_nbt_node_init(PyTypeObject *self, PyObject *args, PyObject *
 
 static bool PyObject_AsDestinationTuple(PyObject *obj, const char **dest_addr, uint16_t *dest_port)
 {
-	if (PyString_Check(obj)) {
-		*dest_addr = PyString_AsString(obj);
+	if (PyUnicode_Check(obj)) {
+		*dest_addr = PyUnicode_AsUTF8(obj);
 		*dest_port = NBT_NAME_SERVICE_PORT;
 		return true;
 	}
@@ -68,18 +69,18 @@ static bool PyObject_AsDestinationTuple(PyObject *obj, const char **dest_addr, u
 			return false;
 		}
 
-		if (!PyString_Check(PyTuple_GetItem(obj, 0))) {
+		if (!PyUnicode_Check(PyTuple_GetItem(obj, 0))) {
 			PyErr_SetString(PyExc_TypeError, "Destination tuple first element not string");
 			return false;
 		}
 
-		*dest_addr = PyString_AsString(obj);
+		*dest_addr = PyUnicode_AsUTF8(obj);
 
 		if (PyTuple_Size(obj) == 1) {
 			*dest_port = NBT_NAME_SERVICE_PORT;
 			return true;
-		} else if (PyInt_Check(PyTuple_GetItem(obj, 1))) {
-			*dest_port = PyInt_AsLong(PyTuple_GetItem(obj, 1));
+		} else if (PyLong_Check(PyTuple_GetItem(obj, 1))) {
+			*dest_port = PyLong_AsLong(PyTuple_GetItem(obj, 1));
 			return true;
 		} else {
 			PyErr_SetString(PyExc_TypeError, "Destination tuple second element not a port");
@@ -95,14 +96,29 @@ static bool PyObject_AsNBTName(PyObject *obj, struct nbt_name_socket *name_socke
 {
 	if (PyTuple_Check(obj)) {
 		if (PyTuple_Size(obj) == 2) {
-			name->name = PyString_AsString(PyTuple_GetItem(obj, 0));
-			name->type = PyInt_AsLong(PyTuple_GetItem(obj, 1));
+			name->name = PyUnicode_AsUTF8(PyTuple_GetItem(obj, 0));
+			if (name->name == NULL) {
+				goto err;
+			}
+			name->type = PyLong_AsLong(PyTuple_GetItem(obj, 1));
+			if (name->type == -1 && PyErr_Occurred()) {
+				goto err;
+			}
 			name->scope = NULL;
 			return true;
 		} else if (PyTuple_Size(obj) == 3) {
-			name->name = PyString_AsString(PyTuple_GetItem(obj, 0));
-			name->scope = PyString_AsString(PyTuple_GetItem(obj, 1));
-			name->type = PyInt_AsLong(PyTuple_GetItem(obj, 2));
+			name->name = PyUnicode_AsUTF8(PyTuple_GetItem(obj, 0));
+			if (name->name == NULL) {
+				goto err;
+			}
+			name->scope = PyUnicode_AsUTF8(PyTuple_GetItem(obj, 1));
+			if (name->scope == NULL) {
+				goto err;
+			}
+			name->type = PyLong_AsLong(PyTuple_GetItem(obj, 2));
+			if (name->type == -1 && PyErr_Occurred()) {
+				goto err;
+			}
 			return true;
 		} else {
 			PyErr_SetString(PyExc_TypeError, "Invalid tuple size");
@@ -110,14 +126,17 @@ static bool PyObject_AsNBTName(PyObject *obj, struct nbt_name_socket *name_socke
 		}
 	}
 
-	if (PyString_Check(obj)) {
+	if (PyUnicode_Check(obj)) {
 		/* FIXME: Parse string to be able to interpret things like RHONWYN<02> ? */
-		name->name = PyString_AsString(obj);
+		name->name = PyUnicode_AsUTF8(obj);
+		if (name->name == NULL) {
+			goto err;
+		}
 		name->scope = NULL;
 		name->type = 0;
 		return true;
 	}
-
+err:
 	PyErr_SetString(PyExc_TypeError, "Invalid type for object");
 	return false;
 }
@@ -171,7 +190,7 @@ static PyObject *py_nbt_name_query(PyObject *self, PyObject *args, PyObject *kwa
 	ret = PyTuple_New(3);
 	if (ret == NULL)
 		return NULL;
-	PyTuple_SetItem(ret, 0, PyString_FromString(io.out.reply_from));
+	PyTuple_SetItem(ret, 0, PyUnicode_FromString(io.out.reply_from));
 
 	py_name = PyObject_FromNBTName(node->socket, &io.out.name);
 	if (py_name == NULL)
@@ -186,7 +205,7 @@ static PyObject *py_nbt_name_query(PyObject *self, PyObject *args, PyObject *kwa
 	}
 
 	for (i = 0; i < io.out.num_addrs; i++) {
-		PyList_SetItem(reply_addrs, i, PyString_FromString(io.out.reply_addrs[i]));
+		PyList_SetItem(reply_addrs, i, PyUnicode_FromString(io.out.reply_addrs[i]));
 	}
 
 	PyTuple_SetItem(ret, 2, reply_addrs);
@@ -229,7 +248,7 @@ static PyObject *py_nbt_name_status(PyObject *self, PyObject *args, PyObject *kw
 	ret = PyTuple_New(3);
 	if (ret == NULL)
 		return NULL;
-	PyTuple_SetItem(ret, 0, PyString_FromString(io.out.reply_from));
+	PyTuple_SetItem(ret, 0, PyUnicode_FromString(io.out.reply_from));
 
 	py_name = PyObject_FromNBTName(node->socket, &io.out.name);
 	if (py_name == NULL)
@@ -264,6 +283,7 @@ static PyObject *py_nbt_name_register(PyObject *self, PyObject *args, PyObject *
 	io.in.broadcast = true;
 	io.in.multi_homed = true;
 	io.in.register_demand = true;
+	io.in.ttl = 0;
 	io.in.timeout = 0;
 	io.in.retries = 0;
 
@@ -289,10 +309,10 @@ static PyObject *py_nbt_name_register(PyObject *self, PyObject *args, PyObject *
 		return NULL;
 	}
 
-	ret = PyTuple_New(3);
+	ret = PyTuple_New(4);
 	if (ret == NULL)
 		return NULL;
-	PyTuple_SetItem(ret, 0, PyString_FromString(io.out.reply_from));
+	PyTuple_SetItem(ret, 0, PyUnicode_FromString(io.out.reply_from));
 
 	py_name = PyObject_FromNBTName(node->socket, &io.out.name);
 	if (py_name == NULL)
@@ -300,9 +320,9 @@ static PyObject *py_nbt_name_register(PyObject *self, PyObject *args, PyObject *
 
 	PyTuple_SetItem(ret, 1, py_name);
 
-	PyTuple_SetItem(ret, 2, PyString_FromString(io.out.reply_addr));
+	PyTuple_SetItem(ret, 2, PyUnicode_FromString(io.out.reply_addr));
 
-	PyTuple_SetItem(ret, 3, PyInt_FromLong(io.out.rcode));
+	PyTuple_SetItem(ret, 3, PyLong_FromLong(io.out.rcode));
 
 	return ret;
 }
@@ -319,6 +339,7 @@ static PyObject *py_nbt_name_refresh(PyObject *self, PyObject *args, PyObject *k
 
 	io.in.broadcast = true;
 	io.in.nb_flags = 0;
+	io.in.ttl = 0;
 	io.in.timeout = 0;
 	io.in.retries = 0;
 
@@ -347,7 +368,7 @@ static PyObject *py_nbt_name_refresh(PyObject *self, PyObject *args, PyObject *k
 	ret = PyTuple_New(3);
 	if (ret == NULL)
 		return NULL;
-	PyTuple_SetItem(ret, 0, PyString_FromString(io.out.reply_from));
+	PyTuple_SetItem(ret, 0, PyUnicode_FromString(io.out.reply_from));
 
 	py_name = PyObject_FromNBTName(node->socket, &io.out.name);
 	if (py_name == NULL)
@@ -355,9 +376,9 @@ static PyObject *py_nbt_name_refresh(PyObject *self, PyObject *args, PyObject *k
 
 	PyTuple_SetItem(ret, 1, py_name);
 
-	PyTuple_SetItem(ret, 2, PyString_FromString(io.out.reply_addr));
+	PyTuple_SetItem(ret, 2, PyUnicode_FromString(io.out.reply_addr));
 
-	PyTuple_SetItem(ret, 3, PyInt_FromLong(io.out.rcode));
+	PyTuple_SetItem(ret, 3, PyLong_FromLong(io.out.rcode));
 
 	return ret;
 }
@@ -368,25 +389,31 @@ static PyObject *py_nbt_name_release(PyObject *self, PyObject *args, PyObject *k
 }
 
 static PyMethodDef py_nbt_methods[] = {
-	{ "query_name", (PyCFunction)py_nbt_name_query, METH_VARARGS|METH_KEYWORDS,
+	{ "query_name", PY_DISCARD_FUNC_SIG(PyCFunction, py_nbt_name_query),
+		METH_VARARGS|METH_KEYWORDS,
 		"S.query_name(name, dest, broadcast=True, wins=False, timeout=0, retries=3) -> (reply_from, name, reply_addr)\n"
 		"Query for a NetBIOS name" },
-	{ "register_name", (PyCFunction)py_nbt_name_register, METH_VARARGS|METH_KEYWORDS,
+	{ "register_name", PY_DISCARD_FUNC_SIG(PyCFunction,
+					       py_nbt_name_register),
+		METH_VARARGS|METH_KEYWORDS,
 		"S.register_name(name, address, dest, register_demand=True, broadcast=True, multi_homed=True, ttl=0, timeout=0, retries=0) -> (reply_from, name, reply_addr, rcode)\n"
 		"Register a new name" },
-	{ "release_name", (PyCFunction)py_nbt_name_release, METH_VARARGS|METH_KEYWORDS, "S.release_name(name, address, dest, nb_flags=0, broadcast=true, timeout=0, retries=3) -> (reply_from, name, reply_addr, rcode)\n"
+	{ "release_name", PY_DISCARD_FUNC_SIG(PyCFunction, py_nbt_name_release),
+		METH_VARARGS|METH_KEYWORDS, "S.release_name(name, address, dest, nb_flags=0, broadcast=true, timeout=0, retries=3) -> (reply_from, name, reply_addr, rcode)\n"
 		"release a previously registered name" },
-	{ "refresh_name", (PyCFunction)py_nbt_name_refresh, METH_VARARGS|METH_KEYWORDS, "S.refresh_name(name, address, dest, nb_flags=0, broadcast=True, ttl=0, timeout=0, retries=0) -> (reply_from, name, reply_addr, rcode)\n"
+	{ "refresh_name", PY_DISCARD_FUNC_SIG(PyCFunction, py_nbt_name_refresh),
+		METH_VARARGS|METH_KEYWORDS, "S.refresh_name(name, address, dest, nb_flags=0, broadcast=True, ttl=0, timeout=0, retries=0) -> (reply_from, name, reply_addr, rcode)\n"
 		"release a previously registered name" },
-	{ "name_status", (PyCFunction)py_nbt_name_status, METH_VARARGS|METH_KEYWORDS,
+	{ "name_status", PY_DISCARD_FUNC_SIG(PyCFunction, py_nbt_name_status),
+		METH_VARARGS|METH_KEYWORDS,
 		"S.name_status(name, dest, timeout=0, retries=0) -> (reply_from, name, status)\n"
 		"Find the status of a name" },
 
-	{ NULL }
+	{0}
 };
 
 PyTypeObject nbt_node_Type = {
-	PyObject_HEAD_INIT(NULL) 0,
+	PyVarObject_HEAD_INIT(NULL, 0)
 	.tp_name = "netbios.Node",
 	.tp_basicsize = sizeof(nbt_node_Object),
 	.tp_flags = Py_TPFLAGS_DEFAULT|Py_TPFLAGS_BASETYPE,
@@ -397,14 +424,24 @@ PyTypeObject nbt_node_Type = {
 		  "Create a new NetBIOS node\n"
 };
 
-void initnetbios(void)
-{
-	PyObject *mod;
-	if (PyType_Ready(&nbt_node_Type) < 0)
-		return;
+static struct PyModuleDef moduledef = {
+    PyModuleDef_HEAD_INIT,
+    .m_name = "netbios",
+    .m_doc = "NetBIOS over TCP/IP support",
+    .m_size = -1,
+    .m_methods = NULL,
+};
 
-	mod = Py_InitModule3("netbios", NULL, "NetBIOS over TCP/IP support");
+MODULE_INIT_FUNC(netbios)
+{
+	PyObject *mod = NULL;
+	if (PyType_Ready(&nbt_node_Type) < 0)
+		return mod;
+
+	mod = PyModule_Create(&moduledef);
+
 
 	Py_INCREF((PyObject *)&nbt_node_Type);
 	PyModule_AddObject(mod, "Node", (PyObject *)&nbt_node_Type);
+	return mod;
 }

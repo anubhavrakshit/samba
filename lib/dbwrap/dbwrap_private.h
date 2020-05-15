@@ -23,10 +23,15 @@
 #ifndef __DBWRAP_PRIVATE_H__
 #define __DBWRAP_PRIVATE_H__
 
+struct tevent_context;
+struct tevent_req;
+
 struct db_record {
 	struct db_context *db;
 	TDB_DATA key, value;
-	NTSTATUS (*store)(struct db_record *rec, TDB_DATA data, int flag);
+	bool value_valid;
+	NTSTATUS (*storev)(struct db_record *rec, const TDB_DATA *dbufs,
+			   int num_dbufs, int flag);
 	NTSTATUS (*delete_rec)(struct db_record *rec);
 	void *private_data;
 };
@@ -55,22 +60,33 @@ struct db_context {
 				 void (*parser)(TDB_DATA key, TDB_DATA data,
 						void *private_data),
 				 void *private_data);
+	struct tevent_req *(*parse_record_send)(
+		TALLOC_CTX *mem_ctx,
+		struct tevent_context *ev,
+		struct db_context *db,
+		TDB_DATA key,
+		void (*parser)(TDB_DATA key, TDB_DATA data, void *private_data),
+		void *private_data,
+		enum dbwrap_req_state *req_state);
+	NTSTATUS (*parse_record_recv)(struct tevent_req *req);
+	NTSTATUS (*do_locked)(struct db_context *db, TDB_DATA key,
+			      void (*fn)(struct db_record *rec,
+					 TDB_DATA value,
+					 void *private_data),
+			      void *private_data);
 	int (*exists)(struct db_context *db,TDB_DATA key);
 	int (*wipe)(struct db_context *db);
 	int (*check)(struct db_context *db);
-	void (*id)(struct db_context *db, const uint8_t **id, size_t *idlen);
+	size_t (*id)(struct db_context *db, uint8_t *id, size_t idlen);
+
 	const char *name;
-	int hash_size;
 	void *private_data;
 	enum dbwrap_lock_order lock_order;
 	bool persistent;
-	void (*stored_callback)(struct db_context *db, struct db_record *rec,
-				void *private_data);
-	void *stored_callback_private_data;
 };
 
 #define DBWRAP_LOCK_ORDER_MIN DBWRAP_LOCK_ORDER_1
-#define DBWRAP_LOCK_ORDER_MAX DBWRAP_LOCK_ORDER_3
+#define DBWRAP_LOCK_ORDER_MAX DBWRAP_LOCK_ORDER_4
 
 #define DBWRAP_LOCK_ORDER_VALID(order) \
 	(((order) >= DBWRAP_LOCK_ORDER_MIN) && \

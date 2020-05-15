@@ -48,7 +48,7 @@ static struct tevent_req *create_cancel_send(
 	subreq = cli_ntcreate_send(
 		mem_ctx, ev, cli, fname, 0, FILE_GENERIC_READ,
 		FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ|FILE_SHARE_WRITE,
-		FILE_OPEN_IF, 0, 0);
+		FILE_OPEN_IF, 0, SMB2_IMPERSONATION_IMPERSONATION, 0);
 	if (tevent_req_nomem(subreq, req)) {
 		return tevent_req_post(req, ev);
 	}
@@ -113,15 +113,22 @@ bool run_oplock_cancel(int dummy)
 	const char *fname = "oplock-cancel";
 	uint16_t fnum1;
 	NTSTATUS status;
+	/*
+	 * Currently this test seems to work only
+	 * with SMB2/3 and only against Samba.
+	 *
+	 * TODO: we should change our server
+	 * to ignore cancel for SMB2 Create
+	 * and behave like Windows.
+	 */
+	int flags = CLI_FULL_CONNECTION_DISABLE_SMB1;
 
-	lp_set_cmdline("client max protocol", "smb3");
-
-	if (!torture_open_connection(&cli1, 0)) {
+	if (!torture_open_connection_flags(&cli1, 0, flags)) {
 		return false;
 	}
 	cli1->use_oplocks = true;
 
-	if (!torture_open_connection(&cli2, 0)) {
+	if (!torture_open_connection_flags(&cli2, 0, flags)) {
 		return false;
 	}
 	cli2->use_oplocks = true;

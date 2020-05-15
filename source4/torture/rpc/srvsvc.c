@@ -557,10 +557,10 @@ static bool test_NetShareAddSetDel(struct torture_context *tctx,
 		uint32_t level;
 		WERROR expected;
 	} levels[] = {
-		 { 0,		WERR_UNKNOWN_LEVEL },
+		 { 0,		WERR_INVALID_LEVEL },
 		 { 1,		WERR_OK },
 		 { 2,		WERR_OK },
-		 { 501,		WERR_UNKNOWN_LEVEL },
+		 { 501,		WERR_INVALID_LEVEL },
 		 { 502,		WERR_OK },
 		 { 1004,	WERR_OK },
 		 { 1005,	WERR_OK },
@@ -860,7 +860,7 @@ static bool test_NetShareEnum(struct torture_context *tctx,
 		 { 0,	WERR_OK,		WERR_OK },
 		 { 1,	WERR_OK,		WERR_OK },
 		 { 2,	WERR_ACCESS_DENIED,	WERR_OK },
-		 { 501,	WERR_UNKNOWN_LEVEL,	WERR_UNKNOWN_LEVEL },
+		 { 501,	WERR_INVALID_LEVEL,	WERR_INVALID_LEVEL },
 		 { 502,	WERR_ACCESS_DENIED,	WERR_OK },
 	};
 	int i;
@@ -970,6 +970,7 @@ static bool test_NetDiskEnum(struct torture_context *tctx,
 	struct dcerpc_binding_handle *b = p->binding_handle;
 
 	ZERO_STRUCT(info);
+	ZERO_STRUCT(r);
 
 	r.in.server_unc = NULL;
 	r.in.resume_handle = &resume_handle;
@@ -1108,6 +1109,13 @@ again:
 			if (W_ERROR_IS_OK(r.out.result)) {
 				min = n;
 				n += (max - min + 1)/2;
+				if (n == min) {
+					/*
+					 * We did not move, so
+					 * do not loop forever
+					 */
+					break;
+				}
 				continue;
 				
 			} else {

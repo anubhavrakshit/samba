@@ -36,6 +36,9 @@
 #include "../lib/util/tevent_ntstatus.h"
 #include "libcli/security/security.h"
 
+#undef DBGC_CLASS
+#define DBGC_CLASS            DBGC_DRS_REPL
+
 struct dreplsrv_out_drsuapi_state {
 	struct tevent_context *ev;
 
@@ -237,10 +240,27 @@ NTSTATUS dreplsrv_out_drsuapi_recv(struct tevent_req *req)
 	return NT_STATUS_OK;
 }
 
+struct dreplsrv_op_pull_source_schema_cycle {
+	struct repsFromTo1 repsFrom1;
+	size_t object_count;
+	struct drsuapi_DsReplicaObjectListItemEx *first_object;
+	struct drsuapi_DsReplicaObjectListItemEx *last_object;
+	uint32_t linked_attributes_count;
+	struct drsuapi_DsReplicaLinkedAttribute *linked_attributes;
+};
+
 struct dreplsrv_op_pull_source_state {
 	struct tevent_context *ev;
 	struct dreplsrv_out_operation *op;
 	void *ndr_struct_ptr;
+	/*
+	 * Used when we have to re-try with a different NC, eg for
+	 * EXOP retry or to get a current schema first
+	 */
+	struct dreplsrv_partition_source_dsa *source_dsa_retry;
+	enum drsuapi_DsExtendedOperation extended_op_retry;
+	bool retry_started;
+	struct dreplsrv_op_pull_source_schema_cycle *schema_cycle;
 };
 
 static void dreplsrv_op_pull_source_connect_done(struct tevent_req *subreq);
@@ -270,6 +290,38 @@ struct tevent_req *dreplsrv_op_pull_source_send(TALLOC_CTX *mem_ctx,
 	return req;
 }
 
+static bool dreplsrv_op_pull_source_detect_schema_cycle(struct tevent_req *req)
+{
+	struct dreplsrv_op_pull_source_state *state =
+		tevent_req_data(req,
+		struct dreplsrv_op_pull_source_state);
+	bool is_schema = false;
+
+	if (state->op->extended_op == DRSUAPI_EXOP_NONE) {
+		struct dreplsrv_out_operation *op = state->op;
+		struct dreplsrv_service *service = op->service;
+		struct ldb_dn *schema_dn = ldb_get_schema_basedn(service->samdb);
+		struct dreplsrv_partition *partition = op->source_dsa->partition;
+
+		is_schema = ldb_dn_compare(partition->dn, schema_dn) == 0;
+	}
+
+	if (is_schema) {
+		struct dreplsrv_op_pull_source_schema_cycle *sc;
+
+		sc = talloc_zero(state,
+				 struct dreplsrv_op_pull_source_schema_cycle);
+		if (tevent_req_nomem(sc, req)) {
+			return false;
+		}
+		sc->repsFrom1 = *state->op->source_dsa->repsFrom1;
+
+		state->schema_cycle = sc;
+	}
+
+	return true;
+}
+
 static void dreplsrv_op_pull_source_get_changes_trigger(struct tevent_req *req);
 
 static void dreplsrv_op_pull_source_connect_done(struct tevent_req *subreq)
@@ -277,10 +329,16 @@ static void dreplsrv_op_pull_source_connect_done(struct tevent_req *subreq)
 	struct tevent_req *req = tevent_req_callback_data(subreq,
 				 struct tevent_req);
 	NTSTATUS status;
+	bool ok;
 
 	status = dreplsrv_out_drsuapi_recv(subreq);
 	TALLOC_FREE(subreq);
 	if (tevent_req_nterror(req, status)) {
+		return;
+	}
+
+	ok = dreplsrv_op_pull_source_detect_schema_cycle(req);
+	if (!ok) {
 		return;
 	}
 
@@ -295,6 +353,7 @@ static void dreplsrv_op_pull_source_get_changes_done(struct tevent_req *subreq);
 static NTSTATUS dreplsrv_get_rodc_partial_attribute_set(struct dreplsrv_service *service,
 							TALLOC_CTX *mem_ctx,
 							struct drsuapi_DsPartialAttributeSet **_pas,
+							struct drsuapi_DsReplicaOIDMapping_Ctr **pfm,
 							bool for_schema)
 {
 	struct drsuapi_DsPartialAttributeSet *pas;
@@ -333,6 +392,11 @@ static NTSTATUS dreplsrv_get_rodc_partial_attribute_set(struct dreplsrv_service 
 	}
 
 	*_pas = pas;
+
+	if (pfm != NULL) {
+		dsdb_get_oid_mappings_drsuapi(schema, true, mem_ctx, pfm);
+	}
+
 	return NT_STATUS_OK;
 }
 
@@ -342,7 +406,8 @@ static NTSTATUS dreplsrv_get_rodc_partial_attribute_set(struct dreplsrv_service 
  */
 static NTSTATUS dreplsrv_get_gc_partial_attribute_set(struct dreplsrv_service *service,
 						      TALLOC_CTX *mem_ctx,
-						      struct drsuapi_DsPartialAttributeSet **_pas)
+						      struct drsuapi_DsPartialAttributeSet **_pas,
+						      struct drsuapi_DsReplicaOIDMapping_Ctr **pfm)
 {
 	struct drsuapi_DsPartialAttributeSet *pas;
 	struct dsdb_schema *schema;
@@ -376,6 +441,11 @@ static NTSTATUS dreplsrv_get_gc_partial_attribute_set(struct dreplsrv_service *s
 	}
 
 	*_pas = pas;
+
+	if (pfm != NULL) {
+		dsdb_get_oid_mappings_drsuapi(schema, true, mem_ctx, pfm);
+	}
+
 	return NT_STATUS_OK;
 }
 
@@ -408,7 +478,7 @@ static void dreplsrv_op_pull_source_get_changes_trigger(struct tevent_req *req)
 {
 	struct dreplsrv_op_pull_source_state *state = tevent_req_data(req,
 						      struct dreplsrv_op_pull_source_state);
-	struct repsFromTo1 *rf1 = state->op->source_dsa->repsFrom1;
+	const struct repsFromTo1 *rf1 = state->op->source_dsa->repsFrom1;
 	struct dreplsrv_service *service = state->op->service;
 	struct dreplsrv_partition *partition = state->op->source_dsa->partition;
 	struct dreplsrv_drsuapi_connection *drsuapi = state->op->source_dsa->conn->drsuapi;
@@ -419,7 +489,13 @@ static void dreplsrv_op_pull_source_get_changes_trigger(struct tevent_req *req)
 	NTSTATUS status;
 	uint32_t replica_flags;
 	struct drsuapi_DsReplicaHighWaterMark highwatermark;
-	struct ldb_dn *schema_dn = ldb_get_schema_basedn(service->samdb);
+	struct drsuapi_DsReplicaOIDMapping_Ctr *mappings = NULL;
+	bool is_schema = false;
+
+	if (state->schema_cycle != NULL) {
+		is_schema = true;
+		rf1 = &state->schema_cycle->repsFrom1;
+	}
 
 	r = talloc(state, struct drsuapi_DsGetNCChanges);
 	if (tevent_req_nomem(r, req)) {
@@ -446,6 +522,8 @@ static void dreplsrv_op_pull_source_get_changes_trigger(struct tevent_req *req)
 		if (!W_ERROR_IS_OK(werr)) {
 			DEBUG(0,(__location__ ": Failed to convert UDV for %s : %s\n",
 				 ldb_dn_get_linearized(partition->dn), win_errstr(werr)));
+			tevent_req_nterror(req, werror_to_ntstatus(werr));
+			return;
 		}
 	}
 
@@ -458,22 +536,32 @@ static void dreplsrv_op_pull_source_get_changes_trigger(struct tevent_req *req)
 	replica_flags = rf1->replica_flags;
 	highwatermark = rf1->highwatermark;
 
+	if (state->op->options & DRSUAPI_DRS_GET_ANC) {
+		replica_flags |= DRSUAPI_DRS_GET_ANC;
+	}
+
+	if (state->op->options & DRSUAPI_DRS_SYNC_FORCED) {
+		replica_flags |= DRSUAPI_DRS_SYNC_FORCED;
+	}
+
 	if (partition->partial_replica) {
-		status = dreplsrv_get_gc_partial_attribute_set(service, r, &pas);
+		status = dreplsrv_get_gc_partial_attribute_set(service, r,
+							       &pas,
+							       &mappings);
 		if (!NT_STATUS_IS_OK(status)) {
 			DEBUG(0,(__location__ ": Failed to construct GC partial attribute set : %s\n", nt_errstr(status)));
+			tevent_req_nterror(req, status);
 			return;
 		}
 		replica_flags &= ~DRSUAPI_DRS_WRIT_REP;
-	} else if (partition->rodc_replica) {
-		bool for_schema = false;
-		if (ldb_dn_compare_base(schema_dn, partition->dn) == 0) {
-			for_schema = true;
-		}
-
-		status = dreplsrv_get_rodc_partial_attribute_set(service, r, &pas, for_schema);
+	} else if (partition->rodc_replica || state->op->extended_op == DRSUAPI_EXOP_REPL_SECRET) {
+		status = dreplsrv_get_rodc_partial_attribute_set(service, r,
+								 &pas,
+								 &mappings,
+								 is_schema);
 		if (!NT_STATUS_IS_OK(status)) {
 			DEBUG(0,(__location__ ": Failed to construct RODC partial attribute set : %s\n", nt_errstr(status)));
+			tevent_req_nterror(req, status);
 			return;
 		}
 		replica_flags &= ~DRSUAPI_DRS_WRIT_REP;
@@ -482,7 +570,21 @@ static void dreplsrv_op_pull_source_get_changes_trigger(struct tevent_req *req)
 		} else {
 			replica_flags |= DRSUAPI_DRS_SPECIAL_SECRET_PROCESSING;
 		}
+
+		/*
+		 * As per MS-DRSR:
+		 *
+		 * 4.1.10.4
+		 * Client Behavior When Sending the IDL_DRSGetNCChanges Request
+		 *
+		 * 4.1.10.4.1
+		 * ReplicateNCRequestMsg
+		 */
+		replica_flags |= DRSUAPI_DRS_GET_ALL_GROUP_MEMBERSHIP;
+	} else {
+		replica_flags |= DRSUAPI_DRS_GET_ALL_GROUP_MEMBERSHIP;
 	}
+
 	if (state->op->extended_op != DRSUAPI_EXOP_NONE) {
 		/*
 		 * If it's an exop never set the ADD_REF even if it's in
@@ -505,7 +607,28 @@ static void dreplsrv_op_pull_source_get_changes_trigger(struct tevent_req *req)
 	}
 
 	r->in.bind_handle	= &drsuapi->bind_handle;
-	if (drsuapi->remote_info28.supported_extensions & DRSUAPI_SUPPORTED_EXTENSION_GETCHGREQ_V8) {
+
+	if (drsuapi->remote_info28.supported_extensions & DRSUAPI_SUPPORTED_EXTENSION_GETCHGREQ_V10) {
+		r->in.level				= 10;
+		r->in.req->req10.destination_dsa_guid	= service->ntds_guid;
+		r->in.req->req10.source_dsa_invocation_id= rf1->source_dsa_invocation_id;
+		r->in.req->req10.naming_context		= &partition->nc;
+		r->in.req->req10.highwatermark		= highwatermark;
+		r->in.req->req10.uptodateness_vector	= uptodateness_vector;
+		r->in.req->req10.replica_flags		= replica_flags;
+		r->in.req->req10.max_object_count	= 133;
+		r->in.req->req10.max_ndr_size		= 1336811;
+		r->in.req->req10.extended_op		= state->op->extended_op;
+		r->in.req->req10.fsmo_info		= state->op->fsmo_info;
+		r->in.req->req10.partial_attribute_set	= pas;
+		r->in.req->req10.partial_attribute_set_ex= NULL;
+		r->in.req->req10.mapping_ctr.num_mappings= mappings == NULL ? 0 : mappings->num_mappings;
+		r->in.req->req10.mapping_ctr.mappings	= mappings == NULL ? NULL : mappings->mappings;
+
+		/* the only difference to v8 is the more_flags */
+		r->in.req->req10.more_flags = state->op->more_flags;
+
+	} else if (drsuapi->remote_info28.supported_extensions & DRSUAPI_SUPPORTED_EXTENSION_GETCHGREQ_V8) {
 		r->in.level				= 8;
 		r->in.req->req8.destination_dsa_guid	= service->ntds_guid;
 		r->in.req->req8.source_dsa_invocation_id= rf1->source_dsa_invocation_id;
@@ -519,8 +642,8 @@ static void dreplsrv_op_pull_source_get_changes_trigger(struct tevent_req *req)
 		r->in.req->req8.fsmo_info		= state->op->fsmo_info;
 		r->in.req->req8.partial_attribute_set	= pas;
 		r->in.req->req8.partial_attribute_set_ex= NULL;
-		r->in.req->req8.mapping_ctr.num_mappings= 0;
-		r->in.req->req8.mapping_ctr.mappings	= NULL;
+		r->in.req->req8.mapping_ctr.num_mappings= mappings == NULL ? 0 : mappings->num_mappings;
+		r->in.req->req8.mapping_ctr.mappings	= mappings == NULL ? NULL : mappings->mappings;
 	} else {
 		r->in.level				= 5;
 		r->in.req->req5.destination_dsa_guid	= service->ntds_guid;
@@ -643,6 +766,53 @@ static void dreplsrv_op_pull_source_get_changes_done(struct tevent_req *subreq)
 	dreplsrv_op_pull_source_apply_changes_trigger(req, r, ctr_level, ctr1, ctr6);
 }
 
+/**
+ * If processing a chunk of replication data fails, check if it is due to a
+ * problem that can be fixed by setting extra flags in the GetNCChanges request,
+ * i.e. GET_ANC or GET_TGT.
+ * @returns NT_STATUS_OK if the request was retried, and an error code if not
+ */
+static NTSTATUS dreplsrv_op_pull_retry_with_flags(struct tevent_req *req,
+						  WERROR error_code)
+{
+	struct dreplsrv_op_pull_source_state *state;
+	NTSTATUS nt_status = NT_STATUS_OK;
+
+	state = tevent_req_data(req, struct dreplsrv_op_pull_source_state);
+
+	/*
+	 * Check if we failed to apply the records due to a missing parent or
+	 * target object. If so, try again and ask for any mising parent/target
+	 * objects to be included this time.
+	 */
+	if (W_ERROR_EQUAL(error_code, WERR_DS_DRA_RECYCLED_TARGET)) {
+
+		if (state->op->more_flags & DRSUAPI_DRS_GET_TGT) {
+			DEBUG(1,("Missing target object despite setting DRSUAPI_DRS_GET_TGT flag\n"));
+			nt_status = NT_STATUS_INVALID_NETWORK_RESPONSE;
+		} else {
+			state->op->more_flags |= DRSUAPI_DRS_GET_TGT;
+			DEBUG(1,("Missing target object when we didn't set the DRSUAPI_DRS_GET_TGT flag, retrying\n"));
+			dreplsrv_op_pull_source_get_changes_trigger(req);
+		}
+	} else if (W_ERROR_EQUAL(error_code, WERR_DS_DRA_MISSING_PARENT)) {
+
+		if (state->op->options & DRSUAPI_DRS_GET_ANC) {
+			DEBUG(1,("Missing parent object despite setting DRSUAPI_DRS_GET_ANC flag\n"));
+			nt_status = NT_STATUS_INVALID_NETWORK_RESPONSE;
+		} else {
+			state->op->options |= DRSUAPI_DRS_GET_ANC;
+			DEBUG(4,("Missing parent object when we didn't set the DRSUAPI_DRS_GET_ANC flag, retrying\n"));
+			dreplsrv_op_pull_source_get_changes_trigger(req);
+		}
+	} else {
+		nt_status = werror_to_ntstatus(WERR_BAD_NET_RESP);
+	}
+
+	return nt_status;
+}
+
+
 static void dreplsrv_update_refs_trigger(struct tevent_req *req);
 
 static void dreplsrv_op_pull_source_apply_changes_trigger(struct tevent_req *req,
@@ -658,6 +828,7 @@ static void dreplsrv_op_pull_source_apply_changes_trigger(struct tevent_req *req
 	struct dreplsrv_partition *partition = state->op->source_dsa->partition;
 	struct dreplsrv_drsuapi_connection *drsuapi = state->op->source_dsa->conn->drsuapi;
 	struct ldb_dn *schema_dn = ldb_get_schema_basedn(service->samdb);
+	struct dreplsrv_op_pull_source_schema_cycle *sc = NULL;
 	struct dsdb_schema *schema;
 	struct dsdb_schema *working_schema = NULL;
 	const struct drsuapi_DsReplicaOIDMapping_Ctr *mapping_ctr;
@@ -671,6 +842,9 @@ static void dreplsrv_op_pull_source_apply_changes_trigger(struct tevent_req *req
 	WERROR status;
 	NTSTATUS nt_status;
 	uint32_t dsdb_repl_flags = 0;
+	struct ldb_dn *nc_root = NULL;
+	bool was_schema = false;
+	int ret;
 
 	switch (ctr_level) {
 	case 1:
@@ -703,7 +877,90 @@ static void dreplsrv_op_pull_source_apply_changes_trigger(struct tevent_req *req
 		return;
 	}
 
-	schema = dsdb_get_schema(service->samdb, NULL);
+	/*
+	 * We need to cache the schema changes until we replicated
+	 * everything before we can apply the new schema.
+	 */
+	if (state->schema_cycle != NULL) {
+		TALLOC_CTX *mem = NULL;
+		struct drsuapi_DsReplicaObjectListItemEx **ptr = NULL;
+		struct drsuapi_DsReplicaObjectListItemEx *l = NULL;
+
+		was_schema = true;
+		sc = state->schema_cycle;
+
+		sc->repsFrom1 = rf1;
+
+		if (sc->first_object == NULL) {
+			mem = sc;
+			ptr = &sc->first_object;
+		} else {
+			mem = sc->last_object;
+			ptr = &sc->last_object->next_object;
+		}
+		*ptr = talloc_move(mem, &first_object);
+		for (l = *ptr; l != NULL; l = l->next_object) {
+			sc->object_count++;
+			if (l->next_object == NULL) {
+				sc->last_object = l;
+				break;
+			}
+		}
+
+		if (sc->linked_attributes_count == 0) {
+			sc->linked_attributes = talloc_move(sc, &linked_attributes);
+			sc->linked_attributes_count = linked_attributes_count;
+			linked_attributes_count = 0;
+		} else if (linked_attributes_count > 0) {
+			struct drsuapi_DsReplicaLinkedAttribute *new_las = NULL;
+			struct drsuapi_DsReplicaLinkedAttribute *tmp_las = NULL;
+			uint64_t new_count;
+			uint64_t add_size;
+			uint32_t add_idx;
+
+			new_count = sc->linked_attributes_count;
+			new_count += linked_attributes_count;
+			if (new_count > UINT32_MAX) {
+				nt_status = werror_to_ntstatus(WERR_BAD_NET_RESP);
+				tevent_req_nterror(req, nt_status);
+				return;
+			}
+			add_size = linked_attributes_count;
+			add_size *= sizeof(linked_attributes[0]);
+			if (add_size > SIZE_MAX) {
+				nt_status = werror_to_ntstatus(WERR_BAD_NET_RESP);
+				tevent_req_nterror(req, nt_status);
+				return;
+			}
+			add_idx = sc->linked_attributes_count;
+
+			tmp_las = talloc_realloc(sc,
+						 sc->linked_attributes,
+						 struct drsuapi_DsReplicaLinkedAttribute,
+						 new_count);
+			if (tevent_req_nomem(tmp_las, req)) {
+				return;
+			}
+			new_las = talloc_move(tmp_las, &linked_attributes);
+			memcpy(&tmp_las[add_idx], new_las, add_size);
+			sc->linked_attributes = tmp_las;
+			sc->linked_attributes_count = new_count;
+			linked_attributes_count = 0;
+		}
+
+		if (more_data) {
+			/* we don't need this structure anymore */
+			TALLOC_FREE(r);
+
+			dreplsrv_op_pull_source_get_changes_trigger(req);
+			return;
+		}
+
+		/* detach sc from state */
+		state->schema_cycle = NULL;
+	}
+
+	schema = dsdb_get_schema(service->samdb, state);
 	if (!schema) {
 		DEBUG(0,(__location__ ": Schema is not loaded yet!\n"));
 		tevent_req_nterror(req, NT_STATUS_INTERNAL_ERROR);
@@ -714,9 +971,14 @@ static void dreplsrv_op_pull_source_apply_changes_trigger(struct tevent_req *req
 	 * Decide what working schema to use for object conversion.
 	 * We won't need a working schema for empty replicas sent.
 	 */
-	if (first_object) {
-		bool is_schema = ldb_dn_compare(partition->dn, schema_dn) == 0;
-		if (is_schema) {
+	if (sc != NULL) {
+		first_object = talloc_move(r, &sc->first_object);
+		object_count = sc->object_count;
+		linked_attributes = talloc_move(r, &sc->linked_attributes);
+		linked_attributes_count = sc->linked_attributes_count;
+		TALLOC_FREE(sc);
+
+		if (first_object != NULL) {
 			/* create working schema to convert objects with */
 			status = dsdb_repl_make_working_schema(service->samdb,
 							       schema,
@@ -740,10 +1002,34 @@ static void dreplsrv_op_pull_source_apply_changes_trigger(struct tevent_req *req
 	if (state->op->options & DRSUAPI_DRS_FULL_SYNC_IN_PROGRESS) {
 		dsdb_repl_flags |= DSDB_REPL_FLAG_PRIORITISE_INCOMING;
 	}
+	if (state->op->options & DRSUAPI_DRS_SPECIAL_SECRET_PROCESSING) {
+		dsdb_repl_flags |= DSDB_REPL_FLAG_EXPECT_NO_SECRETS;
+	}
+	if (state->op->options & DRSUAPI_DRS_CRITICAL_ONLY ||
+	    state->op->extended_op != DRSUAPI_EXOP_NONE) {
+		dsdb_repl_flags |= DSDB_REPL_FLAG_OBJECT_SUBSET;
+	}
+
+	if (state->op->more_flags & DRSUAPI_DRS_GET_TGT) {
+		dsdb_repl_flags |= DSDB_REPL_FLAG_TARGETS_UPTODATE;
+	}
+
+	if (state->op->extended_op != DRSUAPI_EXOP_NONE) {
+		ret = dsdb_find_nc_root(service->samdb, partition,
+					partition->dn, &nc_root);
+		if (ret != LDB_SUCCESS) {
+			DEBUG(0,(__location__ ": Failed to find nc_root for %s\n",
+				 ldb_dn_get_linearized(partition->dn)));
+			tevent_req_nterror(req, NT_STATUS_INTERNAL_ERROR);
+			return;
+		}
+	} else {
+		nc_root = partition->dn;
+	}
 
 	status = dsdb_replicated_objects_convert(service->samdb,
 						 working_schema ? working_schema : schema,
-						 partition->nc.dn,
+						 nc_root,
 						 mapping_ctr,
 						 object_count,
 						 first_object,
@@ -754,7 +1040,116 @@ static void dreplsrv_op_pull_source_apply_changes_trigger(struct tevent_req *req
 						 &drsuapi->gensec_skey,
 						 dsdb_repl_flags,
 						 state, &objects);
-	if (!W_ERROR_IS_OK(status)) {
+
+	if (W_ERROR_EQUAL(status, WERR_DS_DRA_SCHEMA_MISMATCH)) {
+		struct dreplsrv_partition *p;
+		bool ok;
+
+		if (was_schema) {
+			nt_status = werror_to_ntstatus(WERR_BAD_NET_RESP);
+			DBG_ERR("Got mismatch for schema partition: %s/%s\n",
+				  win_errstr(status), nt_errstr(nt_status));
+			tevent_req_nterror(req, nt_status);
+			return;
+		}
+
+		if (state->retry_started) {
+			nt_status = werror_to_ntstatus(WERR_BAD_NET_RESP);
+			DEBUG(0,("Failed to convert objects after retry: %s/%s\n",
+				  win_errstr(status), nt_errstr(nt_status)));
+			tevent_req_nterror(req, nt_status);
+			return;
+		}
+
+		/*
+		 * Change info sync or extended operation into a fetch
+		 * of the schema partition, so we get all the schema
+		 * objects we need.
+		 *
+		 * We don't want to re-do the remote exop,
+		 * unless it was REPL_SECRET so we set the
+		 * fallback operation to just be a fetch of
+		 * the relevent partition.
+		 */
+
+
+		if (state->op->extended_op == DRSUAPI_EXOP_REPL_SECRET) {
+			state->extended_op_retry = state->op->extended_op;
+		} else {
+			state->extended_op_retry = DRSUAPI_EXOP_NONE;
+		}
+		state->op->extended_op = DRSUAPI_EXOP_NONE;
+
+		if (ldb_dn_compare(nc_root, partition->dn) == 0) {
+			state->source_dsa_retry = state->op->source_dsa;
+		} else {
+			status = dreplsrv_partition_find_for_nc(service,
+								NULL, NULL,
+								ldb_dn_get_linearized(nc_root),
+								&p);
+			if (!W_ERROR_IS_OK(status)) {
+				DEBUG(2, ("Failed to find requested Naming Context for %s: %s",
+					  ldb_dn_get_linearized(nc_root),
+					  win_errstr(status)));
+				nt_status = werror_to_ntstatus(status);
+				tevent_req_nterror(req, nt_status);
+				return;
+			}
+			status = dreplsrv_partition_source_dsa_by_guid(p,
+								       &state->op->source_dsa->repsFrom1->source_dsa_obj_guid,
+								       &state->source_dsa_retry);
+
+			if (!W_ERROR_IS_OK(status)) {
+				struct GUID_txt_buf str;
+				DEBUG(2, ("Failed to find requested source DSA for %s and %s: %s",
+					  ldb_dn_get_linearized(nc_root),
+					  GUID_buf_string(&state->op->source_dsa->repsFrom1->source_dsa_obj_guid, &str),
+					  win_errstr(status)));
+				nt_status = werror_to_ntstatus(status);
+				tevent_req_nterror(req, nt_status);
+				return;
+			}
+		}
+
+		/* Find schema naming context to be synchronized first */
+		status = dreplsrv_partition_find_for_nc(service,
+							NULL, NULL,
+							ldb_dn_get_linearized(schema_dn),
+							&p);
+		if (!W_ERROR_IS_OK(status)) {
+			DEBUG(2, ("Failed to find requested Naming Context for schema: %s",
+				  win_errstr(status)));
+			nt_status = werror_to_ntstatus(status);
+			tevent_req_nterror(req, nt_status);
+			return;
+		}
+
+		status = dreplsrv_partition_source_dsa_by_guid(p,
+							       &state->op->source_dsa->repsFrom1->source_dsa_obj_guid,
+							       &state->op->source_dsa);
+		if (!W_ERROR_IS_OK(status)) {
+			struct GUID_txt_buf str;
+			DEBUG(2, ("Failed to find requested source DSA for %s and %s: %s",
+				  ldb_dn_get_linearized(schema_dn),
+				  GUID_buf_string(&state->op->source_dsa->repsFrom1->source_dsa_obj_guid, &str),
+				  win_errstr(status)));
+			nt_status = werror_to_ntstatus(status);
+			tevent_req_nterror(req, nt_status);
+			return;
+		}
+		DEBUG(4,("Wrong schema when applying reply GetNCChanges, retrying\n"));
+
+		state->retry_started = true;
+
+		ok = dreplsrv_op_pull_source_detect_schema_cycle(req);
+		if (!ok) {
+			return;
+		}
+
+		dreplsrv_op_pull_source_get_changes_trigger(req);
+		return;
+
+	} else if (!W_ERROR_IS_OK(status)) {
 		nt_status = werror_to_ntstatus(WERR_BAD_NET_RESP);
 		DEBUG(0,("Failed to convert objects: %s/%s\n",
 			  win_errstr(status), nt_errstr(nt_status)));
@@ -767,8 +1162,24 @@ static void dreplsrv_op_pull_source_apply_changes_trigger(struct tevent_req *req
 						objects,
 						&state->op->source_dsa->notify_uSN);
 	talloc_free(objects);
+
 	if (!W_ERROR_IS_OK(status)) {
-		nt_status = werror_to_ntstatus(WERR_BAD_NET_RESP);
+
+		/*
+		 * Check if this error can be fixed by resending the GetNCChanges
+		 * request with extra flags set (i.e. GET_ANC/GET_TGT)
+		 */
+		nt_status = dreplsrv_op_pull_retry_with_flags(req, status);
+
+		if (NT_STATUS_IS_OK(nt_status)) {
+
+			/*
+			 * We resent the request. Don't update the highwatermark,
+			 * we'll start this part of the cycle again.
+			 */
+			return;
+		}
+
 		DEBUG(0,("Failed to commit objects: %s/%s\n",
 			  win_errstr(status), nt_errstr(nt_status)));
 		tevent_req_nterror(req, nt_status);
@@ -784,6 +1195,19 @@ static void dreplsrv_op_pull_source_apply_changes_trigger(struct tevent_req *req
 	TALLOC_FREE(r);
 
 	if (more_data) {
+		dreplsrv_op_pull_source_get_changes_trigger(req);
+		return;
+	}
+
+	/*
+	 * If we had to divert via doing some other thing, such as
+	 * pulling the schema, then go back and do the original
+	 * operation once we are done.
+	 */
+	if (state->source_dsa_retry != NULL) {
+		state->op->source_dsa = state->source_dsa_retry;
+		state->op->extended_op = state->extended_op_retry;
+		state->source_dsa_retry = NULL;
 		dreplsrv_op_pull_source_get_changes_trigger(req);
 		return;
 	}

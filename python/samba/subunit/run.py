@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/env python3
 #
 # Simple subunit testrunner for python
 # Copyright (C) Jelmer Vernooij <jelmer@samba.org> 2014
@@ -24,7 +24,7 @@
   $ python -m samba.subunit.run mylib.tests.test_suite
 """
 
-from iso8601.iso8601 import Utc
+from iso8601.iso8601 import UTC
 
 import datetime
 import os
@@ -79,7 +79,7 @@ class TestProtocolClient(unittest.TestResult):
     suite = make_suite()
     # Create a stream (any object with a 'write' method). This should accept
     # bytes not strings: subunit is a byte orientated protocol.
-    stream = file('tests.log', 'wb')
+    stream = open('tests.log', 'wb')
     # Create a subunit result object which will output to the stream
     result = subunit.TestProtocolClient(stream)
     # Optionally, to get timing data for performance analysis, wrap the
@@ -94,6 +94,10 @@ class TestProtocolClient(unittest.TestResult):
     def __init__(self, stream):
         unittest.TestResult.__init__(self)
         self._stream = stream
+        self.failed = False
+
+    def wasSuccessful(self):
+        return not self.failed
 
     def addError(self, test, error=None):
         """Report an error in test test.
@@ -102,6 +106,7 @@ class TestProtocolClient(unittest.TestResult):
             exc_info tuple.
         """
         self._addOutcome("error", test, error=error)
+        self.failed = True
 
     def addExpectedFailure(self, test, error=None):
         """Report an expected failure in test test.
@@ -118,6 +123,7 @@ class TestProtocolClient(unittest.TestResult):
             exc_info tuple.
         """
         self._addOutcome("failure", test, error=error)
+        self.failed = True
 
     def _addOutcome(self, outcome, test, error=None, error_permitted=True):
         """Report a failure in test test.
@@ -129,7 +135,7 @@ class TestProtocolClient(unittest.TestResult):
         :param error_permitted: If True then error must be supplied.
             If False then error must not be supplied.
         """
-        self._stream.write(("%s: " % outcome) + self._test_id(test))
+        self._stream.write(("%s: " % outcome) + test.id())
         if error_permitted:
             if error is None:
                 raise ValueError
@@ -161,17 +167,12 @@ class TestProtocolClient(unittest.TestResult):
         """Report an unexpected success in test test.
         """
         self._addOutcome("uxsuccess", test, error_permitted=False)
-
-    def _test_id(self, test):
-        result = test.id()
-        if type(result) is not bytes:
-            result = result.encode('utf8')
-        return result
+        self.failed = True
 
     def startTest(self, test):
         """Mark a test as starting its test run."""
         super(TestProtocolClient, self).startTest(test)
-        self._stream.write("test: " + self._test_id(test) + "\n")
+        self._stream.write("test: " + test.id() + "\n")
         self._stream.flush()
 
     def stopTest(self, test):
@@ -183,7 +184,7 @@ class TestProtocolClient(unittest.TestResult):
 
         ":param datetime: A datetime.datetime object.
         """
-        time = a_datetime.astimezone(Utc())
+        time = a_datetime.astimezone(UTC)
         self._stream.write("time: %04d-%02d-%02d %02d:%02d:%02d.%06dZ\n" % (
             time.year, time.month, time.day, time.hour, time.minute,
             time.second, time.microsecond))
@@ -457,7 +458,7 @@ class AutoTimingTestResultDecorator(HookedTestResultDecorator):
         time = self._time
         if time is not None:
             return
-        time = datetime.datetime.utcnow().replace(tzinfo=Utc())
+        time = datetime.datetime.utcnow().replace(tzinfo=UTC)
         self.decorated.time(time)
 
     @property

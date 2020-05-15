@@ -86,7 +86,7 @@ static WERROR pull_winreg_Data(TALLOC_CTX *mem_ctx,
 	ndr_err = ndr_pull_union_blob(blob, mem_ctx, data, type,
 			(ndr_pull_flags_fn_t)ndr_pull_winreg_Data);
 	if (!NDR_ERR_CODE_IS_SUCCESS(ndr_err)) {
-		return WERR_GENERAL_FAILURE;
+		return WERR_GEN_FAILURE;
 	}
 	return WERR_OK;
 }
@@ -202,19 +202,19 @@ static WERROR cmd_winreg_querymultiplevalues_ex(struct rpc_pipe_client *cli,
 
 	values_in = talloc_zero_array(mem_ctx, struct QueryMultipleValue, num_values);
 	if (values_in == NULL) {
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	values_out = talloc_zero_array(mem_ctx, struct QueryMultipleValue, num_values);
 	if (values_out == NULL) {
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	for (i=0; i < num_values; i++) {
 
 		values_in[i].ve_valuename = talloc_zero(values_in, struct winreg_ValNameBuf);
 		if (values_in[i].ve_valuename == NULL) {
-			return WERR_NOMEM;
+			return WERR_NOT_ENOUGH_MEMORY;
 		}
 
 		values_in[i].ve_valuename->name = talloc_strdup(values_in[i].ve_valuename, argv[i+2]);
@@ -243,7 +243,7 @@ static WERROR cmd_winreg_querymultiplevalues_ex(struct rpc_pipe_client *cli,
 
 			buffer = talloc_zero_array(mem_ctx, uint8_t, needed);
 			if (buffer == NULL) {
-				return WERR_NOMEM;
+				return WERR_NOT_ENOUGH_MEMORY;
 			}
 
 			status = dcerpc_winreg_QueryMultipleValues2(b, mem_ctx,
@@ -269,7 +269,7 @@ static WERROR cmd_winreg_querymultiplevalues_ex(struct rpc_pipe_client *cli,
 
 		buffer = talloc_zero_array(mem_ctx, uint8_t, buffer_size);
 		if (buffer == NULL) {
-			return WERR_NOMEM;
+			return WERR_NOT_ENOUGH_MEMORY;
 		}
 
 		status = dcerpc_winreg_QueryMultipleValues(b, mem_ctx,
@@ -318,9 +318,40 @@ static WERROR cmd_winreg_querymultiplevalues2(struct rpc_pipe_client *cli,
 
 struct cmd_set winreg_commands[] = {
 
-	{ "WINREG" },
-	{ "winreg_enumkey", RPC_RTYPE_WERROR, NULL, cmd_winreg_enumkeys, &ndr_table_winreg, NULL, "Enumerate Keys", "" },
-	{ "querymultiplevalues", RPC_RTYPE_WERROR, NULL, cmd_winreg_querymultiplevalues, &ndr_table_winreg, NULL, "Query multiple values", "" },
-	{ "querymultiplevalues2", RPC_RTYPE_WERROR, NULL, cmd_winreg_querymultiplevalues2, &ndr_table_winreg, NULL, "Query multiple values", "" },
-	{ NULL }
+	{
+		.name = "WINREG",
+	},
+	{
+		.name               = "winreg_enumkey",
+		.returntype         = RPC_RTYPE_WERROR,
+		.ntfn               = NULL,
+		.wfn                = cmd_winreg_enumkeys,
+		.table              = &ndr_table_winreg,
+		.rpc_pipe           = NULL,
+		.description        = "Enumerate Keys",
+		.usage              = "",
+	},
+	{
+		.name               = "querymultiplevalues",
+		.returntype         = RPC_RTYPE_WERROR,
+		.ntfn               = NULL,
+		.wfn                = cmd_winreg_querymultiplevalues,
+		.table              = &ndr_table_winreg,
+		.rpc_pipe           = NULL,
+		.description        = "Query multiple values",
+		.usage              = "",
+	},
+	{
+		.name               = "querymultiplevalues2",
+		.returntype         = RPC_RTYPE_WERROR,
+		.ntfn               = NULL,
+		.wfn                = cmd_winreg_querymultiplevalues2,
+		.table              = &ndr_table_winreg,
+		.rpc_pipe           = NULL,
+		.description        = "Query multiple values",
+		.usage              = "",
+	},
+	{
+		.name = NULL,
+	},
 };

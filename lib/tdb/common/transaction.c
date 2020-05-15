@@ -43,7 +43,7 @@
     tdb_free() the old record to place it on the normal tdb freelist
     before allocating the new record
 
-  - during transactions, keep a linked list of writes all that have
+  - during transactions, keep a linked list of all writes that have
     been performed by intercepting all tdb_write() calls. The hooked
     transaction versions of tdb_read() and tdb_write() check this
     linked list and try to use the elements of the list in preference
@@ -210,6 +210,10 @@ static int transaction_write(struct tdb_context *tdb, tdb_off_t off,
 {
 	uint32_t blk;
 
+	if (buf == NULL) {
+		return -1;
+	}
+
 	/* Only a commit is allowed on a prepared transaction */
 	if (tdb->transaction->prepared) {
 		tdb->ecode = TDB_ERR_EINVAL;
@@ -234,9 +238,7 @@ static int transaction_write(struct tdb_context *tdb, tdb_off_t off,
 		}
 		len -= len2;
 		off += len2;
-		if (buf != NULL) {
-			buf = (const void *)(len2 + (const char *)buf);
-		}
+		buf = (const void *)(len2 + (const char *)buf);
 	}
 
 	if (len == 0) {
@@ -289,11 +291,7 @@ static int transaction_write(struct tdb_context *tdb, tdb_off_t off,
 	}
 
 	/* overwrite part of an existing block */
-	if (buf == NULL) {
-		memset(tdb->transaction->blocks[blk] + off, 0, len);
-	} else {
-		memcpy(tdb->transaction->blocks[blk] + off, buf, len);
-	}
+	memcpy(tdb->transaction->blocks[blk] + off, buf, len);
 	if (blk == tdb->transaction->num_blocks-1) {
 		if (len + off > tdb->transaction->last_block_size) {
 			tdb->transaction->last_block_size = len + off;
@@ -332,7 +330,7 @@ static int transaction_write_existing(struct tdb_context *tdb, tdb_off_t off,
 		}
 	}
 
-	if (len == 0) {
+	if (len == 0 || buf == NULL) {
 		return 0;
 	}
 
@@ -380,6 +378,11 @@ static void transaction_next_hash_chain(struct tdb_context *tdb, uint32_t *chain
 static int transaction_oob(struct tdb_context *tdb, tdb_off_t off,
 			   tdb_len_t len, int probe)
 {
+	/*
+	 * This duplicates functionality from tdb_oob(). Don't remove:
+	 * we still have direct callers of tdb->methods->tdb_oob()
+	 * inside transaction.c.
+	 */
 	if (off + len >= off && off + len <= tdb->map_size) {
 		return 0;
 	}
@@ -393,10 +396,20 @@ static int transaction_oob(struct tdb_context *tdb, tdb_off_t off,
 static int transaction_expand_file(struct tdb_context *tdb, tdb_off_t size,
 				   tdb_off_t addition)
 {
-	/* add a write to the transaction elements, so subsequent
-	   reads see the zero data */
-	if (transaction_write(tdb, size, NULL, addition) != 0) {
-		return -1;
+	const char buf_zero[8192] = {0};
+	size_t buf_len = sizeof(buf_zero);
+
+	while (addition > 0) {
+		size_t n = MIN(addition, buf_len);
+		int ret;
+
+		ret = transaction_write(tdb, size, buf_zero, n);
+		if (ret != 0) {
+			return ret;
+		}
+
+		addition -= n;
+		size += n;
 	}
 
 	tdb->transaction->expanded = true;
@@ -412,6 +425,14 @@ static const struct tdb_methods transaction_methods = {
 	transaction_expand_file,
 };
 
+/*
+ * Is a transaction currently active on this context?
+ *
+ */
+_PUBLIC_ bool tdb_transaction_active(struct tdb_context *tdb)
+{
+	return (tdb->transaction != NULL);
+}
 
 /*
   start a tdb transaction. No token is returned, as only a single
@@ -476,6 +497,10 @@ static int _tdb_transaction_start(struct tdb_context *tdb,
 		SAFE_FREE(tdb->transaction);
 		if ((lockflags & TDB_LOCK_WAIT) == 0) {
 			tdb->ecode = TDB_ERR_NOLOCK;
+		} else {
+			TDB_LOG((tdb, TDB_DEBUG_ERROR,
+				 "tdb_transaction_start: "
+				 "failed to get transaction lock\n"));
 		}
 		return -1;
 	}
@@ -504,7 +529,7 @@ static int _tdb_transaction_start(struct tdb_context *tdb,
 
 	/* make sure we know about any file expansions already done by
 	   anyone else */
-	tdb->methods->tdb_oob(tdb, tdb->map_size, 1, 1);
+	tdb_oob(tdb, tdb->map_size, 1, 1);
 	tdb->transaction->old_map_size = tdb->map_size;
 
 	/* finally hook the io methods, replacing them with
@@ -572,7 +597,8 @@ static int transaction_sync(struct tdb_context *tdb, tdb_off_t offset, tdb_len_t
 
 static int _tdb_transaction_cancel(struct tdb_context *tdb)
 {
-	int i, ret = 0;
+	uint32_t i;
+	int ret = 0;
 
 	if (tdb->transaction == NULL) {
 		TDB_LOG((tdb, TDB_DEBUG_ERROR, "tdb_transaction_cancel: no transaction\n"));
@@ -589,7 +615,8 @@ static int _tdb_transaction_cancel(struct tdb_context *tdb)
 
 	/* free all the transaction blocks */
 	for (i=0;i<tdb->transaction->num_blocks;i++) {
-		if (tdb->transaction->blocks[i] != NULL) {
+		if ((tdb->transaction->blocks != NULL) &&
+		    tdb->transaction->blocks[i] != NULL) {
 			free(tdb->transaction->blocks[i]);
 		}
 	}
@@ -634,7 +661,7 @@ _PUBLIC_ int tdb_transaction_cancel(struct tdb_context *tdb)
 static bool tdb_recovery_size(struct tdb_context *tdb, tdb_len_t *result)
 {
 	tdb_len_t recovery_size = 0;
-	int i;
+	uint32_t i;
 
 	recovery_size = sizeof(uint32_t);
 	for (i=0;i<tdb->transaction->num_blocks;i++) {
@@ -669,6 +696,8 @@ int tdb_recovery_area(struct tdb_context *tdb,
 		      tdb_off_t *recovery_offset,
 		      struct tdb_record *rec)
 {
+	int ret;
+
 	if (tdb_ofs_read(tdb, TDB_RECOVERY_HEAD, recovery_offset) == -1) {
 		return -1;
 	}
@@ -689,6 +718,13 @@ int tdb_recovery_area(struct tdb_context *tdb,
 		*recovery_offset = 0;
 		rec->rec_len = 0;
 	}
+
+	ret = methods->tdb_oob(tdb, *recovery_offset, rec->rec_len, 1);
+	if (ret == -1) {
+		*recovery_offset = 0;
+		rec->rec_len = 0;
+	}
+
 	return 0;
 }
 
@@ -814,7 +850,7 @@ static int transaction_setup_recovery(struct tdb_context *tdb,
 	tdb_off_t recovery_offset, recovery_max_size;
 	tdb_off_t old_map_size = tdb->transaction->old_map_size;
 	uint32_t magic, tailer;
-	int i;
+	uint32_t i;
 
 	/*
 	  check that the recovery area has enough space
@@ -824,13 +860,12 @@ static int transaction_setup_recovery(struct tdb_context *tdb,
 		return -1;
 	}
 
-	data = (unsigned char *)malloc(recovery_size + sizeof(*rec));
-	if (data == NULL) {
+	rec = malloc(recovery_size + sizeof(*rec));
+	if (rec == NULL) {
 		tdb->ecode = TDB_ERR_OOM;
 		return -1;
 	}
 
-	rec = (struct tdb_record *)data;
 	memset(rec, 0, sizeof(*rec));
 
 	rec->magic    = TDB_RECOVERY_INVALID_MAGIC;
@@ -838,6 +873,8 @@ static int transaction_setup_recovery(struct tdb_context *tdb,
 	rec->rec_len  = recovery_max_size;
 	rec->key_len  = old_map_size;
 	CONVERT(*rec);
+
+	data = (unsigned char *)rec;
 
 	/* build the recovery data into a single blob to allow us to do a single
 	   large write, which should be more efficient */
@@ -982,7 +1019,23 @@ static int _tdb_transaction_prepare_commit(struct tdb_context *tdb)
 
 	/* upgrade the main transaction lock region to a write lock */
 	if (tdb_allrecord_upgrade(tdb) == -1) {
-		TDB_LOG((tdb, TDB_DEBUG_ERROR, "tdb_transaction_prepare_commit: failed to upgrade hash locks\n"));
+		if (tdb->ecode == TDB_ERR_RDONLY && tdb->read_only) {
+			TDB_LOG((tdb, TDB_DEBUG_ERROR,
+				 "tdb_transaction_prepare_commit: "
+				 "failed to upgrade hash locks: "
+				 "database is read only\n"));
+		} else if (tdb->ecode == TDB_ERR_RDONLY
+			   && tdb->traverse_read) {
+			TDB_LOG((tdb, TDB_DEBUG_ERROR,
+				 "tdb_transaction_prepare_commit: "
+				 "failed to upgrade hash locks: "
+				 "a database traverse is in progress\n"));
+		} else {
+			TDB_LOG((tdb, TDB_DEBUG_ERROR,
+				 "tdb_transaction_prepare_commit: "
+				 "failed to upgrade hash locks: %s\n",
+				 tdb_errorstr(tdb)));
+		}
 		_tdb_transaction_cancel(tdb);
 		return -1;
 	}
@@ -1060,7 +1113,7 @@ static bool repack_worthwhile(struct tdb_context *tdb)
 _PUBLIC_ int tdb_transaction_commit(struct tdb_context *tdb)
 {
 	const struct tdb_methods *methods;
-	int i;
+	uint32_t i;
 	bool need_repack = false;
 
 	if (tdb->transaction == NULL) {
@@ -1162,7 +1215,29 @@ _PUBLIC_ int tdb_transaction_commit(struct tdb_context *tdb)
 	_tdb_transaction_cancel(tdb);
 
 	if (need_repack) {
-		return tdb_repack(tdb);
+		int ret = tdb_repack(tdb);
+		if (ret != 0) {
+			TDB_LOG((tdb, TDB_DEBUG_FATAL,
+				 __location__ " Failed to repack database (not fatal)\n"));
+		}
+		/*
+		 * Ignore the error.
+		 *
+		 * Why?
+		 *
+		 * We just committed to the DB above, so anything
+		 * written during the transaction is committed, the
+		 * caller needs to know that the long-term state was
+		 * successfully modified.
+		 *
+		 * tdb_repack is an optimization that can fail for
+		 * reasons like lock ordering and we cannot recover
+		 * the transaction lock at this point, having released
+		 * it above.
+		 *
+		 * If we return a failure the caller thinks the
+		 * transaction was rolled back.
+		 */
 	}
 
 	return 0;

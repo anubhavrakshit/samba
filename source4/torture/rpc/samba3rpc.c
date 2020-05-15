@@ -31,12 +31,12 @@
 #include "librpc/gen_ndr/ndr_spoolss_c.h"
 #include "librpc/gen_ndr/ndr_winreg_c.h"
 #include "librpc/gen_ndr/ndr_wkssvc_c.h"
+#include "librpc/gen_ndr/ndr_svcctl_c.h"
 #include "lib/cmdline/popt_common.h"
 #include "torture/rpc/torture_rpc.h"
 #include "libcli/libcli.h"
 #include "libcli/smb_composite/smb_composite.h"
 #include "libcli/auth/libcli_auth.h"
-#include "../lib/crypto/crypto.h"
 #include "libcli/security/security.h"
 #include "param/param.h"
 #include "lib/registry/registry.h"
@@ -47,6 +47,7 @@
 #include "librpc/rpc/dcerpc.h"
 #include "librpc/rpc/dcerpc_proto.h"
 #include "libcli/smb/smbXcli_base.h"
+#include "source3/rpc_client/init_samr.h"
 
 /*
  * open pipe and bind, given an IPC$ context
@@ -195,7 +196,7 @@ bool torture_bind_authcontext(struct torture_context *torture)
 					lpcfg_smb_ports(torture->lp_ctx),
 					"IPC$", NULL,
 					lpcfg_socket_options(torture->lp_ctx),
-					cmdline_credentials,
+					popt_get_cmdline_credentials(),
 					lpcfg_resolve_context(torture->lp_ctx),
 					torture->ev, &options, &session_options,
 					lpcfg_gensec_settings(torture, torture->lp_ctx));
@@ -430,7 +431,7 @@ static bool torture_bind_samba3(struct torture_context *torture)
 					lpcfg_smb_ports(torture->lp_ctx),
 					"IPC$", NULL,
 					lpcfg_socket_options(torture->lp_ctx),
-					cmdline_credentials,
+					popt_get_cmdline_credentials(),
 					lpcfg_resolve_context(torture->lp_ctx),
 					torture->ev, &options, &session_options,
 					lpcfg_gensec_settings(torture, torture->lp_ctx));
@@ -442,13 +443,17 @@ static bool torture_bind_samba3(struct torture_context *torture)
 
 	ret = true;
 
-	ret &= bindtest(torture, cli, cmdline_credentials, DCERPC_AUTH_TYPE_NTLMSSP,
+	ret &= bindtest(torture, cli, popt_get_cmdline_credentials(),
+			DCERPC_AUTH_TYPE_NTLMSSP,
 			DCERPC_AUTH_LEVEL_INTEGRITY);
-	ret &= bindtest(torture, cli, cmdline_credentials, DCERPC_AUTH_TYPE_NTLMSSP,
+	ret &= bindtest(torture, cli, popt_get_cmdline_credentials(),
+			DCERPC_AUTH_TYPE_NTLMSSP,
 			DCERPC_AUTH_LEVEL_PRIVACY);
-	ret &= bindtest(torture, cli, cmdline_credentials, DCERPC_AUTH_TYPE_SPNEGO,
+	ret &= bindtest(torture, cli, popt_get_cmdline_credentials(),
+			DCERPC_AUTH_TYPE_SPNEGO,
 			DCERPC_AUTH_LEVEL_INTEGRITY);
-	ret &= bindtest(torture, cli, cmdline_credentials, DCERPC_AUTH_TYPE_SPNEGO,
+	ret &= bindtest(torture, cli, popt_get_cmdline_credentials(),
+			DCERPC_AUTH_TYPE_SPNEGO,
 			DCERPC_AUTH_LEVEL_PRIVACY);
 
  done:
@@ -659,7 +664,6 @@ static bool create_user(struct torture_context *tctx,
 		union samr_UserInfo *info;
 		DATA_BLOB session_key;
 
-
 		ZERO_STRUCT(u_info);
 		encode_pw_buffer(u_info.info23.password.data, password,
 				 STR_UNICODE);
@@ -669,8 +673,15 @@ static bool create_user(struct torture_context *tctx,
 			torture_comment(tctx, "dcerpc_fetch_session_key failed\n");
 			goto done;
 		}
-		arcfour_crypt_blob(u_info.info23.password.data, 516,
-				   &session_key);
+
+		status = init_samr_CryptPassword(password,
+						 &session_key,
+						 &u_info.info23.password);
+		if (!NT_STATUS_IS_OK(status)) {
+			torture_comment(tctx, "init_samr_CryptPassword failed\n");
+			goto done;
+		}
+
 		u_info.info23.info.password_expired = 0;
 		u_info.info23.info.fields_present = SAMR_FIELD_NT_PASSWORD_PRESENT |
 						    SAMR_FIELD_LM_PASSWORD_PRESENT |
@@ -865,10 +876,6 @@ static bool join3(struct torture_context *tctx,
 		union samr_UserInfo u_info;
 		struct samr_UserInfo21 *i21 = &u_info.info25.info;
 		DATA_BLOB session_key;
-		DATA_BLOB confounded_session_key = data_blob_talloc(
-			mem_ctx, NULL, 16);
-		MD5_CTX ctx;
-		uint8_t confounder[16];
 
 		ZERO_STRUCT(u_info);
 
@@ -883,25 +890,16 @@ static bool join3(struct torture_context *tctx,
 		i21->password_expired = 1;
 		*/
 
-		encode_pw_buffer(u_info.info25.password.data,
-				 cli_credentials_get_password(wks_creds),
-				 STR_UNICODE);
 		status = dcerpc_fetch_session_key(samr_pipe, &session_key);
 		if (!NT_STATUS_IS_OK(status)) {
 			torture_comment(tctx, "dcerpc_fetch_session_key failed: %s\n",
 				 nt_errstr(status));
 			goto done;
 		}
-		generate_random_buffer((uint8_t *)confounder, 16);
 
-		MD5Init(&ctx);
-		MD5Update(&ctx, confounder, 16);
-		MD5Update(&ctx, session_key.data, session_key.length);
-		MD5Final(confounded_session_key.data, &ctx);
-
-		arcfour_crypt_blob(u_info.info25.password.data, 516,
-				   &confounded_session_key);
-		memcpy(&u_info.info25.password.data[516], confounder, 16);
+		status = init_samr_CryptPasswordEx(cli_credentials_get_password(wks_creds),
+						   &session_key,
+						   &u_info.info25.password);
 
 		sui2.in.user_handle = wks_handle;
 		sui2.in.level = 25;
@@ -935,8 +933,11 @@ static bool join3(struct torture_context *tctx,
 			torture_comment(tctx, "dcerpc_fetch_session_key failed\n");
 			goto done;
 		}
-		arcfour_crypt_blob(u_info.info24.password.data, 516,
-				   &session_key);
+
+		status = init_samr_CryptPassword(cli_credentials_get_password(wks_creds),
+						 &session_key,
+						 &u_info.info24.password);
+
 		sui2.in.user_handle = wks_handle;
 		sui2.in.info = &u_info;
 		sui2.in.level = 24;
@@ -1070,7 +1071,7 @@ static bool auth2(struct torture_context *tctx,
 		goto done;
 	}
 
-	negotiate_flags = NETLOGON_NEG_AUTH2_FLAGS;
+	negotiate_flags = NETLOGON_NEG_AUTH2_ADS_FLAGS;
 	E_md4hash(cli_credentials_get_password(wks_cred), mach_pw.hash);
 
 	a.in.server_name = talloc_asprintf(
@@ -1189,10 +1190,10 @@ static bool schan(struct torture_context *tctx,
 		generate_random_buffer(chal.data, chal.length);
 		names_blob = NTLMv2_generate_names_blob(
 			mem_ctx,
-			cli_credentials_get_workstation(user_creds),
-			cli_credentials_get_domain(user_creds));
+			cli_credentials_get_workstation(wks_creds),
+			cli_credentials_get_domain(wks_creds));
 		status = cli_credentials_get_ntlm_response(
-			user_creds, mem_ctx, &flags, chal, names_blob,
+			user_creds, mem_ctx, &flags, chal, NULL, names_blob,
 			&lm_resp, &nt_resp, NULL, NULL);
 		if (!NT_STATUS_IS_OK(status)) {
 			torture_comment(tctx, "cli_credentials_get_ntlm_response failed:"
@@ -1208,8 +1209,7 @@ static bool schan(struct torture_context *tctx,
 		ninfo.identity_info.domain_name.string =
 			cli_credentials_get_domain(user_creds);
 		ninfo.identity_info.parameter_control = 0;
-		ninfo.identity_info.logon_id_low = 0;
-		ninfo.identity_info.logon_id_high = 0;
+		ninfo.identity_info.logon_id = 0;
 		ninfo.identity_info.workstation.string =
 			cli_credentials_get_workstation(user_creds);
 		memcpy(ninfo.challenge, chal.data, sizeof(ninfo.challenge));
@@ -1362,7 +1362,6 @@ static bool torture_netlogon_samba3(struct torture_context *torture)
 {
 	NTSTATUS status;
 	struct smbcli_state *cli;
-	struct cli_credentials *anon_creds;
 	struct cli_credentials *wks_creds;
 	const char *wks_name;
 	int i;
@@ -1370,13 +1369,7 @@ static bool torture_netlogon_samba3(struct torture_context *torture)
 	struct smbcli_session_options session_options;
 
 	wks_name = torture_setting_string(torture, "wksname", NULL);
-	if (wks_name == NULL) {
-		wks_name = get_myname(torture);
-	}
-
-	if (!(anon_creds = cli_credentials_init_anon(torture))) {
-		torture_fail(torture, "create_anon_creds failed\n");
-	}
+	torture_assert(torture, wks_name != NULL, "wksname not set");
 
 	lpcfg_smbcli_options(torture->lp_ctx, &options);
 	lpcfg_smbcli_session_options(torture->lp_ctx, &session_options);
@@ -1386,7 +1379,7 @@ static bool torture_netlogon_samba3(struct torture_context *torture)
 					lpcfg_smb_ports(torture->lp_ctx),
 					"IPC$", NULL,
 					lpcfg_socket_options(torture->lp_ctx),
-					anon_creds,
+					popt_get_cmdline_credentials(),
 					lpcfg_resolve_context(torture->lp_ctx),
 					torture->ev, &options, &session_options,
 					lpcfg_gensec_settings(torture, torture->lp_ctx));
@@ -1406,11 +1399,12 @@ static bool torture_netlogon_samba3(struct torture_context *torture)
 				     CRED_SPECIFIED);
 
 	torture_assert(torture,
-		join3(torture, cli, false, cmdline_credentials, wks_creds),
+		join3(torture, cli, false, NULL, wks_creds),
 		"join failed");
 
 	cli_credentials_set_domain(
-		cmdline_credentials, cli_credentials_get_domain(wks_creds),
+		popt_get_cmdline_credentials(),
+		cli_credentials_get_domain(wks_creds),
 		CRED_SPECIFIED);
 
 	for (i=0; i<2; i++) {
@@ -1427,13 +1421,14 @@ static bool torture_netlogon_samba3(struct torture_context *torture)
 
 		for (j=0; j<2; j++) {
 			torture_assert(torture,
-				schan(torture, cli, wks_creds, cmdline_credentials),
+				schan(torture, cli, wks_creds,
+				popt_get_cmdline_credentials()),
 				"schan failed");
 		}
 	}
 
 	torture_assert(torture,
-		leave(torture, cli, cmdline_credentials, wks_creds),
+		leave(torture, cli, NULL, wks_creds),
 		"leave failed");
 
 	return true;
@@ -1485,7 +1480,8 @@ static bool test_join3(struct torture_context *tctx,
 		"join failed");
 
 	cli_credentials_set_domain(
-		cmdline_credentials, cli_credentials_get_domain(wks_creds),
+		popt_get_cmdline_credentials(),
+		cli_credentials_get_domain(wks_creds),
 		CRED_SPECIFIED);
 
 	torture_assert(tctx,
@@ -1511,7 +1507,9 @@ static bool torture_samba3_sessionkey(struct torture_context *torture)
 	struct cli_credentials *anon_creds;
 	const char *wks_name;
 
-	wks_name = torture_setting_string(torture, "wksname", get_myname(torture));
+
+	wks_name = torture_setting_string(torture, "wksname", NULL);
+	torture_assert(torture, wks_name != NULL, "wksname not set");
 
 	if (!(anon_creds = cli_credentials_init_anon(torture))) {
 		torture_fail(torture, "create_anon_creds failed\n");
@@ -1532,27 +1530,17 @@ static bool torture_samba3_sessionkey(struct torture_context *torture)
 	}
 
 	torture_assert(torture,
-		test_join3(torture, false, anon_creds, cmdline_credentials, wks_name),
-		"join using ntlmssp bind on an anonymous smb connection failed");
-
-	torture_assert(torture,
-		test_join3(torture, false, cmdline_credentials, NULL, wks_name),
+		test_join3(torture, false, popt_get_cmdline_credentials(),
+		NULL, wks_name),
 		"join using anonymous bind on an authenticated smb connection failed");
-
-	torture_assert(torture,
-		test_join3(torture, false, cmdline_credentials, cmdline_credentials, wks_name),
-		"join using ntlmssp bind on an authenticated smb connection failed");
 
 	/*
 	 * The following two are tests for setuserinfolevel 25
 	 */
 
 	torture_assert(torture,
-		test_join3(torture, true, anon_creds, cmdline_credentials, wks_name),
-		"join using ntlmssp bind on an anonymous smb connection failed");
-
-	torture_assert(torture,
-		test_join3(torture, true, cmdline_credentials, NULL, wks_name),
+		test_join3(torture, true, popt_get_cmdline_credentials(),
+		NULL, wks_name),
 		"join using anonymous bind on an authenticated smb connection failed");
 
 	return true;
@@ -1799,20 +1787,6 @@ static bool torture_samba3_rpc_getusername(struct torture_context *torture)
 	lpcfg_smbcli_options(torture->lp_ctx, &options);
 	lpcfg_smbcli_session_options(torture->lp_ctx, &session_options);
 
-	status = smbcli_full_connection(
-		torture, &cli, torture_setting_string(torture, "host", NULL),
-		lpcfg_smb_ports(torture->lp_ctx),
-		"IPC$", NULL, lpcfg_socket_options(torture->lp_ctx), cmdline_credentials,
-		lpcfg_resolve_context(torture->lp_ctx), torture->ev, &options,
-		&session_options, lpcfg_gensec_settings(torture, torture->lp_ctx));
-	torture_assert_ntstatus_ok(torture, status, "smbcli_full_connection failed\n");
-
-	if (!(user_sid = whoami(torture, torture, cli->tree))) {
-		torture_fail(torture, "whoami on auth'ed connection failed\n");
-	}
-
-	talloc_free(cli);
-
 	if (!(anon_creds = cli_credentials_init_anon(torture))) {
 		torture_fail(torture, "create_anon_creds failed\n");
 	}
@@ -1833,6 +1807,21 @@ static bool torture_samba3_rpc_getusername(struct torture_context *torture)
 	torture_assert_sid_equal(torture, user_sid, dom_sid_parse_talloc(torture, "s-1-5-7"),
 		"Anon lsa_GetUserName returned unexpected SID");
 
+	talloc_free(cli);
+
+	status = smbcli_full_connection(
+		torture, &cli, torture_setting_string(torture, "host", NULL),
+		lpcfg_smb_ports(torture->lp_ctx),
+		"IPC$", NULL, lpcfg_socket_options(torture->lp_ctx),
+		popt_get_cmdline_credentials(),
+		lpcfg_resolve_context(torture->lp_ctx), torture->ev, &options,
+		&session_options, lpcfg_gensec_settings(torture, torture->lp_ctx));
+	torture_assert_ntstatus_ok(torture, status, "smbcli_full_connection failed\n");
+
+	if (!(user_sid = whoami(torture, torture, cli->tree))) {
+		torture_fail(torture, "whoami on auth'ed connection failed\n");
+	}
+
 	if (!(user_creds = cli_credentials_init(torture))) {
 		torture_fail(torture, "cli_credentials_init failed\n");
 	}
@@ -1844,7 +1833,7 @@ static bool torture_samba3_rpc_getusername(struct torture_context *torture)
 				     generate_random_password(user_creds, 8, 255),
 				     CRED_SPECIFIED);
 
-	if (!create_user(torture, torture, cli, cmdline_credentials,
+	if (!create_user(torture, torture, cli, NULL,
 			 cli_credentials_get_username(user_creds),
 			 cli_credentials_get_password(user_creds),
 			 &domain_name, &created_sid)) {
@@ -1899,7 +1888,7 @@ static bool torture_samba3_rpc_getusername(struct torture_context *torture)
 
  del:
 	if (!delete_user(torture, cli,
-			 cmdline_credentials,
+			 NULL,
 			 cli_credentials_get_username(user_creds))) {
 		torture_fail(torture, "delete_user failed\n");
 	}
@@ -2529,7 +2518,7 @@ static bool torture_samba3_rpc_sharesec(struct torture_context *torture)
 			torture, torture, sd, cli->session,
 			torture_setting_string(torture, "share", NULL),
 			user_sid, SEC_FILE_ALL, NT_STATUS_OK, NT_STATUS_OK),
-			"failed to test tcon with SEC_FILE_ALL access_mask")
+			"failed to test tcon with SEC_FILE_ALL access_mask");
 
 	return true;
 }
@@ -2802,7 +2791,8 @@ static bool torture_samba3_rpc_spoolss(struct torture_context *torture)
 	ZERO_STRUCT(userlevel1);
 	userlevel1.client = talloc_asprintf(
 		torture, "\\\\%s", lpcfg_netbios_name(torture->lp_ctx));
-	userlevel1.user = cli_credentials_get_username(cmdline_credentials);
+	userlevel1.user = cli_credentials_get_username(
+				popt_get_cmdline_credentials());
 	userlevel1.build = 2600;
 	userlevel1.major = 3;
 	userlevel1.minor = 0;
@@ -2977,6 +2967,7 @@ static bool enumvalues(struct torture_context *tctx,
 		NTSTATUS status;
 		uint32_t size, length;
 
+		ZERO_STRUCT(buf8);
 		r.in.handle = handle;
 		r.in.enum_index = enum_index;
 		name.name = "";
@@ -3181,7 +3172,12 @@ static bool torture_samba3_createshare(struct torture_context *tctx,
 	struct policy_handle new_handle;
 	struct winreg_CreateKey c;
 	struct winreg_CloseKey cl;
-	enum winreg_CreateAction action_taken;
+	enum winreg_CreateAction action_taken = REG_ACTION_NONE;
+
+	ZERO_STRUCT(c);
+	ZERO_STRUCT(cl);
+	ZERO_STRUCT(hklm);
+	ZERO_STRUCT(new_handle);
 
 	c.in.handle = &hklm;
 	c.in.name.name = talloc_asprintf(
@@ -3422,7 +3418,7 @@ static bool torture_rpc_smb_reauth1(struct torture_context *torture)
 					lpcfg_smb_ports(torture->lp_ctx),
 					"IPC$", NULL,
 					lpcfg_socket_options(torture->lp_ctx),
-					cmdline_credentials,
+					popt_get_cmdline_credentials(),
 					lpcfg_resolve_context(torture->lp_ctx),
 					torture->ev, &options, &session_options,
 					lpcfg_gensec_settings(torture, torture->lp_ctx));
@@ -3507,7 +3503,7 @@ static bool torture_rpc_smb_reauth1(struct torture_context *torture)
 	ZERO_STRUCT(io);
 	io.in.sesskey         = cli->transport->negotiate.sesskey;
 	io.in.capabilities    = cli->transport->negotiate.capabilities;
-	io.in.credentials     = cmdline_credentials;
+	io.in.credentials     = popt_get_cmdline_credentials();
 	io.in.workgroup       = lpcfg_workgroup(torture->lp_ctx);
 	io.in.gensec_settings = lpcfg_gensec_settings(torture, torture->lp_ctx);
 
@@ -3581,7 +3577,7 @@ static bool torture_rpc_smb_reauth2(struct torture_context *torture)
 					lpcfg_smb_ports(torture->lp_ctx),
 					"IPC$", NULL,
 					lpcfg_socket_options(torture->lp_ctx),
-					cmdline_credentials,
+					popt_get_cmdline_credentials(),
 					lpcfg_resolve_context(torture->lp_ctx),
 					torture->ev, &options, &session_options,
 					lpcfg_gensec_settings(torture, torture->lp_ctx));
@@ -3644,7 +3640,7 @@ static bool torture_rpc_smb_reauth2(struct torture_context *torture)
 	ZERO_STRUCT(io);
 	io.in.sesskey         = cli->transport->negotiate.sesskey;
 	io.in.capabilities    = cli->transport->negotiate.capabilities;
-	io.in.credentials     = cmdline_credentials;
+	io.in.credentials     = popt_get_cmdline_credentials();
 	io.in.workgroup       = lpcfg_workgroup(torture->lp_ctx);
 	io.in.gensec_settings = lpcfg_gensec_settings(torture, torture->lp_ctx);
 
@@ -3714,7 +3710,7 @@ static bool torture_rpc_smb2_reauth1(struct torture_context *torture)
 			      lpcfg_smb_ports(torture->lp_ctx),
 			      "IPC$",
 			      lpcfg_resolve_context(torture->lp_ctx),
-			      cmdline_credentials,
+			      popt_get_cmdline_credentials(),
 			      &tree,
 			      torture->ev,
 			      &options,
@@ -3795,7 +3791,7 @@ static bool torture_rpc_smb2_reauth1(struct torture_context *torture)
 	/* smb re-auth again to the original user */
 
 	status = smb2_session_setup_spnego(tree->session,
-					   cmdline_credentials,
+					   popt_get_cmdline_credentials(),
 					   0 /* previous_session_id */);
 	torture_assert_ntstatus_ok_goto(torture, status, ret, done,
 					"session reauth to anon failed");
@@ -3864,7 +3860,7 @@ static bool torture_rpc_smb2_reauth2(struct torture_context *torture)
 			      lpcfg_smb_ports(torture->lp_ctx),
 			      "IPC$",
 			      lpcfg_resolve_context(torture->lp_ctx),
-			      cmdline_credentials,
+			      popt_get_cmdline_credentials(),
 			      &tree,
 			      torture->ev,
 			      &options,
@@ -3923,7 +3919,7 @@ static bool torture_rpc_smb2_reauth2(struct torture_context *torture)
 	/* smb re-auth again to the original user */
 
 	status = smb2_session_setup_spnego(tree->session,
-					   cmdline_credentials,
+					   popt_get_cmdline_credentials(),
 					   0 /* previous_session_id */);
 	torture_assert_ntstatus_ok_goto(torture, status, ret, done,
 					"session reauth to anon failed");
@@ -3982,7 +3978,7 @@ static bool torture_rpc_smb1_pipe_name(struct torture_context *torture)
 					lpcfg_smb_ports(torture->lp_ctx),
 					"IPC$", NULL,
 					lpcfg_socket_options(torture->lp_ctx),
-					cmdline_credentials,
+					popt_get_cmdline_credentials(),
 					lpcfg_resolve_context(torture->lp_ctx),
 					torture->ev, &options, &session_options,
 					lpcfg_gensec_settings(torture, torture->lp_ctx));
@@ -4231,7 +4227,7 @@ static bool torture_rpc_smb2_pipe_name(struct torture_context *torture)
 			      lpcfg_smb_ports(torture->lp_ctx),
 			      "IPC$",
 			      lpcfg_resolve_context(torture->lp_ctx),
-			      cmdline_credentials,
+			      popt_get_cmdline_credentials(),
 			      &tree,
 			      torture->ev,
 			      &options,
@@ -4325,7 +4321,7 @@ static bool torture_rpc_smb2_pipe_read_close(struct torture_context *torture)
 			      lpcfg_smb_ports(torture->lp_ctx),
 			      "IPC$",
 			      lpcfg_resolve_context(torture->lp_ctx),
-			      cmdline_credentials,
+			      popt_get_cmdline_credentials(),
 			      &tree,
 			      torture->ev,
 			      &options,
@@ -4409,7 +4405,7 @@ static bool torture_rpc_smb2_pipe_read_tdis(struct torture_context *torture)
 			      lpcfg_smb_ports(torture->lp_ctx),
 			      "IPC$",
 			      lpcfg_resolve_context(torture->lp_ctx),
-			      cmdline_credentials,
+			      popt_get_cmdline_credentials(),
 			      &tree,
 			      torture->ev,
 			      &options,
@@ -4493,7 +4489,7 @@ static bool torture_rpc_smb2_pipe_read_logoff(struct torture_context *torture)
 			      lpcfg_smb_ports(torture->lp_ctx),
 			      "IPC$",
 			      lpcfg_resolve_context(torture->lp_ctx),
-			      cmdline_credentials,
+			      popt_get_cmdline_credentials(),
 			      &tree,
 			      torture->ev,
 			      &options,
@@ -4545,6 +4541,145 @@ done:
 	return ret;
 }
 
+static bool torture_rpc_lsa_over_netlogon(struct torture_context *torture)
+{
+	TALLOC_CTX *mem_ctx;
+	NTSTATUS status;
+	bool ret = false;
+	struct smbcli_options options;
+	struct smb2_tree *tree;
+	struct dcerpc_pipe *netlogon_pipe;
+	struct dcerpc_binding_handle *lsa_handle;
+	struct lsa_ObjectAttribute attr;
+	struct lsa_QosInfo qos;
+	struct lsa_OpenPolicy2 o;
+	struct policy_handle handle;
+
+	torture_comment(torture, "Testing if we can access LSA server over "
+			"\\\\pipe\\netlogon rather than \\\\pipe\\lsarpc\n");
+
+	mem_ctx = talloc_init("torture_samba3_rpc_lsa_over_netlogon");
+	torture_assert(torture, (mem_ctx != NULL), "talloc_init failed");
+
+	lpcfg_smbcli_options(torture->lp_ctx, &options);
+
+	status = smb2_connect(mem_ctx,
+			      torture_setting_string(torture, "host", NULL),
+			      lpcfg_smb_ports(torture->lp_ctx),
+			      "IPC$",
+			      lpcfg_resolve_context(torture->lp_ctx),
+			      popt_get_cmdline_credentials(),
+			      &tree,
+			      torture->ev,
+			      &options,
+			      lpcfg_socket_options(torture->lp_ctx),
+			      lpcfg_gensec_settings(torture, torture->lp_ctx)
+			      );
+	torture_assert_ntstatus_ok_goto(torture, status, ret, done,
+					"smb2_connect failed");
+
+	status = pipe_bind_smb2(torture, mem_ctx, tree, "netlogon",
+			        &ndr_table_lsarpc, &netlogon_pipe);
+	torture_assert_ntstatus_ok_goto(torture, status, ret, done,
+					"pipe_bind_smb2 failed");
+	lsa_handle = netlogon_pipe->binding_handle;
+
+	qos.len = 0;
+	qos.impersonation_level = 2;
+	qos.context_mode = 1;
+	qos.effective_only = 0;
+
+	attr.len = 0;
+	attr.root_dir = NULL;
+	attr.object_name = NULL;
+	attr.attributes = 0;
+	attr.sec_desc = NULL;
+	attr.sec_qos = &qos;
+
+	o.in.system_name = "\\";
+	o.in.attr = &attr;
+	o.in.access_mask = SEC_FLAG_MAXIMUM_ALLOWED;
+	o.out.handle = &handle;
+
+	torture_assert_ntstatus_ok(torture,
+			dcerpc_lsa_OpenPolicy2_r(lsa_handle, torture, &o),
+			"OpenPolicy2 failed");
+	torture_assert_ntstatus_ok(torture,
+				   o.out.result,
+				   "OpenPolicy2 failed");
+
+	ret = true;
+ done:
+	talloc_free(mem_ctx);
+	return ret;
+}
+
+static bool torture_rpc_pipes_supported_interfaces(
+					struct torture_context *torture)
+{
+	TALLOC_CTX *mem_ctx;
+	NTSTATUS status;
+	bool ret = false;
+	struct smbcli_options options;
+	struct smb2_tree *tree;
+	struct dcerpc_pipe *pipe1;
+	struct dcerpc_pipe *pipe2;
+	struct dcerpc_pipe *pipe3;
+
+	torture_comment(torture, "Testing only appropiate interfaces are "
+			"available in smb pipes\n");
+
+	mem_ctx = talloc_init("torture_samba3_rpc_pipes_supported_interfaces");
+	torture_assert(torture, (mem_ctx != NULL), "talloc_init failed");
+
+	lpcfg_smbcli_options(torture->lp_ctx, &options);
+
+	status = smb2_connect(mem_ctx,
+			      torture_setting_string(torture, "host", NULL),
+			      lpcfg_smb_ports(torture->lp_ctx),
+			      "IPC$",
+			      lpcfg_resolve_context(torture->lp_ctx),
+			      popt_get_cmdline_credentials(),
+			      &tree,
+			      torture->ev,
+			      &options,
+			      lpcfg_socket_options(torture->lp_ctx),
+			      lpcfg_gensec_settings(torture, torture->lp_ctx)
+			      );
+	torture_assert_ntstatus_ok_goto(torture, status, ret, done,
+					"smb2_connect failed");
+
+	/* Test embedded services pipes. The svcctl interface is
+	 * not available if we open the winreg pipe. */
+	status = pipe_bind_smb2(torture, mem_ctx, tree, "winreg",
+			        &ndr_table_svcctl, &pipe1);
+	torture_assert_ntstatus_equal(torture,
+			status,
+			NT_STATUS_RPC_UNSUPPORTED_NAME_SYNTAX,
+			"svcctl interface not supported in winreg pipe");
+
+	/* Test it is not possible to bind to S4 server provided services */
+	status = pipe_bind_smb2(torture, mem_ctx, tree, "srvsvc",
+			        &ndr_table_samr, &pipe2);
+	torture_assert_ntstatus_equal(torture,
+			status,
+			NT_STATUS_RPC_UNSUPPORTED_NAME_SYNTAX,
+			"samr interface not supported in srvsvc pipe");
+
+	/* Test pipes in forked daemons like lsassd. The lsarpc interface is
+	 * not available if we open the SAMR pipe. */
+	status = pipe_bind_smb2(torture, mem_ctx, tree, "samr",
+			        &ndr_table_lsarpc, &pipe3);
+	torture_assert_ntstatus_equal(torture,
+			status,
+			NT_STATUS_RPC_UNSUPPORTED_NAME_SYNTAX,
+			"lsarpc interface not supported in samr pipe");
+
+	ret = true;
+ done:
+	talloc_free(mem_ctx);
+	return ret;
+}
 
 struct torture_suite *torture_rpc_samba3(TALLOC_CTX *mem_ctx)
 {
@@ -4572,6 +4707,12 @@ struct torture_suite *torture_rpc_samba3(TALLOC_CTX *mem_ctx)
 	torture_suite_add_simple_test(suite, "smb2-pipe-read-close", torture_rpc_smb2_pipe_read_close);
 	torture_suite_add_simple_test(suite, "smb2-pipe-read-tdis", torture_rpc_smb2_pipe_read_tdis);
 	torture_suite_add_simple_test(suite, "smb2-pipe-read-logoff", torture_rpc_smb2_pipe_read_logoff);
+	torture_suite_add_simple_test(suite,
+				      "lsa_over_netlogon",
+				      torture_rpc_lsa_over_netlogon);
+	torture_suite_add_simple_test(suite,
+				      "pipes_supported_interfaces",
+				      torture_rpc_pipes_supported_interfaces);
 
 	suite->description = talloc_strdup(suite, "samba3 DCERPC interface tests");
 

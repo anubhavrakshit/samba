@@ -22,6 +22,7 @@
 #include "includes.h"
 #include "smb_krb5.h"
 #include "ads.h"
+#include "secrets.h"
 #include "libnet/libnet_keytab.h"
 
 #ifdef HAVE_KRB5
@@ -73,15 +74,17 @@ krb5_error_code libnet_keytab_init(TALLOC_CTX *mem_ctx,
 
 	talloc_set_destructor(r, keytab_close);
 
-	initialize_krb5_error_table();
-	ret = krb5_init_context(&context);
+	ret = smb_krb5_init_context_common(&context);
 	if (ret) {
-		DEBUG(1,("keytab_init: could not krb5_init_context: %s\n",
-			error_message(ret)));
+		DBG_ERR("kerberos init context failed (%s)\n",
+			error_message(ret));
 		return ret;
 	}
 
-	ret = smb_krb5_open_keytab(context, keytab_name, true, &keytab);
+	ret = smb_krb5_kt_open_relative(context,
+					keytab_name,
+					true, /* write_access */
+					&keytab);
 	if (ret) {
 		DEBUG(1,("keytab_init: smb_krb5_open_keytab failed (%s)\n",
 			error_message(ret)));
@@ -89,7 +92,7 @@ krb5_error_code libnet_keytab_init(TALLOC_CTX *mem_ctx,
 		return ret;
 	}
 
-	ret = smb_krb5_keytab_name(mem_ctx, context, keytab, &keytab_string);
+	ret = smb_krb5_kt_get_name(mem_ctx, context, keytab, &keytab_string);
 	if (ret) {
 		krb5_kt_close(context, keytab);
 		krb5_free_context(context);
@@ -214,6 +217,8 @@ static krb5_error_code libnet_keytab_add_entry(krb5_context context,
 	krb5_keyblock *keyp;
 	krb5_keytab_entry kt_entry;
 	krb5_error_code ret;
+	krb5_principal salt_princ = NULL;
+	char *salt_princ_s;
 
 	/* remove duplicates first ... */
 	ret = libnet_keytab_remove_entries(context, keytab, princ_s, kvno,
@@ -236,9 +241,28 @@ static krb5_error_code libnet_keytab_add_entry(krb5_context context,
 
 	keyp = KRB5_KT_KEY(&kt_entry);
 
-	if (create_kerberos_key_from_string(context, kt_entry.principal,
-					    &password, keyp, enctype, true))
-	{
+	salt_princ_s = kerberos_secrets_fetch_salt_princ();
+	if (salt_princ_s == NULL) {
+		ret = KRB5KRB_ERR_GENERIC;
+		goto done;
+	}
+
+	ret = krb5_parse_name(context, salt_princ_s, &salt_princ);
+	SAFE_FREE(salt_princ_s);
+	if (ret != 0) {
+		ret = KRB5KRB_ERR_GENERIC;
+		goto done;
+	}
+
+	ret = create_kerberos_key_from_string(context,
+					      kt_entry.principal,
+					      salt_princ,
+					      &password,
+					      keyp,
+					      enctype,
+					      true);
+	krb5_free_principal(context, salt_princ);
+	if (ret != 0) {
 		ret = KRB5KRB_ERR_GENERIC;
 		goto done;
 	}

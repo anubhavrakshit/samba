@@ -18,6 +18,7 @@
 */
 
 #include "includes.h"
+#include <math.h>
 #include "libcli/libcli.h"
 #include "torture/util.h"
 #include "torture/basic/proto.h"
@@ -31,25 +32,68 @@ static struct {
 	NTSTATUS status;
 	union smb_fsinfo fsinfo;
 } levels[] = {
-	{"DSKATTR",               RAW_QFS_DSKATTR, },
-	{"ALLOCATION",            RAW_QFS_ALLOCATION, },
-	{"VOLUME",                RAW_QFS_VOLUME, },
-	{"VOLUME_INFO",           RAW_QFS_VOLUME_INFO, },
-	{"SIZE_INFO",             RAW_QFS_SIZE_INFO, },
-	{"DEVICE_INFO",           RAW_QFS_DEVICE_INFO, },
-	{"ATTRIBUTE_INFO",        RAW_QFS_ATTRIBUTE_INFO, },
-	{"UNIX_INFO",             RAW_QFS_UNIX_INFO, CAP_UNIX},
-	{"VOLUME_INFORMATION",    RAW_QFS_VOLUME_INFORMATION, },
-	{"SIZE_INFORMATION",      RAW_QFS_SIZE_INFORMATION, },
-	{"DEVICE_INFORMATION",    RAW_QFS_DEVICE_INFORMATION, },
-	{"ATTRIBUTE_INFORMATION", RAW_QFS_ATTRIBUTE_INFORMATION, },
-	{"QUOTA_INFORMATION",     RAW_QFS_QUOTA_INFORMATION, },
-	{"FULL_SIZE_INFORMATION", RAW_QFS_FULL_SIZE_INFORMATION, },
+	{
+		.name = "DSKATTR",
+		.level = RAW_QFS_DSKATTR,
+	},
+	{
+		.name = "ALLOCATION",
+		.level = RAW_QFS_ALLOCATION,
+	},
+	{
+		.name = "VOLUME",
+		.level = RAW_QFS_VOLUME,
+	},
+	{
+		.name = "VOLUME_INFO",
+		.level = RAW_QFS_VOLUME_INFO,
+	},
+	{
+		.name = "SIZE_INFO",
+		.level = RAW_QFS_SIZE_INFO,
+	},
+	{
+		.name = "DEVICE_INFO",
+		.level = RAW_QFS_DEVICE_INFO,
+	},
+	{
+		.name = "ATTRIBUTE_INFO",
+		.level = RAW_QFS_ATTRIBUTE_INFO,
+	},
+	{
+		.name = "UNIX_INFO",
+		.level = RAW_QFS_UNIX_INFO,
+		.capability_mask = CAP_UNIX,
+	},
+	{
+		.name = "VOLUME_INFORMATION",
+		.level = RAW_QFS_VOLUME_INFORMATION,
+	},
+	{
+		.name = "SIZE_INFORMATION",
+		.level = RAW_QFS_SIZE_INFORMATION,
+	},
+	{
+		.name = "DEVICE_INFORMATION",
+		.level = RAW_QFS_DEVICE_INFORMATION,
+	},
+	{
+		.name = "ATTRIBUTE_INFORMATION",
+		.level = RAW_QFS_ATTRIBUTE_INFORMATION,
+	},
+	{
+		.name = "QUOTA_INFORMATION",
+		.level = RAW_QFS_QUOTA_INFORMATION,
+	},
+	{
+		.name = "FULL_SIZE_INFORMATION",
+		.level = RAW_QFS_FULL_SIZE_INFORMATION,
+	},
 #if 0
 	/* w2k3 seems to no longer support this */
 	{"OBJECTID_INFORMATION",  RAW_QFS_OBJECTID_INFORMATION, },
 #endif
-	{ NULL, }
+	{ .name = NULL, },
 };
 
 
@@ -123,9 +167,9 @@ static union smb_fsinfo *find(const char *name)
 bool torture_raw_qfsinfo(struct torture_context *torture, 
 			 struct smbcli_state *cli)
 {
-	int i;
+	size_t i;
 	bool ret = true;
-	int count;
+	size_t count;
 	union smb_fsinfo *s1, *s2;	
 
 	/* scan all the levels, pulling the results */
@@ -151,7 +195,7 @@ bool torture_raw_qfsinfo(struct torture_context *torture,
 	}
 
 	if (count != 0) {
-		torture_comment(torture, "%d levels failed\n", count);
+		torture_comment(torture, "%zu levels failed\n", count);
 		torture_assert(torture, count > 13, "too many level failures - giving up");
 	}
 
@@ -206,7 +250,7 @@ bool torture_raw_qfsinfo(struct torture_context *torture,
 			s2->allocation.out.sectors_per_unit *
 			s2->allocation.out.total_alloc_units *
 			s2->allocation.out.bytes_per_sector / scale;
-		if (abs(size1 - size2) > 1) {
+		if (fabs(size1 - size2) > 1) {
 			printf("Inconsistent total size in DSKATTR and ALLOCATION - size1=%.0f size2=%.0f\n", 
 			       size1, size2);
 			ret = false;
@@ -228,7 +272,7 @@ bool torture_raw_qfsinfo(struct torture_context *torture,
 			s2->allocation.out.sectors_per_unit *
 			s2->allocation.out.avail_alloc_units *
 			s2->allocation.out.bytes_per_sector / scale;
-		if (abs(size1 - size2) > 1) {
+		if (fabs(size1 - size2) > 1) {
 			printf("Inconsistent avail size in DSKATTR and ALLOCATION - size1=%.0f size2=%.0f\n", 
 			       size1, size2);
 			ret = false;

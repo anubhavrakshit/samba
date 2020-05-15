@@ -18,20 +18,17 @@
    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+#ifndef _SOURCE3_SMBD_GLOBALS_H_
+#define _SOURCE3_SMBD_GLOBALS_H_
+
 #include "system/select.h"
 #include "librpc/gen_ndr/smbXsrv.h"
 #include "smbprofile.h"
-
-extern int aio_pending_size;
-extern int outstanding_aio_calls;
 
 #ifdef USE_DMAPI
 struct smbd_dmapi_context;
 extern struct smbd_dmapi_context *dmapi_ctx;
 #endif
-
-/* how many write cache buffers have been allocated */
-extern unsigned int allocated_write_caches;
 
 /* A singleton cache to speed up searching by dev/inode. */
 struct fsp_singleton_cache {
@@ -92,6 +89,7 @@ extern uint16_t fnf_handle;
 struct conn_ctx {
 	connection_struct *conn;
 	uint64_t vuid;
+	userdom_struct user_info;
 };
 /* A stack of current_user connection contexts. */
 extern struct conn_ctx conn_ctx_stack[MAX_SEC_CTX_DEPTH];
@@ -115,20 +113,17 @@ DATA_BLOB negprot_spnego(TALLOC_CTX *ctx, struct smbXsrv_connection *xconn);
 void smbd_lock_socket(struct smbXsrv_connection *xconn);
 void smbd_unlock_socket(struct smbXsrv_connection *xconn);
 
-NTSTATUS smbd_do_locking(struct smb_request *req,
-			 files_struct *fsp,
-			 uint8_t type,
-			 int32_t timeout,
-			 uint16_t num_locks,
-			 struct smbd_lock_element *locks,
-			 bool *async);
+struct GUID smbd_request_guid(struct smb_request *smb1req, uint16_t idx);
+
 NTSTATUS smbd_do_unlocking(struct smb_request *req,
 			   files_struct *fsp,
 			   uint16_t num_ulocks,
-			   struct smbd_lock_element *ulocks);
+			   struct smbd_lock_element *ulocks,
+			   enum brl_flavour lock_flav);
 
 NTSTATUS smbd_do_qfilepathinfo(connection_struct *conn,
 			       TALLOC_CTX *mem_ctx,
+			       struct smb_request *req,
 			       uint16_t info_level,
 			       files_struct *fsp,
 			       struct smb_filename *smb_fname,
@@ -142,6 +137,13 @@ NTSTATUS smbd_do_qfilepathinfo(connection_struct *conn,
 			       size_t *fixed_portion,
 			       char **ppdata,
 			       unsigned int *pdata_size);
+
+NTSTATUS smbd_do_setfsinfo(connection_struct *conn,
+				struct smb_request *req,
+				TALLOC_CTX *mem_ctx,
+				uint16_t info_level,
+				files_struct *fsp,
+				const DATA_BLOB *pdata);
 
 NTSTATUS smbd_do_setfilepathinfo(connection_struct *conn,
 				struct smb_request *req,
@@ -169,6 +171,7 @@ bool smbd_dirptr_get_entry(TALLOC_CTX *ctx,
 			   uint32_t dirtype,
 			   bool dont_descend,
 			   bool ask_sharemode,
+			   bool get_dosmode,
 			   bool (*match_fn)(TALLOC_CTX *ctx,
 					    void *private_data,
 					    const char *dname,
@@ -177,6 +180,7 @@ bool smbd_dirptr_get_entry(TALLOC_CTX *ctx,
 			   bool (*mode_fn)(TALLOC_CTX *ctx,
 					   void *private_data,
 					   struct smb_filename *smb_fname,
+					   bool get_dosmode,
 					   uint32_t *_mode),
 			   void *private_data,
 			   char **_fname,
@@ -194,21 +198,25 @@ NTSTATUS smbd_dirptr_lanman2_entry(TALLOC_CTX *ctx,
 			       int requires_resume_key,
 			       bool dont_descend,
 			       bool ask_sharemode,
+			       bool get_dosmode,
 			       uint8_t align,
 			       bool do_pad,
 			       char **ppdata,
 			       char *base_data,
 			       char *end_data,
 			       int space_remaining,
+			       struct smb_filename **smb_fname,
 			       bool *got_exact_match,
 			       int *_last_entry_off,
-			       struct ea_list *name_list);
+			       struct ea_list *name_list,
+			       struct file_id *file_id);
 
 NTSTATUS smbd_calculate_access_mask(connection_struct *conn,
-				    const struct smb_filename *smb_fname,
-				    bool use_privs,
-				    uint32_t access_mask,
-				    uint32_t *access_mask_out);
+			struct files_struct *dirfsp,
+			const struct smb_filename *smb_fname,
+			bool use_privs,
+			uint32_t access_mask,
+			uint32_t *access_mask_out);
 
 void smbd_notify_cancel_by_smbreq(const struct smb_request *smbreq);
 
@@ -220,14 +228,16 @@ void smbd_server_connection_terminate_ex(struct smbXsrv_connection *xconn,
 
 const char *smb2_opcode_name(uint16_t opcode);
 bool smbd_is_smb2_header(const uint8_t *inbuf, size_t size);
+bool smbd_smb2_is_compound(const struct smbd_smb2_request *req);
 
 NTSTATUS smbd_add_connection(struct smbXsrv_client *client, int sock_fd,
 			     struct smbXsrv_connection **_xconn);
 
-void reply_smb2002(struct smb_request *req, uint16_t choice);
-void reply_smb20ff(struct smb_request *req, uint16_t choice);
-void smbd_smb2_first_negprot(struct smbXsrv_connection *xconn,
-			     const uint8_t *inpdu, size_t size);
+NTSTATUS reply_smb2002(struct smb_request *req, uint16_t choice);
+NTSTATUS reply_smb20ff(struct smb_request *req, uint16_t choice);
+NTSTATUS smbd_smb2_process_negprot(struct smbXsrv_connection *xconn,
+			       uint64_t expected_seq_low,
+			       const uint8_t *inpdu, size_t size);
 
 DATA_BLOB smbd_smb2_generate_outbody(struct smbd_smb2_request *req, size_t size);
 
@@ -270,6 +280,9 @@ NTSTATUS smbd_smb2_request_verify_creditcharge(struct smbd_smb2_request *req,
 NTSTATUS smbd_smb2_request_verify_sizes(struct smbd_smb2_request *req,
 					size_t expected_body_size);
 
+void smb2_request_set_async_internal(struct smbd_smb2_request *req,
+				     bool async_internal);
+
 enum protocol_types smbd_smb2_protocol_dialect_match(const uint8_t *indyn,
 		                                     const int dialect_count,
 						     uint16_t *dialect);
@@ -306,23 +319,6 @@ struct deferred_open_record;
 void send_break_message_smb2(files_struct *fsp,
 			     uint32_t break_from,
 			     uint32_t break_to);
-struct blocking_lock_record *get_pending_smb2req_blr(struct smbd_smb2_request *smb2req);
-bool push_blocking_lock_request_smb2( struct byte_range_lock *br_lck,
-				struct smb_request *req,
-				files_struct *fsp,
-				int lock_timeout,
-				int lock_num,
-				uint64_t smblctx,
-				enum brl_type lock_type,
-				enum brl_flavour lock_flav,
-				uint64_t offset,
-				uint64_t count,
-				uint64_t blocking_smblctx);
-void process_blocking_lock_queue_smb2(
-	struct smbd_server_connection *sconn, struct timeval tv_curr);
-void cancel_pending_lock_requests_by_fid_smb2(files_struct *fsp,
-			struct byte_range_lock *br_lck,
-			enum file_close_type close_type);
 /* From smbd/smb2_create.c */
 int map_smb2_oplock_levels_to_samba(uint8_t in_oplock_level);
 bool get_deferred_open_message_state_smb2(struct smbd_smb2_request *smb2req,
@@ -351,13 +347,9 @@ struct smbXsrv_connection {
 
 	struct smbXsrv_client *client;
 
-
 	const struct tsocket_address *local_address;
 	const struct tsocket_address *remote_address;
 	const char *remote_hostname;
-
-	struct tevent_context *ev_ctx;
-	struct messaging_context *msg_ctx;
 
 	enum protocol_types protocol;
 
@@ -503,6 +495,7 @@ struct smbXsrv_connection {
 		struct {
 			uint32_t capabilities;
 			struct GUID guid;
+			bool guid_verified;
 			uint16_t security_mode;
 			uint16_t num_dialects;
 			uint16_t *dialects;
@@ -529,10 +522,26 @@ const char *smbXsrv_connection_dbg(const struct smbXsrv_connection *xconn);
 NTSTATUS smbXsrv_version_global_init(const struct server_id *server_id);
 uint32_t smbXsrv_version_global_current(void);
 
+struct smbXsrv_client_table;
+NTSTATUS smbXsrv_client_global_init(void);
+NTSTATUS smbXsrv_client_create(TALLOC_CTX *mem_ctx,
+			       struct tevent_context *ev_ctx,
+			       struct messaging_context *msg_ctx,
+			       NTTIME now,
+			       struct smbXsrv_client **_client);
+NTSTATUS smbXsrv_client_update(struct smbXsrv_client *client);
+NTSTATUS smbXsrv_client_remove(struct smbXsrv_client *client);
+NTSTATUS smb2srv_client_lookup_global(struct smbXsrv_client *client,
+				      struct GUID client_guid,
+				      TALLOC_CTX *mem_ctx,
+				      struct smbXsrv_client_global0 **_pass);
+NTSTATUS smb2srv_client_connection_pass(struct smbd_smb2_request *smb2req,
+					struct smbXsrv_client_global0 *global);
+
 NTSTATUS smbXsrv_connection_init_tables(struct smbXsrv_connection *conn,
 					enum protocol_types protocol);
 
-NTSTATUS smbXsrv_session_global_init(void);
+NTSTATUS smbXsrv_session_global_init(struct messaging_context *msg_ctx);
 NTSTATUS smbXsrv_session_create(struct smbXsrv_connection *conn,
 				NTTIME now,
 				struct smbXsrv_session **_session);
@@ -560,11 +569,14 @@ struct tevent_req *smb2srv_session_shutdown_send(TALLOC_CTX *mem_ctx,
 					struct smbd_smb2_request *current_req);
 NTSTATUS smb2srv_session_shutdown_recv(struct tevent_req *req);
 NTSTATUS smbXsrv_session_logoff(struct smbXsrv_session *session);
-NTSTATUS smbXsrv_session_logoff_all(struct smbXsrv_connection *conn);
+NTSTATUS smbXsrv_session_logoff_all(struct smbXsrv_client *client);
 NTSTATUS smb1srv_session_table_init(struct smbXsrv_connection *conn);
 NTSTATUS smb1srv_session_lookup(struct smbXsrv_connection *conn,
 				uint16_t vuid, NTTIME now,
 				struct smbXsrv_session **session);
+NTSTATUS smbXsrv_session_info_lookup(struct smbXsrv_client *client,
+				     uint64_t session_wire_id,
+				     struct auth_session_info **si);
 NTSTATUS smb2srv_session_table_init(struct smbXsrv_connection *conn);
 NTSTATUS smb2srv_session_lookup_conn(struct smbXsrv_connection *conn,
 				     uint64_t session_id, NTTIME now,
@@ -572,6 +584,14 @@ NTSTATUS smb2srv_session_lookup_conn(struct smbXsrv_connection *conn,
 NTSTATUS smb2srv_session_lookup_client(struct smbXsrv_client *client,
 				       uint64_t session_id, NTTIME now,
 				       struct smbXsrv_session **session);
+NTSTATUS get_valid_smbXsrv_session(struct smbXsrv_client *client,
+				   uint64_t session_wire_id,
+				   struct smbXsrv_session **session);
+NTSTATUS smbXsrv_session_local_traverse(
+	struct smbXsrv_client *client,
+	int (*caller_cb)(struct smbXsrv_session *session,
+			      void *caller_data),
+	void *caller_data);
 struct smbXsrv_session_global0;
 NTSTATUS smbXsrv_session_global_traverse(
 			int (*fn)(struct smbXsrv_session_global0 *, void *),
@@ -594,7 +614,7 @@ NTSTATUS smb1srv_tcon_create(struct smbXsrv_connection *conn,
 NTSTATUS smb1srv_tcon_lookup(struct smbXsrv_connection *conn,
 			     uint16_t tree_id, NTTIME now,
 			     struct smbXsrv_tcon **tcon);
-NTSTATUS smb1srv_tcon_disconnect_all(struct smbXsrv_connection *conn);
+NTSTATUS smb1srv_tcon_disconnect_all(struct smbXsrv_client *client);
 NTSTATUS smb2srv_tcon_table_init(struct smbXsrv_session *session);
 NTSTATUS smb2srv_tcon_create(struct smbXsrv_session *session,
 			     NTTIME now,
@@ -613,7 +633,6 @@ NTSTATUS smbXsrv_open_create(struct smbXsrv_connection *conn,
 			     struct auth_session_info *session_info,
 			     NTTIME now,
 			     struct smbXsrv_open **_open);
-uint32_t smbXsrv_open_hash(struct smbXsrv_open *_open);
 NTSTATUS smbXsrv_open_update(struct smbXsrv_open *_open);
 NTSTATUS smbXsrv_open_close(struct smbXsrv_open *op, NTTIME now);
 NTSTATUS smb1srv_open_table_init(struct smbXsrv_connection *conn);
@@ -626,6 +645,10 @@ NTSTATUS smb2srv_open_lookup(struct smbXsrv_connection *conn,
 			     uint64_t volatile_id,
 			     NTTIME now,
 			     struct smbXsrv_open **_open);
+NTSTATUS smb2srv_open_lookup_replay_cache(struct smbXsrv_connection *conn,
+					  const struct GUID *create_guid,
+					  NTTIME now,
+					  struct smbXsrv_open **_open);
 NTSTATUS smb2srv_open_recreate(struct smbXsrv_connection *conn,
 			       struct auth_session_info *session_info,
 			       uint64_t persistent_id,
@@ -638,6 +661,11 @@ NTSTATUS smbXsrv_open_global_traverse(
 	void *private_data);
 
 NTSTATUS smbXsrv_open_cleanup(uint64_t persistent_id);
+bool smbXsrv_is_encrypted(uint8_t encryption_flags);
+bool smbXsrv_is_partially_encrypted(uint8_t encryption_flags);
+bool smbXsrv_set_crypto_flag(uint8_t *flags, uint8_t flag);
+bool smbXsrv_is_signed(uint8_t signing_flags);
+bool smbXsrv_is_partially_signed(uint8_t signing_flags);
 
 struct smbd_smb2_send_queue {
 	struct smbd_smb2_send_queue *prev, *next;
@@ -676,6 +704,13 @@ struct smbd_smb2_request {
 	bool compound_related;
 
 	/*
+	 * Give the implementation of an SMB2 req a way to tell the SMB2 request
+	 * processing engine that the internal request is going async, while
+	 * preserving synchronous SMB2 behaviour.
+	 */
+	bool async_internal;
+
+	/*
 	 * the encryption key for the whole
 	 * compound chain
 	 */
@@ -694,6 +729,14 @@ struct smbd_smb2_request {
 	/* fake smb1 request. */
 	struct smb_request *smb1req;
 	struct files_struct *compat_chain_fsp;
+
+	/*
+	 * Keep track of whether the outstanding request counters
+	 * had been updated in dispatch, so that they need to be
+	 * adapted again in reply.
+	 */
+	bool request_counters_updated;
+	uint64_t channel_generation;
 
 	/*
 	 * The sub request for async backend calls.
@@ -798,23 +841,12 @@ struct smbd_smb2_request {
 };
 
 struct smbd_server_connection;
-struct user_struct;
 
 struct pending_message_list;
 struct pending_auth_data;
 
-struct user_struct {
-	struct user_struct *next, *prev;
-	uint64_t vuid; /* Tag for this entry. */
-
-	char *session_keystr; /* used by utmp and pam session code.
-				 TDB key string */
-	int homes_snum;
-
-	struct auth_session_info *session_info;
-
-	struct smbXsrv_session *session;
-};
+struct pthreadpool_tevent;
+struct dcesrv_context;
 
 struct smbd_server_connection {
 	const struct tsocket_address *local_address;
@@ -822,13 +854,12 @@ struct smbd_server_connection {
 	const char *remote_hostname;
 	struct tevent_context *ev_ctx;
 	struct messaging_context *msg_ctx;
-	struct sys_notify_context *sys_notify_ctx;
+	struct dcesrv_context *dce_ctx;
 	struct notify_context *notify_ctx;
 	bool using_smb2;
 	int trans_num;
 
 	size_t num_users;
-	struct user_struct *users;
 
 	size_t num_connections;
 	struct connection_struct *connections;
@@ -846,7 +877,6 @@ struct smbd_server_connection {
 	struct {
 		struct bitmap *dptr_bmap;
 		struct dptr_struct *dirptrs;
-		int dirhandles_open;
 	} searches;
 
 	uint64_t num_requests;
@@ -860,33 +890,9 @@ struct smbd_server_connection {
 
 	struct {
 		struct notify_mid_map *notify_mid_maps;
-
-		struct {
-			/* dlink list we store pending lock records on. */
-			struct blocking_lock_record *blocking_lock_queue;
-			/* dlink list we move cancelled lock records onto. */
-			struct blocking_lock_record *blocking_lock_cancelled_queue;
-
-			/* The event that makes us process our blocking lock queue */
-			struct tevent_timer *brl_timeout;
-
-			bool blocking_lock_unlock_state;
-			bool blocking_lock_cancel_state;
-		} locks;
 	} smb1;
-	struct {
-		struct {
-			/* The event that makes us process our blocking lock queue */
-			struct tevent_timer *brl_timeout;
-			bool blocking_lock_unlock_state;
-		} locks;
-	} smb2;
 
-	/*
-	 * Link into libasys for asynchronous operations
-	 */
-	struct asys_context *asys_ctx;
-	struct tevent_fd *asys_fde;
+	struct pthreadpool_tevent *pool;
 
 	struct smbXsrv_client *client;
 };
@@ -894,3 +900,5 @@ struct smbd_server_connection {
 extern struct smbXsrv_client *global_smbXsrv_client;
 
 void smbd_init_globals(void);
+
+#endif /* _SOURCE3_SMBD_GLOBALS_H_ */

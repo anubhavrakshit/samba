@@ -37,6 +37,7 @@
 #endif
 
 static char *corepath;
+static bool using_helper_binary = false;
 
 /**
  * Build up the default corepath as "<logbase>/cores/<progname>"
@@ -169,6 +170,12 @@ static char *get_linux_corepath(void)
 		/*
 		 * No absolute path, use the default (cwd)
 		 */
+		if (result[0] == '|') {
+			/*
+			* Core dump handled by helper binaries
+			*/
+			using_helper_binary = true;
+		}
 		TALLOC_FREE(result);
 		return NULL;
 	}
@@ -251,21 +258,6 @@ void dump_core_setup(const char *progname, const char *log_file)
 		goto out;
 	}
 
-
-#ifdef HAVE_GETRLIMIT
-#ifdef RLIMIT_CORE
-	{
-		struct rlimit rlp;
-		getrlimit(RLIMIT_CORE, &rlp);
-		rlp.rlim_cur = MAX(16*1024*1024,rlp.rlim_cur);
-		setrlimit(RLIMIT_CORE, &rlp);
-		getrlimit(RLIMIT_CORE, &rlp);
-		DEBUG(3,("Maximum core file size limits now %d(soft) %d(hard)\n",
-			 (int)rlp.rlim_cur,(int)rlp.rlim_max));
-	}
-#endif
-#endif
-
 	/* FIXME: if we have a core-plus-pid facility, configurably set
 	 * this up here.
 	 */
@@ -306,16 +298,25 @@ void dump_core_setup(const char *progname, const char *log_file)
 	}
 
 	if (*corepath != '\0') {
-		/* The chdir might fail if we dump core before we finish
-		 * processing the config file.
+		/*
+		 * Check whether coredump is handled by helper binaries or not.
+		 * If so skip chdir().
 		 */
-		if (chdir(corepath) != 0) {
-			DEBUG(0, ("unable to change to %s\n", corepath));
-			DEBUGADD(0, ("refusing to dump core\n"));
-			exit(1);
-		}
+		if (!using_helper_binary) {
+			/* The chdir might fail if we dump core before we finish
+			 * processing the config file.
+			 */
+			if (chdir(corepath) != 0) {
+				DEBUG(0, ("unable to change to %s\n", corepath));
+				DEBUGADD(0, ("refusing to dump core\n"));
+				exit(1);
+			}
 
-		DEBUG(0,("dumping core in %s\n", corepath));
+			DEBUG(0,("dumping core in %s\n", corepath));
+		} else {
+			DEBUG(0,("coredump is handled by helper binary "
+				 "specified at /proc/sys/kernel/core_pattern\n"));
+		}
 	}
 
 	umask(~(0700));

@@ -48,7 +48,7 @@
 	DATA_BLOB tmp_blob = data_blob(NULL, 0);
 	struct PAC_SIGNATURE_DATA *kdc_checksum = NULL;
 	struct PAC_SIGNATURE_DATA *srv_checksum = NULL;
-	int i;
+	uint32_t i;
 
 	/* First, just get the keytypes filled in (and lengths right, eventually) */
 	for (i=0; i < pac_data->num_buffers; i++) {
@@ -120,6 +120,13 @@
 					 &srv_checksum->type,
 					 &srv_checksum->signature);
 
+	if (ret) {
+		DBG_WARNING("making krbtgt PAC srv_checksum failed: %s\n",
+			    smb_get_krb5_error_message(context, ret, mem_ctx));
+		talloc_free(pac_data);
+		return ret;
+	}
+
 	/* Then sign Server checksum */
 	ret = smb_krb5_make_pac_checksum(mem_ctx,
 					 &srv_checksum->signature,
@@ -128,8 +135,8 @@
 					 &kdc_checksum->type,
 					 &kdc_checksum->signature);
 	if (ret) {
-		DEBUG(2, ("making krbtgt PAC checksum failed: %s\n",
-			  smb_get_krb5_error_message(context, ret, mem_ctx)));
+		DBG_WARNING("making krbtgt PAC kdc_checksum failed: %s\n",
+			    smb_get_krb5_error_message(context, ret, mem_ctx));
 		talloc_free(pac_data);
 		return ret;
 	}
@@ -288,8 +295,12 @@ krb5_error_code kerberos_pac_to_user_info_dc(TALLOC_CTX *mem_ctx,
 
 	DATA_BLOB pac_logon_info_in, pac_srv_checksum_in, pac_kdc_checksum_in;
 	krb5_data k5pac_logon_info_in, k5pac_srv_checksum_in, k5pac_kdc_checksum_in;
+	DATA_BLOB pac_upn_dns_info_in;
+	krb5_data k5pac_upn_dns_info_in;
 
 	union PAC_INFO info;
+	union PAC_INFO _upn_dns_info;
+	const struct PAC_UPN_DNS_INFO *upn_dns_info = NULL;
 	struct auth_user_info_dc *user_info_dc_out;
 
 	TALLOC_CTX *tmp_ctx = talloc_new(mem_ctx);
@@ -309,17 +320,53 @@ krb5_error_code kerberos_pac_to_user_info_dc(TALLOC_CTX *mem_ctx,
 	ndr_err = ndr_pull_union_blob(&pac_logon_info_in, tmp_ctx, &info,
 				      PAC_TYPE_LOGON_INFO,
 				      (ndr_pull_flags_fn_t)ndr_pull_PAC_INFO);
-	kerberos_free_data_contents(context, &k5pac_logon_info_in);
-	if (!NDR_ERR_CODE_IS_SUCCESS(ndr_err) || !info.logon_info.info) {
+	smb_krb5_free_data_contents(context, &k5pac_logon_info_in);
+	if (!NDR_ERR_CODE_IS_SUCCESS(ndr_err)) {
 		nt_status = ndr_map_error2ntstatus(ndr_err);
 		DEBUG(0,("can't parse the PAC LOGON_INFO: %s\n", nt_errstr(nt_status)));
 		talloc_free(tmp_ctx);
 		return EINVAL;
 	}
+	if (info.logon_info.info == NULL) {
+		DEBUG(0,("can't parse the PAC LOGON_INFO: missing info pointer\n"));
+		talloc_free(tmp_ctx);
+		return EINVAL;
+	}
+
+	ret = krb5_pac_get_buffer(context, pac, PAC_TYPE_UPN_DNS_INFO,
+				  &k5pac_upn_dns_info_in);
+	if (ret == ENOENT) {
+		ZERO_STRUCT(k5pac_upn_dns_info_in);
+		ret = 0;
+	}
+	if (ret != 0) {
+		talloc_free(tmp_ctx);
+		return EINVAL;
+	}
+
+	pac_upn_dns_info_in = data_blob_const(k5pac_upn_dns_info_in.data,
+					      k5pac_upn_dns_info_in.length);
+
+	if (pac_upn_dns_info_in.length != 0) {
+		ndr_err = ndr_pull_union_blob(&pac_upn_dns_info_in, tmp_ctx,
+					      &_upn_dns_info,
+					      PAC_TYPE_UPN_DNS_INFO,
+					      (ndr_pull_flags_fn_t)ndr_pull_PAC_INFO);
+		smb_krb5_free_data_contents(context, &k5pac_upn_dns_info_in);
+		if (!NDR_ERR_CODE_IS_SUCCESS(ndr_err)) {
+			nt_status = ndr_map_error2ntstatus(ndr_err);
+			DEBUG(0,("can't parse the PAC UPN_DNS_INFO: %s\n",
+				 nt_errstr(nt_status)));
+			talloc_free(tmp_ctx);
+			return EINVAL;
+		}
+		upn_dns_info = &_upn_dns_info.upn_dns_info;
+	}
 
 	/* Pull this right into the normal auth sysstem structures */
 	nt_status = make_user_info_dc_pac(mem_ctx,
 					 info.logon_info.info,
+					 upn_dns_info,
 					 &user_info_dc_out);
 	if (!NT_STATUS_IS_OK(nt_status)) {
 		talloc_free(tmp_ctx);
@@ -338,7 +385,7 @@ krb5_error_code kerberos_pac_to_user_info_dc(TALLOC_CTX *mem_ctx,
 		ndr_err = ndr_pull_struct_blob(&pac_srv_checksum_in, pac_srv_sig,
 					       pac_srv_sig,
 					       (ndr_pull_flags_fn_t)ndr_pull_PAC_SIGNATURE_DATA);
-		kerberos_free_data_contents(context, &k5pac_srv_checksum_in);
+		smb_krb5_free_data_contents(context, &k5pac_srv_checksum_in);
 		if (!NDR_ERR_CODE_IS_SUCCESS(ndr_err)) {
 			nt_status = ndr_map_error2ntstatus(ndr_err);
 			DEBUG(0,("can't parse the KDC signature: %s\n",
@@ -359,7 +406,7 @@ krb5_error_code kerberos_pac_to_user_info_dc(TALLOC_CTX *mem_ctx,
 		ndr_err = ndr_pull_struct_blob(&pac_kdc_checksum_in, pac_kdc_sig,
 					       pac_kdc_sig,
 					       (ndr_pull_flags_fn_t)ndr_pull_PAC_SIGNATURE_DATA);
-		kerberos_free_data_contents(context, &k5pac_kdc_checksum_in);
+		smb_krb5_free_data_contents(context, &k5pac_kdc_checksum_in);
 		if (!NDR_ERR_CODE_IS_SUCCESS(ndr_err)) {
 			nt_status = ndr_map_error2ntstatus(ndr_err);
 			DEBUG(0,("can't parse the KDC signature: %s\n",

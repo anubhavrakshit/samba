@@ -34,8 +34,9 @@
 #include "auth/auth.h"
 #include "param/param.h"
 #include "../lib/tsocket/tsocket.h"
+#include "libds/common/roles.h"
 
-NTSTATUS server_service_cldapd_init(void);
+NTSTATUS server_service_cldapd_init(TALLOC_CTX *);
 
 /*
   handle incoming cldap requests
@@ -153,7 +154,7 @@ static NTSTATUS cldapd_startup_interfaces(struct cldapd_server *cldapd, struct l
 	/* if we are allowing incoming packets from any address, then
 	   we need to bind to the wildcard address */
 	if (!lpcfg_bind_interfaces_only(lp_ctx)) {
-		int num_binds = 0;
+		size_t num_binds = 0;
 		char **wcard = iface_list_wildcard(cldapd);
 		NT_STATUS_HAVE_NO_MEMORY(wcard);
 		for (i=0; wcard[i]; i++) {
@@ -184,7 +185,7 @@ static NTSTATUS cldapd_startup_interfaces(struct cldapd_server *cldapd, struct l
 /*
   startup the cldapd task
 */
-static void cldapd_task_init(struct task_server *task)
+static NTSTATUS cldapd_task_init(struct task_server *task)
 {
 	struct cldapd_server *cldapd;
 	NTSTATUS status;
@@ -194,18 +195,18 @@ static void cldapd_task_init(struct task_server *task)
 
 	if (iface_list_count(ifaces) == 0) {
 		task_server_terminate(task, "cldapd: no network interfaces configured", false);
-		return;
+		return NT_STATUS_UNSUCCESSFUL;
 	}
 
 	switch (lpcfg_server_role(task->lp_ctx)) {
 	case ROLE_STANDALONE:
 		task_server_terminate(task, "cldap_server: no CLDAP server required in standalone configuration", 
 				      false);
-		return;
+		return NT_STATUS_INVALID_DOMAIN_ROLE;
 	case ROLE_DOMAIN_MEMBER:
 		task_server_terminate(task, "cldap_server: no CLDAP server required in member server configuration",
 				      false);
-		return;
+		return NT_STATUS_INVALID_DOMAIN_ROLE;
 	case ROLE_ACTIVE_DIRECTORY_DC:
 		/* Yes, we want an CLDAP server */
 		break;
@@ -216,31 +217,44 @@ static void cldapd_task_init(struct task_server *task)
 	cldapd = talloc(task, struct cldapd_server);
 	if (cldapd == NULL) {
 		task_server_terminate(task, "cldapd: out of memory", true);
-		return;
+		return NT_STATUS_NO_MEMORY;
 	}
 
 	cldapd->task = task;
-	cldapd->samctx = samdb_connect(cldapd, task->event_ctx, task->lp_ctx, system_session(task->lp_ctx), 0);
+	cldapd->samctx = samdb_connect(cldapd,
+				       task->event_ctx,
+				       task->lp_ctx,
+				       system_session(task->lp_ctx),
+				       NULL,
+				       0);
 	if (cldapd->samctx == NULL) {
 		task_server_terminate(task, "cldapd failed to open samdb", true);
-		return;
+		return NT_STATUS_UNSUCCESSFUL;
 	}
 
 	/* start listening on the configured network interfaces */
 	status = cldapd_startup_interfaces(cldapd, task->lp_ctx, ifaces);
 	if (!NT_STATUS_IS_OK(status)) {
 		task_server_terminate(task, "cldapd failed to setup interfaces", true);
-		return;
+		return status;
 	}
 
 	irpc_add_name(task->msg_ctx, "cldap_server");
+
+	return NT_STATUS_OK;
 }
 
 
 /*
   register ourselves as a available server
 */
-NTSTATUS server_service_cldapd_init(void)
+NTSTATUS server_service_cldapd_init(TALLOC_CTX *ctx)
 {
-	return register_server_service("cldap", cldapd_task_init);
+	static const struct service_details details = {
+		.inhibit_fork_on_accept = true,
+		.inhibit_pre_fork = true,
+		.task_init = cldapd_task_init,
+		.post_fork = NULL
+	};
+	return register_server_service(ctx, "cldap", &details);
 }

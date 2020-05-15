@@ -25,12 +25,12 @@
 #include "popt_common.h"
 #include "dbwrap/dbwrap.h"
 #include "dbwrap/dbwrap_open.h"
-#include "dbwrap/dbwrap_watch.h"
 #include "messages.h"
 #include "util_tdb.h"
+#include "cmdline_contexts.h"
 
 enum dbwrap_op { OP_FETCH, OP_STORE, OP_DELETE, OP_ERASE, OP_LISTKEYS,
-		 OP_LISTWATCHERS, OP_EXISTS };
+		 OP_EXISTS };
 
 enum dbwrap_type { TYPE_INT32, TYPE_UINT32, TYPE_STRING, TYPE_HEX, TYPE_NONE };
 
@@ -280,13 +280,6 @@ static int dbwrap_tool_exists(struct db_context *db,
 	return (result)?0:1;
 }
 
-
-static int delete_fn(struct db_record *rec, void *priv)
-{
-	dbwrap_record_delete(rec);
-	return 0;
-}
-
 /**
  * dbwrap_tool_erase: erase the whole data base
  * the keyname argument is not used.
@@ -295,11 +288,11 @@ static int dbwrap_tool_erase(struct db_context *db,
 			     const char *keyname,
 			     const char *data)
 {
-	NTSTATUS status;
+	int ret;
 
-	status = dbwrap_traverse(db, delete_fn, NULL, NULL);
+	ret = dbwrap_wipe(db);
 
-	if (!NT_STATUS_IS_OK(status)) {
+	if (ret != 0) {
 		d_fprintf(stderr, "ERROR erasing the database\n");
 		return -1;
 	}
@@ -309,8 +302,9 @@ static int dbwrap_tool_erase(struct db_context *db,
 
 static int listkey_fn(struct db_record *rec, void *private_data)
 {
-	int length = dbwrap_record_get_key(rec).dsize;
-	unsigned char *p = (unsigned char *)dbwrap_record_get_key(rec).dptr;
+	TDB_DATA key = dbwrap_record_get_key(rec);
+	size_t length = key.dsize;
+	unsigned char *p = (unsigned char *)key.dptr;
 
 	while (length--) {
 		if (isprint(*p) && !strchr("\"\\", *p)) {
@@ -342,33 +336,6 @@ static int dbwrap_tool_listkeys(struct db_context *db,
 	return 0;
 }
 
-static int dbwrap_tool_listwatchers_cb(const uint8_t *db_id, size_t db_id_len,
-				       const TDB_DATA key,
-				       const struct server_id *watchers,
-				       size_t num_watchers,
-				       void *private_data)
-{
-	uint32_t i;
-	dump_data_file(db_id, db_id_len, false, stdout);
-	dump_data_file(key.dptr, key.dsize, false, stdout);
-
-	for (i=0; i<num_watchers; i++) {
-		struct server_id_buf idbuf;
-		printf("%s\n", server_id_str_buf(watchers[i], &idbuf));
-	}
-	printf("\n");
-	return 0;
-}
-
-
-static int dbwrap_tool_listwatchers(struct db_context *db,
-				    const char *keyname,
-				    const char *data)
-{
-	dbwrap_watchers_traverse_read(dbwrap_tool_listwatchers_cb, NULL);
-	return 0;
-}
-
 struct dbwrap_op_dispatch_table {
 	enum dbwrap_op op;
 	enum dbwrap_type type;
@@ -389,7 +356,6 @@ struct dbwrap_op_dispatch_table dispatch_table[] = {
 	{ OP_DELETE, TYPE_INT32,  dbwrap_tool_delete },
 	{ OP_ERASE,  TYPE_INT32,  dbwrap_tool_erase },
 	{ OP_LISTKEYS, TYPE_INT32, dbwrap_tool_listkeys },
-	{ OP_LISTWATCHERS, TYPE_NONE, dbwrap_tool_listwatchers },
 	{ OP_EXISTS, TYPE_STRING, dbwrap_tool_exists },
 	{ 0, 0, NULL },
 };
@@ -463,19 +429,18 @@ int main(int argc, const char **argv)
 			  "USAGE: %s [options] <database> <op> [<key> [<type> "
 			  "[<value>]]]\n"
 			  "       ops: fetch, store, delete, exists, "
-			  "erase, listkeys, listwatchers\n"
+			  "erase, listkeys\n"
 			  "       types: int32, uint32, string, hex\n",
 			 argv[0]);
 		goto done;
 	}
 
-	if ((persistent == 0 && non_persistent == 0) ||
-	    (persistent == 1 && non_persistent == 1))
-	{
+	if ((persistent + non_persistent) != 1) {
 		d_fprintf(stderr, "ERROR: you must specify exactly one "
 			  "of --persistent and --non-persistent\n");
 		goto done;
-	} else if (non_persistent == 1) {
+	}
+	if (non_persistent == 1) {
 		tdb_flags |= TDB_CLEAR_IF_FIRST;
 	}
 
@@ -523,14 +488,6 @@ int main(int argc, const char **argv)
 			goto done;
 		}
 		op = OP_LISTKEYS;
-	} else if (strcmp(opname, "listwatchers") == 0) {
-		if (extra_argc != 2) {
-			d_fprintf(stderr, "ERROR: operation 'listwatchers' "
-				  "does not take an argument\n");
-			goto done;
-		}
-		op = OP_LISTWATCHERS;
-		keytype = "none";
 	} else if (strcmp(opname, "exists") == 0) {
 		if (extra_argc != 3) {
 			d_fprintf(stderr, "ERROR: operation 'exists' does "
@@ -544,7 +501,7 @@ int main(int argc, const char **argv)
 		d_fprintf(stderr,
 			  "ERROR: invalid op '%s' specified\n"
 			  "       supported ops: fetch, store, delete, exists, "
-			  "erase, listkeys, listwatchers\n",
+			  "erase, listkeys\n",
 			  opname);
 		goto done;
 	}
@@ -608,6 +565,7 @@ int main(int argc, const char **argv)
 	}
 
 done:
+	poptFreeContext(pc);
 	TALLOC_FREE(mem_ctx);
 	return ret;
 }

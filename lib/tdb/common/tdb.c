@@ -59,6 +59,11 @@ static void tdb_increment_seqnum(struct tdb_context *tdb)
 		return;
 	}
 
+	if (tdb->transaction != NULL) {
+		tdb_increment_seqnum_nonblock(tdb);
+		return;
+	}
+
 	if (tdb_nest_lock(tdb, TDB_SEQNUM_OFS, F_WRLCK,
 			  TDB_LOCK_WAIT|TDB_LOCK_PROBE) != 0) {
 		return;
@@ -74,19 +79,53 @@ static int tdb_key_compare(TDB_DATA key, TDB_DATA data, void *private_data)
 	return memcmp(data.dptr, key.dptr, data.dsize);
 }
 
+void tdb_chainwalk_init(struct tdb_chainwalk_ctx *ctx, tdb_off_t ptr)
+{
+	*ctx = (struct tdb_chainwalk_ctx) { .slow_ptr = ptr };
+}
+
+bool tdb_chainwalk_check(struct tdb_context *tdb,
+			 struct tdb_chainwalk_ctx *ctx,
+			 tdb_off_t next_ptr)
+{
+	int ret;
+
+	if (ctx->slow_chase) {
+		ret = tdb_ofs_read(tdb, ctx->slow_ptr, &ctx->slow_ptr);
+		if (ret == -1) {
+			return false;
+		}
+	}
+	ctx->slow_chase = !ctx->slow_chase;
+
+	if (next_ptr == ctx->slow_ptr) {
+		tdb->ecode = TDB_ERR_CORRUPT;
+		TDB_LOG((tdb, TDB_DEBUG_ERROR,
+			 "tdb_chainwalk_check: circular chain\n"));
+		return false;
+	}
+
+	return true;
+}
+
 /* Returns 0 on fail.  On success, return offset of record, and fills
    in rec */
 static tdb_off_t tdb_find(struct tdb_context *tdb, TDB_DATA key, uint32_t hash,
 			struct tdb_record *r)
 {
 	tdb_off_t rec_ptr;
+	struct tdb_chainwalk_ctx chainwalk;
 
 	/* read in the hash top */
 	if (tdb_ofs_read(tdb, TDB_HASH_TOP(hash), &rec_ptr) == -1)
 		return 0;
 
+	tdb_chainwalk_init(&chainwalk, rec_ptr);
+
 	/* keep looking until we find the right record */
 	while (rec_ptr) {
+		bool ok;
+
 		if (tdb_rec_read(tdb, rec_ptr, r) == -1)
 			return 0;
 
@@ -97,13 +136,12 @@ static tdb_off_t tdb_find(struct tdb_context *tdb, TDB_DATA key, uint32_t hash,
 				      NULL) == 0) {
 			return rec_ptr;
 		}
-		/* detect tight infinite loop */
-		if (rec_ptr == r->next) {
-			tdb->ecode = TDB_ERR_CORRUPT;
-			TDB_LOG((tdb, TDB_DEBUG_FATAL, "tdb_find: loop detected.\n"));
+		rec_ptr = r->next;
+
+		ok = tdb_chainwalk_check(tdb, &chainwalk, rec_ptr);
+		if (!ok) {
 			return 0;
 		}
-		rec_ptr = r->next;
 	}
 	tdb->ecode = TDB_ERR_NOEXIST;
 	return 0;
@@ -124,16 +162,34 @@ tdb_off_t tdb_find_lock_hash(struct tdb_context *tdb, TDB_DATA key, uint32_t has
 
 static TDB_DATA _tdb_fetch(struct tdb_context *tdb, TDB_DATA key);
 
+struct tdb_update_hash_state {
+	const TDB_DATA *dbufs;
+	int num_dbufs;
+	tdb_len_t dbufs_len;
+};
+
 static int tdb_update_hash_cmp(TDB_DATA key, TDB_DATA data, void *private_data)
 {
-	TDB_DATA *dbuf = (TDB_DATA *)private_data;
+	struct tdb_update_hash_state *state = private_data;
+	unsigned char *dptr = data.dptr;
+	int i;
 
-	if (dbuf->dsize != data.dsize) {
+	if (state->dbufs_len != data.dsize) {
 		return -1;
 	}
-	if (memcmp(dbuf->dptr, data.dptr, data.dsize) != 0) {
-		return -1;
+
+	for (i=0; i<state->num_dbufs; i++) {
+		TDB_DATA dbuf = state->dbufs[i];
+		if( dbuf.dsize > 0) {
+			int ret;
+			ret = memcmp(dptr, dbuf.dptr, dbuf.dsize);
+			if (ret != 0) {
+				return -1;
+			}
+			dptr += dbuf.dsize;
+		}
 	}
+
 	return 0;
 }
 
@@ -141,10 +197,14 @@ static int tdb_update_hash_cmp(TDB_DATA key, TDB_DATA data, void *private_data)
    is <= the old data size and the key exists.
    on failure return -1.
 */
-static int tdb_update_hash(struct tdb_context *tdb, TDB_DATA key, uint32_t hash, TDB_DATA dbuf)
+static int tdb_update_hash(struct tdb_context *tdb, TDB_DATA key,
+			   uint32_t hash,
+			   const TDB_DATA *dbufs, int num_dbufs,
+			   tdb_len_t dbufs_len)
 {
 	struct tdb_record rec;
-	tdb_off_t rec_ptr;
+	tdb_off_t rec_ptr, ofs;
+	int i;
 
 	/* find entry */
 	if (!(rec_ptr = tdb_find(tdb, key, hash, &rec)))
@@ -152,26 +212,41 @@ static int tdb_update_hash(struct tdb_context *tdb, TDB_DATA key, uint32_t hash,
 
 	/* it could be an exact duplicate of what is there - this is
 	 * surprisingly common (eg. with a ldb re-index). */
-	if (rec.key_len == key.dsize &&
-	    rec.data_len == dbuf.dsize &&
-	    rec.full_hash == hash &&
-	    tdb_parse_record(tdb, key, tdb_update_hash_cmp, &dbuf) == 0) {
-		return 0;
+	if (rec.data_len == dbufs_len) {
+		struct tdb_update_hash_state state = {
+			.dbufs = dbufs, .num_dbufs = num_dbufs,
+			.dbufs_len = dbufs_len
+		};
+		int ret;
+
+		ret = tdb_parse_record(tdb, key, tdb_update_hash_cmp, &state);
+		if (ret == 0) {
+			return 0;
+		}
 	}
 
 	/* must be long enough key, data and tailer */
-	if (rec.rec_len < key.dsize + dbuf.dsize + sizeof(tdb_off_t)) {
+	if (rec.rec_len < key.dsize + dbufs_len + sizeof(tdb_off_t)) {
 		tdb->ecode = TDB_SUCCESS; /* Not really an error */
 		return -1;
 	}
 
-	if (tdb->methods->tdb_write(tdb, rec_ptr + sizeof(rec) + rec.key_len,
-		      dbuf.dptr, dbuf.dsize) == -1)
-		return -1;
+	ofs = rec_ptr + sizeof(rec) + rec.key_len;
 
-	if (dbuf.dsize != rec.data_len) {
+	for (i=0; i<num_dbufs; i++) {
+		TDB_DATA dbuf = dbufs[i];
+		int ret;
+
+		ret = tdb->methods->tdb_write(tdb, ofs, dbuf.dptr, dbuf.dsize);
+		if (ret == -1) {
+			return -1;
+		}
+		ofs += dbuf.dsize;
+	}
+
+	if (dbufs_len != rec.data_len) {
 		/* update size */
-		rec.data_len = dbuf.dsize;
+		rec.data_len = dbufs_len;
 		return tdb_rec_write(tdb, rec_ptr, &rec);
 	}
 
@@ -284,103 +359,139 @@ _PUBLIC_ int tdb_exists(struct tdb_context *tdb, TDB_DATA key)
 	return ret;
 }
 
-/* actually delete an entry in the database given the offset */
-int tdb_do_delete(struct tdb_context *tdb, tdb_off_t rec_ptr, struct tdb_record *rec)
+/*
+ * Move a dead record to the freelist. The hash chain and freelist
+ * must be locked.
+ */
+static int tdb_del_dead(struct tdb_context *tdb,
+			uint32_t last_ptr,
+			uint32_t rec_ptr,
+			struct tdb_record *rec,
+			bool *deleted)
 {
-	tdb_off_t last_ptr, i;
-	struct tdb_record lastrec;
+	int ret;
 
-	if (tdb->read_only || tdb->traverse_read) return -1;
-
-	if (((tdb->traverse_write != 0) && (!TDB_DEAD(rec))) ||
-	    tdb_write_lock_record(tdb, rec_ptr) == -1) {
-		/* Someone traversing here: mark it as dead */
-		rec->magic = TDB_DEAD_MAGIC;
-		return tdb_rec_write(tdb, rec_ptr, rec);
-	}
-	if (tdb_write_unlock_record(tdb, rec_ptr) != 0)
-		return -1;
-
-	/* find previous record in hash chain */
-	if (tdb_ofs_read(tdb, TDB_HASH_TOP(rec->full_hash), &i) == -1)
-		return -1;
-	for (last_ptr = 0; i != rec_ptr; last_ptr = i, i = lastrec.next)
-		if (tdb_rec_read(tdb, i, &lastrec) == -1)
-			return -1;
-
-	/* unlink it: next ptr is at start of record. */
-	if (last_ptr == 0)
-		last_ptr = TDB_HASH_TOP(rec->full_hash);
-	if (tdb_ofs_write(tdb, last_ptr, &rec->next) == -1)
-		return -1;
-
-	/* recover the space */
-	if (tdb_free(tdb, rec_ptr, rec) == -1)
-		return -1;
-	return 0;
-}
-
-static int tdb_count_dead(struct tdb_context *tdb, uint32_t hash)
-{
-	int res = 0;
-	tdb_off_t rec_ptr;
-	struct tdb_record rec;
-
-	/* read in the hash top */
-	if (tdb_ofs_read(tdb, TDB_HASH_TOP(hash), &rec_ptr) == -1)
+	ret = tdb_write_lock_record(tdb, rec_ptr);
+	if (ret == -1) {
+		/* Someone traversing here: Just leave it dead */
 		return 0;
-
-	while (rec_ptr) {
-		if (tdb_rec_read(tdb, rec_ptr, &rec) == -1)
-			return 0;
-
-		if (rec.magic == TDB_DEAD_MAGIC) {
-			res += 1;
-		}
-		rec_ptr = rec.next;
 	}
-	return res;
+	ret = tdb_write_unlock_record(tdb, rec_ptr);
+	if (ret == -1) {
+		return -1;
+	}
+	ret = tdb_ofs_write(tdb, last_ptr, &rec->next);
+	if (ret == -1) {
+		return -1;
+	}
+
+	*deleted = true;
+
+	ret = tdb_free(tdb, rec_ptr, rec);
+	return ret;
 }
 
 /*
- * Purge all DEAD records from a hash chain
+ * Walk the hash chain and leave tdb->max_dead_records around. Move
+ * the rest of dead records to the freelist.
  */
-int tdb_purge_dead(struct tdb_context *tdb, uint32_t hash)
+int tdb_trim_dead(struct tdb_context *tdb, uint32_t hash)
 {
-	int res = -1;
+	struct tdb_chainwalk_ctx chainwalk;
 	struct tdb_record rec;
-	tdb_off_t rec_ptr;
+	tdb_off_t last_ptr, rec_ptr;
+	bool locked_freelist = false;
+	int num_dead = 0;
+	int ret;
 
-	if (tdb_lock_nonblock(tdb, -1, F_WRLCK) == -1) {
-		/*
-		 * Don't block the freelist if not strictly necessary
-		 */
+	last_ptr = TDB_HASH_TOP(hash);
+
+	/*
+	 * Init chainwalk with the pointer to the hash top. It might
+	 * be that the very first record in the chain is a dead one
+	 * that we have to delete.
+	 */
+	tdb_chainwalk_init(&chainwalk, last_ptr);
+
+	ret = tdb_ofs_read(tdb, last_ptr, &rec_ptr);
+	if (ret == -1) {
 		return -1;
 	}
 
-	/* read in the hash top */
-	if (tdb_ofs_read(tdb, TDB_HASH_TOP(hash), &rec_ptr) == -1)
-		goto fail;
+	while (rec_ptr != 0) {
+		bool deleted = false;
+		uint32_t next;
 
-	while (rec_ptr) {
-		tdb_off_t next;
-
-		if (tdb_rec_read(tdb, rec_ptr, &rec) == -1) {
+		ret = tdb_rec_read(tdb, rec_ptr, &rec);
+		if (ret == -1) {
 			goto fail;
 		}
 
+		/*
+		 * Make a copy of rec.next: Further down we might
+		 * delete and put the record on the freelist. Make
+		 * sure that modifications in that code path can't
+		 * break the chainwalk here.
+		 */
 		next = rec.next;
 
-		if (rec.magic == TDB_DEAD_MAGIC
-		    && tdb_do_delete(tdb, rec_ptr, &rec) == -1) {
-			goto fail;
+		if (rec.magic == TDB_DEAD_MAGIC) {
+			num_dead += 1;
+
+			if (num_dead > tdb->max_dead_records) {
+
+				if (!locked_freelist) {
+					/*
+					 * Lock the freelist only if
+					 * it's really required.
+					 */
+					ret = tdb_lock(tdb, -1, F_WRLCK);
+					if (ret == -1) {
+						goto fail;
+					};
+					locked_freelist = true;
+				}
+
+				ret = tdb_del_dead(
+					tdb,
+					last_ptr,
+					rec_ptr,
+					&rec,
+					&deleted);
+
+				if (ret == -1) {
+					goto fail;
+				}
+			}
+		}
+
+		/*
+		 * Don't do the chainwalk check if "rec_ptr" was
+		 * deleted. We reduced the chain, and the chainwalk
+		 * check might catch up early. Imagine a valid chain
+		 * with just dead records: We never can bump the
+		 * "slow" pointer in chainwalk_check, as there isn't
+		 * anything left to jump to and compare.
+		 */
+		if (!deleted) {
+			bool ok;
+
+			last_ptr = rec_ptr;
+
+			ok = tdb_chainwalk_check(tdb, &chainwalk, next);
+			if (!ok) {
+				ret = -1;
+				goto fail;
+			}
 		}
 		rec_ptr = next;
 	}
-	res = 0;
- fail:
-	tdb_unlock(tdb, -1, F_WRLCK);
-	return res;
+	ret = 0;
+fail:
+	if (locked_freelist) {
+		tdb_unlock(tdb, -1, F_WRLCK);
+	}
+	return ret;
 }
 
 /* delete an entry in the database given a key */
@@ -390,43 +501,29 @@ static int tdb_delete_hash(struct tdb_context *tdb, TDB_DATA key, uint32_t hash)
 	struct tdb_record rec;
 	int ret;
 
+	if (tdb->read_only || tdb->traverse_read) {
+		tdb->ecode = TDB_ERR_RDONLY;
+		return -1;
+	}
+
 	rec_ptr = tdb_find_lock_hash(tdb, key, hash, F_WRLCK, &rec);
 	if (rec_ptr == 0) {
 		return -1;
 	}
 
-	if (tdb->max_dead_records != 0) {
-
-		uint32_t magic = TDB_DEAD_MAGIC;
-
-		/*
-		 * Allow for some dead records per hash chain, mainly for
-		 * tdb's with a very high create/delete rate like locking.tdb.
-		 */
-
-		if (tdb_count_dead(tdb, hash) >= tdb->max_dead_records) {
-			/*
-			 * Don't let the per-chain freelist grow too large,
-			 * delete all existing dead records
-			 */
-			tdb_purge_dead(tdb, hash);
-		}
-
-		/*
-		 * Just mark the record as dead.
-		 */
-		ret = tdb_ofs_write(
-			tdb, rec_ptr + offsetof(struct tdb_record, magic),
-			&magic);
-	}
-	else {
-		ret = tdb_do_delete(tdb, rec_ptr, &rec);
+	/*
+	 * Mark the record dead
+	 */
+	rec.magic = TDB_DEAD_MAGIC;
+	ret = tdb_rec_write(tdb, rec_ptr, &rec);
+	if (ret == -1) {
+		goto done;
 	}
 
-	if (ret == 0) {
-		tdb_increment_seqnum(tdb);
-	}
+	tdb_increment_seqnum(tdb);
 
+	ret = tdb_trim_dead(tdb, hash);
+done:
 	if (tdb_unlock(tdb, BUCKET(hash), F_WRLCK) != 0)
 		TDB_LOG((tdb, TDB_DEBUG_WARNING, "tdb_delete: WARNING tdb_unlock failed!\n"));
 	return ret;
@@ -450,6 +547,7 @@ tdb_off_t tdb_find_dead(struct tdb_context *tdb, uint32_t hash,
 			tdb_off_t *p_last_ptr)
 {
 	tdb_off_t rec_ptr, last_ptr;
+	struct tdb_chainwalk_ctx chainwalk;
 	tdb_off_t best_rec_ptr = 0;
 	tdb_off_t best_last_ptr = 0;
 	struct tdb_record best = { .rec_len = UINT32_MAX };
@@ -462,8 +560,12 @@ tdb_off_t tdb_find_dead(struct tdb_context *tdb, uint32_t hash,
 	if (tdb_ofs_read(tdb, last_ptr, &rec_ptr) == -1)
 		return 0;
 
+	tdb_chainwalk_init(&chainwalk, rec_ptr);
+
 	/* keep looking until we find the right record */
 	while (rec_ptr) {
+		bool ok;
+
 		if (tdb_rec_read(tdb, rec_ptr, r) == -1)
 			return 0;
 
@@ -475,6 +577,11 @@ tdb_off_t tdb_find_dead(struct tdb_context *tdb, uint32_t hash,
 		}
 		last_ptr = rec_ptr;
 		rec_ptr = r->next;
+
+		ok = tdb_chainwalk_check(tdb, &chainwalk, rec_ptr);
+		if (!ok) {
+			return 0;
+		}
 	}
 
 	if (best.rec_len == UINT32_MAX) {
@@ -486,12 +593,38 @@ tdb_off_t tdb_find_dead(struct tdb_context *tdb, uint32_t hash,
 	return best_rec_ptr;
 }
 
-static int _tdb_store(struct tdb_context *tdb, TDB_DATA key,
-		       TDB_DATA dbuf, int flag, uint32_t hash)
+static int _tdb_storev(struct tdb_context *tdb, TDB_DATA key,
+		       const TDB_DATA *dbufs, int num_dbufs,
+		       int flag, uint32_t hash)
 {
 	struct tdb_record rec;
-	tdb_off_t rec_ptr;
+	tdb_off_t rec_ptr, ofs;
+	tdb_len_t rec_len, dbufs_len;
+	int i;
 	int ret = -1;
+
+	dbufs_len = 0;
+
+	for (i=0; i<num_dbufs; i++) {
+		size_t dsize = dbufs[i].dsize;
+
+		if ((dsize != 0) && (dbufs[i].dptr == NULL)) {
+			tdb->ecode = TDB_ERR_EINVAL;
+			goto fail;
+		}
+
+		dbufs_len += dsize;
+		if (dbufs_len < dsize) {
+			tdb->ecode = TDB_ERR_OOM;
+			goto fail;
+		}
+	}
+
+	rec_len = key.dsize + dbufs_len;
+	if ((rec_len < key.dsize) || (rec_len < dbufs_len)) {
+		tdb->ecode = TDB_ERR_OOM;
+		goto fail;
+	}
 
 	/* check for it existing, on insert. */
 	if (flag == TDB_INSERT) {
@@ -501,7 +634,8 @@ static int _tdb_store(struct tdb_context *tdb, TDB_DATA key,
 		}
 	} else {
 		/* first try in-place update, on modify or replace. */
-		if (tdb_update_hash(tdb, key, hash, dbuf) == 0) {
+		if (tdb_update_hash(tdb, key, hash, dbufs, num_dbufs,
+				    dbufs_len) == 0) {
 			goto done;
 		}
 		if (tdb->ecode == TDB_ERR_NOEXIST &&
@@ -521,7 +655,7 @@ static int _tdb_store(struct tdb_context *tdb, TDB_DATA key,
 		tdb_delete_hash(tdb, key, hash);
 
 	/* we have to allocate some space */
-	rec_ptr = tdb_allocate(tdb, hash, key.dsize + dbuf.dsize, &rec);
+	rec_ptr = tdb_allocate(tdb, hash, rec_len, &rec);
 
 	if (rec_ptr == 0) {
 		goto fail;
@@ -532,17 +666,40 @@ static int _tdb_store(struct tdb_context *tdb, TDB_DATA key,
 		goto fail;
 
 	rec.key_len = key.dsize;
-	rec.data_len = dbuf.dsize;
+	rec.data_len = dbufs_len;
 	rec.full_hash = hash;
 	rec.magic = TDB_MAGIC;
 
+	ofs = rec_ptr;
+
 	/* write out and point the top of the hash chain at it */
-	if (tdb_rec_write(tdb, rec_ptr, &rec) == -1
-	    || tdb->methods->tdb_write(tdb, rec_ptr+sizeof(rec),
-				       key.dptr, key.dsize) == -1
-	    || tdb->methods->tdb_write(tdb, rec_ptr+sizeof(rec)+key.dsize,
-				       dbuf.dptr, dbuf.dsize) == -1
-	    || tdb_ofs_write(tdb, TDB_HASH_TOP(hash), &rec_ptr) == -1) {
+	ret = tdb_rec_write(tdb, ofs, &rec);
+	if (ret == -1) {
+		goto fail;
+	}
+	ofs += sizeof(rec);
+
+	ret = tdb->methods->tdb_write(tdb, ofs, key.dptr, key.dsize);
+	if (ret == -1) {
+		goto fail;
+	}
+	ofs += key.dsize;
+
+	for (i=0; i<num_dbufs; i++) {
+		if (dbufs[i].dsize == 0) {
+			continue;
+		}
+
+		ret = tdb->methods->tdb_write(tdb, ofs, dbufs[i].dptr,
+					      dbufs[i].dsize);
+		if (ret == -1) {
+			goto fail;
+		}
+		ofs += dbufs[i].dsize;
+	}
+
+	ret = tdb_ofs_write(tdb, TDB_HASH_TOP(hash), &rec_ptr);
+	if (ret == -1) {
 		/* Need to tdb_unallocate() here */
 		goto fail;
 	}
@@ -554,6 +711,12 @@ static int _tdb_store(struct tdb_context *tdb, TDB_DATA key,
 		tdb_increment_seqnum(tdb);
 	}
 	return ret;
+}
+
+static int _tdb_store(struct tdb_context *tdb, TDB_DATA key,
+		      TDB_DATA dbuf, int flag, uint32_t hash)
+{
+	return _tdb_storev(tdb, key, &dbuf, 1, flag, hash);
 }
 
 /* store an element in the database, replacing any existing element
@@ -583,11 +746,36 @@ _PUBLIC_ int tdb_store(struct tdb_context *tdb, TDB_DATA key, TDB_DATA dbuf, int
 	return ret;
 }
 
+_PUBLIC_ int tdb_storev(struct tdb_context *tdb, TDB_DATA key,
+			const TDB_DATA *dbufs, int num_dbufs, int flag)
+{
+	uint32_t hash;
+	int ret;
+
+	if (tdb->read_only || tdb->traverse_read) {
+		tdb->ecode = TDB_ERR_RDONLY;
+		tdb_trace_1plusn_rec_flag_ret(tdb, "tdb_storev", key,
+					      dbufs, num_dbufs, flag, -1);
+		return -1;
+	}
+
+	/* find which hash bucket it is in */
+	hash = tdb->hash_fn(&key);
+	if (tdb_lock(tdb, BUCKET(hash), F_WRLCK) == -1)
+		return -1;
+
+	ret = _tdb_storev(tdb, key, dbufs, num_dbufs, flag, hash);
+	tdb_trace_1plusn_rec_flag_ret(tdb, "tdb_storev", key,
+				      dbufs, num_dbufs, flag, -1);
+	tdb_unlock(tdb, BUCKET(hash), F_WRLCK);
+	return ret;
+}
+
 /* Append to an entry. Create if not exist. */
 _PUBLIC_ int tdb_append(struct tdb_context *tdb, TDB_DATA key, TDB_DATA new_dbuf)
 {
 	uint32_t hash;
-	TDB_DATA dbuf;
+	TDB_DATA dbufs[2];
 	int ret = -1;
 
 	/* find which hash bucket it is in */
@@ -595,38 +783,14 @@ _PUBLIC_ int tdb_append(struct tdb_context *tdb, TDB_DATA key, TDB_DATA new_dbuf
 	if (tdb_lock(tdb, BUCKET(hash), F_WRLCK) == -1)
 		return -1;
 
-	dbuf = _tdb_fetch(tdb, key);
+	dbufs[0] = _tdb_fetch(tdb, key);
+	dbufs[1] = new_dbuf;
 
-	if (dbuf.dptr == NULL) {
-		dbuf.dptr = (unsigned char *)malloc(new_dbuf.dsize);
-	} else {
-		unsigned int new_len = dbuf.dsize + new_dbuf.dsize;
-		unsigned char *new_dptr;
+	ret = _tdb_storev(tdb, key, dbufs, 2, 0, hash);
+	tdb_trace_2rec_retrec(tdb, "tdb_append", key, dbufs[0], dbufs[1]);
 
-		/* realloc '0' is special: don't do that. */
-		if (new_len == 0)
-			new_len = 1;
-		new_dptr = (unsigned char *)realloc(dbuf.dptr, new_len);
-		if (new_dptr == NULL) {
-			free(dbuf.dptr);
-		}
-		dbuf.dptr = new_dptr;
-	}
-
-	if (dbuf.dptr == NULL) {
-		tdb->ecode = TDB_ERR_OOM;
-		goto failed;
-	}
-
-	memcpy(dbuf.dptr + dbuf.dsize, new_dbuf.dptr, new_dbuf.dsize);
-	dbuf.dsize += new_dbuf.dsize;
-
-	ret = _tdb_store(tdb, key, dbuf, 0, hash);
-	tdb_trace_2rec_retrec(tdb, "tdb_append", key, new_dbuf, dbuf);
-
-failed:
 	tdb_unlock(tdb, BUCKET(hash), F_WRLCK);
-	SAFE_FREE(dbuf.dptr);
+	SAFE_FREE(dbufs[0].dptr);
 	return ret;
 }
 
@@ -785,7 +949,7 @@ static int tdb_free_region(struct tdb_context *tdb, tdb_off_t offset, ssize_t le
  */
 _PUBLIC_ int tdb_wipe_all(struct tdb_context *tdb)
 {
-	int i;
+	uint32_t i;
 	tdb_off_t offset = 0;
 	ssize_t data_len;
 	tdb_off_t recovery_head;
@@ -1123,6 +1287,25 @@ void tdb_trace_2rec_flag_ret(struct tdb_context *tdb, const char *op,
 	tdb_trace_write(tdb, op);
 	tdb_trace_record(tdb, rec1);
 	tdb_trace_record(tdb, rec2);
+	tdb_trace_write(tdb, msg);
+	tdb_trace_end_ret(tdb, ret);
+}
+
+void tdb_trace_1plusn_rec_flag_ret(struct tdb_context *tdb, const char *op,
+				   TDB_DATA rec,
+				   const TDB_DATA *recs, int num_recs,
+				   unsigned flag, int ret)
+{
+	char msg[1 + sizeof(ret) * 4];
+	int i;
+
+	snprintf(msg, sizeof(msg), " %#x", flag);
+	tdb_trace_start(tdb);
+	tdb_trace_write(tdb, op);
+	tdb_trace_record(tdb, rec);
+	for (i=0; i<num_recs; i++) {
+		tdb_trace_record(tdb, recs[i]);
+	}
 	tdb_trace_write(tdb, msg);
 	tdb_trace_end_ret(tdb, ret);
 }

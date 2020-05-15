@@ -21,8 +21,14 @@
    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-#include "includes.h"
+#include "replace.h"
+#include "samlogon_cache.h"
 #include "system/filesys.h"
+#include "system/time.h"
+#include "lib/util/debug.h"
+#include "lib/util/talloc_stack.h"
+#include "lib/util/memory.h" /* for SAFE_FREE() */
+#include "source3/lib/util_path.h"
 #include "librpc/gen_ndr/ndr_krb5pac.h"
 #include "../libcli/security/security.h"
 #include "util_tdb.h"
@@ -46,7 +52,7 @@ bool netsamlogon_cache_init(void)
 		return true;
 	}
 
-	path = cache_path(NETSAMLOGON_TDB);
+	path = cache_path(talloc_tos(), NETSAMLOGON_TDB);
 	if (path == NULL) {
 		return false;
 	}
@@ -77,22 +83,14 @@ clear:
 	first_try = false;
 
 	DEBUG(0,("retry after truncate for '%s'\n", path));
-	truncate(path, 0);
-	goto again;
-}
-
-
-/***********************************************************************
- Shutdown samlogon_cache database
-***********************************************************************/
-
-bool netsamlogon_cache_shutdown(void)
-{
-	if (netsamlogon_tdb) {
-		return (tdb_close(netsamlogon_tdb) == 0);
+	ret = truncate(path, 0);
+	if (ret == -1) {
+		DBG_ERR("truncate failed: %s\n", strerror(errno));
+		talloc_free(path);
+		return false;
 	}
 
-	return true;
+	goto again;
 }
 
 /***********************************************************************
@@ -101,7 +99,7 @@ bool netsamlogon_cache_shutdown(void)
 
 void netsamlogon_clear_cached_user(const struct dom_sid *user_sid)
 {
-	fstring keystr;
+	struct dom_sid_buf keystr;
 
 	if (!netsamlogon_cache_init()) {
 		DEBUG(0,("netsamlogon_clear_cached_user: cannot open "
@@ -111,11 +109,11 @@ void netsamlogon_clear_cached_user(const struct dom_sid *user_sid)
 	}
 
 	/* Prepare key as DOMAIN-SID/USER-RID string */
-	sid_to_fstring(keystr, user_sid);
+	dom_sid_str_buf(user_sid, &keystr);
 
-	DEBUG(10,("netsamlogon_clear_cached_user: SID [%s]\n", keystr));
+	DBG_DEBUG("SID [%s]\n", keystr.buf);
 
-	tdb_delete_bystring(netsamlogon_tdb, keystr);
+	tdb_delete_bystring(netsamlogon_tdb, keystr.buf);
 }
 
 /***********************************************************************
@@ -125,32 +123,49 @@ void netsamlogon_clear_cached_user(const struct dom_sid *user_sid)
 
 bool netsamlogon_cache_store(const char *username, struct netr_SamInfo3 *info3)
 {
-	TDB_DATA data;
-	fstring keystr;
+	uint8_t dummy = 0;
+	TDB_DATA data = { .dptr = &dummy, .dsize = sizeof(dummy) };
+	struct dom_sid_buf keystr;
 	bool result = false;
 	struct dom_sid	user_sid;
-	time_t t = time(NULL);
 	TALLOC_CTX *tmp_ctx = talloc_stackframe();
 	DATA_BLOB blob;
 	enum ndr_err_code ndr_err;
 	struct netsamlogoncache_entry r;
+	int ret;
 
 	if (!info3) {
-		return false;
+		goto fail;
 	}
 
 	if (!netsamlogon_cache_init()) {
 		DEBUG(0,("netsamlogon_cache_store: cannot open %s for write!\n",
 			NETSAMLOGON_TDB));
-		return false;
+		goto fail;
+	}
+
+	/*
+	 * First write a record with just the domain sid for
+	 * netsamlogon_cache_domain_known. Use TDB_INSERT to avoid
+	 * overwriting potentially other data. We're just interested
+	 * in the existence of that record.
+	 */
+	dom_sid_str_buf(info3->base.domain_sid, &keystr);
+
+	ret = tdb_store_bystring(netsamlogon_tdb, keystr.buf, data, TDB_INSERT);
+
+	if ((ret == -1) && (tdb_error(netsamlogon_tdb) != TDB_ERR_EXISTS)) {
+		DBG_WARNING("Could not store domain marker for %s: %s\n",
+			    keystr.buf, tdb_errorstr(netsamlogon_tdb));
+		goto fail;
 	}
 
 	sid_compose(&user_sid, info3->base.domain_sid, info3->base.rid);
 
 	/* Prepare key as DOMAIN-SID/USER-RID string */
-	sid_to_fstring(keystr, &user_sid);
+	dom_sid_str_buf(&user_sid, &keystr);
 
-	DEBUG(10,("netsamlogon_cache_store: SID [%s]\n", keystr));
+	DBG_DEBUG("SID [%s]\n", keystr.buf);
 
 	/* Prepare data */
 
@@ -165,6 +180,9 @@ bool netsamlogon_cache_store(const char *username, struct netr_SamInfo3 *info3)
 
 		if (full_name != NULL) {
 			info3->base.full_name.string = talloc_strdup(info3, full_name);
+			if (info3->base.full_name.string == NULL) {
+				goto fail;
+			}
 		}
 	}
 
@@ -173,10 +191,17 @@ bool netsamlogon_cache_store(const char *username, struct netr_SamInfo3 *info3)
 
 	if (!info3->base.account_name.string) {
 		info3->base.account_name.string = talloc_strdup(info3, username);
+		if (info3->base.account_name.string == NULL) {
+			goto fail;
+		}
 	}
 
-	r.timestamp = t;
+	r.timestamp = time(NULL);
 	r.info3 = *info3;
+
+	/* avoid storing secret information */
+	ZERO_STRUCT(r.info3.base.key);
+	ZERO_STRUCT(r.info3.base.LMSessKey);
 
 	if (DEBUGLEVEL >= 10) {
 		NDR_PRINT_DEBUG(netsamlogoncache_entry, &r);
@@ -185,33 +210,33 @@ bool netsamlogon_cache_store(const char *username, struct netr_SamInfo3 *info3)
 	ndr_err = ndr_push_struct_blob(&blob, tmp_ctx, &r,
 				       (ndr_push_flags_fn_t)ndr_push_netsamlogoncache_entry);
 	if (!NDR_ERR_CODE_IS_SUCCESS(ndr_err)) {
-		DEBUG(0,("netsamlogon_cache_store: failed to push entry to cache\n"));
-		TALLOC_FREE(tmp_ctx);
-		return false;
+		DBG_WARNING("failed to push entry to cache: %s\n",
+			    ndr_errstr(ndr_err));
+		goto fail;
 	}
 
 	data.dsize = blob.length;
 	data.dptr = blob.data;
 
-	if (tdb_store_bystring(netsamlogon_tdb, keystr, data, TDB_REPLACE) == 0) {
+	if (tdb_store_bystring(netsamlogon_tdb, keystr.buf, data, TDB_REPLACE) == 0) {
 		result = true;
 	}
 
+fail:
 	TALLOC_FREE(tmp_ctx);
-
 	return result;
 }
 
 /***********************************************************************
  Retrieves a netr_SamInfo3 structure from a tdb.  Caller must
- free the user_info struct (malloc()'d memory)
+ free the user_info struct (talloced memory)
 ***********************************************************************/
 
 struct netr_SamInfo3 *netsamlogon_cache_get(TALLOC_CTX *mem_ctx, const struct dom_sid *user_sid)
 {
 	struct netr_SamInfo3 *info3 = NULL;
 	TDB_DATA data;
-	fstring keystr;
+	struct dom_sid_buf keystr;
 	enum ndr_err_code ndr_err;
 	DATA_BLOB blob;
 	struct netsamlogoncache_entry r;
@@ -223,9 +248,9 @@ struct netr_SamInfo3 *netsamlogon_cache_get(TALLOC_CTX *mem_ctx, const struct do
 	}
 
 	/* Prepare key as DOMAIN-SID/USER-RID string */
-	sid_to_fstring(keystr, user_sid);
-	DEBUG(10,("netsamlogon_cache_get: SID [%s]\n", keystr));
-	data = tdb_fetch_bystring( netsamlogon_tdb, keystr );
+	dom_sid_str_buf(user_sid, &keystr);
+	DBG_DEBUG("SID [%s]\n", keystr.buf);
+	data = tdb_fetch_bystring( netsamlogon_tdb, keystr.buf );
 
 	if (!data.dptr) {
 		return NULL;
@@ -238,12 +263,13 @@ struct netr_SamInfo3 *netsamlogon_cache_get(TALLOC_CTX *mem_ctx, const struct do
 
 	blob = data_blob_const(data.dptr, data.dsize);
 
-	ndr_err = ndr_pull_struct_blob(&blob, mem_ctx, &r,
-				      (ndr_pull_flags_fn_t)ndr_pull_netsamlogoncache_entry);
+	ndr_err = ndr_pull_struct_blob_all(
+		&blob, mem_ctx, &r,
+		(ndr_pull_flags_fn_t)ndr_pull_netsamlogoncache_entry);
 
 	if (!NDR_ERR_CODE_IS_SUCCESS(ndr_err)) {
 		DEBUG(0,("netsamlogon_cache_get: failed to pull entry from cache\n"));
-		tdb_delete_bystring(netsamlogon_tdb, keystr);
+		tdb_delete_bystring(netsamlogon_tdb, keystr.buf);
 		TALLOC_FREE(info3);
 		goto done;
 	}
@@ -259,41 +285,122 @@ struct netr_SamInfo3 *netsamlogon_cache_get(TALLOC_CTX *mem_ctx, const struct do
 	SAFE_FREE(data.dptr);
 
 	return info3;
-
-#if 0	/* The netsamlogon cache needs to hang around.  Something about
-	   this feels wrong, but it is the only way we can get all of the
-	   groups.  The old universal groups cache didn't expire either.
-	   --jerry */
-	{
-		time_t		now = time(NULL);
-		uint32_t	time_diff;
-
-		/* is the entry expired? */
-		time_diff = now - t;
-
-		if ( (time_diff < 0 ) || (time_diff > lp_winbind_cache_time()) ) {
-			DEBUG(10,("netsamlogon_cache_get: cache entry expired \n"));
-			tdb_delete( netsamlogon_tdb, key );
-			TALLOC_FREE( user );
-		}
-	}
-#endif
 }
 
-bool netsamlogon_cache_have(const struct dom_sid *user_sid)
+bool netsamlogon_cache_have(const struct dom_sid *sid)
 {
-	TALLOC_CTX *mem_ctx = talloc_init("netsamlogon_cache_have");
-	struct netr_SamInfo3 *info3 = NULL;
-	bool result;
+	struct dom_sid_buf keystr;
+	bool ok;
 
-	if (!mem_ctx)
-		return False;
+	if (!netsamlogon_cache_init()) {
+		DBG_WARNING("Cannot open %s\n", NETSAMLOGON_TDB);
+		return false;
+	}
 
-	info3 = netsamlogon_cache_get(mem_ctx, user_sid);
+	dom_sid_str_buf(sid, &keystr);
 
-	result = (info3 != NULL);
+	ok = tdb_exists(netsamlogon_tdb, string_term_tdb_data(keystr.buf));
+	return ok;
+}
 
-	talloc_destroy(mem_ctx);
+struct netsamlog_cache_forall_state {
+	TALLOC_CTX *mem_ctx;
+	int (*cb)(const char *sid_str,
+		  time_t when_cached,
+		  struct netr_SamInfo3 *,
+		  void *private_data);
+	void *private_data;
+};
 
-	return result;
+static int netsamlog_cache_traverse_cb(struct tdb_context *tdb,
+				       TDB_DATA key,
+				       TDB_DATA data,
+				       void *private_data)
+{
+	struct netsamlog_cache_forall_state *state =
+		(struct netsamlog_cache_forall_state *)private_data;
+	TALLOC_CTX *mem_ctx = NULL;
+	DATA_BLOB blob;
+	const char *sid_str = NULL;
+	struct dom_sid sid;
+	struct netsamlogoncache_entry r;
+	enum ndr_err_code ndr_err;
+	int ret;
+	bool ok;
+
+	if (key.dsize == 0) {
+		return 0;
+	}
+	if (key.dptr[key.dsize - 1] != '\0') {
+		return 0;
+	}
+	if (data.dptr == NULL) {
+		return 0;
+	}
+	sid_str = (char *)key.dptr;
+
+	ok = string_to_sid(&sid, sid_str);
+	if (!ok) {
+		DBG_ERR("String to SID failed for %s\n", sid_str);
+		return -1;
+	}
+
+	if (sid.num_auths != 5) {
+		return 0;
+	}
+
+	mem_ctx = talloc_new(state->mem_ctx);
+	if (mem_ctx == NULL) {
+		return -1;
+	}
+
+	blob = data_blob_const(data.dptr, data.dsize);
+
+	ndr_err = ndr_pull_struct_blob(
+		&blob, state->mem_ctx, &r,
+		(ndr_pull_flags_fn_t)ndr_pull_netsamlogoncache_entry);
+
+	if (!NDR_ERR_CODE_IS_SUCCESS(ndr_err)) {
+		DBG_ERR("failed to pull entry from cache\n");
+		return -1;
+	}
+
+	ret = state->cb(sid_str, r.timestamp, &r.info3, state->private_data);
+
+	TALLOC_FREE(mem_ctx);
+	return ret;
+}
+
+int netsamlog_cache_for_all(int (*cb)(const char *sid_str,
+				      time_t when_cached,
+				      struct netr_SamInfo3 *,
+				      void *private_data),
+			    void *private_data)
+{
+	int ret;
+	TALLOC_CTX *mem_ctx = NULL;
+	struct netsamlog_cache_forall_state state;
+
+	if (!netsamlogon_cache_init()) {
+		DBG_ERR("Cannot open %s\n", NETSAMLOGON_TDB);
+		return -1;
+	}
+
+	mem_ctx = talloc_init("netsamlog_cache_for_all");
+	if (mem_ctx == NULL) {
+		return -1;
+	}
+
+	state = (struct netsamlog_cache_forall_state) {
+		.mem_ctx = mem_ctx,
+		.cb = cb,
+		.private_data = private_data,
+	};
+
+	ret = tdb_traverse_read(netsamlogon_tdb,
+				netsamlog_cache_traverse_cb,
+				&state);
+
+	TALLOC_FREE(state.mem_ctx);
+	return ret;
 }

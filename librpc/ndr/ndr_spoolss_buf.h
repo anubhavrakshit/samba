@@ -55,11 +55,11 @@ enum ndr_err_code ndr_pull_spoolss_EnumMonitors(struct ndr_pull *ndr, int flags,
 uint32_t ndr_size_spoolss_EnumMonitors_info(TALLOC_CTX *mem_ctx, uint32_t level, uint32_t count, union spoolss_MonitorInfo *info);
 enum ndr_err_code ndr_push_spoolss_EnumPrintProcessors(struct ndr_push *ndr, int flags, const struct spoolss_EnumPrintProcessors *r);
 enum ndr_err_code ndr_pull_spoolss_EnumPrintProcessors(struct ndr_pull *ndr, int flags, struct spoolss_EnumPrintProcessors *r);
-uint32_t ndr_size_spoolss_EnumPrintProcessors_info(TALLOC_CTX *mem_ctx, 
+uint32_t ndr_size_spoolss_EnumPrintProcessors_info(TALLOC_CTX *mem_ctx,
 						   uint32_t level, uint32_t count, union spoolss_PrintProcessorInfo *info);
-enum ndr_err_code ndr_push_spoolss_EnumPrintProcDataTypes(struct ndr_push *ndr, int flags, const struct spoolss_EnumPrintProcDataTypes *r);
-enum ndr_err_code ndr_pull_spoolss_EnumPrintProcDataTypes(struct ndr_pull *ndr, int flags, struct spoolss_EnumPrintProcDataTypes *r);
-uint32_t ndr_size_spoolss_EnumPrintProcDataTypes_info(TALLOC_CTX *mem_ctx, 
+enum ndr_err_code ndr_push_spoolss_EnumPrintProcessorDataTypes(struct ndr_push *ndr, int flags, const struct spoolss_EnumPrintProcessorDataTypes *r);
+enum ndr_err_code ndr_pull_spoolss_EnumPrintProcessorDataTypes(struct ndr_pull *ndr, int flags, struct spoolss_EnumPrintProcessorDataTypes *r);
+uint32_t ndr_size_spoolss_EnumPrintProcessorDataTypes_info(TALLOC_CTX *mem_ctx,
 						      uint32_t level, uint32_t count, union spoolss_PrintProcDataTypesInfo *info);
 enum ndr_err_code ndr_push_spoolss_EnumPrinterDataEx(struct ndr_push *ndr, int flags, const struct spoolss_EnumPrinterDataEx *r);
 enum ndr_err_code ndr_pull_spoolss_EnumPrinterDataEx(struct ndr_pull *ndr, int flags, struct spoolss_EnumPrinterDataEx *r);
@@ -77,6 +77,7 @@ enum ndr_err_code ndr_push_spoolss_security_descriptor(struct ndr_push *ndr, int
 _PUBLIC_ void ndr_print_spoolss_Time(struct ndr_print *ndr, const char *name, const struct spoolss_Time *r);
 _PUBLIC_ uint32_t ndr_spoolss_PrinterEnumValues_align(enum winreg_Type type);
 
+uint32_t ndr_size_spoolss_EnumPerMachineConnections_info(TALLOC_CTX *mem_ctx, uint32_t count, struct spoolss_PrinterInfo4 *info);
 #undef _PRINTF_ATTRIBUTE
 #define _PRINTF_ATTRIBUTE(a1, a2)
 

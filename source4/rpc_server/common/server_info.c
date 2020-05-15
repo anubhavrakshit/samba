@@ -23,10 +23,11 @@
 #include "librpc/gen_ndr/srvsvc.h"
 #include "rpc_server/dcerpc_server.h"
 #include "dsdb/samdb/samdb.h"
+#include "dsdb/common/util.h"
 #include "auth/auth.h"
 #include "param/param.h"
 #include "rpc_server/common/common.h"
-#include "rpc_server/common/share.h"
+#include "libds/common/roles.h"
 
 /* 
     Here are common server info functions used by some dcerpc server interfaces
@@ -83,7 +84,13 @@ uint32_t dcesrv_common_get_server_type(TALLOC_CTX *mem_ctx, struct tevent_contex
 				break;
 			}
 			/* open main ldb */
-			samctx = samdb_connect(tmp_ctx, event_ctx, dce_ctx->lp_ctx, anonymous_session(tmp_ctx, dce_ctx->lp_ctx), 0);
+			samctx = samdb_connect(
+				tmp_ctx,
+				event_ctx,
+				dce_ctx->lp_ctx,
+				anonymous_session(tmp_ctx, dce_ctx->lp_ctx),
+				NULL,
+				0);
 			if (samctx == NULL) {
 				DEBUG(2,("Unable to open samdb in determining server announce flags\n"));
 			} else {
@@ -179,4 +186,32 @@ bool dcesrv_common_validate_share_name(TALLOC_CTX *mem_ctx, const char *share_na
 	}
 
 	return true;
+}
+
+/*
+ * Open an ldb connection under the system session and save the remote users
+ * session details in a ldb_opaque. This will allow the audit logging to
+ * log the original session for operations performed in the system session.
+ */
+struct ldb_context *dcesrv_samdb_connect_as_system(
+	TALLOC_CTX *mem_ctx,
+	struct dcesrv_call_state *dce_call)
+{
+	struct ldb_context *samdb = NULL;
+	samdb = samdb_connect(
+		mem_ctx,
+		dce_call->event_ctx,
+		dce_call->conn->dce_ctx->lp_ctx,
+		system_session(dce_call->conn->dce_ctx->lp_ctx),
+		dce_call->conn->remote_address,
+		0);
+	if (samdb) {
+		struct auth_session_info *session_info =
+			dcesrv_call_session_info(dce_call);
+		ldb_set_opaque(
+			samdb,
+			DSDB_NETWORK_SESSION_INFO,
+			session_info);
+	}
+	return samdb;
 }

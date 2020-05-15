@@ -32,12 +32,7 @@
 
 #include "system/kerberos.h"
 
-struct PAC_DATA;
-
-struct PAC_DATA_CTR {
-	DATA_BLOB pac_blob;
-	struct PAC_DATA *pac_data;
-};
+struct PAC_DATA_CTR;
 
 #define DEFAULT_KRB5_PORT 88
 
@@ -45,7 +40,7 @@ struct PAC_DATA_CTR {
 
 /* The following definitions come from libads/kerberos.c  */
 
-int kerberos_kinit_password_ext(const char *principal,
+int kerberos_kinit_password_ext(const char *given_principal,
 				const char *password,
 				int time_offset,
 				time_t *expire_time,
@@ -54,14 +49,12 @@ int kerberos_kinit_password_ext(const char *principal,
 				bool request_pac,
 				bool add_netbios_addr,
 				time_t renewable_time,
+				TALLOC_CTX *mem_ctx,
+				char **_canon_principal,
+				char **_canon_realm,
 				NTSTATUS *ntstatus);
 int ads_kdestroy(const char *cc_name);
-char* kerberos_standard_des_salt( void );
-bool kerberos_secrets_store_des_salt( const char* salt );
 
-bool kerberos_secrets_store_salting_principal(const char *service,
-					      int enctype,
-					      const char *principal);
 int kerberos_kinit_password(const char *principal,
 			    const char *password,
 			    int time_offset,
@@ -99,6 +92,7 @@ ADS_STATUS kerberos_set_password(const char *kpasswd_server,
 #ifdef HAVE_KRB5
 int create_kerberos_key_from_string(krb5_context context,
 					krb5_principal host_princ,
+					krb5_principal salt_princ,
 					krb5_data *password,
 					krb5_keyblock *key,
 					krb5_enctype enctype,

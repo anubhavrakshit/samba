@@ -345,7 +345,7 @@ WERROR dialog_create(struct dialog *dia)
 	ncols += 6;
 	dia->pad = newpad(nlines, ncols);
 	if (dia->pad == NULL) {
-		rv = WERR_NOMEM;
+		rv = WERR_NOT_ENOUGH_MEMORY;
 		goto fail;
 	}
 	dia->centered = false;
@@ -355,12 +355,12 @@ WERROR dialog_create(struct dialog *dia)
 	}
 	dia->window = newwin(nlines, ncols, dia->y, dia->x);
 	if (dia->window == NULL) {
-		rv = WERR_NOMEM;
+		rv = WERR_NOT_ENOUGH_MEMORY;
 		goto fail;
 	}
 	dia->panel = new_panel(dia->window);
 	if (dia->panel == NULL) {
-		rv = WERR_NOMEM;
+		rv = WERR_NOT_ENOUGH_MEMORY;
 		goto fail;
 	}
 
@@ -398,7 +398,7 @@ WERROR dialog_create(struct dialog *dia)
 		section->window = subpad(dia->pad, section->nlines,
 					 section->ncols, row, col);
 		if (section->window == NULL) {
-			rv = WERR_NOMEM;
+			rv = WERR_NOT_ENOUGH_MEMORY;
 			goto fail;
 		}
 		SMB_ASSERT(section->ops->create != NULL);
@@ -742,14 +742,14 @@ static WERROR text_field_create(struct dialog *dia,
 	text_field->field[0] = new_field(section->nlines, section->ncols,
 				         0, 0, 0, 0);
 	if (text_field->field[0] == NULL) {
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 	set_field_back(text_field->field[0], A_REVERSE);
 	set_field_opts(text_field->field[0], text_field->opts);
 
 	text_field->form = new_form(text_field->field);
 	if (text_field->form == NULL) {
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	set_form_win(text_field->form, dia->window);
@@ -986,7 +986,7 @@ WERROR dialog_section_text_field_set_lines(TALLOC_CTX *ctx,
 				     talloc_array_length(buf) +
 				     length + padding + 1);
 		if (buf == NULL) {
-			return WERR_NOMEM;
+			return WERR_NOT_ENOUGH_MEMORY;
 		}
 		memcpy(&buf[idx], *arrayp, length);
 		idx += length;
@@ -1029,9 +1029,8 @@ bool dialog_section_text_field_get_int(struct dialog_section *section,
 bool dialog_section_text_field_get_uint(struct dialog_section *section,
 				        unsigned long long *out)
 {
-	bool rv;
 	const char *buf;
-	char *endp;
+	int error = 0;
 	struct dialog_section_text_field *text_field =
 		talloc_get_type_abort(section, struct dialog_section_text_field);
 
@@ -1041,13 +1040,12 @@ bool dialog_section_text_field_get_uint(struct dialog_section *section,
 	if (buf == NULL) {
 		return false;
 	}
-	*out = strtoull(buf, &endp, 0);
-	rv = true;
-	if (endp == buf || endp == NULL || endp[0] != '\0') {
-		rv = false;
+	*out = smb_strtoull(buf, NULL, 0, &error, SMB_STR_FULL_STR_CONV);
+	if (error != 0) {
+		return false;
 	}
 
-	return rv;
+	return true;
 }
 
 /* hex editor field */
@@ -1066,7 +1064,7 @@ static WERROR hexedit_create(struct dialog *dia,
 	hexedit->buf = hexedit_new(dia, section->window, NULL,
 				   HEXEDIT_MIN_SIZE);
 	if (hexedit->buf == NULL) {
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	hexedit_refresh(hexedit->buf);
@@ -1762,6 +1760,12 @@ static int dialog_input_internal(TALLOC_CTX *ctx, void *output,
 				 enum input_type type,
 				 const char *title,
 				 const char *msg, va_list ap)
+				 PRINTF_ATTRIBUTE(5,0);
+
+static int dialog_input_internal(TALLOC_CTX *ctx, void *output,
+				 enum input_type type,
+				 const char *title,
+				 const char *msg, va_list ap)
 {
 	WERROR err;
 	struct input_req req;
@@ -1906,7 +1910,7 @@ static WERROR fill_value_buffer(struct dialog *dia, struct edit_req *edit)
 		}
 		tmp = talloc_asprintf(dia, "%u", (unsigned)v);
 		if (tmp == NULL) {
-			return WERR_NOMEM;
+			return WERR_NOT_ENOUGH_MEMORY;
 		}
 		dialog_section_text_field_set(data, tmp);
 		talloc_free(tmp);
@@ -1917,7 +1921,7 @@ static WERROR fill_value_buffer(struct dialog *dia, struct edit_req *edit)
 		const char *s;
 
 		if (!pull_reg_sz(dia, &edit->vitem->data, &s)) {
-			return WERR_NOMEM;
+			return WERR_NOT_ENOUGH_MEMORY;
 		}
 		dialog_section_text_field_set(data, s);
 		break;
@@ -1926,7 +1930,7 @@ static WERROR fill_value_buffer(struct dialog *dia, struct edit_req *edit)
 		const char **array;
 
 		if (!pull_reg_multi_sz(dia, &edit->vitem->data, &array)) {
-			return WERR_NOMEM;
+			return WERR_NOT_ENOUGH_MEMORY;
 		}
 		return dialog_section_text_field_set_lines(dia, data, array);
 	}
@@ -2012,7 +2016,7 @@ static bool edit_on_submit(struct dialog *dia, struct dialog_section *section,
 
 		buf = dialog_section_text_field_get(dia, data);
 		if (!buf || !push_reg_sz(dia, &blob, buf)) {
-			rv = WERR_NOMEM;
+			rv = WERR_NOT_ENOUGH_MEMORY;
 		}
 		break;
 	}
@@ -2021,7 +2025,7 @@ static bool edit_on_submit(struct dialog *dia, struct dialog_section *section,
 
 		lines = dialog_section_text_field_get_lines(dia, data);
 		if (!lines || !push_reg_multi_sz(dia, &blob, lines)) {
-			rv = WERR_NOMEM;
+			rv = WERR_NOT_ENOUGH_MEMORY;
 		}
 		break;
 	}

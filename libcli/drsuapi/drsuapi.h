@@ -1,5 +1,5 @@
 /* 
-   Unix SMB/CIFS mplementation.
+   Unix SMB/CIFS implementation.
    Helper functions for applying replicated objects
    
    Copyright (C) Stefan Metzmacher <metze@samba.org> 2007
@@ -19,16 +19,10 @@
    
 */
 
-WERROR drsuapi_decrypt_attribute_value(TALLOC_CTX *mem_ctx,
-				       const DATA_BLOB *gensec_skey,
-				       bool rid_crypt,
-				       uint32_t rid,
-				       DATA_BLOB *in,
-				       DATA_BLOB *out);
-
 WERROR drsuapi_decrypt_attribute(TALLOC_CTX *mem_ctx, 
 				 const DATA_BLOB *gensec_skey,
 				 uint32_t rid,
+				 uint32_t dsdb_repl_flags,
 				 struct drsuapi_DsReplicaAttribute *attr);
 
 

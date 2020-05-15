@@ -206,7 +206,7 @@ static NTSTATUS svfs_map_fileinfo(struct ntvfs_module_context *ntvfs,
 {
 	struct svfs_dir *dir = NULL;
 	char *pattern = NULL;
-	int i;
+	int i, ret;
 	const char *s, *short_name;
 
 	s = strrchr(unix_path, '/');
@@ -216,8 +216,11 @@ static NTSTATUS svfs_map_fileinfo(struct ntvfs_module_context *ntvfs,
 		short_name = "";
 	}
 
-	asprintf(&pattern, "%s:*", unix_path);
-	
+	ret = asprintf(&pattern, "%s:*", unix_path);
+	if (ret == -1) {
+		return NT_STATUS_NO_MEMORY;
+	}
+
 	if (pattern) {
 		dir = svfs_list_unix(req, req, pattern);
 	}
@@ -1052,7 +1055,7 @@ static NTSTATUS svfs_trans(struct ntvfs_module_context *ntvfs,
 /*
   initialialise the POSIX disk backend, registering ourselves with the ntvfs subsystem
  */
-NTSTATUS ntvfs_simple_init(void)
+NTSTATUS ntvfs_simple_init(TALLOC_CTX *ctx)
 {
 	NTSTATUS ret;
 	struct ntvfs_ops ops;

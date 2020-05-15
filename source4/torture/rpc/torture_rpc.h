@@ -34,6 +34,12 @@ struct torture_rpc_tcase {
 	struct torture_tcase tcase;
 	const struct ndr_interface_table *table;
 	const char *machine_name;
+	bool (*setup_fn)(struct torture_context *,
+			 struct dcerpc_pipe *,
+			 void *);
+	bool (*teardown_fn)(struct torture_context *,
+			    struct dcerpc_pipe *,
+			    void *);
 };
 
 struct torture_rpc_tcase_data {
@@ -45,6 +51,10 @@ struct torture_rpc_tcase_data {
 NTSTATUS torture_rpc_connection(struct torture_context *tctx,
 				struct dcerpc_pipe **p, 
 				const struct ndr_interface_table *table);
+NTSTATUS torture_rpc_connection_with_binding(struct torture_context *tctx,
+					     struct dcerpc_binding *binding,
+					     struct dcerpc_pipe **p,
+					     const struct ndr_interface_table *table);
 
 struct test_join *torture_join_domain(struct torture_context *tctx,
 					       const char *machine_name, 
@@ -55,6 +65,16 @@ void torture_leave_domain(struct torture_context *tctx, struct test_join *join);
 struct torture_rpc_tcase *torture_suite_add_rpc_iface_tcase(struct torture_suite *suite, 
 								const char *name,
 								const struct ndr_interface_table *table);
+struct torture_rpc_tcase *torture_suite_add_rpc_setup_tcase(
+				struct torture_suite *suite,
+				const char *name,
+				const struct ndr_interface_table *table,
+				bool (*setup_fn)(struct torture_context *,
+						 struct dcerpc_pipe *,
+						 void *),
+				bool (*teardown_fn)(struct torture_context *,
+						    struct dcerpc_pipe *,
+						    void *));
 
 struct torture_test *torture_rpc_tcase_add_test(
 					struct torture_rpc_tcase *tcase, 
@@ -69,7 +89,13 @@ struct torture_test *torture_rpc_tcase_add_test_join(
 	const char *name,
 	bool (*fn) (struct torture_context *, struct dcerpc_pipe *,
 		    struct cli_credentials *, struct test_join *));
-
+_PUBLIC_ struct torture_test *torture_rpc_tcase_add_test_setup(
+	struct torture_rpc_tcase *tcase,
+	const char *name,
+	bool (*fn)(struct torture_context *,
+		   struct dcerpc_pipe *,
+		   void *),
+	void *userdata);
 struct torture_test *torture_rpc_tcase_add_test_ex(
 					struct torture_rpc_tcase *tcase, 
 					const char *name, 

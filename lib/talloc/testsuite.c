@@ -31,18 +31,27 @@
 #include <pthread.h>
 #endif
 
+#include <unistd.h>
+#include <sys/wait.h>
+
+#ifdef NDEBUG
+#undef NDEBUG
+#endif
+
+#include <assert.h>
+
 #include "talloc_testsuite.h"
 
-static struct timeval timeval_current(void)
+static struct timeval private_timeval_current(void)
 {
 	struct timeval tv;
 	gettimeofday(&tv, NULL);
 	return tv;
 }
 
-static double timeval_elapsed(struct timeval *tv)
+static double private_timeval_elapsed(struct timeval *tv)
 {
-	struct timeval tv2 = timeval_current();
+	struct timeval tv2 = private_timeval_current();
 	return (tv2.tv_sec - tv->tv_sec) + 
 	       (tv2.tv_usec - tv->tv_usec)*1.0e-6;
 }
@@ -54,7 +63,9 @@ static double timeval_elapsed(struct timeval *tv)
 }
 
 #define torture_assert_str_equal(test, arg1, arg2, desc) \
-	if (arg1 == NULL && arg2 == NULL) {				\
+	if (arg1 == NULL && arg2 == NULL) { /* OK, both NULL == equal */ \
+	} else if (arg1 == NULL || arg2 == NULL) {			\
+		return false;						\
 	} else if (strcmp(arg1, arg2)) {			\
 		printf("failure: %s [\n%s: Expected %s, got %s: %s\n]\n", \
 		   test, __location__, arg1, arg2, desc); \
@@ -601,7 +612,7 @@ static bool test_realloc_child(void)
 	void *root;
 	struct el2 {
 		const char *name;
-	} *el2;	
+	} *el2, *el2_2, *el2_3, **el_list_save;
 	struct el1 {
 		int count;
 		struct el2 **list, **list2, **list3;
@@ -625,13 +636,34 @@ static bool test_realloc_child(void)
 	el1->list3[0]->name = talloc_strdup(el1->list3[0], "testing2");
 	
 	el2 = talloc(el1->list, struct el2);
-	el2 = talloc(el1->list2, struct el2);
-	el2 = talloc(el1->list3, struct el2);
-	(void)el2;
+	CHECK_PARENT("el2", el2, el1->list);
+	el2_2 = talloc(el1->list2, struct el2);
+	CHECK_PARENT("el2", el2_2, el1->list2);
+	el2_3 = talloc(el1->list3, struct el2);
+	CHECK_PARENT("el2", el2_3, el1->list3);
 
+	el_list_save = el1->list;
 	el1->list = talloc_realloc(el1, el1->list, struct el2 *, 100);
+	if (el1->list == el_list_save) {
+		printf("failure: talloc_realloc didn't move pointer");
+		return false;
+	}
+
+	CHECK_PARENT("el1_after_realloc", el1->list, el1);
 	el1->list2 = talloc_realloc(el1, el1->list2, struct el2 *, 200);
+	CHECK_PARENT("el1_after_realloc", el1->list2, el1);
 	el1->list3 = talloc_realloc(el1, el1->list3, struct el2 *, 300);
+	CHECK_PARENT("el1_after_realloc", el1->list3, el1);
+
+	CHECK_PARENT("el2", el2, el1->list);
+	CHECK_PARENT("el2", el2_2, el1->list2);
+	CHECK_PARENT("el2", el2_3, el1->list3);
+
+	/* Finally check realloc with multiple children */
+	el1 = talloc_realloc(root, el1, struct el1, 100);
+	CHECK_PARENT("el1->list", el1->list, el1);
+	CHECK_PARENT("el1->list2", el1->list2, el1);
+	CHECK_PARENT("el1->list3", el1->list3, el1);
 
 	talloc_free(root);
 
@@ -832,7 +864,7 @@ static bool test_speed(void)
 
 	printf("test: speed\n# TALLOC VS MALLOC SPEED\n");
 
-	tv = timeval_current();
+	tv = private_timeval_current();
 	count = 0;
 	do {
 		void *p1, *p2, *p3;
@@ -845,15 +877,15 @@ static bool test_speed(void)
 			talloc_free(p1);
 		}
 		count += 3 * loop;
-	} while (timeval_elapsed(&tv) < 5.0);
+	} while (private_timeval_elapsed(&tv) < 5.0);
 
-	fprintf(stderr, "talloc: %.0f ops/sec\n", count/timeval_elapsed(&tv));
+	fprintf(stderr, "talloc: %.0f ops/sec\n", count/private_timeval_elapsed(&tv));
 
 	talloc_free(ctx);
 
 	ctx = talloc_pool(NULL, 1024);
 
-	tv = timeval_current();
+	tv = private_timeval_current();
 	count = 0;
 	do {
 		void *p1, *p2, *p3;
@@ -866,13 +898,13 @@ static bool test_speed(void)
 			talloc_free(p1);
 		}
 		count += 3 * loop;
-	} while (timeval_elapsed(&tv) < 5.0);
+	} while (private_timeval_elapsed(&tv) < 5.0);
 
 	talloc_free(ctx);
 
-	fprintf(stderr, "talloc_pool: %.0f ops/sec\n", count/timeval_elapsed(&tv));
+	fprintf(stderr, "talloc_pool: %.0f ops/sec\n", count/private_timeval_elapsed(&tv));
 
-	tv = timeval_current();
+	tv = private_timeval_current();
 	count = 0;
 	do {
 		void *p1, *p2, *p3;
@@ -885,8 +917,8 @@ static bool test_speed(void)
 			free(p3);
 		}
 		count += 3 * loop;
-	} while (timeval_elapsed(&tv) < 5.0);
-	fprintf(stderr, "malloc: %.0f ops/sec\n", count/timeval_elapsed(&tv));
+	} while (private_timeval_elapsed(&tv) < 5.0);
+	fprintf(stderr, "malloc: %.0f ops/sec\n", count/private_timeval_elapsed(&tv));
 
 	printf("success: speed\n");
 
@@ -952,6 +984,59 @@ static bool test_loop(void)
 	loop_destructor_count = 0;
 
 	printf("success: loop\n");
+	return true;
+}
+
+static int realloc_parent_destructor_count;
+
+static int test_realloc_parent_destructor(char *ptr)
+{
+	realloc_parent_destructor_count++;
+	return 0;
+}
+
+static bool test_realloc_on_destructor_parent(void)
+{
+	void *top = talloc_new(NULL);
+	char *parent;
+	char *a, *b, *C, *D;
+	realloc_parent_destructor_count = 0;
+
+	printf("test: free_for_exit\n# TALLOC FREE FOR EXIT\n");
+
+	parent = talloc_strdup(top, "parent");
+	a = talloc_strdup(parent, "a");
+	b = talloc_strdup(a, "b");
+	C = talloc_strdup(a, "C");
+	D = talloc_strdup(b, "D");
+	talloc_set_destructor(D, test_realloc_parent_destructor);
+	/* Capitalised ones have destructors.
+	 *
+	 * parent --> a -> b -> D
+	 *              -> c
+	 */
+
+	a = talloc_realloc(parent, a, char, 2048);
+
+	torture_assert("check talloc_realloc", a != NULL, "talloc_realloc failed");
+
+	talloc_set_destructor(C, test_realloc_parent_destructor);
+	/*
+	 * parent --> a[2048] -> b -> D
+	 *                    -> C
+	 *
+	 */
+
+	talloc_free(parent);
+
+	torture_assert("check destructor realloc_parent_destructor",
+		       realloc_parent_destructor_count == 2,
+		       "FAILED TO FIRE free_for_exit_destructor\n");
+
+
+	printf("success: free_for_exit\n");
+	talloc_free(top); /* make ASAN happy */
+
 	return true;
 }
 
@@ -1181,6 +1266,8 @@ static bool test_talloc_free_in_destructor(void)
 
 	talloc_free(level0);
 
+	talloc_free(level3); /* make ASAN happy */
+
 	printf("success: free_in_destructor\n");
 	return true;
 }
@@ -1381,6 +1468,8 @@ static bool test_pool_nest(void)
 
 	talloc_free(p1);
 
+	talloc_free(e); /* make ASAN happy */
+
 	return true;
 }
 
@@ -1451,7 +1540,7 @@ static bool test_free_ref_null_context(void)
 static bool test_rusty(void)
 {
 	void *root;
-	const char *p1;
+	char *p1;
 
 	talloc_enable_null_tracking();
 	root = talloc_new(NULL);
@@ -1460,6 +1549,8 @@ static bool test_rusty(void)
 	talloc_report_full(root, stdout);
 	talloc_free(root);
 	CHECK_BLOCKS("null_context", NULL, 2);
+	talloc_free(p1); /* make ASAN happy */
+
 	return true;
 }
 
@@ -1747,7 +1838,8 @@ static void *thread_fn(void *arg)
 		ret = pthread_cond_wait(&condvar, &mtx);
 		if (ret != 0) {
 			talloc_free(top_ctx);
-			pthread_mutex_unlock(&mtx);
+			ret = pthread_mutex_unlock(&mtx);
+			assert(ret == 0);
 			return NULL;
 		}
 	}
@@ -1757,7 +1849,8 @@ static void *thread_fn(void *arg)
 
 	/* Tell the main thread it's ready for pickup. */
 	pthread_cond_broadcast(&condvar);
-	pthread_mutex_unlock(&mtx);
+	ret = pthread_mutex_unlock(&mtx);
+	assert(ret == 0);
 
 	talloc_free(top_ctx);
 	return NULL;
@@ -1792,11 +1885,11 @@ static bool test_pthread_talloc_passing(void)
 	 * They will use their own toplevel contexts.
 	 */
 	for (i = 0; i < NUM_THREADS; i++) {
-		(void)snprintf(str_array[i],
-				20,
-				"thread:%d",
-				i);
-		if (str_array[i] == NULL) {
+		ret = snprintf(str_array[i],
+			       20,
+			       "thread:%d",
+			       i);
+		if (ret < 0) {
 			printf("snprintf %d failed\n", i);
 			return false;
 		}
@@ -1828,8 +1921,8 @@ static bool test_pthread_talloc_passing(void)
 				printf("pthread_cond_wait %d failed (%d)\n", i,
 					ret);
 				talloc_free(mem_ctx);
-				pthread_mutex_unlock(&mtx);
-				return false;
+				ret = pthread_mutex_unlock(&mtx);
+				assert(ret == 0);
 			}
 		}
 
@@ -1838,7 +1931,8 @@ static bool test_pthread_talloc_passing(void)
 
 		/* Tell the sub-threads we're ready for another. */
 		pthread_cond_broadcast(&condvar);
-		pthread_mutex_unlock(&mtx);
+		ret = pthread_mutex_unlock(&mtx);
+		assert(ret == 0);
 	}
 
 	CHECK_SIZE("pthread_talloc_passing", mem_ctx, NUM_THREADS * 100);
@@ -1851,6 +1945,144 @@ static bool test_pthread_talloc_passing(void)
 	return true;
 }
 #endif
+
+static void test_magic_protection_abort(const char *reason)
+{
+	/* exit with errcode 42 to communicate successful test to the parent process */
+	if (strcmp(reason, "Bad talloc magic value - unknown value") == 0) {
+		_exit(42);
+	} else {
+		printf("talloc aborted for an unexpected reason\n");
+	}
+}
+
+static int test_magic_protection_destructor(int *ptr)
+{
+	_exit(404); /* Not 42 */
+}
+
+static bool test_magic_protection(void)
+{
+	void *pool = talloc_pool(NULL, 1024);
+	int *p1, *p2;
+	pid_t pid;
+	int exit_status;
+
+	printf("test: magic_protection\n");
+	p1 = talloc(pool, int);
+	p2 = talloc(pool, int);
+
+	/* To avoid complaints from the compiler assign values to the p1 & p2. */
+	*p1 = 6;
+	*p2 = 9;
+
+	pid = fork();
+	if (pid == 0) {
+		talloc_set_abort_fn(test_magic_protection_abort);
+		talloc_set_destructor(p2, test_magic_protection_destructor);
+
+		/*
+		 * Simulate a security attack
+		 * by triggering a buffer overflow in memset to overwrite the
+		 * constructor in the next pool chunk.
+		 *
+		 * Real attacks would attempt to set a real destructor.
+		 */
+		memset(p1, '\0', 32);
+
+		/* Then the attack takes effect when the memory's freed. */
+		talloc_free(pool);
+
+		/* Never reached. Make compilers happy */
+		return true;
+	}
+
+	while (wait(&exit_status) != pid);
+
+	talloc_free(pool); /* make ASAN happy */
+
+	if (!WIFEXITED(exit_status)) {
+		printf("Child exited through unexpected abnormal means\n");
+		return false;
+	}
+	if (WEXITSTATUS(exit_status) != 42) {
+		printf("Child exited with wrong exit status\n");
+		return false;
+	}
+	if (WIFSIGNALED(exit_status)) {
+		printf("Child received unexpected signal\n");
+		return false;
+	}
+
+	printf("success: magic_protection\n");
+	return true;
+}
+
+static void test_magic_free_protection_abort(const char *reason)
+{
+	/* exit with errcode 42 to communicate successful test to the parent process */
+	if (strcmp(reason, "Bad talloc magic value - access after free") == 0) {
+		_exit(42);
+	}
+	/* not 42 */
+	_exit(404);
+}
+
+static bool test_magic_free_protection(void)
+{
+	void *pool = talloc_pool(NULL, 1024);
+	int *p1, *p2, *p3;
+	pid_t pid;
+	int exit_status;
+
+	printf("test: magic_free_protection\n");
+	p1 = talloc(pool, int);
+	p2 = talloc(pool, int);
+
+	/* To avoid complaints from the compiler assign values to the p1 & p2. */
+	*p1 = 6;
+	*p2 = 9;
+
+	p3 = talloc_realloc(pool, p2, int, 2048);
+	torture_assert("pool realloc 2048",
+		       p3 != p2,
+		       "failed: pointer not changed");
+
+	/*
+	 * Now access the memory in the pool after the realloc().  It
+	 * should be marked as free, so use of the old pointer should
+	 * trigger the abort function
+	 */
+	pid = fork();
+	if (pid == 0) {
+		talloc_set_abort_fn(test_magic_free_protection_abort);
+
+		talloc_get_name(p2);
+
+		/* Never reached. Make compilers happy */
+		return true;
+	}
+
+	while (wait(&exit_status) != pid);
+
+	if (!WIFEXITED(exit_status)) {
+		printf("Child exited through unexpected abnormal means\n");
+		return false;
+	}
+	if (WEXITSTATUS(exit_status) != 42) {
+		printf("Child exited with wrong exit status\n");
+		return false;
+	}
+	if (WIFSIGNALED(exit_status)) {
+		printf("Child received unexpected signal\n");
+		return false;
+	}
+
+	talloc_free(pool);
+
+	printf("success: magic_free_protection\n");
+	return true;
+}
 
 static void test_reset(void)
 {
@@ -1903,6 +2135,8 @@ bool torture_local_talloc(struct torture_context *tctx)
 	test_reset();
 	ret &= test_free_parent_deny_child(); 
 	test_reset();
+	ret &= test_realloc_on_destructor_parent();
+	test_reset();
 	ret &= test_free_parent_reparent_child();
 	test_reset();
 	ret &= test_free_parent_reparent_child_in_pool();
@@ -1934,6 +2168,10 @@ bool torture_local_talloc(struct torture_context *tctx)
 	}
 	test_reset();
 	ret &= test_autofree();
+	test_reset();
+	ret &= test_magic_protection();
+	test_reset();
+	ret &= test_magic_free_protection();
 
 	test_reset();
 	talloc_disable_null_tracking();

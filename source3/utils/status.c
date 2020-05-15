@@ -31,6 +31,8 @@
  */
 
 #include "includes.h"
+#include "lib/util/server_id.h"
+#include "smbd/globals.h"
 #include "system/filesys.h"
 #include "popt_common.h"
 #include "dbwrap/dbwrap.h"
@@ -42,10 +44,12 @@
 #include "librpc/gen_ndr/open_files.h"
 #include "smbd/smbd.h"
 #include "librpc/gen_ndr/notify.h"
-#include "lib/conn_tdb.h"
+#include "conn_tdb.h"
 #include "serverid.h"
 #include "status_profile.h"
 #include "smbd/notifyd/notifyd.h"
+#include "cmdline_contexts.h"
+#include "locking/leases_db.h"
 
 #define SMB_MAXPIDS		2048
 static uid_t 		Ucrit_uid = 0;               /* added by OH */
@@ -89,7 +93,7 @@ static unsigned int Ucrit_checkPid(struct server_id pid)
 		return 1;
 
 	for (i=0;i<Ucrit_MaxPid;i++) {
-		if (serverid_equal(&pid, &Ucrit_pid[i])) {
+		if (server_id_equal(&pid, &Ucrit_pid[i])) {
 			return 1;
 		}
 	}
@@ -114,11 +118,12 @@ static bool Ucrit_addPid( struct server_id pid )
 	return True;
 }
 
-static int print_share_mode(const struct share_mode_entry *e,
-			    const char *sharepath,
-			    const char *fname,
-			    void *dummy)
+static int print_share_mode(struct file_id fid,
+			    const struct share_mode_data *d,
+			    const struct share_mode_entry *e,
+			    void *private_data)
 {
+	bool resolve_uids = *((bool *)private_data);
 	static int count;
 
 	if (do_checks && !is_valid_share_mode_entry(e)) {
@@ -127,7 +132,7 @@ static int print_share_mode(const struct share_mode_entry *e,
 
 	if (count==0) {
 		d_printf("Locked files:\n");
-		d_printf("Pid          Uid        DenyMode   Access      R/W        Oplock           SharePath   Name   Time\n");
+		d_printf("Pid          User(ID)   DenyMode   Access      R/W        Oplock           SharePath   Name   Time\n");
 		d_printf("--------------------------------------------------------------------------------------------------\n");
 	}
 	count++;
@@ -140,15 +145,19 @@ static int print_share_mode(const struct share_mode_entry *e,
 	if (Ucrit_checkPid(e->pid)) {
 		struct server_id_buf tmp;
 		d_printf("%-11s  ", server_id_str_buf(e->pid, &tmp));
-		d_printf("%-9u  ", (unsigned int)e->uid);
+		if (resolve_uids) {
+			d_printf("%-14s  ", uidtoname(e->uid));
+		} else {
+			d_printf("%-9u  ", (unsigned int)e->uid);
+		}
 		switch (map_share_mode_to_deny_mode(e->share_access,
 						    e->private_options)) {
 			case DENY_NONE: d_printf("DENY_NONE  "); break;
 			case DENY_ALL:  d_printf("DENY_ALL   "); break;
 			case DENY_DOS:  d_printf("DENY_DOS   "); break;
 			case DENY_READ: d_printf("DENY_READ  "); break;
-			case DENY_WRITE:printf("DENY_WRITE "); break;
-			case DENY_FCB:  d_printf("DENY_FCB "); break;
+			case DENY_WRITE:d_printf("DENY_WRITE "); break;
+			case DENY_FCB:  d_printf("DENY_FCB   "); break;
 			default: {
 				d_printf("unknown-please report ! "
 					 "e->share_access = 0x%x, "
@@ -178,19 +187,39 @@ static int print_share_mode(const struct share_mode_entry *e,
 		} else if (e->op_type & LEVEL_II_OPLOCK) {
 			d_printf("LEVEL_II        ");
 		} else if (e->op_type == LEASE_OPLOCK) {
-			uint32_t lstate = e->lease->current_state;
-			d_printf("LEASE(%s%s%s)%s%s%s      ",
-				 (lstate & SMB2_LEASE_READ)?"R":"",
-				 (lstate & SMB2_LEASE_WRITE)?"W":"",
-				 (lstate & SMB2_LEASE_HANDLE)?"H":"",
-				 (lstate & SMB2_LEASE_READ)?"":" ",
-				 (lstate & SMB2_LEASE_WRITE)?"":" ",
-				 (lstate & SMB2_LEASE_HANDLE)?"":" ");
+			NTSTATUS status;
+			uint32_t lstate;
+
+			status = leases_db_get(
+				&e->client_guid,
+				&e->lease_key,
+				&d->id,
+				&lstate, /* current_state */
+				NULL, /* breaking */
+				NULL, /* breaking_to_requested */
+				NULL, /* breaking_to_required */
+				NULL, /* lease_version */
+				NULL); /* epoch */
+
+			if (NT_STATUS_IS_OK(status)) {
+				d_printf("LEASE(%s%s%s)%s%s%s      ",
+					 (lstate & SMB2_LEASE_READ)?"R":"",
+					 (lstate & SMB2_LEASE_WRITE)?"W":"",
+					 (lstate & SMB2_LEASE_HANDLE)?"H":"",
+					 (lstate & SMB2_LEASE_READ)?"":" ",
+					 (lstate & SMB2_LEASE_WRITE)?"":" ",
+					 (lstate & SMB2_LEASE_HANDLE)?"":" ");
+			} else {
+				d_printf("LEASE STATE UNKNOWN");
+			}
 		} else {
 			d_printf("NONE            ");
 		}
 
-		d_printf(" %s   %s   %s",sharepath, fname, time_to_asc((time_t)e->time.tv_sec));
+		d_printf(" %s   %s%s   %s",
+			 d->servicepath, d->base_name,
+			 (d->stream_name != NULL) ? d->stream_name : "",
+			 time_to_asc((time_t)e->time.tv_sec));
 	}
 
 	return 0;
@@ -212,8 +241,6 @@ static void print_brl(struct file_id id,
 	} lock_types[] = {
 		{ READ_LOCK, "R" },
 		{ WRITE_LOCK, "W" },
-		{ PENDING_READ_LOCK, "PR" },
-		{ PENDING_WRITE_LOCK, "PW" },
 		{ UNLOCK_LOCK, "U" }
 	};
 	const char *desc="X";
@@ -221,6 +248,7 @@ static void print_brl(struct file_id id,
 	char *fname = NULL;
 	struct share_mode_lock *share_mode;
 	struct server_id_buf tmp;
+	struct file_id_buf ftmp;
 
 	if (count==0) {
 		d_printf("Byte range locks:\n");
@@ -253,7 +281,8 @@ static void print_brl(struct file_id id,
 	}
 
 	d_printf("%-10s %-15s %-4s %-9jd %-9jd %-24s %-24s\n",
-		 server_id_str_buf(pid, &tmp), file_id_string_tos(&id),
+		 server_id_str_buf(pid, &tmp),
+		 file_id_str_buf(id, &ftmp),
 		 desc,
 		 (intmax_t)start, (intmax_t)size,
 		 sharepath, fname);
@@ -262,11 +291,45 @@ static void print_brl(struct file_id id,
 	TALLOC_FREE(share_mode);
 }
 
+static const char *session_dialect_str(uint16_t dialect)
+{
+	static fstring unkown_dialect;
+
+	switch(dialect){
+	case SMB2_DIALECT_REVISION_000:
+		return "NT1";
+	case SMB2_DIALECT_REVISION_202:
+		return "SMB2_02";
+	case SMB2_DIALECT_REVISION_210:
+		return "SMB2_10";
+	case SMB2_DIALECT_REVISION_222:
+		return "SMB2_22";
+	case SMB2_DIALECT_REVISION_224:
+		return "SMB2_24";
+	case SMB3_DIALECT_REVISION_300:
+		return "SMB3_00";
+	case SMB3_DIALECT_REVISION_302:
+		return "SMB3_02";
+	case SMB3_DIALECT_REVISION_310:
+		return "SMB3_10";
+	case SMB3_DIALECT_REVISION_311:
+		return "SMB3_11";
+	}
+
+	fstr_sprintf(unkown_dialect, "Unknown (0x%04x)", dialect);
+	return unkown_dialect;
+}
+
 static int traverse_connections(const struct connections_key *key,
 				const struct connections_data *crec,
-				void *state)
+				void *private_data)
 {
+	TALLOC_CTX *mem_ctx = (TALLOC_CTX *)private_data;
 	struct server_id_buf tmp;
+	char *timestr = NULL;
+	int result = 0;
+	const char *encryption = "-";
+	const char *signing = "-";
 
 	if (crec->cnum == TID_FIELD_INVALID)
 		return 0;
@@ -276,19 +339,61 @@ static int traverse_connections(const struct connections_key *key,
 		return 0;
 	}
 
-	d_printf("%-10s   %s   %-12s  %s",
+	timestr = timestring(mem_ctx, crec->start);
+	if (timestr == NULL) {
+		return -1;
+	}
+
+	if (smbXsrv_is_encrypted(crec->encryption_flags)) {
+		switch (crec->cipher) {
+		case SMB_ENCRYPTION_GSSAPI:
+			encryption = "GSSAPI";
+			break;
+		case SMB2_ENCRYPTION_AES128_CCM:
+			encryption = "AES-128-CCM";
+			break;
+		case SMB2_ENCRYPTION_AES128_GCM:
+			encryption = "AES-128-GCM";
+			break;
+		default:
+			encryption = "???";
+			result = -1;
+			break;
+		}
+	}
+
+	if (smbXsrv_is_signed(crec->signing_flags)) {
+		if (crec->dialect >= SMB3_DIALECT_REVISION_302) {
+			signing = "AES-128-CMAC";
+		} else if (crec->dialect >= SMB2_DIALECT_REVISION_202) {
+			signing = "HMAC-SHA256";
+		} else {
+			signing = "HMAC-MD5";
+		}
+	}
+
+	d_printf("%-12s %-7s %-13s %-32s %-12s %-12s\n",
 		 crec->servicename, server_id_str_buf(crec->pid, &tmp),
 		 crec->machine,
-		 time_to_asc(crec->start));
+		 timestr,
+		 encryption,
+		 signing);
 
-	return 0;
+	TALLOC_FREE(timestr);
+
+	return result;
 }
 
 static int traverse_sessionid(const char *key, struct sessionid *session,
 			      void *private_data)
 {
-	fstring uid_str, gid_str;
+	TALLOC_CTX *mem_ctx = (TALLOC_CTX *)private_data;
+	fstring uid_gid_str;
 	struct server_id_buf tmp;
+	char *machine_hostname = NULL;
+	int result = 0;
+	const char *encryption = "-";
+	const char *signing = "-";
 
 	if (do_checks &&
 	    (!process_exists(session->pid) ||
@@ -298,32 +403,111 @@ static int traverse_sessionid(const char *key, struct sessionid *session,
 
 	Ucrit_addPid(session->pid);
 
-	fstrcpy(uid_str, "-1");
-
-	if (session->uid != -1) {
-		if (numeric_only) {
-			fstr_sprintf(uid_str, "%u", (unsigned int)session->uid);
+	if (numeric_only) {
+		fstr_sprintf(uid_gid_str, "%-12u %-12u",
+			     (unsigned int)session->uid,
+			     (unsigned int)session->gid);
+	} else {
+		if (session->uid == -1 && session->gid == -1) {
+			/*
+			 * The session is not fully authenticated yet.
+			 */
+			fstrcpy(uid_gid_str, "(auth in progress)");
 		} else {
-			fstrcpy(uid_str, uidtoname(session->uid));
+			/*
+			 * In theory it should not happen that one of
+			 * session->uid and session->gid is valid (ie != -1)
+			 * while the other is not (ie = -1), so we a check for
+			 * that case that bails out would be reasonable.
+			 */
+			const char *uid_name = "-1";
+			const char *gid_name = "-1";
+
+			if (session->uid != -1) {
+				uid_name = uidtoname(session->uid);
+				if (uid_name == NULL) {
+					return -1;
+				}
+			}
+			if (session->gid != -1) {
+				gid_name = gidtoname(session->gid);
+				if (gid_name == NULL) {
+					return -1;
+				}
+			}
+			fstr_sprintf(uid_gid_str, "%-12s %-12s",
+				     uid_name, gid_name);
 		}
 	}
 
-	fstrcpy(gid_str, "-1");
+	machine_hostname = talloc_asprintf(mem_ctx, "%s (%s)",
+					   session->remote_machine,
+					   session->hostname);
+	if (machine_hostname == NULL) {
+		return -1;
+	}
 
-	if (session->gid != -1) {
-		if (numeric_only) {
-			fstr_sprintf(gid_str, "%u", (unsigned int)session->gid);
-		} else {
-			fstrcpy(gid_str, gidtoname(session->gid));
+	if (smbXsrv_is_encrypted(session->encryption_flags)) {
+		switch (session->cipher) {
+		case SMB2_ENCRYPTION_AES128_CCM:
+			encryption = "AES-128-CCM";
+			break;
+		case SMB2_ENCRYPTION_AES128_GCM:
+			encryption = "AES-128-GCM";
+			break;
+		default:
+			encryption = "???";
+			result = -1;
+			break;
+		}
+	} else if (smbXsrv_is_partially_encrypted(session->encryption_flags)) {
+		switch (session->cipher) {
+		case SMB_ENCRYPTION_GSSAPI:
+			encryption = "partial(GSSAPI)";
+			break;
+		case SMB2_ENCRYPTION_AES128_CCM:
+			encryption = "partial(AES-128-CCM)";
+			break;
+		case SMB2_ENCRYPTION_AES128_GCM:
+			encryption = "partial(AES-128-GCM)";
+			break;
+		default:
+			encryption = "???";
+			result = -1;
+			break;
 		}
 	}
 
-	d_printf("%-7s   %-12s  %-12s  %-12s (%s) %-12s\n",
+	if (smbXsrv_is_signed(session->signing_flags)) {
+		if (session->connection_dialect >= SMB3_DIALECT_REVISION_302) {
+			signing = "AES-128-CMAC";
+		} else if (session->connection_dialect >= SMB2_DIALECT_REVISION_202) {
+			signing = "HMAC-SHA256";
+		} else {
+			signing = "HMAC-MD5";
+		}
+	} else if (smbXsrv_is_partially_signed(session->signing_flags)) {
+		if (session->connection_dialect >= SMB3_DIALECT_REVISION_302) {
+			signing = "partial(AES-128-CMAC)";
+		} else if (session->connection_dialect >= SMB2_DIALECT_REVISION_202) {
+			signing = "partial(HMAC-SHA256)";
+		} else {
+			signing = "partial(HMAC-MD5)";
+		}
+	}
+
+
+	d_printf("%-7s %-25s %-41s %-17s %-20s %-21s\n",
 		 server_id_str_buf(session->pid, &tmp),
-		 uid_str, gid_str,
-		 session->remote_machine, session->hostname, session->protocol_ver);
+		 uid_gid_str,
+		 machine_hostname,
+		 session_dialect_str(session->connection_dialect),
+		 encryption,
+		 signing);
 
-	return 0;
+	TALLOC_FREE(machine_hostname);
+
+	return result;
 }
 
 
@@ -340,27 +524,124 @@ static bool print_notify_rec(const char *path, struct server_id server,
 	return true;
 }
 
+enum {
+	OPT_RESOLVE_UIDS = 1000,
+};
+
 int main(int argc, const char *argv[])
 {
 	int c;
 	int profile_only = 0;
 	bool show_processes, show_locks, show_shares;
 	bool show_notify = false;
-	poptContext pc;
+	bool resolve_uids = false;
+	poptContext pc = NULL;
 	struct poptOption long_options[] = {
 		POPT_AUTOHELP
-		{"processes",	'p', POPT_ARG_NONE,	NULL, 'p', "Show processes only" },
-		{"verbose",	'v', POPT_ARG_NONE, 	NULL, 'v', "Be verbose" },
-		{"locks",	'L', POPT_ARG_NONE,	NULL, 'L', "Show locks only" },
-		{"shares",	'S', POPT_ARG_NONE,	NULL, 'S', "Show shares only" },
-		{"notify",	'N', POPT_ARG_NONE,	NULL, 'N', "Show notifies" },
-		{"user", 	'u', POPT_ARG_STRING,	&username, 'u', "Switch to user" },
-		{"brief",	'b', POPT_ARG_NONE, 	NULL, 'b', "Be brief" },
-		{"profile",     'P', POPT_ARG_NONE, NULL, 'P', "Do profiling" },
-		{"profile-rates", 'R', POPT_ARG_NONE, NULL, 'R', "Show call rates" },
-		{"byterange",	'B', POPT_ARG_NONE,	NULL, 'B', "Include byte range locks"},
-		{"numeric",	'n', POPT_ARG_NONE,	NULL, 'n', "Numeric uid/gid"},
-		{"fast",	'f', POPT_ARG_NONE,	NULL, 'f', "Skip checks if processes still exist"},
+		{
+			.longName   = "processes",
+			.shortName  = 'p',
+			.argInfo    = POPT_ARG_NONE,
+			.arg        = NULL,
+			.val        = 'p',
+			.descrip    = "Show processes only",
+		},
+		{
+			.longName   = "verbose",
+			.shortName  = 'v',
+			.argInfo    = POPT_ARG_NONE,
+			.arg        = NULL,
+			.val        = 'v',
+			.descrip    = "Be verbose",
+		},
+		{
+			.longName   = "locks",
+			.shortName  = 'L',
+			.argInfo    = POPT_ARG_NONE,
+			.arg        = NULL,
+			.val        = 'L',
+			.descrip    = "Show locks only",
+		},
+		{
+			.longName   = "shares",
+			.shortName  = 'S',
+			.argInfo    = POPT_ARG_NONE,
+			.arg        = NULL,
+			.val        = 'S',
+			.descrip    = "Show shares only",
+		},
+		{
+			.longName   = "notify",
+			.shortName  = 'N',
+			.argInfo    = POPT_ARG_NONE,
+			.arg        = NULL,
+			.val        = 'N',
+			.descrip    = "Show notifies",
+		},
+		{
+			.longName   = "user",
+			.shortName  = 'u',
+			.argInfo    = POPT_ARG_STRING,
+			.arg        = &username,
+			.val        = 'u',
+			.descrip    = "Switch to user",
+		},
+		{
+			.longName   = "brief",
+			.shortName  = 'b',
+			.argInfo    = POPT_ARG_NONE,
+			.arg        = NULL,
+			.val        = 'b',
+			.descrip    = "Be brief",
+		},
+		{
+			.longName   = "profile",
+			.shortName  =     'P',
+			.argInfo    = POPT_ARG_NONE,
+			.arg        = NULL,
+			.val        = 'P',
+			.descrip    = "Do profiling",
+		},
+		{
+			.longName   = "profile-rates",
+			.shortName  = 'R',
+			.argInfo    = POPT_ARG_NONE,
+			.arg        = NULL,
+			.val        = 'R',
+			.descrip    = "Show call rates",
+		},
+		{
+			.longName   = "byterange",
+			.shortName  = 'B',
+			.argInfo    = POPT_ARG_NONE,
+			.arg        = NULL,
+			.val        = 'B',
+			.descrip    = "Include byte range locks"
+		},
+		{
+			.longName   = "numeric",
+			.shortName  = 'n',
+			.argInfo    = POPT_ARG_NONE,
+			.arg        = NULL,
+			.val        = 'n',
+			.descrip    = "Numeric uid/gid"
+		},
+		{
+			.longName   = "fast",
+			.shortName  = 'f',
+			.argInfo    = POPT_ARG_NONE,
+			.arg        = NULL,
+			.val        = 'f',
+			.descrip    = "Skip checks if processes still exist"
+		},
+		{
+			.longName   = "resolve-uids",
+			.shortName  = 0,
+			.argInfo    = POPT_ARG_NONE,
+			.arg        = NULL,
+			.val        = OPT_RESOLVE_UIDS,
+			.descrip    = "Try to resolve UIDs to usernames"
+		},
 		POPT_COMMON_SAMBA
 		POPT_TABLEEND
 	};
@@ -428,6 +709,9 @@ int main(int argc, const char *argv[])
 		case 'f':
 			do_checks = false;
 			break;
+		case OPT_RESOLVE_UIDS:
+			resolve_uids = true;
+			break;
 		}
 	}
 
@@ -444,26 +728,11 @@ int main(int argc, const char *argv[])
 		d_printf("using configfile = %s\n", get_dyn_CONFIGFILE());
 	}
 
-	if (!lp_load_initial_only(get_dyn_CONFIGFILE())) {
-		fprintf(stderr, "Can't load %s - run testparm to debug it\n",
-			get_dyn_CONFIGFILE());
+	msg_ctx = cmdline_messaging_context(get_dyn_CONFIGFILE());
+	if (msg_ctx == NULL) {
+		fprintf(stderr, "Could not initialize messaging, not root?\n");
 		ret = -1;
 		goto done;
-	}
-
-
-	if (lp_clustering()) {
-		/*
-		 * This implicitly initializes the global ctdbd
-		 * connection, usable by the db_open() calls further
-		 * down.
-		 */
-		msg_ctx = messaging_init(NULL, samba_tevent_context_init(NULL));
-		if (msg_ctx == NULL) {
-			fprintf(stderr, "messaging_init failed\n");
-			ret = -1;
-			goto done;
-		}
 	}
 
 	if (!lp_load_global(get_dyn_CONFIGFILE())) {
@@ -477,21 +746,23 @@ int main(int argc, const char *argv[])
 		case 'P':
 			/* Dump profile data */
 			ok = status_profile_dump(verbose);
-			return ok ? 0 : 1;
+			ret = ok ? 0 : 1;
+			goto done;
 		case 'R':
 			/* Continuously display rate-converted data */
 			ok = status_profile_rates(verbose);
-			return ok ? 0 : 1;
+			ret = ok ? 0 : 1;
+			goto done;
 		default:
 			break;
 	}
 
 	if ( show_processes ) {
 		d_printf("\nSamba version %s\n",samba_version_string());
-		d_printf("PID     Username      Group         Machine            Protocol Version       \n");
-		d_printf("------------------------------------------------------------------------------\n");
+		d_printf("%-7s %-12s %-12s %-41s %-17s %-20s %-21s\n", "PID", "Username", "Group", "Machine", "Protocol Version", "Encryption", "Signing");
+		d_printf("----------------------------------------------------------------------------------------------------------------------------------------\n");
 
-		sessionid_traverse_read(traverse_sessionid, NULL);
+		sessionid_traverse_read(traverse_sessionid, frame);
 
 		if (processes_only) {
 			goto done;
@@ -499,25 +770,14 @@ int main(int argc, const char *argv[])
 	}
 
 	if ( show_shares ) {
-		if (verbose) {
-			db_path = lock_path("connections.tdb");
-			if (db_path == NULL) {
-				d_printf("Out of memory - exiting\n");
-				ret = -1;
-				goto done;
-			}
-			d_printf("Opened %s\n", db_path);
-			TALLOC_FREE(db_path);
-		}
-
 		if (brief) {
 			goto done;
 		}
 
-		d_printf("\nService      pid     machine       Connected at\n");
-		d_printf("-------------------------------------------------------\n");
+		d_printf("\n%-12s %-7s %-13s %-32s %-12s %-12s\n", "Service", "pid", "Machine", "Connected at", "Encryption", "Signing");
+		d_printf("---------------------------------------------------------------------------------------------\n");
 
-		connections_forall_read(traverse_connections, NULL);
+		connections_forall_read(traverse_connections, frame);
 
 		d_printf("\n");
 
@@ -530,7 +790,7 @@ int main(int argc, const char *argv[])
 		int result;
 		struct db_context *db;
 
-		db_path = lock_path("locking.tdb");
+		db_path = lock_path(talloc_tos(), "locking.tdb");
 		if (db_path == NULL) {
 			d_printf("Out of memory - exiting\n");
 			ret = -1;
@@ -558,7 +818,7 @@ int main(int argc, const char *argv[])
 			goto done;
 		}
 
-		result = share_entry_forall(print_share_mode, NULL);
+		result = share_entry_forall(print_share_mode, &resolve_uids);
 
 		if (result == 0) {
 			d_printf("No locked files\n");
@@ -578,18 +838,8 @@ int main(int argc, const char *argv[])
 	if (show_notify) {
 		struct notify_context *n;
 
-		if (msg_ctx == NULL) {
-			msg_ctx = messaging_init(
-				NULL, samba_tevent_context_init(NULL));
-			if (msg_ctx == NULL) {
-				fprintf(stderr, "messaging_init failed\n");
-				ret = -1;
-				goto done;
-			}
-		}
-
 		n = notify_init(talloc_tos(), msg_ctx,
-				messaging_tevent_context(msg_ctx));
+				NULL, NULL);
 		if (n == NULL) {
 			goto done;
 		}
@@ -598,6 +848,7 @@ int main(int argc, const char *argv[])
 	}
 
 done:
+	poptFreeContext(pc);
 	TALLOC_FREE(frame);
 	return ret;
 }

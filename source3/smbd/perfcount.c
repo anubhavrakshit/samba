@@ -144,7 +144,7 @@ static bool smb_load_perfcount_module(const char *name)
 
 	/* load the perfcounter module */
 	if((entry = smb_perfcount_find_module(module_name)) ||
-	   (NT_STATUS_IS_OK(smb_probe_module("perfcount", module_path)) &&
+	   (NT_STATUS_IS_OK(smb_probe_module_absolute_path(module_path)) &&
 		(entry = smb_perfcount_find_module(module_name)))) {
 
 		DEBUG(3,("Successfully loaded perfcounter module [%s] \n", name));
@@ -174,9 +174,11 @@ void smb_init_perfcount_data(struct smb_perfcount_data *pcd)
 
 bool smb_perfcount_init(void)
 {
+	const struct loadparm_substitution *lp_sub =
+		loadparm_s3_global_substitution();
 	char *perfcount_object;
 
-	perfcount_object = lp_perfcount_module(talloc_tos());
+	perfcount_object = lp_perfcount_module(talloc_tos(), lp_sub);
 
 	/* don't init */
 	if (!perfcount_object || !perfcount_object[0])

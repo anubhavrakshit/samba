@@ -41,7 +41,7 @@ static char *get_server_type_str(uint32_t type)
 	typestr[0] = 0;
 
 	for (i = 0; i < 32; i++) {
-		if (type & (1 << i)) {
+		if (type & ((uint32_t)1 << i)) {
 			switch (1 << i) {
 			case SV_TYPE_WORKSTATION:
 				fstrcat(typestr, "Wk ");
@@ -368,7 +368,7 @@ static WERROR cmd_srvsvc_net_share_enum_int(struct rpc_pipe_client *cli,
 							       &result);
 			break;
 		default:
-			return WERR_INVALID_PARAM;
+			return WERR_INVALID_PARAMETER;
 	}
 
 	if (!NT_STATUS_IS_OK(status)) {
@@ -643,9 +643,13 @@ static WERROR cmd_srvsvc_net_file_enum(struct rpc_pipe_client *cli,
 					 TALLOC_CTX *mem_ctx,
 					 int argc, const char **argv)
 {
-	uint32_t info_level = 3;
-	struct srvsvc_NetFileInfoCtr info_ctr;
-	struct srvsvc_NetFileCtr3 ctr3;
+	struct srvsvc_NetFileCtr3 ctr3 = { 0 };
+	struct srvsvc_NetFileInfoCtr info_ctr = {
+		.level = 3,
+		.ctr = {
+			.ctr3 = &ctr3,
+		},
+	};
 	WERROR result;
 	NTSTATUS status;
 	uint32_t preferred_len = 0xffff;
@@ -658,14 +662,9 @@ static WERROR cmd_srvsvc_net_file_enum(struct rpc_pipe_client *cli,
 		return WERR_OK;
 	}
 
-	if (argc == 2)
-		info_level = atoi(argv[1]);
-
-	ZERO_STRUCT(info_ctr);
-	ZERO_STRUCT(ctr3);
-
-	info_ctr.level = info_level;
-	info_ctr.ctr.ctr3 = &ctr3;
+	if (argc == 2) {
+		info_ctr.level = atoi(argv[1]);
+	}
 
 	status = dcerpc_srvsvc_NetFileEnum(b, mem_ctx,
 					   cli->desthost,
@@ -685,6 +684,14 @@ static WERROR cmd_srvsvc_net_file_enum(struct rpc_pipe_client *cli,
 		goto done;
 	}
 
+	if (info_ctr.level == 3) {
+		struct srvsvc_NetFileCtr3 *ret = info_ctr.ctr.ctr3;
+		uint32_t i;
+
+		for (i=0; i<ret->count; i++) {
+			printf("%s\n", ret->array[i].path);
+		}
+	}
  done:
 	return result;
 }
@@ -883,6 +890,8 @@ static WERROR cmd_srvsvc_net_sess_enum(struct rpc_pipe_client *cli,
 		goto done;
 	}
 
+	d_printf("Received %d entries.\n", total_entries);
+
  done:
 	return result;
 }
@@ -983,7 +992,7 @@ static WERROR cmd_srvsvc_net_conn_enum(struct rpc_pipe_client *cli,
 			info_ctr.ctr.ctr1 = &ctr1;
 			break;
 		default:
-			return WERR_INVALID_PARAM;
+			return WERR_INVALID_PARAMETER;
 	}
 
 	status = dcerpc_srvsvc_NetConnEnum(b, mem_ctx,
@@ -1085,24 +1094,172 @@ static WERROR cmd_srvsvc_net_share_del(struct rpc_pipe_client *cli,
 
 struct cmd_set srvsvc_commands[] = {
 
-	{ "SRVSVC" },
+	{
+		.name = "SRVSVC",
+	},
 
-	{ "srvinfo",     RPC_RTYPE_WERROR, NULL, cmd_srvsvc_srv_query_info, &ndr_table_srvsvc, NULL, "Server query info", "" },
-	{ "netshareenum",RPC_RTYPE_WERROR, NULL, cmd_srvsvc_net_share_enum, &ndr_table_srvsvc, NULL, "Enumerate shares", "" },
-	{ "netshareenumall",RPC_RTYPE_WERROR, NULL, cmd_srvsvc_net_share_enum_all, &ndr_table_srvsvc, NULL, "Enumerate all shares", "" },
-	{ "netsharegetinfo",RPC_RTYPE_WERROR, NULL, cmd_srvsvc_net_share_get_info, &ndr_table_srvsvc, NULL, "Get Share Info", "" },
-	{ "netsharesetinfo",RPC_RTYPE_WERROR, NULL, cmd_srvsvc_net_share_set_info, &ndr_table_srvsvc, NULL, "Set Share Info", "" },
-	{ "netsharesetdfsflags",RPC_RTYPE_WERROR, NULL, cmd_srvsvc_net_share_set_dfs_flags, &ndr_table_srvsvc, NULL, "Set DFS flags", "" },
-	{ "netfileenum", RPC_RTYPE_WERROR, NULL, cmd_srvsvc_net_file_enum,  &ndr_table_srvsvc, NULL, "Enumerate open files", "" },
-	{ "netremotetod",RPC_RTYPE_WERROR, NULL, cmd_srvsvc_net_remote_tod, &ndr_table_srvsvc, NULL, "Fetch remote time of day", "" },
-	{ "netnamevalidate", RPC_RTYPE_WERROR, NULL, cmd_srvsvc_net_name_validate, &ndr_table_srvsvc, NULL, "Validate sharename", "" },
-	{ "netfilegetsec", RPC_RTYPE_WERROR, NULL, cmd_srvsvc_net_file_get_sec, &ndr_table_srvsvc, NULL, "Get File security", "" },
-	{ "netsessdel", RPC_RTYPE_WERROR, NULL, cmd_srvsvc_net_sess_del, &ndr_table_srvsvc, NULL, "Delete Session", "" },
-	{ "netsessenum", RPC_RTYPE_WERROR, NULL, cmd_srvsvc_net_sess_enum, &ndr_table_srvsvc, NULL, "Enumerate Sessions", "" },
-	{ "netdiskenum", RPC_RTYPE_WERROR, NULL, cmd_srvsvc_net_disk_enum, &ndr_table_srvsvc, NULL, "Enumerate Disks", "" },
-	{ "netconnenum", RPC_RTYPE_WERROR, NULL, cmd_srvsvc_net_conn_enum, &ndr_table_srvsvc, NULL, "Enumerate Connections", "" },
-	{ "netshareadd", RPC_RTYPE_WERROR, NULL, cmd_srvsvc_net_share_add, &ndr_table_srvsvc, NULL, "Add share", "" },
-	{ "netsharedel", RPC_RTYPE_WERROR, NULL, cmd_srvsvc_net_share_del, &ndr_table_srvsvc, NULL, "Delete share", "" },
+	{
+		.name               = "srvinfo",
+		.returntype         = RPC_RTYPE_WERROR,
+		.ntfn               = NULL,
+		.wfn                = cmd_srvsvc_srv_query_info,
+		.table              = &ndr_table_srvsvc,
+		.rpc_pipe           = NULL,
+		.description        = "Server query info",
+		.usage              = "",
+	},
+	{
+		.name               = "netshareenum",
+		.returntype         = RPC_RTYPE_WERROR,
+		.ntfn               = NULL,
+		.wfn                = cmd_srvsvc_net_share_enum,
+		.table              = &ndr_table_srvsvc,
+		.rpc_pipe           = NULL,
+		.description        = "Enumerate shares",
+		.usage              = "",
+	},
+	{
+		.name               = "netshareenumall",
+		.returntype         = RPC_RTYPE_WERROR,
+		.ntfn               = NULL,
+		.wfn                = cmd_srvsvc_net_share_enum_all,
+		.table              = &ndr_table_srvsvc,
+		.rpc_pipe           = NULL,
+		.description        = "Enumerate all shares",
+		.usage              = "",
+	},
+	{
+		.name               = "netsharegetinfo",
+		.returntype         = RPC_RTYPE_WERROR,
+		.ntfn               = NULL,
+		.wfn                = cmd_srvsvc_net_share_get_info,
+		.table              = &ndr_table_srvsvc,
+		.rpc_pipe           = NULL,
+		.description        = "Get Share Info",
+		.usage              = "",
+	},
+	{
+		.name               = "netsharesetinfo",
+		.returntype         = RPC_RTYPE_WERROR,
+		.ntfn               = NULL,
+		.wfn                = cmd_srvsvc_net_share_set_info,
+		.table              = &ndr_table_srvsvc,
+		.rpc_pipe           = NULL,
+		.description        = "Set Share Info",
+		.usage              = "",
+	},
+	{
+		.name               = "netsharesetdfsflags",
+		.returntype         = RPC_RTYPE_WERROR,
+		.ntfn               = NULL,
+		.wfn                = cmd_srvsvc_net_share_set_dfs_flags,
+		.table              = &ndr_table_srvsvc,
+		.rpc_pipe           = NULL,
+		.description        = "Set DFS flags",
+		.usage              = "",
+	},
+	{
+		.name               = "netfileenum",
+		.returntype         = RPC_RTYPE_WERROR,
+		.ntfn               = NULL,
+		.wfn                = cmd_srvsvc_net_file_enum,
+		.table              =  &ndr_table_srvsvc,
+		.rpc_pipe           = NULL,
+		.description        = "Enumerate open files",
+		.usage              = "",
+	},
+	{
+		.name               = "netremotetod",
+		.returntype         = RPC_RTYPE_WERROR,
+		.ntfn               = NULL,
+		.wfn                = cmd_srvsvc_net_remote_tod,
+		.table              = &ndr_table_srvsvc,
+		.rpc_pipe           = NULL,
+		.description        = "Fetch remote time of day",
+		.usage              = "",
+	},
+	{
+		.name               = "netnamevalidate",
+		.returntype         = RPC_RTYPE_WERROR,
+		.ntfn               = NULL,
+		.wfn                = cmd_srvsvc_net_name_validate,
+		.table              = &ndr_table_srvsvc,
+		.rpc_pipe           = NULL,
+		.description        = "Validate sharename",
+		.usage              = "",
+	},
+	{
+		.name               = "netfilegetsec",
+		.returntype         = RPC_RTYPE_WERROR,
+		.ntfn               = NULL,
+		.wfn                = cmd_srvsvc_net_file_get_sec,
+		.table              = &ndr_table_srvsvc,
+		.rpc_pipe           = NULL,
+		.description        = "Get File security",
+		.usage              = "",
+	},
+	{
+		.name               = "netsessdel",
+		.returntype         = RPC_RTYPE_WERROR,
+		.ntfn               = NULL,
+		.wfn                = cmd_srvsvc_net_sess_del,
+		.table              = &ndr_table_srvsvc,
+		.rpc_pipe           = NULL,
+		.description        = "Delete Session",
+		.usage              = "",
+	},
+	{
+		.name               = "netsessenum",
+		.returntype         = RPC_RTYPE_WERROR,
+		.ntfn               = NULL,
+		.wfn                = cmd_srvsvc_net_sess_enum,
+		.table              = &ndr_table_srvsvc,
+		.rpc_pipe           = NULL,
+		.description        = "Enumerate Sessions",
+		.usage              = "",
+	},
+	{
+		.name               = "netdiskenum",
+		.returntype         = RPC_RTYPE_WERROR,
+		.ntfn               = NULL,
+		.wfn                = cmd_srvsvc_net_disk_enum,
+		.table              = &ndr_table_srvsvc,
+		.rpc_pipe           = NULL,
+		.description        = "Enumerate Disks",
+		.usage              = "",
+	},
+	{
+		.name               = "netconnenum",
+		.returntype         = RPC_RTYPE_WERROR,
+		.ntfn               = NULL,
+		.wfn                = cmd_srvsvc_net_conn_enum,
+		.table              = &ndr_table_srvsvc,
+		.rpc_pipe           = NULL,
+		.description        = "Enumerate Connections",
+		.usage              = "",
+	},
+	{
+		.name               = "netshareadd",
+		.returntype         = RPC_RTYPE_WERROR,
+		.ntfn               = NULL,
+		.wfn                = cmd_srvsvc_net_share_add,
+		.table              = &ndr_table_srvsvc,
+		.rpc_pipe           = NULL,
+		.description        = "Add share",
+		.usage              = "",
+	},
+	{
+		.name               = "netsharedel",
+		.returntype         = RPC_RTYPE_WERROR,
+		.ntfn               = NULL,
+		.wfn                = cmd_srvsvc_net_share_del,
+		.table              = &ndr_table_srvsvc,
+		.rpc_pipe           = NULL,
+		.description        = "Delete share",
+		.usage              = "",
+	},
 
-	{ NULL }
+	{
+		.name = NULL,
+	}
 };

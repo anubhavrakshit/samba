@@ -7,7 +7,7 @@
 	<manvolnum>8</manvolnum>
 	<refmiscinfo class="source">Samba</refmiscinfo>
 	<refmiscinfo class="manual">System Administration tools</refmiscinfo>
-	<refmiscinfo class="version">4.3</refmiscinfo>
+	<refmiscinfo class="version">&doc.version;</refmiscinfo>
 </refmeta>
 
 
@@ -101,14 +101,44 @@
 		</varlistentry>
 
 		<varlistentry>
-		<term>-M model</term>
+		<term>-M|--model</term>
 		<listitem><para>This parameter can be used to specify the
 		&quot;process model&quot; samba should use. This determines
 		how concurrent clients are handled. Available process
-		models include <emphasis>single</emphasis> (everything in
-		a single process), <emphasis>standard</emphasis> (similar
-		behaviour to that of Samba 3), <emphasis>thread</emphasis>
-		(single process, different threads.
+		models include:
+		<itemizedlist>
+			<listitem><para><emphasis>single</emphasis></para>
+			<para>All Samba services run in a single process. This is
+			not recommended for production configurations.
+			</para></listitem>
+
+			<listitem><para><emphasis>standard</emphasis></para>
+			<para>A process is created for each Samba service,
+			and for those services that support it (currently only
+			LDAP and NETLOGON) a new processes is started
+			for each new client connection.</para>
+
+			<para>Historically, this was the 'standard' way Samba behaved
+			up until v4.10. Note that this model can be resource intensive
+			if you have a large number of client connections.</para>
+			</listitem>
+
+			<listitem><para><emphasis>prefork</emphasis></para>
+			<para>The default. A process is started for each Samba service,
+			and a fixed number of worker processes are started for those
+			services that support it (currently LDAP, NETLOGON, and KDC).
+			The client connections are then shared amongst the worker
+			processes.
+			Requests for services not supporting prefork are handled
+			by a single process for that service.</para>
+			<para>The number of prefork worker processes started is
+			controlled by the
+			<citerefentry><refentrytitle>smb.conf</refentrytitle>
+			<manvolnum>5</manvolnum></citerefentry> parameter
+		        <smbconfoption name="prefork children"/>,
+			which defaults to 4.
+			</para></listitem>
+		</itemizedlist>
 		</para></listitem>
 		</varlistentry>
 
@@ -212,7 +242,7 @@
 <refsect1>
 	<title>VERSION</title>
 
-	<para>This man page is correct for version 4 of	the Samba suite.</para>
+	<para>This man page is part of version &doc.version; of	the Samba suite.</para>
 </refsect1>
 
 <refsect1>
@@ -228,8 +258,8 @@
 	<manvolnum>1</manvolnum></citerefentry>, and the
 	Internet RFC's	<filename>rfc1001.txt</filename>, <filename>rfc1002.txt</filename>.
 	In addition the CIFS (formerly SMB) specification is available
-	as a link from the Web page <ulink noescape="1" url="http://samba.org/cifs/">
-	http://samba.org/cifs/</ulink>.</para>
+	as a link from the Web page <ulink noescape="1" url="https://www.samba.org/cifs/">
+	https://www.samba.org/cifs/</ulink>.</para>
 </refsect1>
 
 <refsect1>

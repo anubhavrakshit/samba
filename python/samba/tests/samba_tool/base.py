@@ -25,11 +25,18 @@ import random
 import string
 from samba.auth import system_session
 from samba.samdb import SamDB
-from cStringIO import StringIO
+from samba.compat import StringIO
 from samba.netcmd.main import cmd_sambatool
 import samba.tests
 
-class SambaToolCmdTest(samba.tests.TestCaseInTempDir):
+
+def truncate_string(s, cutoff=100):
+    if len(s) < cutoff + 15:
+        return s
+    return s[:cutoff] + '[%d more characters]' % (len(s) - cutoff)
+
+
+class SambaToolCmdTest(samba.tests.BlackboxTestCase):
 
     def getSamDB(self, *argv):
         """a convenience function to get a samdb instance so that we can query it"""
@@ -61,46 +68,60 @@ class SambaToolCmdTest(samba.tests.TestCaseInTempDir):
                       credentials=creds, lp=lp)
         return samdb
 
-
     def runcmd(self, name, *args):
         """run a single level command"""
         cmd = cmd_sambatool.subcommands[name]
         cmd.outf = StringIO()
         cmd.errf = StringIO()
-        result = cmd._run(name, *args)
+        result = cmd._run("samba-tool %s" % name, *args)
         return (result, cmd.outf.getvalue(), cmd.errf.getvalue())
 
     def runsubcmd(self, name, sub, *args):
         """run a command with sub commands"""
         # The reason we need this function separate from runcmd is
-        # that the .outf StringIO assignment is overriden if we use
+        # that the .outf StringIO assignment is overridden if we use
         # runcmd, so we can't capture stdout and stderr
         cmd = cmd_sambatool.subcommands[name].subcommands[sub]
         cmd.outf = StringIO()
         cmd.errf = StringIO()
-        result = cmd._run(name, *args)
+        result = cmd._run("samba-tool %s %s" % (name, sub), *args)
         return (result, cmd.outf.getvalue(), cmd.errf.getvalue())
 
-    def assertCmdSuccess(self, val, msg=""):
-        self.assertIsNone(val, msg)
+    def runsublevelcmd(self, name, sublevels, *args):
+        """run a command with any number of sub command levels"""
+        # Same as runsubcmd, except this handles a varying number of sub-command
+        # levels, e.g. 'samba-tool domain passwordsettings pso set', whereas
+        # runsubcmd() only handles exactly one level of sub-commands.
+        # First, traverse the levels of sub-commands to get the actual cmd
+        # object we'll run, and construct the cmd string along the way
+        cmd = cmd_sambatool.subcommands[name]
+        cmd_str = "samba-tool %s" % name
+        for sub in sublevels:
+            cmd = cmd.subcommands[sub]
+            cmd_str += " %s" % sub
+        cmd.outf = StringIO()
+        cmd.errf = StringIO()
+        result = cmd._run(cmd_str, *args)
+        return (result, cmd.outf.getvalue(), cmd.errf.getvalue())
+
+    def assertCmdSuccess(self, exit, out, err, msg=""):
+        self.assertIsNone(exit, msg="exit[%s] stdout[%s] stderr[%s]: %s" % (
+                          exit, out, err, msg))
 
     def assertCmdFail(self, val, msg=""):
         self.assertIsNotNone(val, msg)
 
-    def assertMatch(self, base, string, msg=""):
-        self.assertTrue(string in base, msg)
+    def assertMatch(self, base, string, msg=None):
+        # Note: we should stop doing this and just use self.assertIn()
+        if msg is None:
+            msg = "%r is not in %r" % (truncate_string(string),
+                                       truncate_string(base))
+        self.assertIn(string, base, msg)
 
     def randomName(self, count=8):
         """Create a random name, cap letters and numbers, and always starting with a letter"""
         name = random.choice(string.ascii_uppercase)
-        name += ''.join(random.choice(string.ascii_uppercase + string.ascii_lowercase+ string.digits) for x in range(count - 1))
-        return name
-
-    def randomPass(self, count=16):
-        name = random.choice(string.ascii_uppercase)
-        name += random.choice(string.digits)
-        name += random.choice(string.ascii_lowercase)
-        name += ''.join(random.choice(string.ascii_uppercase + string.ascii_lowercase+ string.digits) for x in range(count - 3))
+        name += ''.join(random.choice(string.ascii_uppercase + string.ascii_lowercase + string.digits) for x in range(count - 1))
         return name
 
     def randomXid(self):

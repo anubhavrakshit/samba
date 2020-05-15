@@ -73,7 +73,7 @@ char *elog_tdbname(TALLOC_CTX *ctx, const char *name )
 	char *file;
 	char *tdbname;
 
-	path = state_path("eventlog");
+	path = state_path(talloc_tos(), "eventlog");
 	if (!path) {
 		return NULL;
 	}
@@ -373,7 +373,7 @@ ELOG_TDB *elog_open_tdb( const char *logname, bool force_clear, bool read_only )
 
 	/* make sure that the eventlog dir exists */
 
-	eventlogdir = state_path("eventlog");
+	eventlogdir = state_path(talloc_tos(), "eventlog");
 	if (eventlogdir == NULL) {
 		return NULL;
 	}
@@ -898,10 +898,12 @@ NTSTATUS evlog_evt_entry_to_tdb_entry(TALLOC_CTX *mem_ctx,
 
 	/* t->sid_padding; */
 	if (e->UserSidLength > 0) {
-		const char *sid_str = NULL;
+		struct dom_sid_buf sid_str;
 		smb_ucs2_t *dummy = NULL;
-		sid_str = sid_string_talloc(mem_ctx, &e->UserSid);
-		t->sid_length = rpcstr_push_talloc(mem_ctx, &dummy, sid_str);
+		t->sid_length = rpcstr_push_talloc(
+			mem_ctx,
+			&dummy,
+			dom_sid_str_buf(&e->UserSid, &sid_str));
 		if (t->sid_length == -1) {
 			return NT_STATUS_NO_MEMORY;
 		}
@@ -958,7 +960,7 @@ NTSTATUS evlog_tdb_entry_to_evt_entry(TALLOC_CTX *mem_ctx,
 	NT_STATUS_HAVE_NO_MEMORY(e->Computername);
 
 	if (t->sid_length > 0) {
-		const char *sid_str = NULL;
+		char *sid_str = NULL;
 		size_t len;
 		if (!convert_string_talloc(mem_ctx, CH_UTF16, CH_UNIX,
 					   t->sid.data, t->sid.length,
@@ -966,8 +968,12 @@ NTSTATUS evlog_tdb_entry_to_evt_entry(TALLOC_CTX *mem_ctx,
 			return NT_STATUS_INVALID_SID;
 		}
 		if (len > 0) {
-			string_to_sid(&e->UserSid, sid_str);
+			bool ok = string_to_sid(&e->UserSid, sid_str);
+			if (!ok) {
+				return NT_STATUS_INVALID_SID;
+			}
 		}
+		TALLOC_FREE(sid_str);
 	}
 
 	e->Strings		= talloc_array(mem_ctx, const char *, t->num_of_strings);

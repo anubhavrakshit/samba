@@ -31,6 +31,7 @@
 #include "rpc_client/cli_samr.h"
 #include "rpc_client/cli_lsarpc.h"
 #include "../libcli/security/security.h"
+#include "libsmb/samlogon_cache.h"
 
 #undef DBGC_CLASS
 #define DBGC_CLASS DBGC_WINBIND
@@ -48,21 +49,15 @@ static NTSTATUS winbindd_lookup_names(TALLOC_CTX *mem_ctx,
    application. */
 static NTSTATUS msrpc_query_user_list(struct winbindd_domain *domain,
 				      TALLOC_CTX *mem_ctx,
-				      uint32_t *pnum_info,
-				      struct wbint_userinfo **pinfo)
+				      uint32_t **prids)
 {
 	struct rpc_pipe_client *samr_pipe = NULL;
 	struct policy_handle dom_pol;
-	struct wbint_userinfo *info = NULL;
-	uint32_t num_info = 0;
+	uint32_t *rids = NULL;
 	TALLOC_CTX *tmp_ctx;
 	NTSTATUS status;
 
 	DEBUG(3, ("msrpc_query_user_list\n"));
-
-	if (pnum_info) {
-		*pnum_info = 0;
-	}
 
 	tmp_ctx = talloc_stackframe();
 	if (tmp_ctx == NULL) {
@@ -85,21 +80,17 @@ static NTSTATUS msrpc_query_user_list(struct winbindd_domain *domain,
 				     samr_pipe,
 				     &dom_pol,
 				     &domain->sid,
-				     &num_info,
-				     &info);
+				     &rids);
 	if (!NT_STATUS_IS_OK(status)) {
 		goto done;
 	}
 
-	if (pnum_info) {
-		*pnum_info = num_info;
-	}
-
-	if (pinfo) {
-		*pinfo = talloc_move(mem_ctx, &info);
+	if (prids) {
+		*prids = talloc_move(mem_ctx, &rids);
 	}
 
 done:
+	TALLOC_FREE(rids);
 	TALLOC_FREE(tmp_ctx);
 	return status;
 }
@@ -227,6 +218,7 @@ static NTSTATUS msrpc_name_to_sid(struct winbindd_domain *domain,
 				  const char *domain_name,
 				  const char *name,
 				  uint32_t flags,
+				  const char **pdom_name,
 				  struct dom_sid *sid,
 				  enum lsa_SidType *type)
 {
@@ -235,6 +227,7 @@ static NTSTATUS msrpc_name_to_sid(struct winbindd_domain *domain,
 	enum lsa_SidType *types = NULL;
 	char *full_name = NULL;
 	const char *names[1];
+	const char **domains;
 	NTSTATUS name_map_status = NT_STATUS_UNSUCCESSFUL;
 	char *mapped_name = NULL;
 
@@ -269,12 +262,23 @@ static NTSTATUS msrpc_name_to_sid(struct winbindd_domain *domain,
 	names[0] = full_name;
 
 	result = winbindd_lookup_names(mem_ctx, domain, 1,
-				       names, NULL,
+				       names, &domains,
 				       &sids, &types);
 	if (!NT_STATUS_IS_OK(result))
 		return result;
 
 	/* Return rid and type if lookup successful */
+
+	if (pdom_name != NULL) {
+		const char *dom_name;
+
+		dom_name = talloc_strdup(mem_ctx, domains[0]);
+		if (dom_name == NULL) {
+			return NT_STATUS_NO_MEMORY;
+		}
+
+		*pdom_name = dom_name;
+	}
 
 	sid_copy(sid, &sids[0]);
 	*type = types[0];
@@ -298,9 +302,11 @@ static NTSTATUS msrpc_sid_to_name(struct winbindd_domain *domain,
 	NTSTATUS result;
 	NTSTATUS name_map_status = NT_STATUS_UNSUCCESSFUL;
 	char *mapped_name = NULL;
+	struct dom_sid_buf buf;
 
-	DEBUG(3, ("msrpc_sid_to_name: %s for domain %s\n", sid_string_dbg(sid),
-		 domain->name ));
+	DEBUG(3, ("msrpc_sid_to_name: %s for domain %s\n",
+		  dom_sid_str_buf(sid, &buf),
+		  domain->name));
 
 	result = winbindd_lookup_sids(mem_ctx,
 				      domain,
@@ -322,7 +328,7 @@ static NTSTATUS msrpc_sid_to_name(struct winbindd_domain *domain,
 
 	DEBUG(5,("Mapped sid to [%s]\\[%s]\n", domains[0], *name));
 
-	name_map_status = normalize_name_map(mem_ctx, domain, *name,
+	name_map_status = normalize_name_map(mem_ctx, domain->name, *name,
 					     &mapped_name);
 	if (NT_STATUS_IS_OK(name_map_status) ||
 	    NT_STATUS_EQUAL(name_map_status, NT_STATUS_FILE_RENAMED))
@@ -386,7 +392,7 @@ static NTSTATUS msrpc_rids_to_names(struct winbindd_domain *domain,
 
 		if ((*types)[i] != SID_NAME_UNKNOWN) {
 			name_map_status = normalize_name_map(mem_ctx,
-							     domain,
+							     domain->name,
 							     ret_names[i],
 							     &mapped_name);
 			if (NT_STATUS_IS_OK(name_map_status) ||
@@ -402,84 +408,6 @@ static NTSTATUS msrpc_rids_to_names(struct winbindd_domain *domain,
 	return result;
 }
 
-/* Lookup user information from a rid or username. */
-static NTSTATUS msrpc_query_user(struct winbindd_domain *domain,
-			   TALLOC_CTX *mem_ctx, 
-			   const struct dom_sid *user_sid,
-			   struct wbint_userinfo *user_info)
-{
-	struct rpc_pipe_client *samr_pipe;
-	struct policy_handle dom_pol;
-	struct netr_SamInfo3 *user;
-	TALLOC_CTX *tmp_ctx;
-	NTSTATUS status;
-
-	DEBUG(3,("msrpc_query_user sid=%s\n", sid_string_dbg(user_sid)));
-
-	tmp_ctx = talloc_stackframe();
-	if (tmp_ctx == NULL) {
-		return NT_STATUS_NO_MEMORY;
-	}
-
-	if (user_info) {
-		user_info->homedir = NULL;
-		user_info->shell = NULL;
-		user_info->primary_gid = (gid_t)-1;
-	}
-
-	/* try netsamlogon cache first */
-	user = netsamlogon_cache_get(tmp_ctx, user_sid);
-	if (user != NULL) {
-		DEBUG(5,("msrpc_query_user: Cache lookup succeeded for %s\n",
-			sid_string_dbg(user_sid)));
-
-		sid_compose(&user_info->user_sid, &domain->sid, user->base.rid);
-		sid_compose(&user_info->group_sid, &domain->sid,
-			    user->base.primary_gid);
-
-		user_info->acct_name = talloc_strdup(user_info,
-						     user->base.account_name.string);
-		user_info->full_name = talloc_strdup(user_info,
-						     user->base.full_name.string);
-
-		if (user_info->full_name == NULL) {
-			/* this might fail so we dont check the return code */
-			wcache_query_user_fullname(domain,
-						   mem_ctx,
-						   user_sid,
-						   &user_info->full_name);
-		}
-
-		status = NT_STATUS_OK;
-		goto done;
-	}
-
-	if ( !winbindd_can_contact_domain( domain ) ) {
-		DEBUG(10,("query_user: No incoming trust for domain %s\n",
-			  domain->name));
-		/* Tell the cache manager not to remember this one */
-		status = NT_STATUS_SYNCHRONIZATION_REQUIRED;
-		goto done;
-	}
-
-	/* no cache; hit the wire */
-	status = cm_connect_sam(domain, tmp_ctx, false, &samr_pipe, &dom_pol);
-	if (!NT_STATUS_IS_OK(status)) {
-		goto done;
-	}
-
-	status = rpc_query_user(tmp_ctx,
-				samr_pipe,
-				&dom_pol,
-				&domain->sid,
-				user_sid,
-				user_info);
-
-done:
-	TALLOC_FREE(tmp_ctx);
-	return status;
-}
-
 /* Lookup groups a user is a member of.  I wish Unix had a call like this! */
 static NTSTATUS msrpc_lookup_usergroups(struct winbindd_domain *domain,
 					TALLOC_CTX *mem_ctx,
@@ -490,11 +418,13 @@ static NTSTATUS msrpc_lookup_usergroups(struct winbindd_domain *domain,
 	struct rpc_pipe_client *samr_pipe;
 	struct policy_handle dom_pol;
 	struct dom_sid *user_grpsids = NULL;
+	struct dom_sid_buf buf;
 	uint32_t num_groups = 0;
 	TALLOC_CTX *tmp_ctx;
 	NTSTATUS status;
 
-	DEBUG(3,("msrpc_lookup_usergroups sid=%s\n", sid_string_dbg(user_sid)));
+	DEBUG(3,("msrpc_lookup_usergroups sid=%s\n",
+		 dom_sid_str_buf(user_sid, &buf)));
 
 	*pnum_groups = 0;
 
@@ -504,8 +434,7 @@ static NTSTATUS msrpc_lookup_usergroups(struct winbindd_domain *domain,
 	}
 
 	/* Check if we have a cached user_info_3 */
-	status = lookup_usergroups_cached(domain,
-					  tmp_ctx,
+	status = lookup_usergroups_cached(tmp_ctx,
 					  user_sid,
 					  &num_groups,
 					  &user_grpsids);
@@ -637,9 +566,10 @@ static NTSTATUS msrpc_lookup_groupmem(struct winbindd_domain *domain,
 	unsigned int orig_timeout;
 	struct samr_RidAttrArray *rids = NULL;
 	struct dcerpc_binding_handle *b;
+	struct dom_sid_buf buf;
 
 	DEBUG(3,("msrpc_lookup_groupmem: %s sid=%s\n", domain->name,
-		  sid_string_dbg(group_sid)));
+		 dom_sid_str_buf(group_sid, &buf)));
 
 	if ( !winbindd_can_contact_domain( domain ) ) {
 		DEBUG(10,("lookup_groupmem: No incoming trust for domain %s\n",
@@ -664,11 +594,8 @@ static NTSTATUS msrpc_lookup_groupmem(struct winbindd_domain *domain,
 				       group_rid,
 				       &group_pol,
 				       &result);
-	if (!NT_STATUS_IS_OK(status)) {
+	if (any_nt_status_not_ok(status, result, &status)) {
 		return status;
-	}
-	if (!NT_STATUS_IS_OK(result)) {
-		return result;
 	}
 
         /* Step #1: Get a list of user rids that are the members of the
@@ -692,12 +619,8 @@ static NTSTATUS msrpc_lookup_groupmem(struct winbindd_domain *domain,
 		dcerpc_samr_Close(b, mem_ctx, &group_pol, &_result);
 	}
 
-	if (!NT_STATUS_IS_OK(status)) {
+	if (any_nt_status_not_ok(status, result, &status)) {
 		return status;
-	}
-
-	if (!NT_STATUS_IS_OK(result)) {
-		return result;
 	}
 
 	if (!rids || !rids->count) {
@@ -1015,12 +938,8 @@ static NTSTATUS msrpc_lockout_policy(struct winbindd_domain *domain,
 					     DomainLockoutInformation,
 					     &info,
 					     &result);
-	if (!NT_STATUS_IS_OK(status)) {
-		goto done;
-	}
-	if (!NT_STATUS_IS_OK(result)) {
-		status = result;
-		goto done;
+	if (any_nt_status_not_ok(status, result, &status)) {
+		return status;
 	}
 
 	*lockout_policy = info->info12;
@@ -1082,6 +1001,60 @@ static NTSTATUS msrpc_password_policy(struct winbindd_domain *domain,
 	return status;
 }
 
+static enum lsa_LookupNamesLevel winbindd_lookup_level(
+	struct winbindd_domain *domain)
+{
+	enum lsa_LookupNamesLevel level = LSA_LOOKUP_NAMES_DOMAINS_ONLY;
+
+	if (domain->internal) {
+		level = LSA_LOOKUP_NAMES_ALL;
+	} else if (domain->secure_channel_type == SEC_CHAN_DNS_DOMAIN) {
+		if (domain->domain_flags & NETR_TRUST_FLAG_IN_FOREST) {
+			/*
+			 * TODO:
+			 *
+			 * Depending on what we want to resolve. We need to use:
+			 * 1. LsapLookupXForestReferral(5)/LSA_LOOKUP_NAMES_FOREST_TRUSTS_ONLY
+			 *    if we want to pass the request into the direction of the forest
+			 *    root domain. The forest root domain uses
+			 *    LsapLookupXForestResolve(6)/LSA_LOOKUP_NAMES_UPLEVEL_TRUSTS_ONLY2
+			 *    when passing the request to trusted forests.
+			 * 2. LsapLookupGC(4)/LSA_LOOKUP_NAMES_UPLEVEL_TRUSTS_ONLY
+			 *    if we're not a GC and want to resolve a name within our own forest.
+			 *
+			 * As we don't support more than one domain in our own forest
+			 * and always try to be a GC for now, we just set
+			 * LSA_LOOKUP_NAMES_FOREST_TRUSTS_ONLY.
+			 */
+			level = LSA_LOOKUP_NAMES_FOREST_TRUSTS_ONLY;
+		} else if (domain->domain_trust_attribs & LSA_TRUST_ATTRIBUTE_FOREST_TRANSITIVE) {
+			/*
+			 * This is LsapLookupXForestResolve(6)/LSA_LOOKUP_NAMES_UPLEVEL_TRUSTS_ONLY2
+			 */
+			level = LSA_LOOKUP_NAMES_UPLEVEL_TRUSTS_ONLY2;
+		} else {
+			/*
+			 * This is LsapLookupTDL(3)/LSA_LOOKUP_NAMES_PRIMARY_DOMAIN_ONLY
+			 */
+			level = LSA_LOOKUP_NAMES_PRIMARY_DOMAIN_ONLY;
+		}
+	} else if (domain->secure_channel_type == SEC_CHAN_DOMAIN) {
+		/*
+		 * This is LsapLookupTDL(3)/LSA_LOOKUP_NAMES_PRIMARY_DOMAIN_ONLY
+		 */
+		level = LSA_LOOKUP_NAMES_PRIMARY_DOMAIN_ONLY;
+	} else if (domain->rodc) {
+		level = LSA_LOOKUP_NAMES_RODC_REFERRAL_TO_FULL_DC;
+	} else {
+		/*
+		 * This is LsapLookupPDC(2)/LSA_LOOKUP_NAMES_DOMAINS_ONLY
+		 */
+		level = LSA_LOOKUP_NAMES_DOMAINS_ONLY;
+	}
+
+	return level;
+}
+
 NTSTATUS winbindd_lookup_sids(TALLOC_CTX *mem_ctx,
 			      struct winbindd_domain *domain,
 			      uint32_t num_sids,
@@ -1098,6 +1071,7 @@ NTSTATUS winbindd_lookup_sids(TALLOC_CTX *mem_ctx,
 	unsigned int orig_timeout;
 	bool use_lookupsids3 = false;
 	bool retried = false;
+	enum lsa_LookupNamesLevel level = LSA_LOOKUP_NAMES_ALL;
 
  connect:
 	status = cm_connect_lsat(domain, mem_ctx, &cli, &lsa_policy);
@@ -1111,6 +1085,8 @@ NTSTATUS winbindd_lookup_sids(TALLOC_CTX *mem_ctx,
 		use_lookupsids3 = true;
 	}
 
+	level = winbindd_lookup_level(domain);
+
 	/*
 	 * This call can take a long time
 	 * allow the server to time out.
@@ -1123,6 +1099,7 @@ NTSTATUS winbindd_lookup_sids(TALLOC_CTX *mem_ctx,
 						&lsa_policy,
 						num_sids,
 						sids,
+						level,
 						domains,
 						names,
 						types,
@@ -1150,12 +1127,8 @@ NTSTATUS winbindd_lookup_sids(TALLOC_CTX *mem_ctx,
 		status = NT_STATUS_ACCESS_DENIED;
 	}
 
-	if (!NT_STATUS_IS_OK(status)) {
+	if (any_nt_status_not_ok(status, result, &status)) {
 		return status;
-	}
-
-	if (!NT_STATUS_IS_OK(result)) {
-		return result;
 	}
 
 	return NT_STATUS_OK;
@@ -1177,6 +1150,7 @@ static NTSTATUS winbindd_lookup_names(TALLOC_CTX *mem_ctx,
 	unsigned int orig_timeout = 0;
 	bool use_lookupnames4 = false;
 	bool retried = false;
+	enum lsa_LookupNamesLevel level = LSA_LOOKUP_NAMES_ALL;
 
  connect:
 	status = cm_connect_lsat(domain, mem_ctx, &cli, &lsa_policy);
@@ -1189,6 +1163,8 @@ static NTSTATUS winbindd_lookup_names(TALLOC_CTX *mem_ctx,
 	if (cli->transport->transport == NCACN_IP_TCP) {
 		use_lookupnames4 = true;
 	}
+
+	level = winbindd_lookup_level(domain);
 
 	/*
 	 * This call can take a long time
@@ -1203,7 +1179,7 @@ static NTSTATUS winbindd_lookup_names(TALLOC_CTX *mem_ctx,
 						 num_names,
 						 (const char **) names,
 						 domains,
-						 1,
+						 level,
 						 sids,
 						 types,
 						 use_lookupnames4,
@@ -1229,12 +1205,8 @@ static NTSTATUS winbindd_lookup_names(TALLOC_CTX *mem_ctx,
 		status = NT_STATUS_ACCESS_DENIED;
 	}
 
-	if (!NT_STATUS_IS_OK(status)) {
+	if (any_nt_status_not_ok(status, result, &status)) {
 		return status;
-	}
-
-	if (!NT_STATUS_IS_OK(result)) {
-		return result;
 	}
 
 	return NT_STATUS_OK;
@@ -1249,7 +1221,6 @@ struct winbindd_methods msrpc_methods = {
 	msrpc_name_to_sid,
 	msrpc_sid_to_name,
 	msrpc_rids_to_names,
-	msrpc_query_user,
 	msrpc_lookup_usergroups,
 	msrpc_lookup_useraliases,
 	msrpc_lookup_groupmem,

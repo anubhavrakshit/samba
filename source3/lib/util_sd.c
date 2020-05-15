@@ -84,7 +84,7 @@ static NTSTATUS cli_lsa_lookup_sid(struct cli_state *cli,
 				   enum lsa_SidType *type,
 				   char **domain, char **name)
 {
-	uint16_t orig_cnum = cli_state_get_tid(cli);
+	struct smbXcli_tcon *orig_tcon = NULL;
 	struct rpc_pipe_client *p = NULL;
 	struct policy_handle handle;
 	NTSTATUS status;
@@ -93,7 +93,15 @@ static NTSTATUS cli_lsa_lookup_sid(struct cli_state *cli,
 	char **domains;
 	char **names;
 
-	status = cli_tree_connect(cli, "IPC$", "?????", "", 0);
+	if (cli_state_has_tcon(cli)) {
+		orig_tcon = cli_state_save_tcon(cli);
+		if (orig_tcon == NULL) {
+			status = NT_STATUS_NO_MEMORY;
+			goto tcon_fail;
+		}
+	}
+
+	status = cli_tree_connect(cli, "IPC$", "?????", NULL);
 	if (!NT_STATUS_IS_OK(status)) {
 		goto tcon_fail;
 	}
@@ -125,7 +133,7 @@ static NTSTATUS cli_lsa_lookup_sid(struct cli_state *cli,
 	TALLOC_FREE(p);
 	cli_tdis(cli);
  tcon_fail:
-	cli_state_set_tid(cli, orig_cnum);
+	cli_state_restore_tcon(cli, orig_tcon);
 	TALLOC_FREE(frame);
 	return status;
 }
@@ -165,7 +173,7 @@ static NTSTATUS cli_lsa_lookup_name(struct cli_state *cli,
 				    enum lsa_SidType *type,
 				    struct dom_sid *sid)
 {
-	uint16_t orig_cnum = cli_state_get_tid(cli);
+	struct smbXcli_tcon *orig_tcon = NULL;
 	struct rpc_pipe_client *p;
 	struct policy_handle handle;
 	NTSTATUS status;
@@ -173,7 +181,15 @@ static NTSTATUS cli_lsa_lookup_name(struct cli_state *cli,
 	struct dom_sid *sids;
 	enum lsa_SidType *types;
 
-	status = cli_tree_connect(cli, "IPC$", "?????", "", 0);
+	if (cli_state_has_tcon(cli)) {
+		orig_tcon = cli_state_save_tcon(cli);
+		if (orig_tcon == NULL) {
+			status = NT_STATUS_NO_MEMORY;
+			goto tcon_fail;
+		}
+	}
+
+	status = cli_tree_connect(cli, "IPC$", "?????", NULL);
 	if (!NT_STATUS_IS_OK(status)) {
 		goto tcon_fail;
 	}
@@ -204,7 +220,7 @@ static NTSTATUS cli_lsa_lookup_name(struct cli_state *cli,
 	TALLOC_FREE(p);
 	cli_tdis(cli);
  tcon_fail:
-	cli_state_set_tid(cli, orig_cnum);
+	cli_state_restore_tcon(cli, orig_tcon);
 	TALLOC_FREE(frame);
 	return status;
 }
@@ -378,6 +394,8 @@ static bool parse_ace_flags(const char *str, unsigned int *pflags)
 		switch (*p) {
 		case '|':
 			p++;
+
+			FALL_THROUGH;
 		case '\0':
 			continue;
 		default:
@@ -418,14 +436,6 @@ bool parse_ace(struct cli_state *cli, struct security_ace *ace,
 	}
 	*p = '\0';
 	p++;
-	/* Try to parse numeric form */
-
-	if (sscanf(p, "%u/%u/%u", &atype, &aflags, &amask) == 3 &&
-	    StringToSid(cli, &sid, str)) {
-		goto done;
-	}
-
-	/* Try to parse text form */
 
 	if (!StringToSid(cli, &sid, str)) {
 		printf("ACE '%s': failed to convert '%s' to SID\n",
@@ -448,6 +458,33 @@ bool parse_ace(struct cli_state *cli, struct security_ace *ace,
 		atype = SEC_ACE_TYPE_ACCESS_ALLOWED;
 	} else if (strncmp(tok, "DENIED", strlen("DENIED")) == 0) {
 		atype = SEC_ACE_TYPE_ACCESS_DENIED;
+
+	} else if (strnequal(tok, "0x", 2)) {
+		int result;
+
+		result = sscanf(tok, "%x", &atype);
+		if (result == 0 ||
+		    (atype != SEC_ACE_TYPE_ACCESS_ALLOWED &&
+		     atype != SEC_ACE_TYPE_ACCESS_DENIED)) {
+			printf("ACE '%s': bad hex value for type at '%s'\n",
+			       orig_str, tok);
+			SAFE_FREE(str);
+			TALLOC_FREE(frame);
+			return false;
+		}
+	} else if(tok[0] >= '0' && tok[0] <= '9') {
+		int result;
+
+		result = sscanf(tok, "%u", &atype);
+		if (result == 0 ||
+		    (atype != SEC_ACE_TYPE_ACCESS_ALLOWED &&
+		     atype != SEC_ACE_TYPE_ACCESS_DENIED)) {
+			printf("ACE '%s': bad integer value for type at '%s'\n",
+			       orig_str, tok);
+			SAFE_FREE(str);
+			TALLOC_FREE(frame);
+			return false;
+		}
 	} else {
 		printf("ACE '%s': missing 'ALLOWED' or 'DENIED' entry at '%s'\n",
 			orig_str, tok);
@@ -455,8 +492,6 @@ bool parse_ace(struct cli_state *cli, struct security_ace *ace,
 		TALLOC_FREE(frame);
 		return False;
 	}
-
-	/* Only numeric form accepted for flags at present */
 
 	if (!next_token_talloc(frame, &cp, &tok, "/")) {
 		printf("ACE '%s': bad flags entry at '%s'\n",

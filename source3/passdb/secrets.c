@@ -37,28 +37,10 @@
 
 static struct db_context *db_ctx;
 
-/**
- * Use a TDB to store an incrementing random seed.
- *
- * Initialised to the current pid, the very first time Samba starts,
- * and incremented by one each time it is needed.
- *
- * @note Not called by systems with a working /dev/urandom.
- */
-static void get_rand_seed(void *userdata, int *new_seed)
-{
-	*new_seed = getpid();
-	if (db_ctx) {
-		dbwrap_trans_change_int32_atomic_bystring(
-			db_ctx, "INFO/random_seed", new_seed, 1);
-	}
-}
-
 /* open up the secrets database with specified private_dir path */
 bool secrets_init_path(const char *private_dir)
 {
 	char *fname = NULL;
-	unsigned char dummy;
 	TALLOC_CTX *frame;
 
 	if (db_ctx != NULL) {
@@ -85,17 +67,6 @@ bool secrets_init_path(const char *private_dir)
 		TALLOC_FREE(frame);
 		return False;
 	}
-
-	/**
-	 * Set a reseed function for the crypto random generator
-	 *
-	 * This avoids a problem where systems without /dev/urandom
-	 * could send the same challenge to multiple clients
-	 */
-	set_rand_reseed_callback(get_rand_seed, NULL);
-
-	/* Ensure that the reseed is done now, while we are root, etc */
-	generate_random_buffer(&dummy, sizeof(dummy));
 
 	TALLOC_FREE(frame);
 	return True;
@@ -175,7 +146,7 @@ bool secrets_store(const char *key, const void *data, size_t size)
 
 /* delete a secets database entry
  */
-bool secrets_delete(const char *key)
+bool secrets_delete_entry(const char *key)
 {
 	NTSTATUS status;
 	if (!secrets_init()) {
@@ -185,6 +156,25 @@ bool secrets_delete(const char *key)
 	status = dbwrap_trans_delete(db_ctx, string_tdb_data(key));
 
 	return NT_STATUS_IS_OK(status);
+}
+
+/*
+ * Deletes the key if it exists.
+ */
+bool secrets_delete(const char *key)
+{
+	bool exists;
+
+	if (!secrets_init()) {
+		return false;
+	}
+
+	exists = dbwrap_exists(db_ctx, string_tdb_data(key));
+	if (!exists) {
+		return true;
+	}
+
+	return secrets_delete_entry(key);
 }
 
 /**
@@ -306,7 +296,7 @@ bool secrets_store_trusted_domain_password(const char* domain, const char* pwd,
 
 bool trusted_domain_password_delete(const char *domain)
 {
-	return secrets_delete(trustdom_keystr(domain));
+	return secrets_delete_entry(trustdom_keystr(domain));
 }
 
 bool secrets_store_ldap_pw(const char* dn, char* pw)
@@ -334,7 +324,7 @@ bool fetch_ldap_pw(char **dn, char** pw)
 	char *key = NULL;
 	size_t size = 0;
 
-	*dn = smb_xstrdup(lp_ldap_admin_dn(talloc_tos()));
+	*dn = smb_xstrdup(lp_ldap_admin_dn());
 
 	if (asprintf(&key, "%s/%s", SECRETS_LDAP_BIND_PW, *dn) < 0) {
 		SAFE_FREE(*dn);
@@ -345,6 +335,13 @@ bool fetch_ldap_pw(char **dn, char** pw)
 	*pw=(char *)secrets_fetch(key, &size);
 	SAFE_FREE(key);
 
+	if ((size != 0) && ((*pw)[size-1] != '\0')) {
+		DBG_ERR("Non 0-terminated password for dn %s\n", *dn);
+		SAFE_FREE(*pw);
+		SAFE_FREE(*dn);
+		return false;
+	}
+
 	if (!size) {
 		/* Upgrade 2.2 style entry */
 		char *p;
@@ -354,6 +351,8 @@ bool fetch_ldap_pw(char **dn, char** pw)
 
 		if (!old_style_key) {
 			DEBUG(0, ("fetch_ldap_pw: strdup failed!\n"));
+			SAFE_FREE(*pw);
+			SAFE_FREE(*dn);
 			return False;
 		}
 
@@ -364,6 +363,7 @@ bool fetch_ldap_pw(char **dn, char** pw)
 		if ((data == NULL) || (size < sizeof(old_style_pw))) {
 			DEBUG(0,("fetch_ldap_pw: neither ldap secret retrieved!\n"));
 			SAFE_FREE(old_style_key);
+			SAFE_FREE(*pw);
 			SAFE_FREE(*dn);
 			SAFE_FREE(data);
 			return False;
@@ -378,10 +378,11 @@ bool fetch_ldap_pw(char **dn, char** pw)
 		if (!secrets_store_ldap_pw(*dn, old_style_pw)) {
 			DEBUG(0,("fetch_ldap_pw: ldap secret could not be upgraded!\n"));
 			SAFE_FREE(old_style_key);
+			SAFE_FREE(*pw);
 			SAFE_FREE(*dn);
 			return False;
 		}
-		if (!secrets_delete(old_style_key)) {
+		if (!secrets_delete_entry(old_style_key)) {
 			DEBUG(0,("fetch_ldap_pw: old ldap secret could not be deleted!\n"));
 		}
 

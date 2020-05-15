@@ -21,11 +21,14 @@
 */
 
 #include "includes.h"
+#include "libsmb/dsgetdcname.h"
+#include "libsmb/namequery.h"
 #include "libads/sitename_cache.h"
 #include "../librpc/gen_ndr/ndr_netlogon.h"
 #include "libads/cldap.h"
 #include "../lib/addns/dnsquery.h"
 #include "libsmb/clidgram.h"
+#include "lib/gencache.h"
 
 /* 15 minutes */
 #define DSGETDCNAME_CACHE_TTL	60*15
@@ -35,16 +38,17 @@ struct ip_service_name {
 	const char *hostname;
 };
 
-static NTSTATUS make_dc_info_from_cldap_reply(TALLOC_CTX *mem_ctx,
-					      uint32_t flags,
-					      struct sockaddr_storage *ss,
-					      struct NETLOGON_SAM_LOGON_RESPONSE_EX *r,
-					      struct netr_DsRGetDCNameInfo **info);
+static NTSTATUS make_dc_info_from_cldap_reply(
+	TALLOC_CTX *mem_ctx,
+	uint32_t flags,
+	const struct sockaddr_storage *ss,
+	struct NETLOGON_SAM_LOGON_RESPONSE_EX *r,
+	struct netr_DsRGetDCNameInfo **info);
 
 /****************************************************************
 ****************************************************************/
 
-void debug_dsdcinfo_flags(int lvl, uint32_t flags)
+static void debug_dsdcinfo_flags(int lvl, uint32_t flags)
 {
 	DEBUG(lvl,("debug_dsdcinfo_flags: 0x%08x\n\t", flags));
 
@@ -154,7 +158,7 @@ static NTSTATUS dsgetdcname_cache_delete(TALLOC_CTX *mem_ctx,
 
 static NTSTATUS dsgetdcname_cache_store(TALLOC_CTX *mem_ctx,
 					const char *domain_name,
-					const DATA_BLOB *blob)
+					DATA_BLOB blob)
 {
 	time_t expire_time;
 	char *key;
@@ -200,7 +204,8 @@ static NTSTATUS store_cldap_reply(TALLOC_CTX *mem_ctx,
 	}
 
 	if (r->domain_name) {
-		status = dsgetdcname_cache_store(mem_ctx, r->domain_name, &blob);
+		status = dsgetdcname_cache_store(mem_ctx, r->domain_name,
+						 blob);
 		if (!NT_STATUS_IS_OK(status)) {
 			goto done;
 		}
@@ -209,7 +214,7 @@ static NTSTATUS store_cldap_reply(TALLOC_CTX *mem_ctx,
 		}
 	}
 	if (r->dns_domain) {
-		status = dsgetdcname_cache_store(mem_ctx, r->dns_domain, &blob);
+		status = dsgetdcname_cache_store(mem_ctx, r->dns_domain, blob);
 		if (!NT_STATUS_IS_OK(status)) {
 			goto done;
 		}
@@ -274,43 +279,6 @@ static uint32_t get_cldap_reply_server_flags(struct netlogon_samlogon_response *
 		default:
 			return 0;
 	}
-}
-
-/****************************************************************
-****************************************************************/
-
-#define RETURN_ON_FALSE(x) if (!(x)) return false;
-
-static bool check_cldap_reply_required_flags(uint32_t ret_flags,
-					     uint32_t req_flags)
-{
-	if (ret_flags == 0) {
-		return true;
-	}
-
-	if (req_flags & DS_PDC_REQUIRED)
-		RETURN_ON_FALSE(ret_flags & NBT_SERVER_PDC);
-
-	if (req_flags & DS_GC_SERVER_REQUIRED)
-		RETURN_ON_FALSE(ret_flags & NBT_SERVER_GC);
-
-	if (req_flags & DS_ONLY_LDAP_NEEDED)
-		RETURN_ON_FALSE(ret_flags & NBT_SERVER_LDAP);
-
-	if ((req_flags & DS_DIRECTORY_SERVICE_REQUIRED) ||
-	    (req_flags & DS_DIRECTORY_SERVICE_PREFERRED))
-		RETURN_ON_FALSE(ret_flags & NBT_SERVER_DS);
-
-	if (req_flags & DS_KDC_REQUIRED)
-		RETURN_ON_FALSE(ret_flags & NBT_SERVER_KDC);
-
-	if (req_flags & DS_TIMESERV_REQUIRED)
-		RETURN_ON_FALSE(ret_flags & NBT_SERVER_TIMESERV);
-
-	if (req_flags & DS_WRITABLE_REQUIRED)
-		RETURN_ON_FALSE(ret_flags & NBT_SERVER_WRITABLE);
-
-	return true;
 }
 
 /****************************************************************
@@ -483,10 +451,6 @@ static NTSTATUS discover_dc_netbios(TALLOC_CTX *mem_ctx,
 	*returned_dclist = NULL;
 	*returned_count = 0;
 
-	if (lp_disable_netbios()) {
-		return NT_STATUS_NOT_SUPPORTED;
-	}
-
 	if (flags & DS_PDC_REQUIRED) {
 		name_type = NBT_NAME_PDC;
 	}
@@ -540,14 +504,14 @@ static NTSTATUS discover_dc_dns(TALLOC_CTX *mem_ctx,
 				struct ip_service_name **returned_dclist,
 				int *return_count)
 {
-	int i, j;
+	int i;
+	size_t j;
 	NTSTATUS status;
 	struct dns_rr_srv *dcs = NULL;
 	int numdcs = 0;
 	int numaddrs = 0;
 	struct ip_service_name *dclist = NULL;
 	int count = 0;
-	char *guid_string;
 
 	if (flags & DS_PDC_REQUIRED) {
 		status = ads_dns_query_pdc(mem_ctx,
@@ -573,17 +537,14 @@ static NTSTATUS discover_dc_dns(TALLOC_CTX *mem_ctx,
 					   &dcs,
 					   &numdcs);
 	} else if (domain_guid) {
-		guid_string = GUID_string(mem_ctx, domain_guid);
-		if (!guid_string) {
-			return NT_STATUS_NO_MEMORY;
-		}
+		struct GUID_txt_buf buf;
+		GUID_buf_string(domain_guid, &buf);
 
 		status = ads_dns_query_dcs_guid(mem_ctx,
 						domain_name,
-						guid_string,
+						buf.buf,
 						&dcs,
 						&numdcs);
-		TALLOC_FREE(guid_string);
 	} else {
 		status = ads_dns_query_dcs(mem_ctx,
 					   domain_name,
@@ -757,6 +718,8 @@ static void map_dc_and_domain_names(uint32_t flags,
 				*domain_p = domain_name;
 				break;
 			}
+
+			FALL_THROUGH;
 		case DS_RETURN_DNS_NAME:
 		default:
 			if (dns_dc_name && dns_domain_name &&
@@ -778,11 +741,12 @@ static void map_dc_and_domain_names(uint32_t flags,
 /****************************************************************
 ****************************************************************/
 
-static NTSTATUS make_dc_info_from_cldap_reply(TALLOC_CTX *mem_ctx,
-					      uint32_t flags,
-					      struct sockaddr_storage *ss,
-					      struct NETLOGON_SAM_LOGON_RESPONSE_EX *r,
-					      struct netr_DsRGetDCNameInfo **info)
+static NTSTATUS make_dc_info_from_cldap_reply(
+	TALLOC_CTX *mem_ctx,
+	uint32_t flags,
+	const struct sockaddr_storage *ss,
+	struct NETLOGON_SAM_LOGON_RESPONSE_EX *r,
+	struct netr_DsRGetDCNameInfo **info)
 {
 	const char *dc_hostname = NULL;
 	const char *dc_domain_name = NULL;
@@ -800,14 +764,14 @@ static NTSTATUS make_dc_info_from_cldap_reply(TALLOC_CTX *mem_ctx,
 		print_sockaddr(addr, sizeof(addr), ss);
 		dc_address = addr;
 		dc_address_type = DS_ADDRESS_TYPE_INET;
-	}
-
-	if (!ss && r->sockaddr.pdc_ip) {
-		dc_address	= r->sockaddr.pdc_ip;
-		dc_address_type	= DS_ADDRESS_TYPE_INET;
 	} else {
-		dc_address      = r->pdc_name;
-		dc_address_type = DS_ADDRESS_TYPE_NETBIOS;
+		if (r->sockaddr.pdc_ip) {
+			dc_address	= r->sockaddr.pdc_ip;
+			dc_address_type	= DS_ADDRESS_TYPE_INET;
+		} else {
+			dc_address      = r->pdc_name;
+			dc_address_type = DS_ADDRESS_TYPE_NETBIOS;
+		}
 	}
 
 	map_dc_and_domain_names(flags,
@@ -948,6 +912,8 @@ static NTSTATUS process_dc_netbios(TALLOC_CTX *mem_ctx,
 	uint32_t nt_version = NETLOGON_NT_VERSION_1 |
 			      NETLOGON_NT_VERSION_5 |
 			      NETLOGON_NT_VERSION_5EX_WITH_IP;
+	size_t len = strlen(lp_netbios_name());
+	char my_acct_name[len+2];
 
 	if (msg_ctx == NULL) {
 		return NT_STATUS_INVALID_PARAMETER;
@@ -958,6 +924,11 @@ static NTSTATUS process_dc_netbios(TALLOC_CTX *mem_ctx,
 	}
 
 	nt_version |= map_ds_flags_to_nt_version(flags);
+
+	snprintf(my_acct_name,
+		 sizeof(my_acct_name),
+		 "%s$",
+		 lp_netbios_name());
 
 	DEBUG(10,("process_dc_netbios\n"));
 
@@ -974,7 +945,7 @@ static NTSTATUS process_dc_netbios(TALLOC_CTX *mem_ctx,
 		}
 
 		status = nbt_getdc(msg_ctx, 10, &dclist[i].ss, domain_name,
-				   NULL, nt_version,
+				   NULL, my_acct_name, ACB_WSTRUST, nt_version,
 				   mem_ctx, &nt_version, &dc_name, &r);
 		if (NT_STATUS_IS_OK(status)) {
 			store_cache = true;
@@ -1038,13 +1009,17 @@ static NTSTATUS dsgetdcname_rediscover(TALLOC_CTX *mem_ctx,
 				       const char *site_name,
 				       struct netr_DsRGetDCNameInfo **info)
 {
-	NTSTATUS status = NT_STATUS_DOMAIN_CONTROLLER_NOT_FOUND;
+	NTSTATUS status;
 	struct ip_service_name *dclist = NULL;
 	int num_dcs;
 
 	DEBUG(10,("dsgetdcname_rediscover\n"));
 
 	if (flags & DS_IS_FLAT_NAME) {
+
+		if (lp_disable_netbios()) {
+			return NT_STATUS_NOT_SUPPORTED;
+		}
 
 		status = discover_dc_netbios(mem_ctx, domain_name, flags,
 					     &dclist, &num_dcs);
@@ -1074,6 +1049,10 @@ static NTSTATUS dsgetdcname_rediscover(TALLOC_CTX *mem_ctx,
 		if (NT_STATUS_IS_OK(status)) {
 			return status;
 		}
+	}
+
+	if (lp_disable_netbios()) {
+		return NT_STATUS_DOMAIN_CONTROLLER_NOT_FOUND;
 	}
 
 	status = discover_dc_netbios(mem_ctx, domain_name, flags, &dclist,
@@ -1117,7 +1096,7 @@ static NTSTATUS dsgetdcname_internal(TALLOC_CTX *mem_ctx,
 		     uint32_t flags,
 		     struct netr_DsRGetDCNameInfo **info)
 {
-	NTSTATUS status = NT_STATUS_DOMAIN_CONTROLLER_NOT_FOUND;
+	NTSTATUS status;
 	struct netr_DsRGetDCNameInfo *myinfo = NULL;
 	bool first = true;
 	struct netr_DsRGetDCNameInfo *first_info = NULL;

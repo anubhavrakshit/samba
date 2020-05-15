@@ -7,18 +7,20 @@
 #
 # The test uses well-known SIDs to not require looking up names and SIDs
 #
-# Copyright (C) 2015 Christof Schmitt
+# Copyright (C) 2015, 2019 Christof Schmitt
 
-if [ $# -lt 3 ]; then
-Usage: test_sharesec.sh SERVERCONFFILE SHARESEC SHARE
+if [ $# -lt 4 ]; then
+	echo Usage: test_sharesec.sh SERVERCONFFILE SHARESEC NET SHARE
 exit 1
 fi
 
 CONF=$1
 SHARESEC=$2
-SHARE=$3
+NET=$3
+SHARE=$4
 
 CMD="$SHARESEC $CONF $SHARE"
+NET_CMD="$NET $CONF"
 
 incdir=$(dirname $0)/../../../testprogs/blackbox
 . $incdir/subunit.sh
@@ -94,8 +96,22 @@ testit "Query ACL with three entries after removal" $CMD --view || \
 COUNT=$($CMD --view | grep ACL: | sed -e 's/^ACL://' | wc -l)
 testit "Verify ACL count after removal" test $COUNT -eq 3 || \
 	failed=$(expr $failed + 1)
-ACL="$($CMD --view | grep S-1-5-32-546')"
+ACL="$($CMD --view | grep S-1-5-32-546)"
 testit "Verify removal" test -e "$ACL" || failed=$(expr $failed + 1)
+
+testit "Set ACL as hex value" $CMD --add S-1-5-32-547:0x1/0x0/0x001F01FF || \
+	failed=$(expr $failed + 1)
+ACL="$($CMD --view | grep S-1-5-32-547 | sed -e 's/^ACL://')"
+testit "Verify numerically set entry" \
+	test "$ACL" = S-1-5-32-547:DENIED/0x0/FULL || \
+	failed=$(expr $failed + 1)
+
+testit "Set ACL as dec value" $CMD --add S-1-5-32-548:1/0/0x001F01FF || \
+	failed=$(expr $failed + 1)
+ACL="$($CMD --view | grep S-1-5-32-548 | sed -e 's/^ACL://')"
+testit "Verify numerically set entry" \
+	test "$ACL" = S-1-5-32-548:DENIED/0x0/FULL || \
+	failed=$(expr $failed + 1)
 
 testit "Set back to default ACL " $CMD --replace  S-1-1-0:ALLOWED/0x0/FULL || \
 	failed=$(expr $failed + 1)
@@ -106,6 +122,19 @@ testit "Verify standard ACL count" test $COUNT -eq 1 || \
 	failed=$(expr $failed + 1)
 ACL=$($CMD --view | grep ACL: | sed -e 's/^ACL://')
 testit "Verify standard ACL" test $ACL = S-1-1-0:ALLOWED/0x0/FULL || \
+	failed=$(expr $failed + 1)
+
+testit "Create new share" $NET_CMD conf addshare tmp_share /tmp || \
+	failed=$(expr $failed + 1)
+testit "Change ACL" $SHARESEC $CONF --replace S-1-1-0:DENIED/0x0/FULL tmp_share || \
+	failed=$(expr $failed + 1)
+testit "Delete share" $NET_CMD conf delshare tmp_share || \
+	failed=$(expr $failed + 1)
+testit "Create share again" $NET_CMD conf addshare tmp_share /tmp || \
+	failed=$(expr $failed + 1)
+ACL=$($SHARESEC $CONF --view tmp_share | grep 'ACL:')
+testit "Check for default ACL" \
+       test "$ACL" = "ACL:S-1-1-0:ALLOWED/0x0/FULL" || \
 	failed=$(expr $failed + 1)
 
 testok $0 $failed

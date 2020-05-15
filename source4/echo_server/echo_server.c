@@ -31,8 +31,9 @@
 #include "libcli/util/ntstatus.h"
 /* tsocket-related functions */
 #include "lib/tsocket/tsocket.h"
+#include "libds/common/roles.h"
 
-NTSTATUS server_service_echo_init(void);
+NTSTATUS server_service_echo_init(TALLOC_CTX *);
 
 /* Structure to hold an echo server socket */
 struct echo_socket {
@@ -240,33 +241,13 @@ static NTSTATUS echo_add_socket(struct echo_server *echo,
 /* Set up the listening sockets */
 static NTSTATUS echo_startup_interfaces(struct echo_server *echo,
 					struct loadparm_context *lp_ctx,
-					struct interface *ifaces)
+					struct interface *ifaces,
+					const struct model_ops *model_ops)
 {
-	const struct model_ops *model_ops;
 	int num_interfaces;
 	TALLOC_CTX *tmp_ctx = talloc_new(echo);
 	NTSTATUS status;
 	int i;
-
-	/*
-	 * Samba allows subtask to set their own process model.
-	 * Available models currently are:
-	 * - onefork  (forks exactly one child process)
-	 * - prefork  (keep a couple of child processes around)
-	 * - single   (only run a single process)
-	 * - standard (fork one subprocess per incoming connection)
-	 * - thread   (use threads instead of forks)
-	 *
-	 * For the echo server, the "single" process model works fine,
-	 * you probably don't want to use the thread model unless you really
-	 * know what you're doing.
-	 */
-
-	model_ops = process_model_startup("single");
-	if (model_ops == NULL) {
-		DEBUG(0, ("Can't find 'single' proces model_ops\n"));
-		return NT_STATUS_INTERNAL_ERROR;
-	}
 
 	num_interfaces = iface_list_count(ifaces);
 
@@ -284,7 +265,7 @@ static NTSTATUS echo_startup_interfaces(struct echo_server *echo,
 
 /* Do the basic task initialization, check if the task should run */
 
-static void echo_task_init(struct task_server *task)
+static NTSTATUS echo_task_init(struct task_server *task)
 {
 	struct interface *ifaces;
 	struct echo_server *echo;
@@ -301,7 +282,7 @@ static void echo_task_init(struct task_server *task)
 	case ROLE_DOMAIN_MEMBER:
 		task_server_terminate(task, "echo: Not starting echo server " \
 				      "for domain members", false);
-		return;
+		return NT_STATUS_INVALID_DOMAIN_ROLE;
 	case ROLE_ACTIVE_DIRECTORY_DC:
 		/* Yes, we want to run the echo server */
 		break;
@@ -313,7 +294,7 @@ static void echo_task_init(struct task_server *task)
 		task_server_terminate(task,
 				      "echo: No network interfaces configured",
 				      false);
-		return;
+		return NT_STATUS_UNSUCCESSFUL;
 	}
 
 	task_server_set_title(task, "task[echo]");
@@ -321,17 +302,19 @@ static void echo_task_init(struct task_server *task)
 	echo = talloc_zero(task, struct echo_server);
 	if (echo == NULL) {
 		task_server_terminate(task, "echo: Out of memory", true);
-		return;
+		return NT_STATUS_NO_MEMORY;
 	}
 
 	echo->task = task;
 
-	status = echo_startup_interfaces(echo, task->lp_ctx, ifaces);
+	status = echo_startup_interfaces(echo, task->lp_ctx, ifaces,
+					 task->model_ops);
 	if (!NT_STATUS_IS_OK(status)) {
 		task_server_terminate(task, "echo: Failed to set up interfaces",
 				      true);
-		return;
+		return status;
 	}
+	return NT_STATUS_OK;
 }
 
 /*
@@ -340,7 +323,14 @@ static void echo_task_init(struct task_server *task)
  * This is the function you need to put into the wscript_build file as
  * init_function. All the real work happens in "echo_task_init" above.
  */
-NTSTATUS server_service_echo_init(void)
+NTSTATUS server_service_echo_init(TALLOC_CTX *ctx)
 {
-	return register_server_service("echo", echo_task_init);
+	static const struct service_details details = {
+		.inhibit_fork_on_accept = true,
+		.inhibit_pre_fork = false,
+		.task_init = echo_task_init,
+		.post_fork = NULL
+
+	};
+	return register_server_service(ctx, "echo", &details);
 }

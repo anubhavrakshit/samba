@@ -21,7 +21,9 @@
 */
 
 #include <Python.h>
+#include "python/py3compat.h"
 #include "includes.h"
+#include "python/modules.h"
 #include "librpc/rpc/pyrpc_util.h"
 #include "librpc/rpc/dcerpc.h"
 #include "librpc/rpc/pyrpc.h"
@@ -99,11 +101,12 @@ PyObject *py_dcerpc_interface_init_helper(PyTypeObject *type, PyObject *args, Py
 	const char *binding_string;
 	PyObject *py_lp_ctx = Py_None, *py_credentials = Py_None, *py_basis = Py_None;
 	NTSTATUS status;
+	unsigned int timeout = (unsigned int)-1;
 	const char *kwnames[] = {
-		"binding", "lp_ctx", "credentials", "basis_connection", NULL
+		"binding", "lp_ctx", "credentials", "timeout", "basis_connection", NULL
 	};
 
-	if (!PyArg_ParseTupleAndKeywords(args, kwargs, "s|OOO:samr", discard_const_p(char *, kwnames), &binding_string, &py_lp_ctx, &py_credentials, &py_basis)) {
+	if (!PyArg_ParseTupleAndKeywords(args, kwargs, "s|OOIO:samr", discard_const_p(char *, kwnames), &binding_string, &py_lp_ctx, &py_credentials, &timeout, &py_basis)) {
 		return NULL;
 	}
 
@@ -114,8 +117,14 @@ PyObject *py_dcerpc_interface_init_helper(PyTypeObject *type, PyObject *args, Py
 	}
 
 	ret = PyObject_New(dcerpc_InterfaceObject, type);
+	if (ret == NULL) {
+		PyErr_NoMemory();
+		return NULL;
+	}
+
 	ret->pipe = NULL;
 	ret->binding_handle = NULL;
+	ret->ev = NULL;
 	ret->mem_ctx = talloc_new(NULL);
 	if (ret->mem_ctx == NULL) {
 		PyErr_NoMemory();
@@ -123,28 +132,28 @@ PyObject *py_dcerpc_interface_init_helper(PyTypeObject *type, PyObject *args, Py
 	}
 
 	if (strncmp(binding_string, "irpc:", 5) == 0) {
-		struct tevent_context *event_ctx;
 		struct loadparm_context *lp_ctx;
 
-		event_ctx = s4_event_context_init(ret->mem_ctx);
-		if (event_ctx == NULL) {
-			PyErr_SetString(PyExc_TypeError, "Expected loadparm context");
-			TALLOC_FREE(ret->mem_ctx);
+		ret->ev = s4_event_context_init(ret->mem_ctx);
+		if (ret->ev == NULL) {
+			PyErr_SetString(PyExc_TypeError,
+					"Unable to initialise event context");
+			Py_DECREF(ret);
 			return NULL;
 		}
 
-		lp_ctx = lpcfg_from_py_object(event_ctx, py_lp_ctx);
+		lp_ctx = lpcfg_from_py_object(ret->ev, py_lp_ctx);
 		if (lp_ctx == NULL) {
 			PyErr_SetString(PyExc_TypeError, "Expected loadparm context");
-			TALLOC_FREE(ret->mem_ctx);
+			Py_DECREF(ret);
 			return NULL;
 		}
 
 		status = pyrpc_irpc_connect(ret->mem_ctx, binding_string+5, table,
-					    event_ctx, lp_ctx, &ret->binding_handle);
+					    ret->ev, lp_ctx, &ret->binding_handle);
 		if (!NT_STATUS_IS_OK(status)) {
 			PyErr_SetNTSTATUS(status);
-			TALLOC_FREE(ret->mem_ctx);
+			Py_DECREF(ret);
 			return NULL;
 		}
 	} else if (py_basis != Py_None) {
@@ -154,20 +163,23 @@ PyObject *py_dcerpc_interface_init_helper(PyTypeObject *type, PyObject *args, Py
 
 		py_base = PyImport_ImportModule("samba.dcerpc.base");
 		if (py_base == NULL) {
-			TALLOC_FREE(ret->mem_ctx);
+			Py_DECREF(ret);
 			return NULL;
 		}
 
 		ClientConnection_Type = (PyTypeObject *)PyObject_GetAttrString(py_base, "ClientConnection");
 		if (ClientConnection_Type == NULL) {
 			PyErr_SetNone(PyExc_TypeError);
-			TALLOC_FREE(ret->mem_ctx);
+			Py_DECREF(ret);
+			Py_DECREF(py_base);
 			return NULL;
 		}
 
 		if (!PyObject_TypeCheck(py_basis, ClientConnection_Type)) {
 			PyErr_SetString(PyExc_TypeError, "basis_connection must be a DCE/RPC connection");
-			TALLOC_FREE(ret->mem_ctx);
+			Py_DECREF(ret);
+			Py_DECREF(py_base);
+			Py_DECREF(ClientConnection_Type);
 			return NULL;
 		}
 
@@ -175,62 +187,78 @@ PyObject *py_dcerpc_interface_init_helper(PyTypeObject *type, PyObject *args, Py
 					 ((dcerpc_InterfaceObject *)py_basis)->pipe);
 		if (base_pipe == NULL) {
 			PyErr_NoMemory();
-			TALLOC_FREE(ret->mem_ctx);
+			Py_DECREF(ret);
+			Py_DECREF(py_base);
+			Py_DECREF(ClientConnection_Type);
+			return NULL;
+		}
+
+		ret->ev = talloc_reference(
+			ret->mem_ctx,
+			((dcerpc_InterfaceObject *)py_basis)->ev);
+		if (ret->ev == NULL) {
+			PyErr_NoMemory();
+			Py_DECREF(ret);
+			Py_DECREF(py_base);
+			Py_DECREF(ClientConnection_Type);
 			return NULL;
 		}
 
 		status = dcerpc_secondary_context(base_pipe, &ret->pipe, table);
 		if (!NT_STATUS_IS_OK(status)) {
 			PyErr_SetNTSTATUS(status);
-			TALLOC_FREE(ret->mem_ctx);
+			Py_DECREF(ret);
+			Py_DECREF(py_base);
+			Py_DECREF(ClientConnection_Type);
 			return NULL;
 		}
 
 		ret->pipe = talloc_steal(ret->mem_ctx, ret->pipe);
+		Py_XDECREF(ClientConnection_Type);
+		Py_XDECREF(py_base);
 	} else {
-		struct tevent_context *event_ctx;
 		struct loadparm_context *lp_ctx;
 		struct cli_credentials *credentials;
 
-		event_ctx = s4_event_context_init(ret->mem_ctx);
-		if (event_ctx == NULL) {
+		ret->ev = s4_event_context_init(ret->mem_ctx);
+		if (ret->ev == NULL) {
 			PyErr_SetString(PyExc_TypeError, "Expected loadparm context");
-			TALLOC_FREE(ret->mem_ctx);
+			Py_DECREF(ret);
 			return NULL;
 		}
 
-		lp_ctx = lpcfg_from_py_object(event_ctx, py_lp_ctx);
+		lp_ctx = lpcfg_from_py_object(ret->ev, py_lp_ctx);
 		if (lp_ctx == NULL) {
 			PyErr_SetString(PyExc_TypeError, "Expected loadparm context");
-			TALLOC_FREE(ret->mem_ctx);
+			Py_DECREF(ret);
 			return NULL;
 		}
 
 		credentials = cli_credentials_from_py_object(py_credentials);
 		if (credentials == NULL) {
 			PyErr_SetString(PyExc_TypeError, "Expected credentials");
-			TALLOC_FREE(ret->mem_ctx);
+			Py_DECREF(ret);
 			return NULL;
 		}
 		status = dcerpc_pipe_connect(ret->mem_ctx, &ret->pipe, binding_string,
-			     table, credentials, event_ctx, lp_ctx);
+			     table, credentials, ret->ev, lp_ctx);
 		if (!NT_STATUS_IS_OK(status)) {
 			PyErr_SetNTSTATUS(status);
-			TALLOC_FREE(ret->mem_ctx);
+			Py_DECREF(ret);
 			return NULL;
 		}
-
-		/*
-		 * the event context is cached under the connection,
-		 * so let it be a child of it.
-		 */
-		talloc_steal(ret->pipe->conn, event_ctx);
 	}
 
 	if (ret->pipe) {
 		ret->pipe->conn->flags |= DCERPC_NDR_REF_ALLOC;
 		ret->binding_handle = ret->pipe->binding_handle;
 	}
+
+	/* reset timeout for the handle */
+	if ((timeout != ((unsigned int)-1)) && (ret->binding_handle != NULL)) {
+		dcerpc_binding_handle_set_timeout(ret->binding_handle, timeout);
+	}
+
 	return (PyObject *)ret;
 }
 
@@ -298,13 +326,15 @@ bool PyInterface_AddNdrRpcMethods(PyTypeObject *ifacetype, const struct PyNdrRpc
 		}
 		wb->name = discard_const_p(char, mds[i].name);
 		wb->flags = PyWrapperFlag_KEYWORDS;
-		wb->wrapper = (wrapperfunc)py_dcerpc_call_wrapper;
+		wb->wrapper = PY_DISCARD_FUNC_SIG(wrapperfunc,
+						  py_dcerpc_call_wrapper);
 		wb->doc = discard_const_p(char, mds[i].doc);
 
 		ret = PyDescr_NewWrapper(ifacetype, wb, discard_const_p(void, &mds[i]));
 
 		PyDict_SetItemString(ifacetype->tp_dict, mds[i].name, 
 				     (PyObject *)ret);
+		Py_CLEAR(ret);
 	}
 
 	return true;
@@ -326,7 +356,7 @@ PyObject *py_dcerpc_syntax_init_helper(PyTypeObject *type, PyObject *args, PyObj
 		return NULL;
 	}
 
-	obj = (struct ndr_syntax_id *)pytalloc_get_ptr(ret);
+	obj = pytalloc_get_type(ret, struct ndr_syntax_id);
 	*obj = *syntax;
 
 	return ret;
@@ -349,12 +379,16 @@ void PyErr_SetDCERPCStatus(struct dcerpc_pipe *p, NTSTATUS status)
 
   r_ctx is the context that is a parent of r. It will be referenced by
   the resulting python object
+
+  This MUST only be used by objects that are based on pytalloc_Object
+  otherwise the pytalloc_reference_ex() will fail.
  */
 PyObject *py_return_ndr_struct(const char *module_name, const char *type_name,
 			       TALLOC_CTX *r_ctx, void *r)
 {
 	PyTypeObject *py_type;
 	PyObject *module;
+	PyObject *result = NULL;
 
 	if (r == NULL) {
 		Py_RETURN_NONE;
@@ -367,10 +401,14 @@ PyObject *py_return_ndr_struct(const char *module_name, const char *type_name,
 
 	py_type = (PyTypeObject *)PyObject_GetAttrString(module, type_name);
 	if (py_type == NULL) {
+		Py_DECREF(module);
 		return NULL;
 	}
 
-	return pytalloc_reference_ex(py_type, r_ctx, r);
+	result = pytalloc_reference_ex(py_type, r_ctx, r);
+	Py_CLEAR(module);
+	Py_CLEAR(py_type);
+	return result;
 }
 
 PyObject *PyString_FromStringOrNULL(const char *str)
@@ -378,5 +416,91 @@ PyObject *PyString_FromStringOrNULL(const char *str)
 	if (str == NULL) {
 		Py_RETURN_NONE;
 	}
-	return PyString_FromString(str);
+	return PyUnicode_FromString(str);
+}
+
+PyObject *pyrpc_import_union(PyTypeObject *type, TALLOC_CTX *mem_ctx, int level,
+			     const void *in, const char *typename)
+{
+	PyObject *mem_ctx_obj = NULL;
+	PyObject *in_obj = NULL;
+	PyObject *ret = NULL;
+
+	mem_ctx_obj = pytalloc_GenericObject_reference(mem_ctx);
+	if (mem_ctx_obj == NULL) {
+		return NULL;
+	}
+
+	in_obj = pytalloc_GenericObject_reference_ex(mem_ctx, discard_const(in));
+	if (in_obj == NULL) {
+		Py_XDECREF(mem_ctx_obj);
+		return NULL;
+	}
+
+	ret = PyObject_CallMethod((PyObject *)type,
+				  discard_const_p(char, "__import__"),
+				  discard_const_p(char, "OiO"),
+				  mem_ctx_obj, level, in_obj);
+	Py_XDECREF(mem_ctx_obj);
+	Py_XDECREF(in_obj);
+	if (ret == NULL) {
+		return NULL;
+	}
+
+	return ret;
+}
+
+void *pyrpc_export_union(PyTypeObject *type, TALLOC_CTX *mem_ctx, int level,
+			 PyObject *in, const char *typename)
+{
+	PyObject *mem_ctx_obj = NULL;
+	PyObject *ret_obj = NULL;
+	void *ret = NULL;
+
+	mem_ctx_obj = pytalloc_GenericObject_reference(mem_ctx);
+	if (mem_ctx_obj == NULL) {
+		return NULL;
+	}
+
+	ret_obj = PyObject_CallMethod((PyObject *)type,
+				      discard_const_p(char, "__export__"),
+				      discard_const_p(char, "OiO"),
+				      mem_ctx_obj, level, in);
+	Py_XDECREF(mem_ctx_obj);
+	if (ret_obj == NULL) {
+		return NULL;
+	}
+
+	ret = _pytalloc_get_type(ret_obj, typename);
+	Py_XDECREF(ret_obj);
+	return ret;
+}
+
+PyObject *py_dcerpc_ndr_pointer_deref(PyTypeObject *type, PyObject *obj)
+{
+	if (!PyObject_TypeCheck(obj, type)) {
+		PyErr_Format(PyExc_TypeError,
+			     "Expected type '%s' but got type '%s'",
+			     (type)->tp_name, Py_TYPE(obj)->tp_name);
+		return NULL;
+	}
+
+	return PyObject_GetAttrString(obj, discard_const_p(char, "value"));
+}
+
+PyObject *py_dcerpc_ndr_pointer_wrap(PyTypeObject *type, PyObject *obj)
+{
+	PyObject *args = NULL;
+	PyObject *ret_obj = NULL;
+
+	args = PyTuple_New(1);
+	if (args == NULL) {
+		return NULL;
+	}
+	Py_XINCREF(obj);
+	PyTuple_SetItem(args, 0, obj);
+
+	ret_obj = PyObject_Call((PyObject *)type, args, NULL);
+	Py_XDECREF(args);
+	return ret_obj;
 }

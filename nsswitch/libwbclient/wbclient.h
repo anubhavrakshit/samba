@@ -73,9 +73,13 @@ const char *wbcErrorString(wbcErr error);
  *  0.10: Added wbcPingDc2()
  *  0.11: Extended wbcAuthenticateUserEx to provide PAC parsing
  *  0.12: Added wbcCtxCreate and friends
+ *  0.13: Added wbcCtxUnixIdsToSids and wbcUnixIdsToSids
+ *  0.14: Added "authoritative" to wbcAuthErrorInfo
+ *        Added WBC_SID_NAME_LABEL
+ *  0.15: Added wbcSetClientProcessName()
  **/
 #define WBCLIENT_MAJOR_VERSION 0
-#define WBCLIENT_MINOR_VERSION 12
+#define WBCLIENT_MINOR_VERSION 15
 #define WBCLIENT_VENDOR_VERSION "Samba libwbclient"
 struct wbcLibraryDetails {
 	uint16_t major_version;
@@ -137,7 +141,8 @@ enum wbcSidType {
 	WBC_SID_NAME_DELETED=6,
 	WBC_SID_NAME_INVALID=7,
 	WBC_SID_NAME_UNKNOWN=8,
-	WBC_SID_NAME_COMPUTER=9
+	WBC_SID_NAME_COMPUTER=9,
+	WBC_SID_NAME_LABEL=10
 };
 
 /**
@@ -183,6 +188,7 @@ struct wbcDomainInfo {
 	uint32_t domain_flags;
 	uint32_t trust_flags;
 	uint32_t trust_type;
+	char *trust_routing;
 };
 
 /* wbcDomainInfo->domain_flags */
@@ -205,6 +211,12 @@ struct wbcDomainInfo {
 #define WBC_DOMINFO_TRUSTTYPE_FOREST     0x00000001
 #define WBC_DOMINFO_TRUSTTYPE_IN_FOREST  0x00000002
 #define WBC_DOMINFO_TRUSTTYPE_EXTERNAL   0x00000003
+#define WBC_DOMINFO_TRUSTTYPE_LOCAL      0x00000004
+#define WBC_DOMINFO_TRUSTTYPE_WKSTA      0x00000005
+#define WBC_DOMINFO_TRUSTTYPE_RWDC       0x00000006
+#define WBC_DOMINFO_TRUSTTYPE_RODC       0x00000007
+#define WBC_DOMINFO_TRUSTTYPE_PDC        0x00000008
+
 
 /**
  * @brief Generic Blob
@@ -315,6 +327,7 @@ struct wbcChangePasswordParams {
 #define WBC_MSV1_0_ALLOW_SERVER_TRUST_ACCOUNT		0x00000020
 #define WBC_MSV1_0_RETURN_PROFILE_PATH			0x00000200
 #define WBC_MSV1_0_ALLOW_WORKSTATION_TRUST_ACCOUNT	0x00000800
+#define WBC_MSV1_0_ALLOW_MSVCHAPV2			0x00010000
 
 /* wbcAuthUserParams->flags */
 
@@ -417,6 +430,7 @@ struct wbcAuthErrorInfo {
 	char *nt_string;
 	int32_t pam_error;
 	char *display_string;
+	uint8_t authoritative;
 };
 
 /**
@@ -1029,6 +1043,12 @@ wbcErr wbcCtxSidsToUnixIds(struct wbcContext *ctx,
  **/
 wbcErr wbcSidsToUnixIds(const struct wbcDomainSid *sids, uint32_t num_sids,
 			struct wbcUnixId *ids);
+
+wbcErr wbcCtxUnixIdsToSids(struct wbcContext *ctx,
+			   const struct wbcUnixId *ids, uint32_t num_ids,
+			   struct wbcDomainSid *sids);
+wbcErr wbcUnixIdsToSids(const struct wbcUnixId *ids, uint32_t num_ids,
+			struct wbcDomainSid *sids);
 
 /**
  * @brief Obtain a new uid from Winbind
@@ -2031,5 +2051,18 @@ wbcErr wbcAddNamedBlob(size_t *num_blobs,
 		       uint32_t flags,
 		       uint8_t *data,
 		       size_t length);
+
+/**
+ * @brief Set the name of the process which call wbclient.
+ *
+ * By default wbclient will figure out the process name. This should just be
+ * used in special cases like pam modules or similar. Only alpha numeric
+ * chars in ASCII are allowed.
+ *
+ * This function should only be called once!
+ *
+ * @param[in]  name             The process name to set.
+ */
+void wbcSetClientProcessName(const char *name);
 
 #endif      /* _WBCLIENT_H */

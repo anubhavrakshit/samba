@@ -25,7 +25,11 @@ __docformat__ = "restructuredText"
 import os
 import sys
 import time
+import ldb
 import samba.param
+from samba import _glue
+from samba._ldb import Ldb as _Ldb
+from samba.compat import string_types
 
 
 def source_tree_topdir():
@@ -45,10 +49,6 @@ def in_source_tree():
     except RuntimeError:
         return False
     return True
-
-
-import ldb
-from samba._ldb import Ldb as _Ldb
 
 
 class Ldb(_Ldb):
@@ -98,18 +98,18 @@ class Ldb(_Ldb):
 
         # TODO set debug
         def msg(l, text):
-            print text
-        #self.set_debug(msg)
+            print(text)
+        # self.set_debug(msg)
 
         self.set_utf8_casefold()
 
         # Allow admins to force non-sync ldb for all databases
         if lp is not None:
-            nosync_p = lp.get("nosync", "ldb")
+            nosync_p = lp.get("ldb:nosync")
             if nosync_p is not None and nosync_p:
                 flags |= ldb.FLG_NOSYNC
 
-        self.set_create_perms(0600)
+        self.set_create_perms(0o600)
 
         if url is not None:
             self.connect(url, flags, options)
@@ -140,8 +140,9 @@ class Ldb(_Ldb):
 
         try:
             res = self.search(base=dn, scope=ldb.SCOPE_SUBTREE, attrs=[],
-                      expression="(|(objectclass=user)(objectclass=computer))")
-        except ldb.LdbError, (errno, _):
+                              expression="(|(objectclass=user)(objectclass=computer))")
+        except ldb.LdbError as error:
+            (errno, estr) = error.args
             if errno == ldb.ERR_NO_SUCH_OBJECT:
                 # Ignore no such object errors
                 return
@@ -151,7 +152,8 @@ class Ldb(_Ldb):
         try:
             for msg in res:
                 self.delete(msg.dn, ["relax:0"])
-        except ldb.LdbError, (errno, _):
+        except ldb.LdbError as error:
+            (errno, estr) = error.args
             if errno != ldb.ERR_NO_SUCH_OBJECT:
                 # Ignore no such object errors
                 raise
@@ -171,18 +173,19 @@ class Ldb(_Ldb):
         # Delete the 'visible' records, and the invisble 'deleted' records (if
         # this DB supports it)
         for msg in self.search(basedn, ldb.SCOPE_SUBTREE,
-                       "(&(|(objectclass=*)(distinguishedName=*))(!(distinguishedName=@BASEINFO)))",
-                       [], controls=["show_deleted:0", "show_recycled:0"]):
+                               "(&(|(objectclass=*)(distinguishedName=*))(!(distinguishedName=@BASEINFO)))",
+                               [], controls=["show_deleted:0", "show_recycled:0"]):
             try:
                 self.delete(msg.dn, ["relax:0"])
-            except ldb.LdbError, (errno, _):
+            except ldb.LdbError as error:
+                (errno, estr) = error.args
                 if errno != ldb.ERR_NO_SUCH_OBJECT:
                     # Ignore no such object errors
                     raise
 
         res = self.search(basedn, ldb.SCOPE_SUBTREE,
-            "(&(|(objectclass=*)(distinguishedName=*))(!(distinguishedName=@BASEINFO)))",
-            [], controls=["show_deleted:0", "show_recycled:0"])
+                          "(&(|(objectclass=*)(distinguishedName=*))(!(distinguishedName=@BASEINFO)))",
+                          [], controls=["show_deleted:0", "show_recycled:0"])
         assert len(res) == 0
 
         # delete the specials
@@ -190,7 +193,8 @@ class Ldb(_Ldb):
                      "@OPTIONS", "@PARTITION", "@KLUDGEACL"]:
             try:
                 self.delete(attr, ["relax:0"])
-            except ldb.LdbError, (errno, _):
+            except ldb.LdbError as error:
+                (errno, estr) = error.args
                 if errno != ldb.ERR_NO_SUCH_OBJECT:
                     # Ignore missing dn errors
                     raise
@@ -203,7 +207,8 @@ class Ldb(_Ldb):
         for attr in ["@INDEXLIST", "@ATTRIBUTES"]:
             try:
                 self.delete(attr, ["relax:0"])
-            except ldb.LdbError, (errno, _):
+            except ldb.LdbError as error:
+                (errno, estr) = error.args
                 if errno != ldb.ERR_NO_SUCH_OBJECT:
                     # Ignore missing dn errors
                     raise
@@ -245,8 +250,8 @@ def substitute_var(text, values):
     """
 
     for (name, value) in values.items():
-        assert isinstance(name, str), "%r is not a string" % name
-        assert isinstance(value, str), "Value %r for %s is not a string" % (value, name)
+        assert isinstance(name, string_types), "%r is not a string" % name
+        assert isinstance(value, string_types), "Value %r for %s is not a string" % (value, name)
         text = text.replace("${%s}" % name, value)
 
     return text
@@ -259,14 +264,14 @@ def check_all_substituted(text):
 
     :param text: The text to search for substitution variables
     """
-    if not "${" in text:
+    if "${" not in text:
         return
 
     var_start = text.find("${")
     var_end = text.find("}", var_start)
 
     raise Exception("Not all variables substituted: %s" %
-        text[var_start:var_end+1])
+                    text[var_start:var_end + 1])
 
 
 def read_and_sub_file(file_name, subst_vars):
@@ -275,7 +280,7 @@ def read_and_sub_file(file_name, subst_vars):
     :param file_name: File to be read (typically from setup directory)
      param subst_vars: Optional variables to subsitute in the file.
     """
-    data = open(file_name, 'r').read()
+    data = open(file_name, 'r', encoding="utf-8").read()
     if subst_vars is not None:
         data = substitute_var(data, subst_vars)
         check_all_substituted(data)
@@ -299,7 +304,10 @@ def setup_file(template, fname, subst_vars=None):
     finally:
         f.close()
 
+
 MAX_NETBIOS_NAME_LEN = 15
+
+
 def is_valid_netbios_char(c):
     return (c.isalnum() or c in " !#$%&'()-.@^_{}~")
 
@@ -331,8 +339,8 @@ def import_bundled_package(modulename, location, source_tree_container,
     """
     if in_source_tree():
         extra_path = os.path.join(source_tree_topdir(), source_tree_container,
-            location)
-        if not extra_path in sys.path:
+                                  location)
+        if extra_path not in sys.path:
             sys.path.insert(0, extra_path)
         sys.modules[modulename] = __import__(modulename)
     else:
@@ -351,20 +359,36 @@ def ensure_third_party_module(modulename, location):
         __import__(modulename)
     except ImportError:
         import_bundled_package(modulename, location,
-            source_tree_container="third_party",
-            namespace="samba.third_party")
+                               source_tree_container="third_party",
+                               namespace="samba.third_party")
 
 
 def dn_from_dns_name(dnsdomain):
     """return a DN from a DNS name domain/forest root"""
     return "DC=" + ",DC=".join(dnsdomain.split("."))
 
+
 def current_unix_time():
     return int(time.time())
 
-import _glue
+
+def string_to_byte_array(string):
+    blob = [0] * len(string)
+
+    for i in range(len(string)):
+        blob[i] = string[i] if isinstance(string[i], int) else ord(string[i])
+
+    return blob
+
+
+def arcfour_encrypt(key, data):
+    from samba.crypto import arcfour_crypt_blob
+    return arcfour_crypt_blob(data, key)
+
+
 version = _glue.version
 interface_ips = _glue.interface_ips
+fault_setup = _glue.fault_setup
 set_debug_level = _glue.set_debug_level
 get_debug_level = _glue.get_debug_level
 unix2nttime = _glue.unix2nttime
@@ -372,5 +396,15 @@ nttime2string = _glue.nttime2string
 nttime2unix = _glue.nttime2unix
 unix2nttime = _glue.unix2nttime
 generate_random_password = _glue.generate_random_password
+generate_random_machine_password = _glue.generate_random_machine_password
+check_password_quality = _glue.check_password_quality
+generate_random_bytes = _glue.generate_random_bytes
 strcasecmp_m = _glue.strcasecmp_m
 strstr_m = _glue.strstr_m
+is_ntvfs_fileserver_built = _glue.is_ntvfs_fileserver_built
+is_heimdal_built = _glue.is_heimdal_built
+
+NTSTATUSError = _glue.NTSTATUSError
+HRESULTError = _glue.HRESULTError
+WERRORError = _glue.WERRORError
+DsExtendedError = _glue.DsExtendedError

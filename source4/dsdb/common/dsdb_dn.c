@@ -71,8 +71,8 @@ struct dsdb_dn *dsdb_dn_construct(TALLOC_CTX *mem_ctx, struct ldb_dn *dn, DATA_B
 	return dsdb_dn_construct_internal(mem_ctx, dn, extra_part, dn_format, oid);
 }
 
-struct dsdb_dn *dsdb_dn_parse(TALLOC_CTX *mem_ctx, struct ldb_context *ldb, 
-			      const struct ldb_val *dn_blob, const char *dn_oid)
+struct dsdb_dn *dsdb_dn_parse_trusted(TALLOC_CTX *mem_ctx, struct ldb_context *ldb, 
+				      const struct ldb_val *dn_blob, const char *dn_oid)
 {
 	struct dsdb_dn *dsdb_dn;
 	struct ldb_dn *dn;
@@ -84,6 +84,7 @@ struct dsdb_dn *dsdb_dn_parse(TALLOC_CTX *mem_ctx, struct ldb_context *ldb,
 	struct ldb_val bval;
 	struct ldb_val dval;
 	char *dn_str;
+	int error = 0;
 
 	enum dsdb_dn_format dn_format = dsdb_dn_oid_to_format(dn_oid);
 
@@ -97,7 +98,7 @@ struct dsdb_dn *dsdb_dn_parse(TALLOC_CTX *mem_ctx, struct ldb_context *ldb,
 	case DSDB_NORMAL_DN:
 	{
 		dn = ldb_dn_from_ldb_val(mem_ctx, ldb, dn_blob);
-		if (!dn || !ldb_dn_validate(dn)) {
+		if (!dn) {
 			talloc_free(dn);
 			return NULL;
 		}
@@ -134,8 +135,8 @@ struct dsdb_dn *dsdb_dn_parse(TALLOC_CTX *mem_ctx, struct ldb_context *ldb,
 	}
 
 	errno = 0;
-	blen = strtoul(p1, &p2, 10);
-	if (errno != 0) {
+	blen = smb_strtoul(p1, &p2, 10, &error, SMB_STR_STANDARD);
+	if (error != 0) {
 		DEBUG(10, (__location__ ": failed\n"));
 		goto failed;
 	}
@@ -183,7 +184,7 @@ struct dsdb_dn *dsdb_dn_parse(TALLOC_CTX *mem_ctx, struct ldb_context *ldb,
 			bval.length = strhex_to_str((char *)bval.data, bval.length,
 						    p1, blen);
 			if (bval.length != (blen / 2)) {
-				DEBUG(10, (__location__ ": non hexidecimal characters found in binary prefix\n"));
+				DEBUG(10, (__location__ ": non hexadecimal characters found in binary prefix\n"));
 				goto failed;
 			}
 		} else {
@@ -204,7 +205,7 @@ struct dsdb_dn *dsdb_dn_parse(TALLOC_CTX *mem_ctx, struct ldb_context *ldb,
 	dval.length = strlen(dn_str);
 		
 	dn = ldb_dn_from_ldb_val(tmp_ctx, ldb, &dval);
-	if (!dn || !ldb_dn_validate(dn)) {
+	if (!dn) {
 		DEBUG(10, (__location__ ": err\n"));
 		goto failed;
 	}
@@ -219,6 +220,22 @@ failed:
 	return NULL;
 }
 
+struct dsdb_dn *dsdb_dn_parse(TALLOC_CTX *mem_ctx, struct ldb_context *ldb, 
+			      const struct ldb_val *dn_blob, const char *dn_oid)
+{
+	struct dsdb_dn *dsdb_dn = dsdb_dn_parse_trusted(mem_ctx, ldb,
+							dn_blob, dn_oid);
+	if (dsdb_dn == NULL) {
+		return NULL;
+	}
+	if (ldb_dn_validate(dsdb_dn->dn) == false) {
+		DEBUG(10, ("could not parse %.*s as a %s DN",
+			   (int)dn_blob->length, dn_blob->data,
+			   dn_oid));
+		return NULL;
+	}
+	return dsdb_dn;
+}
 
 static char *dsdb_dn_get_with_postfix(TALLOC_CTX *mem_ctx, 
 				     struct dsdb_dn *dsdb_dn,

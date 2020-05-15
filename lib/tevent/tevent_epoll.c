@@ -216,7 +216,7 @@ static void epoll_update_event(struct epoll_event_context *epoll_ev, struct teve
 
 /*
   reopen the epoll handle when our pid changes
-  see http://junkcode.samba.org/ftp/unpacked/junkcode/epoll_fork.c for an 
+  see http://junkcode.samba.org/ftp/unpacked/junkcode/epoll_fork.c for an
   demonstration of why this is needed
  */
 static void epoll_check_reopen(struct epoll_event_context *epoll_ev)
@@ -323,8 +323,10 @@ static int epoll_add_multiplex_fd(struct epoll_event_context *epoll_ev,
 			     "add_fde[%p] mpx_fde[%p] fd[%d] - disabling\n",
 			     add_fde, mpx_fde, add_fde->fd);
 		DLIST_REMOVE(epoll_ev->ev->fd_events, mpx_fde);
+		mpx_fde->wrapper = NULL;
 		mpx_fde->event_ctx = NULL;
 		DLIST_REMOVE(epoll_ev->ev->fd_events, add_fde);
+		add_fde->wrapper = NULL;
 		add_fde->event_ctx = NULL;
 		return 0;
 	} else if (ret != 0) {
@@ -387,9 +389,11 @@ static void epoll_add_event(struct epoll_event_context *epoll_ev, struct tevent_
 			     "fde[%p] mpx_fde[%p] fd[%d] - disabling\n",
 			     fde, mpx_fde, fde->fd);
 		DLIST_REMOVE(epoll_ev->ev->fd_events, fde);
+		fde->wrapper = NULL;
 		fde->event_ctx = NULL;
 		if (mpx_fde != NULL) {
 			DLIST_REMOVE(epoll_ev->ev->fd_events, mpx_fde);
+			mpx_fde->wrapper = NULL;
 			mpx_fde->event_ctx = NULL;
 		}
 		return;
@@ -462,9 +466,11 @@ static void epoll_del_event(struct epoll_event_context *epoll_ev, struct tevent_
 			     "fde[%p] mpx_fde[%p] fd[%d] - disabling\n",
 			     fde, mpx_fde, fde->fd);
 		DLIST_REMOVE(epoll_ev->ev->fd_events, fde);
+		fde->wrapper = NULL;
 		fde->event_ctx = NULL;
 		if (mpx_fde != NULL) {
 			DLIST_REMOVE(epoll_ev->ev->fd_events, mpx_fde);
+			mpx_fde->wrapper = NULL;
 			mpx_fde->event_ctx = NULL;
 		}
 		return;
@@ -511,9 +517,11 @@ static void epoll_mod_event(struct epoll_event_context *epoll_ev, struct tevent_
 			     "fde[%p] mpx_fde[%p] fd[%d] - disabling\n",
 			     fde, mpx_fde, fde->fd);
 		DLIST_REMOVE(epoll_ev->ev->fd_events, fde);
+		fde->wrapper = NULL;
 		fde->event_ctx = NULL;
 		if (mpx_fde != NULL) {
 			DLIST_REMOVE(epoll_ev->ev->fd_events, mpx_fde);
+			mpx_fde->wrapper = NULL;
 			mpx_fde->event_ctx = NULL;
 		}
 		return;
@@ -661,7 +669,7 @@ static int epoll_event_loop(struct epoll_event_context *epoll_ev, struct timeval
 	}
 
 	for (i=0;i<ret;i++) {
-		struct tevent_fd *fde = talloc_get_type(events[i].data.ptr, 
+		struct tevent_fd *fde = talloc_get_type(events[i].data.ptr,
 						       struct tevent_fd);
 		uint16_t flags = 0;
 		struct tevent_fd *mpx_fde = NULL;
@@ -725,8 +733,7 @@ static int epoll_event_loop(struct epoll_event_context *epoll_ev, struct timeval
 		 */
 		flags &= fde->flags;
 		if (flags) {
-			fde->handler(epoll_ev->ev, fde, flags, fde->private_data);
-			break;
+			return tevent_common_invoke_fd_handler(fde, flags, NULL);
 		}
 	}
 
@@ -888,7 +895,7 @@ static void epoll_event_set_fd_flags(struct tevent_fd *fde, uint16_t flags)
 }
 
 /*
-  do a single event loop using the events defined in ev 
+  do a single event loop using the events defined in ev
 */
 static int epoll_event_loop_once(struct tevent_context *ev, const char *location)
 {
@@ -901,6 +908,10 @@ static int epoll_event_loop_once(struct tevent_context *ev, const char *location
 	if (ev->signal_events &&
 	    tevent_common_check_signal(ev)) {
 		return 0;
+	}
+
+	if (ev->threaded_contexts != NULL) {
+		tevent_common_threaded_activate_immediate(ev);
 	}
 
 	if (ev->immediate_events &&

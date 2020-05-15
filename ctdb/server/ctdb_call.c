@@ -20,13 +20,28 @@
   see http://wiki.samba.org/index.php/Samba_%26_Clustering for
   protocol design and packet details
 */
-#include "includes.h"
-#include "tdb.h"
-#include "lib/util/dlinklist.h"
+#include "replace.h"
 #include "system/network.h"
 #include "system/filesys.h"
-#include "../include/ctdb_private.h"
-#include "../common/rb_tree.h"
+
+#include <talloc.h>
+#include <tevent.h>
+
+#include "lib/util/dlinklist.h"
+#include "lib/util/debug.h"
+#include "lib/util/samba_util.h"
+#include "lib/util/sys_rw.h"
+#include "lib/util/util_process.h"
+
+#include "ctdb_private.h"
+#include "ctdb_client.h"
+
+#include "common/rb_tree.h"
+#include "common/reqid.h"
+#include "common/system.h"
+#include "common/common.h"
+#include "common/logging.h"
+#include "common/hash_count.h"
 
 struct ctdb_sticky_record {
 	struct ctdb_context *ctdb;
@@ -50,7 +65,7 @@ struct ctdb_sticky_record {
 }
 
 /*
-  a varient of input packet that can be used in lock requeue
+  a variant of input packet that can be used in lock requeue
 */
 static void ctdb_call_input_pkt(void *p, struct ctdb_req_header *hdr)
 {
@@ -70,7 +85,7 @@ static void ctdb_send_error(struct ctdb_context *ctdb,
 			    const char *fmt, ...)
 {
 	va_list ap;
-	struct ctdb_reply_error *r;
+	struct ctdb_reply_error_old *r;
 	char *msg;
 	int msglen, len;
 
@@ -87,9 +102,9 @@ static void ctdb_send_error(struct ctdb_context *ctdb,
 	va_end(ap);
 
 	msglen = strlen(msg)+1;
-	len = offsetof(struct ctdb_reply_error, msg);
+	len = offsetof(struct ctdb_reply_error_old, msg);
 	r = ctdb_transport_allocate(ctdb, msg, CTDB_REPLY_ERROR, len + msglen, 
-				    struct ctdb_reply_error);
+				    struct ctdb_reply_error_old);
 	CTDB_NO_MEMORY_FATAL(ctdb, r);
 
 	r->hdr.destnode  = hdr->srcnode;
@@ -120,7 +135,7 @@ static void ctdb_send_error(struct ctdb_context *ctdb,
 static void ctdb_call_send_redirect(struct ctdb_context *ctdb,
 				    struct ctdb_db_context *ctdb_db,
 				    TDB_DATA key,
-				    struct ctdb_req_call *c, 
+				    struct ctdb_req_call_old *c, 
 				    struct ctdb_ltdb_header *header)
 {
 	uint32_t lmaster = ctdb_lmaster(ctdb, &key);
@@ -157,7 +172,7 @@ static void ctdb_send_dmaster_reply(struct ctdb_db_context *ctdb_db,
 				    uint32_t reqid)
 {
 	struct ctdb_context *ctdb = ctdb_db->ctdb;
-	struct ctdb_reply_dmaster *r;
+	struct ctdb_reply_dmaster_old *r;
 	int ret, len;
 	TALLOC_CTX *tmp_ctx;
 
@@ -183,13 +198,14 @@ static void ctdb_send_dmaster_reply(struct ctdb_db_context *ctdb_db,
 	tmp_ctx = talloc_new(ctdb);
 
 	/* send the CTDB_REPLY_DMASTER */
-	len = offsetof(struct ctdb_reply_dmaster, data) + key.dsize + data.dsize + sizeof(uint32_t);
+	len = offsetof(struct ctdb_reply_dmaster_old, data) + key.dsize + data.dsize + sizeof(uint32_t);
 	r = ctdb_transport_allocate(ctdb, tmp_ctx, CTDB_REPLY_DMASTER, len,
-				    struct ctdb_reply_dmaster);
+				    struct ctdb_reply_dmaster_old);
 	CTDB_NO_MEMORY_FATAL(ctdb, r);
 
 	r->hdr.destnode  = new_dmaster;
 	r->hdr.reqid     = reqid;
+	r->hdr.generation = ctdb_db->generation;
 	r->rsn           = header->rsn;
 	r->keylen        = key.dsize;
 	r->datalen       = data.dsize;
@@ -211,11 +227,11 @@ static void ctdb_send_dmaster_reply(struct ctdb_db_context *ctdb_db,
   CTDB_REPLY_DMASTER to the new dmaster
 */
 static void ctdb_call_send_dmaster(struct ctdb_db_context *ctdb_db, 
-				   struct ctdb_req_call *c, 
+				   struct ctdb_req_call_old *c, 
 				   struct ctdb_ltdb_header *header,
 				   TDB_DATA *key, TDB_DATA *data)
 {
-	struct ctdb_req_dmaster *r;
+	struct ctdb_req_dmaster_old *r;
 	struct ctdb_context *ctdb = ctdb_db->ctdb;
 	int len;
 	uint32_t lmaster = ctdb_lmaster(ctdb, key);
@@ -235,13 +251,14 @@ static void ctdb_call_send_dmaster(struct ctdb_db_context *ctdb_db,
 		return;
 	}
 	
-	len = offsetof(struct ctdb_req_dmaster, data) + key->dsize + data->dsize
+	len = offsetof(struct ctdb_req_dmaster_old, data) + key->dsize + data->dsize
 			+ sizeof(uint32_t);
 	r = ctdb_transport_allocate(ctdb, ctdb, CTDB_REQ_DMASTER, len, 
-				    struct ctdb_req_dmaster);
+				    struct ctdb_req_dmaster_old);
 	CTDB_NO_MEMORY_FATAL(ctdb, r);
 	r->hdr.destnode  = lmaster;
 	r->hdr.reqid     = c->hdr.reqid;
+	r->hdr.generation = ctdb_db->generation;
 	r->db_id         = c->db_id;
 	r->rsn           = header->rsn;
 	r->dmaster       = c->hdr.srcnode;
@@ -261,8 +278,9 @@ static void ctdb_call_send_dmaster(struct ctdb_db_context *ctdb_db,
 	talloc_free(r);
 }
 
-static void ctdb_sticky_pindown_timeout(struct event_context *ev, struct timed_event *te, 
-				       struct timeval t, void *private_data)
+static void ctdb_sticky_pindown_timeout(struct tevent_context *ev,
+					struct tevent_timer *te,
+					struct timeval t, void *private_data)
 {
 	struct ctdb_sticky_record *sr = talloc_get_type(private_data, 
 						       struct ctdb_sticky_record);
@@ -303,7 +321,10 @@ ctdb_set_sticky_pindown(struct ctdb_context *ctdb, struct ctdb_db_context *ctdb_
 			DEBUG(DEBUG_ERR,("Failed to allocate pindown context for sticky record\n"));
 			return -1;
 		}
-		event_add_timed(ctdb->ev, sr->pindown, timeval_current_ofs(ctdb->tunable.sticky_pindown / 1000, (ctdb->tunable.sticky_pindown * 1000) % 1000000), ctdb_sticky_pindown_timeout, sr);
+		tevent_add_timer(ctdb->ev, sr->pindown,
+				 timeval_current_ofs(ctdb->tunable.sticky_pindown / 1000,
+						     (ctdb->tunable.sticky_pindown * 1000) % 1000000),
+				 ctdb_sticky_pindown_timeout, sr);
 	}
 
 	return 0;
@@ -332,7 +353,7 @@ static void ctdb_become_dmaster(struct ctdb_db_context *ctdb_db,
 	header.dmaster = ctdb->pnn;
 	header.flags = record_flags;
 
-	state = ctdb_reqid_find(ctdb, hdr->reqid, struct ctdb_call_state);
+	state = reqid_find(ctdb->idr, hdr->reqid, struct ctdb_call_state);
 
 	if (state) {
 		if (state->call->flags & CTDB_CALL_FLAG_VACUUM_MIGRATION) {
@@ -360,7 +381,7 @@ static void ctdb_become_dmaster(struct ctdb_db_context *ctdb_db,
 	   see if the record is flagged as "hot" and set up a pin-down
 	   context to stop migrations for a little while if so
 	*/
-	if (ctdb_db->sticky) {
+	if (ctdb_db_sticky(ctdb_db)) {
 		ctdb_set_sticky_pindown(ctdb, ctdb_db, key);
 	}
 
@@ -396,6 +417,8 @@ static void ctdb_become_dmaster(struct ctdb_db_context *ctdb_db,
 		return;
 	}
 
+	(void) hash_count_increment(ctdb_db->migratedb, key);
+
 	ctdb_call_local(ctdb_db, state->call, &header, state, &data, true);
 
 	ret = ctdb_ltdb_unlock(ctdb_db, state->call->key);
@@ -416,7 +439,7 @@ struct dmaster_defer_call {
 };
 
 struct dmaster_defer_queue {
-	struct ctdb_context *ctdb;
+	struct ctdb_db_context *ctdb_db;
 	uint32_t generation;
 	struct dmaster_defer_call *deferred_calls;
 };
@@ -436,7 +459,7 @@ static void dmaster_defer_reprocess(struct tevent_context *ev,
 static int dmaster_defer_queue_destructor(struct dmaster_defer_queue *ddq)
 {
 	/* Ignore requests, if database recovery happens in-between. */
-	if (ddq->generation != ddq->ctdb->vnn_map->generation) {
+	if (ddq->generation != ddq->ctdb_db->generation) {
 		return 0;
 	}
 
@@ -461,7 +484,7 @@ static void *insert_ddq_callback(void *parm, void *data)
 }
 
 /**
- * This function is used to reigster a key in database that needs to be updated.
+ * This function is used to register a key in database that needs to be updated.
  * Any requests for that key should get deferred till this is completed.
  */
 static int dmaster_defer_setup(struct ctdb_db_context *ctdb_db,
@@ -480,8 +503,15 @@ static int dmaster_defer_setup(struct ctdb_db_context *ctdb_db,
 	/* Already exists */
 	ddq = trbt_lookuparray32(ctdb_db->defer_dmaster, k[0], k);
 	if (ddq != NULL) {
-		talloc_free(k);
-		return 0;
+		if (ddq->generation == ctdb_db->generation) {
+			talloc_free(k);
+			return 0;
+		}
+
+		/* Recovery occurred - get rid of old queue. All the deferred
+		 * requests will be resent anyway from ctdb_call_resend_db.
+		 */
+		talloc_free(ddq);
 	}
 
 	ddq = talloc(hdr, struct dmaster_defer_queue);
@@ -490,7 +520,7 @@ static int dmaster_defer_setup(struct ctdb_db_context *ctdb_db,
 		talloc_free(k);
 		return -1;
 	}
-	ddq->ctdb = ctdb_db->ctdb;
+	ddq->ctdb_db = ctdb_db;
 	ddq->generation = hdr->generation;
 	ddq->deferred_calls = NULL;
 
@@ -539,7 +569,7 @@ static int dmaster_defer_add(struct ctdb_db_context *ctdb_db,
 	call->ctdb = ctdb_db->ctdb;
 	call->hdr = talloc_steal(call, hdr);
 
-	DLIST_ADD_END(ddq->deferred_calls, call, NULL);
+	DLIST_ADD_END(ddq->deferred_calls, call);
 
 	return 0;
 }
@@ -552,7 +582,7 @@ static int dmaster_defer_add(struct ctdb_db_context *ctdb_db,
 */
 void ctdb_request_dmaster(struct ctdb_context *ctdb, struct ctdb_req_header *hdr)
 {
-	struct ctdb_req_dmaster *c = (struct ctdb_req_dmaster *)hdr;
+	struct ctdb_req_dmaster_old *c = (struct ctdb_req_dmaster_old *)hdr;
 	TDB_DATA key, data, data2;
 	struct ctdb_ltdb_header header;
 	struct ctdb_db_context *ctdb_db;
@@ -564,7 +594,7 @@ void ctdb_request_dmaster(struct ctdb_context *ctdb, struct ctdb_req_header *hdr
 	key.dsize = c->keylen;
 	data.dptr = c->data + c->keylen;
 	data.dsize = c->datalen;
-	len = offsetof(struct ctdb_req_dmaster, data) + key.dsize + data.dsize
+	len = offsetof(struct ctdb_req_dmaster_old, data) + key.dsize + data.dsize
 			+ sizeof(uint32_t);
 	if (len <= c->hdr.length) {
 		memcpy(&record_flags, &c->data[c->keylen + c->datalen],
@@ -594,9 +624,10 @@ void ctdb_request_dmaster(struct ctdb_context *ctdb, struct ctdb_req_header *hdr
 	}
 
 	if (ctdb_lmaster(ctdb, &key) != ctdb->pnn) {
-		DEBUG(DEBUG_ALERT,("pnn %u dmaster request to non-lmaster lmaster=%u gen=%u curgen=%u\n",
-			 ctdb->pnn, ctdb_lmaster(ctdb, &key), 
-			 hdr->generation, ctdb->vnn_map->generation));
+		DEBUG(DEBUG_ERR, ("dmaster request to non-lmaster "
+				  "db=%s lmaster=%u gen=%u curgen=%u\n",
+				  ctdb_db->db_name, ctdb_lmaster(ctdb, &key),
+				  hdr->generation, ctdb_db->generation));
 		ctdb_fatal(ctdb, "ctdb_req_dmaster to non-lmaster");
 	}
 
@@ -646,7 +677,8 @@ void ctdb_request_dmaster(struct ctdb_context *ctdb, struct ctdb_req_header *hdr
 	}
 }
 
-static void ctdb_sticky_record_timeout(struct event_context *ev, struct timed_event *te, 
+static void ctdb_sticky_record_timeout(struct tevent_context *ev,
+				       struct tevent_timer *te,
 				       struct timeval t, void *private_data)
 {
 	struct ctdb_sticky_record *sr = talloc_get_type(private_data, 
@@ -700,7 +732,9 @@ ctdb_make_record_sticky(struct ctdb_context *ctdb, struct ctdb_db_context *ctdb_
 
 	trbt_insertarray32_callback(ctdb_db->sticky_records, k[0], &k[0], ctdb_make_sticky_record_callback, sr);
 
-	event_add_timed(ctdb->ev, sr, timeval_current_ofs(ctdb->tunable.sticky_duration, 0), ctdb_sticky_record_timeout, sr);
+	tevent_add_timer(ctdb->ev, sr,
+			 timeval_current_ofs(ctdb->tunable.sticky_duration, 0),
+			 ctdb_sticky_record_timeout, sr);
 
 	talloc_free(tmp_ctx);
 	return 0;
@@ -716,8 +750,9 @@ struct pinned_down_deferred_call {
 	struct ctdb_req_header *hdr;
 };
 
-static void pinned_down_requeue(struct event_context *ev, struct timed_event *te, 
-		       struct timeval t, void *private_data)
+static void pinned_down_requeue(struct tevent_context *ev,
+				struct tevent_timer *te,
+				struct timeval t, void *private_data)
 {
 	struct pinned_down_requeue_handle *handle = talloc_get_type(private_data, struct pinned_down_requeue_handle);
 	struct ctdb_context *ctdb = handle->ctdb;
@@ -737,7 +772,8 @@ static int pinned_down_destructor(struct pinned_down_deferred_call *pinned_down)
 	handle->hdr  = pinned_down->hdr;
 	talloc_steal(handle, handle->hdr);
 
-	event_add_timed(ctdb->ev, handle, timeval_zero(), pinned_down_requeue, handle);
+	tevent_add_timer(ctdb->ev, handle, timeval_zero(),
+			 pinned_down_requeue, handle);
 
 	return 0;
 }
@@ -785,12 +821,14 @@ ctdb_defer_pinned_down_request(struct ctdb_context *ctdb, struct ctdb_db_context
 }
 
 static void
-ctdb_update_db_stat_hot_keys(struct ctdb_db_context *ctdb_db, TDB_DATA key, int hopcount)
+ctdb_update_db_stat_hot_keys(struct ctdb_db_context *ctdb_db, TDB_DATA key,
+			     unsigned int count)
 {
 	int i, id;
+	char *keystr;
 
 	/* smallest value is always at index 0 */
-	if (hopcount <= ctdb_db->statistics.hot_keys[0].count) {
+	if (count <= ctdb_db->statistics.hot_keys[0].count) {
 		return;
 	}
 
@@ -803,10 +841,10 @@ ctdb_update_db_stat_hot_keys(struct ctdb_db_context *ctdb_db, TDB_DATA key, int 
 			continue;
 		}
 		/* found an entry for this key */
-		if (hopcount <= ctdb_db->statistics.hot_keys[i].count) {
+		if (count <= ctdb_db->statistics.hot_keys[i].count) {
 			return;
 		}
-		ctdb_db->statistics.hot_keys[i].count = hopcount;
+		ctdb_db->statistics.hot_keys[i].count = count;
 		goto sort_keys;
 	}
 
@@ -822,9 +860,14 @@ ctdb_update_db_stat_hot_keys(struct ctdb_db_context *ctdb_db, TDB_DATA key, int 
 	}
 	ctdb_db->statistics.hot_keys[id].key.dsize = key.dsize;
 	ctdb_db->statistics.hot_keys[id].key.dptr  = talloc_memdup(ctdb_db, key.dptr, key.dsize);
-	ctdb_db->statistics.hot_keys[id].count = hopcount;
-	DEBUG(DEBUG_NOTICE,("Updated hot key database=%s key=0x%08x id=%d hop_count=%d\n",
-			    ctdb_db->db_name, ctdb_hash(&key), id, hopcount));
+	ctdb_db->statistics.hot_keys[id].count = count;
+
+	keystr = hex_encode_talloc(ctdb_db,
+				   (unsigned char *)key.dptr, key.dsize);
+	DEBUG(DEBUG_NOTICE,("Updated hot key database=%s key=%s id=%d "
+			    "count=%d\n", ctdb_db->db_name,
+			    keystr ? keystr : "" , id, count));
+	talloc_free(keystr);
 
 sort_keys:
 	for (i = 1; i < MAX_HOT_KEYS; i++) {
@@ -832,9 +875,9 @@ sort_keys:
 			continue;
 		}
 		if (ctdb_db->statistics.hot_keys[i].count < ctdb_db->statistics.hot_keys[0].count) {
-			hopcount = ctdb_db->statistics.hot_keys[i].count;
+			count = ctdb_db->statistics.hot_keys[i].count;
 			ctdb_db->statistics.hot_keys[i].count = ctdb_db->statistics.hot_keys[0].count;
-			ctdb_db->statistics.hot_keys[0].count = hopcount;
+			ctdb_db->statistics.hot_keys[0].count = count;
 
 			key = ctdb_db->statistics.hot_keys[i].key;
 			ctdb_db->statistics.hot_keys[i].key = ctdb_db->statistics.hot_keys[0].key;
@@ -848,9 +891,9 @@ sort_keys:
 */
 void ctdb_request_call(struct ctdb_context *ctdb, struct ctdb_req_header *hdr)
 {
-	struct ctdb_req_call *c = (struct ctdb_req_call *)hdr;
+	struct ctdb_req_call_old *c = (struct ctdb_req_call_old *)hdr;
 	TDB_DATA data;
-	struct ctdb_reply_call *r;
+	struct ctdb_reply_call_old *r;
 	int ret, len;
 	struct ctdb_ltdb_header header;
 	struct ctdb_call *call;
@@ -886,7 +929,7 @@ void ctdb_request_call(struct ctdb_context *ctdb, struct ctdb_req_header *hdr)
 	/* If this record is pinned down we should defer the
 	   request until the pindown times out
 	*/
-	if (ctdb_db->sticky) {
+	if (ctdb_db_sticky(ctdb_db)) {
 		if (ctdb_defer_pinned_down_request(ctdb, ctdb_db, call->key, hdr) == 0) {
 			DEBUG(DEBUG_WARNING,
 			      ("Defer request for pinned down record in %s\n", ctdb_db->db_name));
@@ -917,8 +960,8 @@ void ctdb_request_call(struct ctdb_context *ctdb, struct ctdb_req_header *hdr)
 		return;
 	}
 
-	/* Dont do READONLY if we dont have a tracking database */
-	if ((c->flags & CTDB_WANT_READONLY) && !ctdb_db->readonly) {
+	/* Dont do READONLY if we don't have a tracking database */
+	if ((c->flags & CTDB_WANT_READONLY) && !ctdb_db_readonly(ctdb_db)) {
 		c->flags &= ~CTDB_WANT_READONLY;
 	}
 
@@ -1001,7 +1044,7 @@ void ctdb_request_call(struct ctdb_context *ctdb, struct ctdb_req_header *hdr)
 		}
 	}
 	if ((c->flags & CTDB_WANT_READONLY) 
-	&&  (call->call_id == CTDB_FETCH_WITH_HEADER_FUNC)) {
+	&&  ((unsigned int)call->call_id == CTDB_FETCH_WITH_HEADER_FUNC)) {
 		TDB_DATA tdata;
 
 		tdata = tdb_fetch(ctdb_db->rottdb, call->key);
@@ -1018,12 +1061,13 @@ void ctdb_request_call(struct ctdb_context *ctdb, struct ctdb_req_header *hdr)
 			DEBUG(DEBUG_ERR,(__location__ " ctdb_ltdb_unlock() failed with error %d\n", ret));
 		}
 
-		len = offsetof(struct ctdb_reply_call, data) + data.dsize + sizeof(struct ctdb_ltdb_header);
+		len = offsetof(struct ctdb_reply_call_old, data) + data.dsize + sizeof(struct ctdb_ltdb_header);
 		r = ctdb_transport_allocate(ctdb, ctdb, CTDB_REPLY_CALL, len, 
-					    struct ctdb_reply_call);
+					    struct ctdb_reply_call_old);
 		CTDB_NO_MEMORY_FATAL(ctdb, r);
 		r->hdr.destnode  = c->hdr.srcnode;
 		r->hdr.reqid     = c->hdr.reqid;
+		r->hdr.generation = ctdb_db->generation;
 		r->status        = 0;
 		r->datalen       = data.dsize + sizeof(struct ctdb_ltdb_header);
 		header.rsn      -= 2;
@@ -1048,7 +1092,7 @@ void ctdb_request_call(struct ctdb_context *ctdb, struct ctdb_req_header *hdr)
 	tmp_count = c->hopcount;
 	bucket = 0;
 	while (tmp_count) {
-		tmp_count >>= 2;
+		tmp_count >>= 1;
 		bucket++;
 	}
 	if (bucket >= MAX_COUNT_BUCKETS) {
@@ -1056,13 +1100,13 @@ void ctdb_request_call(struct ctdb_context *ctdb, struct ctdb_req_header *hdr)
 	}
 	CTDB_INCREMENT_STAT(ctdb, hop_count_bucket[bucket]);
 	CTDB_INCREMENT_DB_STAT(ctdb_db, hop_count_bucket[bucket]);
-	ctdb_update_db_stat_hot_keys(ctdb_db, call->key, c->hopcount);
 
 	/* If this database supports sticky records, then check if the
 	   hopcount is big. If it is it means the record is hot and we
 	   should make it sticky.
 	*/
-	if (ctdb_db->sticky && c->hopcount >= ctdb->tunable.hopcount_make_sticky) {
+	if (ctdb_db_sticky(ctdb_db) &&
+	    c->hopcount >= ctdb->tunable.hopcount_make_sticky) {
 		ctdb_make_record_sticky(ctdb, ctdb_db, call->key);
 	}
 
@@ -1102,12 +1146,13 @@ void ctdb_request_call(struct ctdb_context *ctdb, struct ctdb_req_header *hdr)
 		DEBUG(DEBUG_ERR,(__location__ " ctdb_ltdb_unlock() failed with error %d\n", ret));
 	}
 
-	len = offsetof(struct ctdb_reply_call, data) + call->reply_data.dsize;
+	len = offsetof(struct ctdb_reply_call_old, data) + call->reply_data.dsize;
 	r = ctdb_transport_allocate(ctdb, ctdb, CTDB_REPLY_CALL, len, 
-				    struct ctdb_reply_call);
+				    struct ctdb_reply_call_old);
 	CTDB_NO_MEMORY_FATAL(ctdb, r);
 	r->hdr.destnode  = hdr->srcnode;
 	r->hdr.reqid     = hdr->reqid;
+	r->hdr.generation = ctdb_db->generation;
 	r->status        = call->status;
 	r->datalen       = call->reply_data.dsize;
 	if (call->reply_data.dsize) {
@@ -1128,10 +1173,10 @@ void ctdb_request_call(struct ctdb_context *ctdb, struct ctdb_req_header *hdr)
  */
 void ctdb_reply_call(struct ctdb_context *ctdb, struct ctdb_req_header *hdr)
 {
-	struct ctdb_reply_call *c = (struct ctdb_reply_call *)hdr;
+	struct ctdb_reply_call_old *c = (struct ctdb_reply_call_old *)hdr;
 	struct ctdb_call_state *state;
 
-	state = ctdb_reqid_find(ctdb, hdr->reqid, struct ctdb_call_state);
+	state = reqid_find(ctdb->idr, hdr->reqid, struct ctdb_call_state);
 	if (state == NULL) {
 		DEBUG(DEBUG_ERR, (__location__ " reqid %u not found\n", hdr->reqid));
 		return;
@@ -1225,7 +1270,7 @@ finished_ro:
  */
 void ctdb_reply_dmaster(struct ctdb_context *ctdb, struct ctdb_req_header *hdr)
 {
-	struct ctdb_reply_dmaster *c = (struct ctdb_reply_dmaster *)hdr;
+	struct ctdb_reply_dmaster_old *c = (struct ctdb_reply_dmaster_old *)hdr;
 	struct ctdb_db_context *ctdb_db;
 	TDB_DATA key, data;
 	uint32_t record_flags = 0;
@@ -1242,7 +1287,7 @@ void ctdb_reply_dmaster(struct ctdb_context *ctdb, struct ctdb_req_header *hdr)
 	key.dsize = c->keylen;
 	data.dptr = &c->data[key.dsize];
 	data.dsize = c->datalen;
-	len = offsetof(struct ctdb_reply_dmaster, data) + key.dsize + data.dsize
+	len = offsetof(struct ctdb_reply_dmaster_old, data) + key.dsize + data.dsize
 		+ sizeof(uint32_t);
 	if (len <= c->hdr.length) {
 		memcpy(&record_flags, &c->data[c->keylen + c->datalen],
@@ -1270,10 +1315,10 @@ void ctdb_reply_dmaster(struct ctdb_context *ctdb, struct ctdb_req_header *hdr)
 */
 void ctdb_reply_error(struct ctdb_context *ctdb, struct ctdb_req_header *hdr)
 {
-	struct ctdb_reply_error *c = (struct ctdb_reply_error *)hdr;
+	struct ctdb_reply_error_old *c = (struct ctdb_reply_error_old *)hdr;
 	struct ctdb_call_state *state;
 
-	state = ctdb_reqid_find(ctdb, hdr->reqid, struct ctdb_call_state);
+	state = reqid_find(ctdb->idr, hdr->reqid, struct ctdb_call_state);
 	if (state == NULL) {
 		DEBUG(DEBUG_ERR,("pnn %u Invalid reqid %u in ctdb_reply_error\n",
 			 ctdb->pnn, hdr->reqid));
@@ -1301,8 +1346,8 @@ void ctdb_reply_error(struct ctdb_context *ctdb, struct ctdb_req_header *hdr)
 */
 static int ctdb_call_destructor(struct ctdb_call_state *state)
 {
-	DLIST_REMOVE(state->ctdb_db->ctdb->pending_calls, state);
-	ctdb_reqid_remove(state->ctdb_db->ctdb, state->reqid);
+	DLIST_REMOVE(state->ctdb_db->pending_calls, state);
+	reqid_remove(state->ctdb_db->ctdb->idr, state->reqid);
 	return 0;
 }
 
@@ -1314,11 +1359,11 @@ static void ctdb_call_resend(struct ctdb_call_state *state)
 {
 	struct ctdb_context *ctdb = state->ctdb_db->ctdb;
 
-	state->generation = ctdb->vnn_map->generation;
+	state->generation = state->ctdb_db->generation;
 
 	/* use a new reqid, in case the old reply does eventually come in */
-	ctdb_reqid_remove(ctdb, state->reqid);
-	state->reqid = ctdb_reqid_new(ctdb, state);
+	reqid_remove(ctdb->idr, state->reqid);
+	state->reqid = reqid_new(ctdb->idr, state);
 	state->c->hdr.reqid = state->reqid;
 
 	/* update the generation count for this request, so its valid with the new vnn_map */
@@ -1328,26 +1373,38 @@ static void ctdb_call_resend(struct ctdb_call_state *state)
 	state->c->hdr.destnode = ctdb->pnn;
 
 	ctdb_queue_packet(ctdb, &state->c->hdr);
-	DEBUG(DEBUG_NOTICE,("resent ctdb_call\n"));
+	DEBUG(DEBUG_NOTICE,("resent ctdb_call for db %s reqid %u generation %u\n",
+			    state->ctdb_db->db_name, state->reqid, state->generation));
 }
 
 /*
   resend all pending calls on recovery
  */
-void ctdb_call_resend_all(struct ctdb_context *ctdb)
+void ctdb_call_resend_db(struct ctdb_db_context *ctdb_db)
 {
 	struct ctdb_call_state *state, *next;
-	for (state=ctdb->pending_calls;state;state=next) {
+
+	for (state = ctdb_db->pending_calls; state; state = next) {
 		next = state->next;
 		ctdb_call_resend(state);
+	}
+}
+
+void ctdb_call_resend_all(struct ctdb_context *ctdb)
+{
+	struct ctdb_db_context *ctdb_db;
+
+	for (ctdb_db = ctdb->db_list; ctdb_db; ctdb_db = ctdb_db->next) {
+		ctdb_call_resend_db(ctdb_db);
 	}
 }
 
 /*
   this allows the caller to setup a async.fn 
 */
-static void call_local_trigger(struct event_context *ev, struct timed_event *te, 
-		       struct timeval t, void *private_data)
+static void call_local_trigger(struct tevent_context *ev,
+			       struct tevent_timer *te,
+			       struct timeval t, void *private_data)
 {
 	struct ctdb_call_state *state = talloc_get_type(private_data, struct ctdb_call_state);
 	if (state->async.fn) {
@@ -1387,7 +1444,8 @@ struct ctdb_call_state *ctdb_call_local_send(struct ctdb_db_context *ctdb_db,
 		DEBUG(DEBUG_DEBUG,("ctdb_call_local() failed, ignoring return code %d\n", ret));
 	}
 
-	event_add_timed(ctdb->ev, state, timeval_zero(), call_local_trigger, state);
+	tevent_add_timer(ctdb->ev, state, timeval_zero(),
+			 call_local_trigger, state);
 
 	return state;
 }
@@ -1406,6 +1464,7 @@ struct ctdb_call_state *ctdb_daemon_call_send_remote(struct ctdb_db_context *ctd
 	uint32_t len;
 	struct ctdb_call_state *state;
 	struct ctdb_context *ctdb = ctdb_db->ctdb;
+	struct ctdb_req_call_old *c;
 
 	if (ctdb->methods == NULL) {
 		DEBUG(DEBUG_INFO,(__location__ " Failed send packet. Transport is down\n"));
@@ -1417,36 +1476,45 @@ struct ctdb_call_state *ctdb_daemon_call_send_remote(struct ctdb_db_context *ctd
 	state->call = talloc(state, struct ctdb_call);
 	CTDB_NO_MEMORY_NULL(ctdb, state->call);
 
-	state->reqid = ctdb_reqid_new(ctdb, state);
+	state->reqid = reqid_new(ctdb->idr, state);
 	state->ctdb_db = ctdb_db;
-	talloc_set_destructor(state, ctdb_call_destructor);
-
-	len = offsetof(struct ctdb_req_call, data) + call->key.dsize + call->call_data.dsize;
-	state->c = ctdb_transport_allocate(ctdb, state, CTDB_REQ_CALL, len, 
-					   struct ctdb_req_call);
-	CTDB_NO_MEMORY_NULL(ctdb, state->c);
-	state->c->hdr.destnode  = header->dmaster;
-
-	/* this limits us to 16k outstanding messages - not unreasonable */
-	state->c->hdr.reqid     = state->reqid;
-	state->c->flags         = call->flags;
-	state->c->db_id         = ctdb_db->db_id;
-	state->c->callid        = call->call_id;
-	state->c->hopcount      = 0;
-	state->c->keylen        = call->key.dsize;
-	state->c->calldatalen   = call->call_data.dsize;
-	memcpy(&state->c->data[0], call->key.dptr, call->key.dsize);
-	memcpy(&state->c->data[call->key.dsize], 
-	       call->call_data.dptr, call->call_data.dsize);
-	*(state->call)              = *call;
-	state->call->call_data.dptr = &state->c->data[call->key.dsize];
-	state->call->key.dptr       = &state->c->data[0];
-
 	state->state  = CTDB_CALL_WAIT;
-	state->generation = ctdb->vnn_map->generation;
+	state->generation = ctdb_db->generation;
 
-	DLIST_ADD(ctdb->pending_calls, state);
+	len = offsetof(struct ctdb_req_call_old, data) + call->key.dsize +
+		       call->call_data.dsize;
 
+	c = ctdb_transport_allocate(ctdb,
+				    state,
+				    CTDB_REQ_CALL,
+				    len,
+				    struct ctdb_req_call_old);
+
+	CTDB_NO_MEMORY_NULL(ctdb, c);
+	state->c = c;
+
+	c->hdr.destnode  = header->dmaster;
+	c->hdr.reqid     = state->reqid;
+	c->hdr.generation = ctdb_db->generation;
+	c->flags         = call->flags;
+	c->db_id         = ctdb_db->db_id;
+	c->callid        = call->call_id;
+	c->hopcount      = 0;
+	c->keylen        = call->key.dsize;
+	c->calldatalen   = call->call_data.dsize;
+
+	memcpy(&c->data[0], call->key.dptr, call->key.dsize);
+	memcpy(&c->data[call->key.dsize],
+	       call->call_data.dptr,
+	       call->call_data.dsize);
+
+	*(state->call) = *call;
+	state->call->call_data.dptr = &c->data[call->key.dsize];
+	state->call->key.dptr       = &c->data[0];
+
+	DLIST_ADD(ctdb_db->pending_calls, state);
+
+	talloc_set_destructor(state, ctdb_call_destructor);
 	ctdb_queue_packet(ctdb, &state->c->hdr);
 
 	return state;
@@ -1461,7 +1529,7 @@ struct ctdb_call_state *ctdb_daemon_call_send_remote(struct ctdb_db_context *ctd
 int ctdb_daemon_call_recv(struct ctdb_call_state *state, struct ctdb_call *call)
 {
 	while (state->state < CTDB_CALL_DONE) {
-		event_loop_once(state->ctdb_db->ctdb->ev);
+		tevent_loop_once(state->ctdb_db->ctdb->ev);
 	}
 	if (state->state != CTDB_CALL_DONE) {
 		ctdb_set_error(state->ctdb_db->ctdb, "%s", state->errmsg);
@@ -1484,128 +1552,143 @@ int ctdb_daemon_call_recv(struct ctdb_call_state *state, struct ctdb_call *call)
 }
 
 
-/* 
-   send a keepalive packet to the other node
-*/
-void ctdb_send_keepalive(struct ctdb_context *ctdb, uint32_t destnode)
-{
-	struct ctdb_req_keepalive *r;
-	
-	if (ctdb->methods == NULL) {
-		DEBUG(DEBUG_INFO,(__location__ " Failed to send keepalive. Transport is DOWN\n"));
-		return;
-	}
-
-	r = ctdb_transport_allocate(ctdb, ctdb, CTDB_REQ_KEEPALIVE,
-				    sizeof(struct ctdb_req_keepalive), 
-				    struct ctdb_req_keepalive);
-	CTDB_NO_MEMORY_FATAL(ctdb, r);
-	r->hdr.destnode  = destnode;
-	r->hdr.reqid     = 0;
-	
-	CTDB_INCREMENT_STAT(ctdb, keepalive_packets_sent);
-
-	ctdb_queue_packet(ctdb, &r->hdr);
-
-	talloc_free(r);
-}
-
-
-
 struct revokechild_deferred_call {
+	struct revokechild_deferred_call *prev, *next;
 	struct ctdb_context *ctdb;
 	struct ctdb_req_header *hdr;
 	deferred_requeue_fn fn;
 	void *ctx;
+	struct revokechild_handle *rev_hdl;
 };
 
 struct revokechild_handle {
 	struct revokechild_handle *next, *prev;
 	struct ctdb_context *ctdb;
 	struct ctdb_db_context *ctdb_db;
-	struct fd_event *fde;
+	struct tevent_fd *fde;
 	int status;
 	int fd[2];
 	pid_t child;
 	TDB_DATA key;
+	struct revokechild_deferred_call *deferred_call_list;
 };
 
-struct revokechild_requeue_handle {
-	struct ctdb_context *ctdb;
-	struct ctdb_req_header *hdr;
-	deferred_requeue_fn fn;
-	void *ctx;
-};
-
-static void deferred_call_requeue(struct event_context *ev, struct timed_event *te, 
-		       struct timeval t, void *private_data)
+static void deferred_call_requeue(struct tevent_context *ev,
+				  struct tevent_timer *te,
+				  struct timeval t, void *private_data)
 {
-	struct revokechild_requeue_handle *requeue_handle = talloc_get_type(private_data, struct revokechild_requeue_handle);
+	struct revokechild_deferred_call *dlist = talloc_get_type_abort(
+		private_data, struct revokechild_deferred_call);
 
-	requeue_handle->fn(requeue_handle->ctx, requeue_handle->hdr);
-	talloc_free(requeue_handle);
+	while (dlist != NULL) {
+		struct revokechild_deferred_call *dcall = dlist;
+
+		talloc_set_destructor(dcall, NULL);
+		DLIST_REMOVE(dlist, dcall);
+		dcall->fn(dcall->ctx, dcall->hdr);
+		talloc_free(dcall);
+	}
 }
 
-static int deferred_call_destructor(struct revokechild_deferred_call *deferred_call)
+static int deferred_call_destructor(struct revokechild_deferred_call *dcall)
 {
-	struct ctdb_context *ctdb = deferred_call->ctdb;
-	struct revokechild_requeue_handle *requeue_handle = talloc(ctdb, struct revokechild_requeue_handle);
-	struct ctdb_req_call *c = (struct ctdb_req_call *)deferred_call->hdr;
+	struct revokechild_handle *rev_hdl = dcall->rev_hdl;
 
-	requeue_handle->ctdb = ctdb;
-	requeue_handle->hdr  = deferred_call->hdr;
-	requeue_handle->fn   = deferred_call->fn;
-	requeue_handle->ctx  = deferred_call->ctx;
-	talloc_steal(requeue_handle, requeue_handle->hdr);
+	DLIST_REMOVE(rev_hdl->deferred_call_list, dcall);
+	return 0;
+}
 
-	/* when revoking, any READONLY requests have 1 second grace to let read/write finish first */
-	event_add_timed(ctdb->ev, requeue_handle, timeval_current_ofs(c->flags & CTDB_WANT_READONLY ? 1 : 0, 0), deferred_call_requeue, requeue_handle);
+static int revokechild_destructor(struct revokechild_handle *rev_hdl)
+{
+	struct revokechild_deferred_call *now_list = NULL;
+	struct revokechild_deferred_call *delay_list = NULL;
+
+	if (rev_hdl->fde != NULL) {
+		talloc_free(rev_hdl->fde);
+	}
+
+	if (rev_hdl->fd[0] != -1) {
+		close(rev_hdl->fd[0]);
+	}
+	if (rev_hdl->fd[1] != -1) {
+		close(rev_hdl->fd[1]);
+	}
+	ctdb_kill(rev_hdl->ctdb, rev_hdl->child, SIGKILL);
+
+	DLIST_REMOVE(rev_hdl->ctdb_db->revokechild_active, rev_hdl);
+
+	while (rev_hdl->deferred_call_list != NULL) {
+		struct revokechild_deferred_call *dcall;
+
+		dcall = rev_hdl->deferred_call_list;
+		DLIST_REMOVE(rev_hdl->deferred_call_list, dcall);
+
+		/* If revoke is successful, then first process all the calls
+		 * that need write access, and delay readonly requests by 1
+		 * second grace.
+		 *
+		 * If revoke is unsuccessful, most likely because of node
+		 * failure, delay all the pending requests, so database can
+		 * be recovered.
+		 */
+
+		if (rev_hdl->status == 0) {
+			struct ctdb_req_call_old *c;
+
+			c = (struct ctdb_req_call_old *)dcall->hdr;
+			if (c->flags & CTDB_WANT_READONLY) {
+				DLIST_ADD(delay_list, dcall);
+			} else {
+				DLIST_ADD(now_list, dcall);
+			}
+		} else {
+			DLIST_ADD(delay_list, dcall);
+		}
+	}
+
+	if (now_list != NULL) {
+		tevent_add_timer(rev_hdl->ctdb->ev,
+				 rev_hdl->ctdb_db,
+				 tevent_timeval_current_ofs(0, 0),
+				 deferred_call_requeue,
+				 now_list);
+	}
+
+	if (delay_list != NULL) {
+		tevent_add_timer(rev_hdl->ctdb->ev,
+				 rev_hdl->ctdb_db,
+				 tevent_timeval_current_ofs(1, 0),
+				 deferred_call_requeue,
+				 delay_list);
+	}
 
 	return 0;
 }
 
-
-static int revokechild_destructor(struct revokechild_handle *rc)
+static void revokechild_handler(struct tevent_context *ev,
+				struct tevent_fd *fde,
+				uint16_t flags, void *private_data)
 {
-	if (rc->fde != NULL) {
-		talloc_free(rc->fde);
-	}
-
-	if (rc->fd[0] != -1) {
-		close(rc->fd[0]);
-	}
-	if (rc->fd[1] != -1) {
-		close(rc->fd[1]);
-	}
-	ctdb_kill(rc->ctdb, rc->child, SIGKILL);
-
-	DLIST_REMOVE(rc->ctdb_db->revokechild_active, rc);
-	return 0;
-}
-
-static void revokechild_handler(struct event_context *ev, struct fd_event *fde, 
-			     uint16_t flags, void *private_data)
-{
-	struct revokechild_handle *rc = talloc_get_type(private_data, 
-						     struct revokechild_handle);
+	struct revokechild_handle *rev_hdl =
+		talloc_get_type(private_data, struct revokechild_handle);
 	int ret;
 	char c;
 
-	ret = sys_read(rc->fd[0], &c, 1);
+	ret = sys_read(rev_hdl->fd[0], &c, 1);
 	if (ret != 1) {
 		DEBUG(DEBUG_ERR,("Failed to read status from revokechild. errno:%d\n", errno));
-		rc->status = -1;
-		talloc_free(rc);
+		rev_hdl->status = -1;
+		talloc_free(rev_hdl);
 		return;
 	}
 	if (c != 0) {
 		DEBUG(DEBUG_ERR,("revokechild returned failure. status:%d\n", c));
-		rc->status = -1;
-		talloc_free(rc);
+		rev_hdl->status = -1;
+		talloc_free(rev_hdl);
 		return;
 	}
 
-	talloc_free(rc);
+	talloc_free(rev_hdl);
 }
 
 struct ctdb_revoke_state {
@@ -1660,8 +1743,9 @@ static void revoke_send_cb(struct ctdb_context *ctdb, uint32_t pnn, void *privat
 
 }
 
-static void ctdb_revoke_timeout_handler(struct event_context *ev, struct timed_event *te, 
-			      struct timeval yt, void *private_data)
+static void ctdb_revoke_timeout_handler(struct tevent_context *ev,
+					struct tevent_timer *te,
+					struct timeval yt, void *private_data)
 {
 	struct ctdb_revoke_state *state = private_data;
 
@@ -1683,10 +1767,12 @@ static int ctdb_revoke_all_delegations(struct ctdb_context *ctdb, struct ctdb_db
  
 	ctdb_trackingdb_traverse(ctdb, tdata, revoke_send_cb, state);
 
-	event_add_timed(ctdb->ev, state, timeval_current_ofs(ctdb->tunable.control_timeout, 0), ctdb_revoke_timeout_handler, state);
+	tevent_add_timer(ctdb->ev, state,
+			 timeval_current_ofs(ctdb->tunable.control_timeout, 0),
+			 ctdb_revoke_timeout_handler, state);
 
 	while (state->finished == 0) {
-		event_loop_once(ctdb->ev);
+		tevent_loop_once(ctdb->ev);
 	}
 
 	if (ctdb_ltdb_lock(ctdb_db, key) != 0) {
@@ -1738,19 +1824,27 @@ static int ctdb_revoke_all_delegations(struct ctdb_context *ctdb, struct ctdb_db
 }
 
 
-int ctdb_start_revoke_ro_record(struct ctdb_context *ctdb, struct ctdb_db_context *ctdb_db, TDB_DATA key, struct ctdb_ltdb_header *header, TDB_DATA data)
+int ctdb_start_revoke_ro_record(struct ctdb_context *ctdb,
+				struct ctdb_db_context *ctdb_db,
+				TDB_DATA key,
+				struct ctdb_ltdb_header *header,
+				TDB_DATA data)
 {
 	TDB_DATA tdata;
-	struct revokechild_handle *rc;
+	struct revokechild_handle *rev_hdl;
 	pid_t parent = getpid();
 	int ret;
 
-	header->flags &= ~(CTDB_REC_RO_REVOKING_READONLY|CTDB_REC_RO_HAVE_DELEGATIONS|CTDB_REC_RO_HAVE_READONLY);
+	header->flags &= ~(CTDB_REC_RO_REVOKING_READONLY |
+			   CTDB_REC_RO_HAVE_DELEGATIONS |
+			   CTDB_REC_RO_HAVE_READONLY);
+
 	header->flags |= CTDB_REC_FLAG_MIGRATED_WITH_DATA;
 	header->rsn   -= 1;
 
-	if ((rc = talloc_zero(ctdb_db, struct revokechild_handle)) == NULL) {
-		DEBUG(DEBUG_ERR,("Failed to allocate revokechild_handle\n"));
+	rev_hdl = talloc_zero(ctdb_db, struct revokechild_handle);
+	if (rev_hdl == NULL) {
+		D_ERR("Failed to allocate revokechild_handle\n");
 		return -1;
 	}
 
@@ -1759,118 +1853,197 @@ int ctdb_start_revoke_ro_record(struct ctdb_context *ctdb, struct ctdb_db_contex
 		uint8_t *tmp;
 
 		tmp = tdata.dptr;
-		tdata.dptr = talloc_memdup(rc, tdata.dptr, tdata.dsize);
+		tdata.dptr = talloc_memdup(rev_hdl, tdata.dptr, tdata.dsize);
 		free(tmp);
 	}
 
-	rc->status    = 0;
-	rc->ctdb      = ctdb;
-	rc->ctdb_db   = ctdb_db;
-	rc->fd[0]     = -1;
-	rc->fd[1]     = -1;
+	rev_hdl->status    = 0;
+	rev_hdl->ctdb      = ctdb;
+	rev_hdl->ctdb_db   = ctdb_db;
+	rev_hdl->fd[0]     = -1;
+	rev_hdl->fd[1]     = -1;
 
-	talloc_set_destructor(rc, revokechild_destructor);
-
-	rc->key.dsize = key.dsize;
-	rc->key.dptr  = talloc_memdup(rc, key.dptr, key.dsize);
-	if (rc->key.dptr == NULL) {
-		DEBUG(DEBUG_ERR,("Failed to allocate key for revokechild_handle\n"));
-		talloc_free(rc);
-		return -1;
+	rev_hdl->key.dsize = key.dsize;
+	rev_hdl->key.dptr  = talloc_memdup(rev_hdl, key.dptr, key.dsize);
+	if (rev_hdl->key.dptr == NULL) {
+		D_ERR("Failed to allocate key for revokechild_handle\n");
+		goto err_out;
 	}
 
-	ret = pipe(rc->fd);
+	ret = pipe(rev_hdl->fd);
 	if (ret != 0) {
-		DEBUG(DEBUG_ERR,("Failed to allocate key for revokechild_handle\n"));
-		talloc_free(rc);
-		return -1;
+		D_ERR("Failed to allocate key for revokechild_handle\n");
+		goto err_out;
 	}
 
 
-	rc->child = ctdb_fork(ctdb);
-	if (rc->child == (pid_t)-1) {
-		DEBUG(DEBUG_ERR,("Failed to fork child for revokechild\n"));
-		talloc_free(rc);
-		return -1;
+	rev_hdl->child = ctdb_fork(ctdb);
+	if (rev_hdl->child == (pid_t)-1) {
+		D_ERR("Failed to fork child for revokechild\n");
+		goto err_out;
 	}
 
-	if (rc->child == 0) {
+	if (rev_hdl->child == 0) {
 		char c = 0;
-		close(rc->fd[0]);
-		debug_extra = talloc_asprintf(NULL, "revokechild-%s:", ctdb_db->db_name);
+		close(rev_hdl->fd[0]);
 
-		ctdb_set_process_name("ctdb_revokechild");
-		if (switch_from_server_to_client(ctdb, "revokechild-%s", ctdb_db->db_name) != 0) {
-			DEBUG(DEBUG_ERR,("Failed to switch from server to client for revokechild process\n"));
+		prctl_set_comment("ctdb_revokechild");
+		if (switch_from_server_to_client(ctdb) != 0) {
+			D_ERR("Failed to switch from server to client "
+			      "for revokechild process\n");
 			c = 1;
 			goto child_finished;
 		}
 
-		c = ctdb_revoke_all_delegations(ctdb, ctdb_db, tdata, key, header, data);
+		c = ctdb_revoke_all_delegations(ctdb,
+						ctdb_db,
+						tdata,
+						key,
+						header,
+						data);
 
 child_finished:
-		sys_write(rc->fd[1], &c, 1);
-		/* make sure we die when our parent dies */
-		while (ctdb_kill(ctdb, parent, 0) == 0 || errno != ESRCH) {
-			sleep(5);
-		}
+		sys_write(rev_hdl->fd[1], &c, 1);
+		ctdb_wait_for_process_to_exit(parent);
 		_exit(0);
 	}
 
-	close(rc->fd[1]);
-	rc->fd[1] = -1;
-	set_close_on_exec(rc->fd[0]);
+	close(rev_hdl->fd[1]);
+	rev_hdl->fd[1] = -1;
+	set_close_on_exec(rev_hdl->fd[0]);
+
+	rev_hdl->fde = tevent_add_fd(ctdb->ev,
+				     rev_hdl,
+				     rev_hdl->fd[0],
+				     TEVENT_FD_READ,
+				     revokechild_handler,
+				     (void *)rev_hdl);
+
+	if (rev_hdl->fde == NULL) {
+		D_ERR("Failed to set up fd event for revokechild process\n");
+		talloc_free(rev_hdl);
+	}
+	tevent_fd_set_auto_close(rev_hdl->fde);
 
 	/* This is an active revokechild child process */
-	DLIST_ADD_END(ctdb_db->revokechild_active, rc, NULL);
-
-	rc->fde = event_add_fd(ctdb->ev, rc, rc->fd[0],
-				   EVENT_FD_READ, revokechild_handler,
-				   (void *)rc);
-	if (rc->fde == NULL) {
-		DEBUG(DEBUG_ERR,("Failed to set up fd event for revokechild process\n"));
-		talloc_free(rc);
-	}
-	tevent_fd_set_auto_close(rc->fde);
+	DLIST_ADD_END(ctdb_db->revokechild_active, rev_hdl);
+	talloc_set_destructor(rev_hdl, revokechild_destructor);
 
 	return 0;
+err_out:
+	talloc_free(rev_hdl);
+	return -1;
 }
 
 int ctdb_add_revoke_deferred_call(struct ctdb_context *ctdb, struct ctdb_db_context *ctdb_db, TDB_DATA key, struct ctdb_req_header *hdr, deferred_requeue_fn fn, void *call_context)
 {
-	struct revokechild_handle *rc;
+	struct revokechild_handle *rev_hdl;
 	struct revokechild_deferred_call *deferred_call;
 
-	for (rc = ctdb_db->revokechild_active; rc; rc = rc->next) {
-		if (rc->key.dsize == 0) {
+	for (rev_hdl = ctdb_db->revokechild_active;
+	     rev_hdl;
+	     rev_hdl = rev_hdl->next) {
+		if (rev_hdl->key.dsize == 0) {
 			continue;
 		}
-		if (rc->key.dsize != key.dsize) {
+		if (rev_hdl->key.dsize != key.dsize) {
 			continue;
 		}
-		if (!memcmp(rc->key.dptr, key.dptr, key.dsize)) {
+		if (!memcmp(rev_hdl->key.dptr, key.dptr, key.dsize)) {
 			break;
 		}
 	}
 
-	if (rc == NULL) {
+	if (rev_hdl == NULL) {
 		DEBUG(DEBUG_ERR,("Failed to add deferred call to revoke list. revoke structure not found\n"));
 		return -1;
 	}
 
-	deferred_call = talloc(rc, struct revokechild_deferred_call);
+	deferred_call = talloc(call_context, struct revokechild_deferred_call);
 	if (deferred_call == NULL) {
 		DEBUG(DEBUG_ERR,("Failed to allocate deferred call structure for revoking record\n"));
 		return -1;
 	}
 
 	deferred_call->ctdb = ctdb;
-	deferred_call->hdr  = hdr;
+	deferred_call->hdr  = talloc_steal(deferred_call, hdr);
 	deferred_call->fn   = fn;
 	deferred_call->ctx  = call_context;
+	deferred_call->rev_hdl   = rev_hdl;
 
 	talloc_set_destructor(deferred_call, deferred_call_destructor);
-	talloc_steal(deferred_call, hdr);
+
+	DLIST_ADD(rev_hdl->deferred_call_list, deferred_call);
+
+	return 0;
+}
+
+static void ctdb_migration_count_handler(TDB_DATA key, uint64_t counter,
+					 void *private_data)
+{
+	struct ctdb_db_context *ctdb_db = talloc_get_type_abort(
+		private_data, struct ctdb_db_context);
+	unsigned int value;
+
+	value = (counter < INT_MAX ? counter : INT_MAX);
+	ctdb_update_db_stat_hot_keys(ctdb_db, key, value);
+}
+
+static void ctdb_migration_cleandb_event(struct tevent_context *ev,
+					 struct tevent_timer *te,
+					 struct timeval current_time,
+					 void *private_data)
+{
+	struct ctdb_db_context *ctdb_db = talloc_get_type_abort(
+		private_data, struct ctdb_db_context);
+
+	if (ctdb_db->migratedb == NULL) {
+		return;
+	}
+
+	hash_count_expire(ctdb_db->migratedb, NULL);
+
+	te = tevent_add_timer(ctdb_db->ctdb->ev, ctdb_db->migratedb,
+			      tevent_timeval_current_ofs(10, 0),
+			      ctdb_migration_cleandb_event, ctdb_db);
+	if (te == NULL) {
+		DEBUG(DEBUG_ERR,
+		      ("Memory error in migration cleandb event for %s\n",
+		       ctdb_db->db_name));
+		TALLOC_FREE(ctdb_db->migratedb);
+	}
+}
+
+int ctdb_migration_init(struct ctdb_db_context *ctdb_db)
+{
+	struct timeval one_second = { 1, 0 };
+	struct tevent_timer *te;
+	int ret;
+
+	if (! ctdb_db_volatile(ctdb_db)) {
+		return 0;
+	}
+
+	ret = hash_count_init(ctdb_db, one_second,
+			      ctdb_migration_count_handler, ctdb_db,
+			      &ctdb_db->migratedb);
+	if (ret != 0) {
+		DEBUG(DEBUG_ERR,
+		      ("Memory error in migration init for %s\n",
+		       ctdb_db->db_name));
+		return -1;
+	}
+
+	te = tevent_add_timer(ctdb_db->ctdb->ev, ctdb_db->migratedb,
+			      tevent_timeval_current_ofs(10, 0),
+			      ctdb_migration_cleandb_event, ctdb_db);
+	if (te == NULL) {
+		DEBUG(DEBUG_ERR,
+		      ("Memory error in migration init for %s\n",
+		       ctdb_db->db_name));
+		TALLOC_FREE(ctdb_db->migratedb);
+		return -1;
+	}
 
 	return 0;
 }

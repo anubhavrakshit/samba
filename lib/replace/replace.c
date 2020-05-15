@@ -541,15 +541,16 @@ long long int rep_strtoll(const char *str, char **endptr, int base)
 #undef strtoll
 long long int rep_strtoll(const char *str, char **endptr, int base)
 {
+	int saved_errno = errno;
 	long long int nb = strtoll(str, endptr, base);
 	/* With glibc EINVAL is only returned if base is not ok */
 	if (errno == EINVAL) {
 		if (base == 0 || (base >1 && base <37)) {
 			/* Base was ok so it's because we were not
-			 * able to make the convertion.
+			 * able to make the conversion.
 			 * Let's reset errno.
 			 */
-			errno = 0;
+			errno = saved_errno;
 		}
 	}
 	return nb;
@@ -573,25 +574,23 @@ unsigned long long int rep_strtoull(const char *str, char **endptr, int base)
 }
 #else
 #ifdef HAVE_BSD_STRTOLL
-#ifdef HAVE_STRTOUQ
+#undef strtoull
 unsigned long long int rep_strtoull(const char *str, char **endptr, int base)
 {
-	unsigned long long int nb = strtouq(str, endptr, base);
-	/* In linux EINVAL is only returned if base is not ok */
+	int saved_errno = errno;
+	unsigned long long int nb = strtoull(str, endptr, base);
+	/* With glibc EINVAL is only returned if base is not ok */
 	if (errno == EINVAL) {
 		if (base == 0 || (base >1 && base <37)) {
 			/* Base was ok so it's because we were not
-			 * able to make the convertion.
+			 * able to make the conversion.
 			 * Let's reset errno.
 			 */
-			errno = 0;
+			errno = saved_errno;
 		}
 	}
 	return nb;
 }
-#else
-#error "You need the strtouq function"
-#endif /* HAVE_STRTOUQ */
 #endif /* HAVE_BSD_STRTOLL */
 #endif /* HAVE_STRTOULL */
 
@@ -821,6 +820,24 @@ int rep_strerror_r(int errnum, char *buf, size_t buflen)
 	strncpy(buf, s, buflen);
 	return 0;
 }
+#elif (!defined(STRERROR_R_XSI_NOT_GNU))
+#undef strerror_r
+int rep_strerror_r(int errnum, char *buf, size_t buflen)
+{
+	char *s = strerror_r(errnum, buf, buflen);
+	if (s == NULL) {
+		/* Shouldn't happen, should always get a string */
+		return EINVAL;
+	}
+	if (s != buf) {
+		strlcpy(buf, s, buflen);
+		if (strlen(s) > buflen - 1) {
+			return ERANGE;
+		}
+	}
+	return 0;
+
+}
 #endif
 
 #ifndef HAVE_CLOCK_GETTIME
@@ -829,7 +846,7 @@ int rep_clock_gettime(clockid_t clk_id, struct timespec *tp)
 	struct timeval tval;
 	switch (clk_id) {
 		case 0: /* CLOCK_REALTIME :*/
-#ifdef HAVE_GETTIMEOFDAY_TZ
+#if defined(HAVE_GETTIMEOFDAY_TZ) || defined(HAVE_GETTIMEOFDAY_TZ_VOID)
 			gettimeofday(&tval,NULL);
 #else
 			gettimeofday(&tval);
@@ -925,3 +942,117 @@ void rep_setproctitle(const char *fmt, ...)
 {
 }
 #endif
+#ifndef HAVE_SETPROCTITLE_INIT
+void rep_setproctitle_init(int argc, char *argv[], char *envp[])
+{
+}
+#endif
+
+#ifndef HAVE_MEMSET_S
+# ifndef RSIZE_MAX
+#  define RSIZE_MAX (SIZE_MAX >> 1)
+# endif
+
+int rep_memset_s(void *dest, size_t destsz, int ch, size_t count)
+{
+	if (dest == NULL) {
+		return EINVAL;
+	}
+
+	if (destsz > RSIZE_MAX ||
+	    count > RSIZE_MAX ||
+	    count > destsz) {
+		return ERANGE;
+	}
+
+#if defined(HAVE_MEMSET_EXPLICIT)
+	memset_explicit(dest, destsz, ch, count);
+#else /* HAVE_MEMSET_EXPLICIT */
+	memset(dest, ch, count);
+# if defined(HAVE_GCC_VOLATILE_MEMORY_PROTECTION)
+	/* See http://llvm.org/bugs/show_bug.cgi?id=15495 */
+	__asm__ volatile("" : : "g"(dest) : "memory");
+# endif /* HAVE_GCC_VOLATILE_MEMORY_PROTECTION */
+#endif /* HAVE_MEMSET_EXPLICIT */
+
+	return 0;
+}
+#endif /* HAVE_MEMSET_S */
+
+#ifndef HAVE_GETPROGNAME
+# ifndef HAVE_PROGRAM_INVOCATION_SHORT_NAME
+# define PROGNAME_SIZE 32
+static char rep_progname[PROGNAME_SIZE];
+# endif /* HAVE_PROGRAM_INVOCATION_SHORT_NAME */
+
+const char *rep_getprogname(void)
+{
+#ifdef HAVE_PROGRAM_INVOCATION_SHORT_NAME
+	return program_invocation_short_name;
+#else /* HAVE_PROGRAM_INVOCATION_SHORT_NAME */
+	FILE *fp = NULL;
+	char cmdline[4096] = {0};
+	char *p = NULL;
+	pid_t pid;
+	size_t nread;
+	int len;
+	int rc;
+
+	if (rep_progname[0] != '\0') {
+		return rep_progname;
+	}
+
+	len = snprintf(rep_progname, sizeof(rep_progname), "%s", "<unknown>");
+	if (len <= 0) {
+		return NULL;
+	}
+
+	pid = getpid();
+	if (pid <= 1 || pid == (pid_t)-1) {
+		return NULL;
+	}
+
+	len = snprintf(cmdline,
+		       sizeof(cmdline),
+		       "/proc/%u/cmdline",
+		       (unsigned int)pid);
+	if (len <= 0 || len == sizeof(cmdline)) {
+		return NULL;
+	}
+
+	fp = fopen(cmdline, "r");
+	if (fp == NULL) {
+		return NULL;
+	}
+
+	nread = fread(cmdline, 1, sizeof(cmdline) - 1, fp);
+
+	rc = fclose(fp);
+	if (rc != 0) {
+		return NULL;
+	}
+
+	if (nread == 0) {
+		return NULL;
+	}
+
+	cmdline[nread] = '\0';
+
+	p = strrchr(cmdline, '/');
+	if (p != NULL) {
+		p++;
+	} else {
+		p = cmdline;
+	}
+
+	len = strlen(p);
+	if (len > PROGNAME_SIZE) {
+		p[PROGNAME_SIZE - 1] = '\0';
+	}
+
+	(void)snprintf(rep_progname, sizeof(rep_progname), "%s", p);
+
+	return rep_progname;
+#endif /* HAVE_PROGRAM_INVOCATION_SHORT_NAME */
+}
+#endif /* HAVE_GETPROGNAME */

@@ -190,7 +190,7 @@ static int map_attrs_partition(struct ldb_module *module, void *mem_ctx, const c
 static int ldb_msg_replace(struct ldb_message *msg, const struct ldb_message_element *el)
 {
 	struct ldb_message_element *old;
-	int j;
+	unsigned j;
 	old = ldb_msg_find_element(msg, el->name);
 
 	/* no local result, add as new element */
@@ -330,7 +330,8 @@ static int ldb_msg_el_merge(struct ldb_module *module, struct ldb_message *local
 				  attr_name);
 			return LDB_SUCCESS;
 		}
-		/* fall through */
+
+		FALL_THROUGH;
 	case LDB_MAP_KEEP:
 	case LDB_MAP_RENAME:
 	case LDB_MAP_RENDROP:
@@ -920,6 +921,9 @@ static int map_subtree_collect_remote(struct ldb_module *module, void *mem_ctx, 
 	}
 
 	map = map_attr_find_local(data, tree->u.equality.attr);
+	if (map == NULL) {
+		return LDB_ERR_OPERATIONS_ERROR;
+	}
 	if (map->convert_operator) {
 		return map->convert_operator(module, mem_ctx, new, tree);
 	}

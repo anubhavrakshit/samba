@@ -741,7 +741,7 @@ static void callback_do_join(GtkWidget *widget,
 							GTK_DIALOG_DESTROY_WITH_PARENT,
 							GTK_MESSAGE_ERROR,
 							GTK_BUTTONS_CLOSE,
-							"The following error occured attempting to unjoin the %s: \"%s\": %s",
+							"The following error occurred attempting to unjoin the %s: \"%s\": %s",
 							initial_workgroup_type,
 							state->name_buffer_initial,
 							err_str);
@@ -830,7 +830,7 @@ static void callback_do_join(GtkWidget *widget,
 						GTK_DIALOG_DESTROY_WITH_PARENT,
 						GTK_MESSAGE_ERROR,
 						GTK_BUTTONS_CLOSE,
-						"The following error occured attempting to join the %s: \"%s\": %s",
+						"The following error occurred attempting to join the %s: \"%s\": %s",
 						new_workgroup_type,
 						state->name_buffer_new,
 						err_str);
@@ -1171,7 +1171,7 @@ static void callback_do_change(GtkWidget *widget,
 	box1 = gtk_vbox_new(FALSE, 0);
 	gtk_container_add(GTK_CONTAINER(window), box1);
 
-	label = gtk_label_new("You can change the name and membership of this computer. Changes may affect access to network ressources.");
+	label = gtk_label_new("You can change the name and membership of this computer. Changes may affect access to network resources.");
 	gtk_label_set_line_wrap(GTK_LABEL(label), TRUE);
 	gtk_misc_set_alignment(GTK_MISC(label), 0, 0);
 	gtk_box_pack_start(GTK_BOX(box1), label, TRUE, TRUE, 0);
@@ -1697,7 +1697,7 @@ static NET_API_STATUS get_server_properties(struct join_state *state)
 	}
 
 	switch (status) {
-		case 124: /* WERR_UNKNOWN_LEVEL */
+		case 124: /* WERR_INVALID_LEVEL */
 		case 50: /* WERR_NOT_SUPPORTED */
 			break;
 		default:

@@ -173,8 +173,13 @@ smbc_urlencode(char *dest,
                 }
         }
 
-        *dest++ = '\0';
-        max_dest_len--;
+	if (max_dest_len <= 0) {
+		/* Ensure we return -1 if no null termination. */
+		return -1;
+	}
+
+	*dest++ = '\0';
+	max_dest_len--;
 
         return max_dest_len;
 }
@@ -252,7 +257,7 @@ SMBC_parse_path(TALLOC_CTX *ctx,
 	}
 
         /*
-         * Assume we wont find an authentication domain to parse, so default
+         * Assume we won't find an authentication domain to parse, so default
          * to the workgroup in the provided context.
          */
 	if (pp_workgroup != NULL) {

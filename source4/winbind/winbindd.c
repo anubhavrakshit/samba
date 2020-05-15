@@ -27,7 +27,6 @@
 #include "lib/param/param.h"
 #include "source4/smbd/service.h"
 #include "source4/smbd/process_model.h"
-#include "file_server/file_server.h"
 #include "dynconfig.h"
 #include "nsswitch/winbind_client.h"
 
@@ -55,7 +54,7 @@ static void winbindd_done(struct tevent_req *subreq)
 /*
   startup a copy of winbindd as a child daemon
 */
-static void winbindd_task_init(struct task_server *task)
+static NTSTATUS winbindd_task_init(struct task_server *task)
 {
 	struct tevent_req *subreq;
 	const char *winbindd_path;
@@ -77,22 +76,30 @@ static void winbindd_task_init(struct task_server *task)
 	if (subreq == NULL) {
 		DEBUG(0, ("Failed to start winbindd as child daemon\n"));
 		task_server_terminate(task, "Failed to startup winbindd task", true);
-		return;
+		return NT_STATUS_UNSUCCESSFUL;
 	}
 
 	tevent_req_set_callback(subreq, winbindd_done, task);
 
 	DEBUG(5,("Started winbindd as a child daemon\n"));
+	return NT_STATUS_OK;
 }
 
 /* called at winbindd startup - register ourselves as a server service */
-NTSTATUS server_service_winbindd_init(void);
+NTSTATUS server_service_winbindd_init(TALLOC_CTX *);
 
-NTSTATUS server_service_winbindd_init(void)
+NTSTATUS server_service_winbindd_init(TALLOC_CTX *ctx)
 {
-	NTSTATUS status = register_server_service("winbindd", winbindd_task_init);
+	static const struct service_details details = {
+		.inhibit_fork_on_accept = true,
+		.inhibit_pre_fork = true,
+		.task_init = winbindd_task_init,
+		.post_fork = NULL
+	};
+
+	NTSTATUS status = register_server_service(ctx, "winbindd", &details);
 	if (!NT_STATUS_IS_OK(status)) {
 		return status;
 	}
-	return register_server_service("winbind", winbindd_task_init);
+	return register_server_service(ctx, "winbind", &details);
 }

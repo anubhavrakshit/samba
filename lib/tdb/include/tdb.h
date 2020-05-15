@@ -244,7 +244,7 @@ int tdb_reopen(struct tdb_context *tdb);
  * improve performance on systems that keep POSIX locks as a non-scalable data
  * structure in the kernel.
  *
- * @param[in]  parent_longlived Wether the parent is longlived or not.
+ * @param[in]  parent_longlived Whether the parent is longlived or not.
  *
  * @return              0 on success, -1 on error.
  */
@@ -357,6 +357,32 @@ int tdb_delete(struct tdb_context *tdb, TDB_DATA key);
  */
 int tdb_store(struct tdb_context *tdb, TDB_DATA key, TDB_DATA dbuf, int flag);
 
+
+/**
+ * @brief Store an element in the database.
+ *
+ * This replaces any existing element with the same key.
+ *
+ * @param[in]  tdb      The tdb to store the entry.
+ *
+ * @param[in]  key      The key to use to store the entry.
+ *
+ * @param[in]  dbufs    A vector of memory chunks to write
+ *
+ * @param[in]  num_dbufs Length of the dbufs vector
+ *
+ * @param[in]  flag     The flags to store the key:\n\n
+ *                      TDB_INSERT: Don't overwrite an existing entry.\n
+ *                      TDB_MODIFY: Don't create a new entry\n
+ *
+ * @return              0 on success, -1 on error with error code set.
+ *
+ * @see tdb_error()
+ * @see tdb_errorstr()
+ */
+int tdb_storev(struct tdb_context *tdb, TDB_DATA key,
+	       const TDB_DATA *dbufs, int num_dbufs, int flag);
+
 /**
  * @brief Append data to an entry.
  *
@@ -454,6 +480,73 @@ int tdb_traverse(struct tdb_context *tdb, tdb_traverse_func fn, void *private_da
  */
 int tdb_traverse_read(struct tdb_context *tdb, tdb_traverse_func fn, void *private_data);
 
+/**
+ * @brief Traverse a single hash chain
+ *
+ * Traverse a single hash chain under a single lock operation. No
+ * database modification is possible in the callback.
+ *
+ * This exists for background cleanup of databases. In normal
+ * operations, traversing a complete database can be much too
+ * expensive. Databases can have many chains, which will all have to
+ * be looked at before tdb_traverse finishes. Also tdb_traverse does a
+ * lot of fcntl activity to protect against concurrent record deletes.
+ *
+ * With this you can walk a fraction of the whole tdb, collect the
+ * entries you want to prune, leave the traverse, and then modify or
+ * delete the records in a subsequent step.
+ *
+ * To walk the entire database, call this function tdb_hash_size()
+ * times, with 0<=chain<tdb_hash_size(tdb).
+ *
+ * @param[in]  tdb      The database to traverse.
+ *
+ * @param[in]  chain    The hash chain number to traverse.
+ *
+ * @param[in]  fn       The function to call on each entry.
+ *
+ * @param[in]  private_data The private data which should be passed to the
+ *                          traversing function.
+ *
+ * @return              The record count traversed, -1 on error.
+ */
+
+int tdb_traverse_chain(struct tdb_context *tdb,
+		       unsigned chain,
+		       tdb_traverse_func fn,
+		       void *private_data);
+
+/**
+ * @brief Traverse a single hash chain
+ *
+ * This is like tdb_traverse_chain(), but for all records that are in
+ * the same chain as the record corresponding to the key parameter.
+ *
+ * Use it for ongoing database maintenance under a lock. Whenever you
+ * are about to modify a database, you know which record you are going
+ * to write to. For that tdb_store(), an exclusive chainlock is taken
+ * behind the scenes. To utilize this exclusive lock for incremental
+ * database cleanup as well, tdb_chainlock() the key you are about to
+ * modify, then tdb_traverse_key_chain() to do the incremental
+ * maintenance, modify your record and tdb_chainunlock() the key
+ * again.
+ *
+ * @param[in]  tdb      The database to traverse.
+ *
+ * @param[in]  key      The record key to walk the chain for.
+ *
+ * @param[in]  fn       The function to call on each entry.
+ *
+ * @param[in]  private_data The private data which should be passed to the
+ *                          traversing function.
+ *
+ * @return              The record count traversed, -1 on error.
+ */
+
+int tdb_traverse_key_chain(struct tdb_context *tdb,
+			   TDB_DATA key,
+			   tdb_traverse_func fn,
+			   void *private_data);
 /**
  * @brief Check if an entry in the database exists.
  *
@@ -625,15 +718,36 @@ tdb_log_func tdb_log_fn(struct tdb_context *tdb);
 void *tdb_get_logging_private(struct tdb_context *tdb);
 
 /**
+ * @brief Is a transaction active?
+ *
+ * It is helpful for the application to know if a transaction is
+ * active, rather than needing to maintain an application-level reference
+ * count.
+ *
+ * @param[in]  tdb      The database to start the transaction.
+ *
+ * @return              true if there is a transaction active, false otherwise
+ *
+ * @see tdb_transaction_start()
+ * @see tdb_transaction_prepare_commit()
+ * @see tdb_transaction_commit()
+ * @see tdb_transaction_cancel()
+ */
+bool tdb_transaction_active(struct tdb_context *tdb);
+
+/**
  * @brief Start a transaction.
  *
  * All operations after the transaction start can either be committed with
  * tdb_transaction_commit() or cancelled with tdb_transaction_cancel().
  *
- * If you call tdb_transaction_start() again on the same tdb context while a
- * transaction is in progress, then the same transaction buffer is re-used. The
- * number of tdb_transaction_{commit,cancel} operations must match the number
- * of successful tdb_transaction_start() calls.
+ * If (the default) TDB_ALLOW_NESTING was specified or
+ * TDB_DISALLOW_NESTING was not specified as a flag via tdb_open() or
+ * tdb_open_ex(), you call tdb_transaction_start() again on the same
+ * tdb context while a transaction is in progress, then the same
+ * transaction buffer is re-used. The number of
+ * tdb_transaction_{commit,cancel} operations must match the number of
+ * successful tdb_transaction_start() calls.
  *
  * Note that transactions are by default disk synchronous, and use a recover
  * area in the database to automatically recover the database on the next open

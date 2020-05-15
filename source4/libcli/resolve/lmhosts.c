@@ -1,7 +1,7 @@
 /*
    Unix SMB/CIFS implementation.
 
-   broadcast name resolution module
+   lmhosts name resolution module
 
    Copyright (C) Andrew Tridgell 1994-1998,2005
    Copyright (C) Jeremy Allison 2007
@@ -38,16 +38,17 @@ struct resolve_lmhosts_state {
 };
 
 /**
-  broadcast name resolution method - async send
+  lmhosts name resolution method - async send
  */
 /*
   general name resolution - async send
  */
-struct composite_context *resolve_name_lmhosts_send(TALLOC_CTX *mem_ctx,
-						  struct tevent_context *event_ctx,
-						  void *userdata, uint32_t flags,
-						  uint16_t port,
-						  struct nbt_name *name)
+static struct composite_context *resolve_name_lmhosts_send(
+	TALLOC_CTX *mem_ctx,
+	struct tevent_context *event_ctx,
+	void *userdata, uint32_t flags,
+	uint16_t port,
+	struct nbt_name *name)
 {
 	struct composite_context *c;
 	struct resolve_lmhosts_state *state;
@@ -71,7 +72,7 @@ struct composite_context *resolve_name_lmhosts_send(TALLOC_CTX *mem_ctx,
 						     state, &resolved_iplist, &resolved_count);
 	if (!composite_is_ok(c)) return c;
 
-	for (i=0; i < resolved_count; i++) {
+	for (i=0; i < resolved_count; i += 2) {
 		state->addrs = talloc_realloc(state, state->addrs, struct socket_address *, i+2);
 		if (composite_nomem(state->addrs, c)) return c;
 
@@ -91,7 +92,6 @@ struct composite_context *resolve_name_lmhosts_send(TALLOC_CTX *mem_ctx,
 
 		state->names[i+1] = NULL;
 
-		i++;
 	}
 
 	composite_done(c);
@@ -101,10 +101,10 @@ struct composite_context *resolve_name_lmhosts_send(TALLOC_CTX *mem_ctx,
 /*
   general name resolution method - recv side
  */
-NTSTATUS resolve_name_lmhosts_recv(struct composite_context *c,
-				 TALLOC_CTX *mem_ctx,
-				 struct socket_address ***addrs,
-				 char ***names)
+static NTSTATUS resolve_name_lmhosts_recv(struct composite_context *c,
+					  TALLOC_CTX *mem_ctx,
+					  struct socket_address ***addrs,
+					  char ***names)
 {
 	NTSTATUS status;
 

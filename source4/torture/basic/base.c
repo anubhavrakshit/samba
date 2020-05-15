@@ -190,7 +190,7 @@ static bool run_attrtest(struct torture_context *tctx,
 
 	torture_comment(tctx, "New file time is %s", ctime(&t));
 
-	if (abs(t - time(NULL)) > 60*60*24*10) {
+	if (labs(t - time(NULL)) > 60*60*24*10) {
 		torture_result(tctx, TORTURE_FAIL, "ERROR: SMBgetatr bug. time is %s",
 		       ctime(&t));
 		t = time(NULL);
@@ -289,13 +289,13 @@ static bool run_trans2test(struct torture_context *tctx,
 			torture_comment(tctx, "modify time=%s", ctime(&m_time));
 			torture_comment(tctx, "This system appears to have sticky create times\n");
 		}
-		if ((abs(a_time - t) > 60) && (a_time % (60*60) == 0)) {
+		if ((labs(a_time - t) > 60) && (a_time % (60*60) == 0)) {
 			torture_comment(tctx, "access time=%s", ctime(&a_time));
 			torture_result(tctx, TORTURE_FAIL, "This system appears to set a midnight access time\n");
 			correct = false;
 		}
 
-		if (abs(m_time - t) > 60*60*24*7) {
+		if (labs(m_time - t) > 60*60*24*7) {
 			torture_result(tctx, TORTURE_FAIL, "ERROR: totally incorrect times - maybe word reversed? mtime=%s", ctime(&m_time));
 			correct = false;
 		}
@@ -371,6 +371,7 @@ static bool run_negprot_nowait(struct torture_context *tctx)
 		struct tevent_req *req;
 		req = smb_raw_negotiate_send(cli, tctx->ev,
 					     cli->transport,
+					     PROTOCOL_CORE,
 					     PROTOCOL_NT1);
 		tevent_loop_once(tctx->ev);
 		if (!tevent_req_is_in_progress(req)) {
@@ -447,7 +448,6 @@ static bool run_tcon_test(struct torture_context *tctx, struct smbcli_state *cli
 	if (NT_STATUS_IS_ERR(smbcli_tconX(cli, share, "?????", password))) {
 		torture_result(tctx, TORTURE_FAIL, "%s refused 2nd tree connect (%s)\n", host,
 		           smbcli_errstr(cli->tree));
-		talloc_free(cli);
 		return false;
 	}
 
@@ -824,7 +824,9 @@ static bool run_vuidtest(struct torture_context *tctx,
 	int failures = 0;
 	int i;
 
-	asprintf(&control_char_fname, "\\readonly.afile");
+	control_char_fname = talloc_strdup(tctx, "\\readonly.afile");
+	torture_assert_not_null(tctx, control_char_fname, "asprintf failed\n");
+
 	for (i = 1; i <= 0x1f; i++) {
 		control_char_fname[10] = i;
 		fnum1 = smbcli_nt_create_full(cli1->tree, control_char_fname, 0, SEC_FILE_WRITE_DATA, FILE_ATTRIBUTE_NORMAL,
@@ -843,7 +845,7 @@ static bool run_vuidtest(struct torture_context *tctx,
 		smbcli_setatr(cli1->tree, control_char_fname, 0, 0);
 		smbcli_unlink(cli1->tree, control_char_fname);
 	}
-	free(control_char_fname);
+	TALLOC_FREE(control_char_fname);
 
 	if (!failures)
 		torture_comment(tctx, "Create file with control char names passed.\n");
@@ -1521,12 +1523,13 @@ static bool torture_chkpath_test(struct torture_context *tctx,
 }
 
 /*
- * This is a test to excercise some weird Samba3 error paths.
+ * This is a test to exercise some weird Samba3 error paths.
  */
 
 static bool torture_samba3_errorpaths(struct torture_context *tctx)
 {
 	bool nt_status_support;
+	bool client_ntlmv2_auth;
 	struct smbcli_state *cli_nt = NULL, *cli_dos = NULL;
 	bool result = false;
 	int fnum;
@@ -1536,9 +1539,14 @@ static bool torture_samba3_errorpaths(struct torture_context *tctx)
 	NTSTATUS status;
 
 	nt_status_support = lpcfg_nt_status_support(tctx->lp_ctx);
+	client_ntlmv2_auth = lpcfg_client_ntlmv2_auth(tctx->lp_ctx);
 
 	if (!lpcfg_set_cmdline(tctx->lp_ctx, "nt status support", "yes")) {
 		torture_result(tctx, TORTURE_FAIL, "Could not set 'nt status support = yes'\n");
+		goto fail;
+	}
+	if (!lpcfg_set_cmdline(tctx->lp_ctx, "client ntlmv2 auth", "yes")) {
+		torture_result(tctx, TORTURE_FAIL, "Could not set 'client ntlmv2 auth = yes'\n");
 		goto fail;
 	}
 
@@ -1547,7 +1555,11 @@ static bool torture_samba3_errorpaths(struct torture_context *tctx)
 	}
 
 	if (!lpcfg_set_cmdline(tctx->lp_ctx, "nt status support", "no")) {
-		torture_result(tctx, TORTURE_FAIL, "Could not set 'nt status support = yes'\n");
+		torture_result(tctx, TORTURE_FAIL, "Could not set 'nt status support = no'\n");
+		goto fail;
+	}
+	if (!lpcfg_set_cmdline(tctx->lp_ctx, "client ntlmv2 auth", "no")) {
+		torture_result(tctx, TORTURE_FAIL, "Could not set 'client ntlmv2 auth = no'\n");
 		goto fail;
 	}
 
@@ -1557,7 +1569,12 @@ static bool torture_samba3_errorpaths(struct torture_context *tctx)
 
 	if (!lpcfg_set_cmdline(tctx->lp_ctx, "nt status support",
 			    nt_status_support ? "yes":"no")) {
-		torture_result(tctx, TORTURE_FAIL, "Could not reset 'nt status support = yes'");
+		torture_result(tctx, TORTURE_FAIL, "Could not reset 'nt status support'");
+		goto fail;
+	}
+	if (!lpcfg_set_cmdline(tctx->lp_ctx, "client ntlmv2 auth",
+			       client_ntlmv2_auth ? "yes":"no")) {
+		torture_result(tctx, TORTURE_FAIL, "Could not reset 'client ntlmv2 auth'");
 		goto fail;
 	}
 
@@ -1917,10 +1934,54 @@ static bool run_birthtimetest(struct torture_context *tctx,
 	return correct;
 }
 
-
-NTSTATUS torture_base_init(void)
+/**
+  SMB1 TWRP open on root of share.
+ */
+static bool torture_smb1_twrp_openroot(struct torture_context *tctx,
+			struct smbcli_state *cli)
 {
-	struct torture_suite *suite = torture_suite_create(talloc_autofree_context(), "base");
+	const char *snapshot = NULL;
+	const char *p = NULL;
+	NTSTATUS status;
+	struct tm tm;
+	bool ret = true;
+
+	snapshot = torture_setting_string(tctx, "twrp_snapshot", NULL);
+	if (snapshot == NULL) {
+		torture_skip(tctx, "missing 'twrp_snapshot' option\n");
+	}
+
+	torture_comment(tctx, "Testing open of root of "
+		"share with timewarp (%s)\n",
+		snapshot);
+
+	setenv("TZ", "GMT", 1);
+
+	p = strptime(snapshot, "@GMT-%Y.%m.%d-%H.%M.%S", &tm);
+	torture_assert_goto(tctx, p != NULL, ret, done, "strptime\n");
+	torture_assert_goto(tctx, *p == '\0', ret, done, "strptime\n");
+
+	cli->session->flags2 |= FLAGS2_REPARSE_PATH;
+	status = smbcli_chkpath(cli->tree, snapshot);
+	cli->session->flags2 &= ~FLAGS2_REPARSE_PATH;
+
+	if (NT_STATUS_IS_ERR(status)) {
+		torture_result(tctx,
+			TORTURE_FAIL,
+			"smbcli_chkpath on %s : %s\n",
+			snapshot,
+			smbcli_errstr(cli->tree));
+		return false;
+	}
+
+  done:
+
+	return ret;
+}
+
+NTSTATUS torture_base_init(TALLOC_CTX *ctx)
+{
+	struct torture_suite *suite = torture_suite_create(ctx, "base");
 
 	torture_suite_add_2smb_test(suite, "fdpass", run_fdpasstest);
 	torture_suite_add_suite(suite, torture_base_locktest(suite));
@@ -1946,7 +2007,7 @@ NTSTATUS torture_base_init(void)
 	torture_suite_add_1smb_test(suite, "xcopy", run_xcopy);
 	torture_suite_add_1smb_test(suite, "iometer", run_iometer);
 	torture_suite_add_1smb_test(suite, "rename", torture_test_rename);
-	torture_suite_add_suite(suite, torture_test_delete());
+	torture_suite_add_suite(suite, torture_test_delete(suite));
 	torture_suite_add_1smb_test(suite, "properties", torture_test_properties);
 	torture_suite_add_1smb_test(suite, "mangle", torture_mangle);
 	torture_suite_add_1smb_test(suite, "openattr", torture_openattrtest);
@@ -1955,7 +2016,7 @@ NTSTATUS torture_base_init(void)
 	torture_suite_add_1smb_test(suite, "chkpath",  torture_chkpath_test);
 	torture_suite_add_1smb_test(suite, "secleak",  torture_sec_leak);
 	torture_suite_add_simple_test(suite, "disconnect",  torture_disconnect);
-	torture_suite_add_suite(suite, torture_delay_write());
+	torture_suite_add_suite(suite, torture_delay_write(suite));
 	torture_suite_add_simple_test(suite, "samba3error", torture_samba3_errorpaths);
 	torture_suite_add_1smb_test(suite, "casetable", torture_casetable);
 	torture_suite_add_1smb_test(suite, "utable", torture_utable);
@@ -1975,11 +2036,14 @@ NTSTATUS torture_base_init(void)
 	torture_suite_add_1smb_test(suite, "scan-pipe_number", run_pipe_number);
 	torture_suite_add_1smb_test(suite, "scan-ioctl", torture_ioctl_test);
 	torture_suite_add_1smb_test(suite, "scan-maxfid", torture_maxfid_test);
+	torture_suite_add_1smb_test(suite,
+			"smb1-twrp-openroot",
+			torture_smb1_twrp_openroot);
 
 	suite->description = talloc_strdup(suite, 
 					"Basic SMB tests (imported from the original smbtorture)");
 
-	torture_register_suite(suite);
+	torture_register_suite(ctx, suite);
 
 	return NT_STATUS_OK;
 }

@@ -21,13 +21,19 @@
 #include "includes.h"
 #include "smbd/smbd.h"
 #include "smbd/globals.h"
-#include "../libcli/auth/spnego.h"
 #include "serverid.h"
 #include "auth.h"
 #include "messages.h"
 #include "smbprofile.h"
 #include "auth/gensec/gensec.h"
 #include "../libcli/smb/smb_signing.h"
+
+/*
+ * MS-CIFS, 2.2.4.52.2 SMB_COM_NEGOTIATE Response:
+ * If the server does not support any of the listed dialects, it MUST return a
+ * DialectIndex of 0XFFFF
+ */
+#define NO_PROTOCOL_CHOSEN	0xffff
 
 extern fstring remote_proto;
 
@@ -60,12 +66,14 @@ static void get_challenge(struct smbXsrv_connection *xconn, uint8_t buff[8])
  Reply for the lanman 1.0 protocol.
 ****************************************************************************/
 
-static void reply_lanman1(struct smb_request *req, uint16_t choice)
+static NTSTATUS reply_lanman1(struct smb_request *req, uint16_t choice)
 {
 	int secword=0;
 	time_t t = time(NULL);
 	struct smbXsrv_connection *xconn = req->xconn;
 	uint16_t raw;
+	NTSTATUS status;
+
 	if (lp_async_smb_echo_handler()) {
 		raw = 0;
 	} else {
@@ -89,7 +97,11 @@ static void reply_lanman1(struct smb_request *req, uint16_t choice)
 		SSVAL(req->outbuf,smb_vwv11, 8);
 	}
 
-	smbXsrv_connection_init_tables(xconn, PROTOCOL_LANMAN1);
+	status = smbXsrv_connection_init_tables(xconn, PROTOCOL_LANMAN1);
+	if (!NT_STATUS_IS_OK(status)) {
+		reply_nterror(req, status);
+		return status;
+	}
 
 	/* Reply, SMBlockread, SMBwritelock supported. */
 	SCVAL(req->outbuf,smb_flg, FLAG_REPLY|FLAG_SUPPORT_LOCKREAD);
@@ -103,19 +115,21 @@ static void reply_lanman1(struct smb_request *req, uint16_t choice)
 
 	srv_put_dos_date((char *)req->outbuf,smb_vwv8,t);
 
-	return;
+	return NT_STATUS_OK;
 }
 
 /****************************************************************************
  Reply for the lanman 2.0 protocol.
 ****************************************************************************/
 
-static void reply_lanman2(struct smb_request *req, uint16_t choice)
+static NTSTATUS reply_lanman2(struct smb_request *req, uint16_t choice)
 {
 	int secword=0;
 	time_t t = time(NULL);
 	struct smbXsrv_connection *xconn = req->xconn;
 	uint16_t raw;
+	NTSTATUS status;
+
 	if (lp_async_smb_echo_handler()) {
 		raw = 0;
 	} else {
@@ -141,7 +155,11 @@ static void reply_lanman2(struct smb_request *req, uint16_t choice)
 		SSVAL(req->outbuf,smb_vwv11, 8);
 	}
 
-	smbXsrv_connection_init_tables(xconn, PROTOCOL_LANMAN2);
+	status = smbXsrv_connection_init_tables(xconn, PROTOCOL_LANMAN2);
+	if (!NT_STATUS_IS_OK(status)) {
+		reply_nterror(req, status);
+		return status;
+	}
 
 	/* Reply, SMBlockread, SMBwritelock supported. */
 	SCVAL(req->outbuf,smb_flg,FLAG_REPLY|FLAG_SUPPORT_LOCKREAD);
@@ -151,6 +169,7 @@ static void reply_lanman2(struct smb_request *req, uint16_t choice)
 	SSVAL(req->outbuf,smb_vwv5,raw); /* readbraw and/or writebraw */
 	SSVAL(req->outbuf,smb_vwv10, set_server_zone_offset(t)/60);
 	srv_put_dos_date((char *)req->outbuf,smb_vwv8,t);
+	return NT_STATUS_OK;
 }
 
 /****************************************************************************
@@ -172,7 +191,16 @@ DATA_BLOB negprot_spnego(TALLOC_CTX *ctx, struct smbXsrv_connection *xconn)
 	/* See if we can get an SPNEGO blob */
 	status = auth_generic_prepare(talloc_tos(),
 				      xconn->remote_address,
+				      xconn->local_address,
+				      "SMB",
 				      &gensec_security);
+
+	/*
+	 * Despite including it above, there is no need to set a
+	 * remote address or similar as we are just interested in the
+	 * SPNEGO blob, we never keep this context.
+	 */
+
 	if (NT_STATUS_IS_OK(status)) {
 		status = gensec_start_mech_by_oid(gensec_security, GENSEC_OID_SPNEGO);
 		if (NT_STATUS_IS_OK(status)) {
@@ -239,7 +267,7 @@ DATA_BLOB negprot_spnego(TALLOC_CTX *ctx, struct smbXsrv_connection *xconn)
  Reply for the nt protocol.
 ****************************************************************************/
 
-static void reply_nt1(struct smb_request *req, uint16_t choice)
+static NTSTATUS reply_nt1(struct smb_request *req, uint16_t choice)
 {
 	/* dual names + lock_and_read + nt SMBs + remote API calls */
 	int capabilities = CAP_NT_FIND|CAP_LOCK_AND_READ|
@@ -252,6 +280,7 @@ static void reply_nt1(struct smb_request *req, uint16_t choice)
 	struct smbXsrv_connection *xconn = req->xconn;
 	bool signing_desired = false;
 	bool signing_required = false;
+	NTSTATUS status;
 
 	xconn->smb1.negprot.encrypted_passwords = lp_encrypt_passwords();
 
@@ -274,7 +303,6 @@ static void reply_nt1(struct smb_request *req, uint16_t choice)
 	   supports it and we can do encrypted passwords */
 
 	if (xconn->smb1.negprot.encrypted_passwords &&
-	    lp_use_spnego() &&
 	    (req->flags2 & FLAGS2_EXTENDED_SECURITY)) {
 		negotiate_spnego = True;
 		capabilities |= CAP_EXTENDED_SECURITY;
@@ -329,7 +357,11 @@ static void reply_nt1(struct smb_request *req, uint16_t choice)
 	SSVAL(req->outbuf,smb_vwv0,choice);
 	SCVAL(req->outbuf,smb_vwv1,secword);
 
-	smbXsrv_connection_init_tables(xconn, PROTOCOL_NT1);
+	status = smbXsrv_connection_init_tables(xconn, PROTOCOL_NT1);
+	if (!NT_STATUS_IS_OK(status)) {
+		reply_nterror(req, status);
+		return status;
+	}
 
 	SSVAL(req->outbuf,smb_vwv1+1, lp_max_mux()); /* maxmpx */
 	SSVAL(req->outbuf,smb_vwv2+1, 1); /* num vcs */
@@ -339,7 +371,7 @@ static void reply_nt1(struct smb_request *req, uint16_t choice)
 	SIVAL(req->outbuf,smb_vwv7+1, getpid()); /* session key */
 	SIVAL(req->outbuf,smb_vwv9+1, capabilities); /* capabilities */
 	clock_gettime(CLOCK_REALTIME,&ts);
-	put_long_date_timespec(TIMESTAMP_SET_NT_OR_BETTER,(char *)req->outbuf+smb_vwv11+1,ts);
+	put_long_date_full_timespec(TIMESTAMP_SET_NT_OR_BETTER,(char *)req->outbuf+smb_vwv11+1,&ts);
 	SSVALS(req->outbuf,smb_vwv15+1,set_server_zone_offset(ts.tv_sec)/60);
 
 	if (!negotiate_spnego) {
@@ -354,7 +386,7 @@ static void reply_nt1(struct smb_request *req, uint16_t choice)
 			if (ret == -1) {
 				DEBUG(0, ("Could not push challenge\n"));
 				reply_nterror(req, NT_STATUS_NO_MEMORY);
-				return;
+				return NT_STATUS_NO_MEMORY;
 			}
 			SCVAL(req->outbuf, smb_vwv16+1, ret);
 		}
@@ -364,7 +396,7 @@ static void reply_nt1(struct smb_request *req, uint16_t choice)
 		if (ret == -1) {
 			DEBUG(0, ("Could not push workgroup string\n"));
 			reply_nterror(req, NT_STATUS_NO_MEMORY);
-			return;
+			return NT_STATUS_NO_MEMORY;
 		}
 		ret = message_push_string(&req->outbuf, lp_netbios_name(),
 					  STR_UNICODE|STR_TERMINATE
@@ -372,7 +404,7 @@ static void reply_nt1(struct smb_request *req, uint16_t choice)
 		if (ret == -1) {
 			DEBUG(0, ("Could not push netbios name string\n"));
 			reply_nterror(req, NT_STATUS_NO_MEMORY);
-			return;
+			return NT_STATUS_NO_MEMORY;
 		}
 		DEBUG(3,("not using SPNEGO\n"));
 	} else {
@@ -380,14 +412,14 @@ static void reply_nt1(struct smb_request *req, uint16_t choice)
 
 		if (spnego_blob.data == NULL) {
 			reply_nterror(req, NT_STATUS_NO_MEMORY);
-			return;
+			return NT_STATUS_NO_MEMORY;
 		}
 
 		ret = message_push_blob(&req->outbuf, spnego_blob);
 		if (ret == -1) {
 			DEBUG(0, ("Could not push spnego blob\n"));
 			reply_nterror(req, NT_STATUS_NO_MEMORY);
-			return;
+			return NT_STATUS_NO_MEMORY;
 		}
 		data_blob_free(&spnego_blob);
 
@@ -395,7 +427,7 @@ static void reply_nt1(struct smb_request *req, uint16_t choice)
 		DEBUG(3,("using SPNEGO\n"));
 	}
 
-	return;
+	return NT_STATUS_OK;
 }
 
 /* these are the protocol lists used for auto architecture detection:
@@ -443,47 +475,73 @@ protocol [XENIX CORE]
 protocol [LANMAN1.0]
 protocol [LM1.2X002]
 protocol [LANMAN2.1]
+
+OSX:
+protocol [NT LM 0.12]
+protocol [SMB 2.002]
+protocol [SMB 2.???]
 */
 
 /*
   * Modified to recognize the architecture of the remote machine better.
   *
   * This appears to be the matrix of which protocol is used by which
-  * MS product.
-       Protocol                       WfWg    Win95   WinNT  Win2K  OS/2 Vista
-       PC NETWORK PROGRAM 1.0          1       1       1      1      1     1
-       XENIX CORE                                      2             2
-       MICROSOFT NETWORKS 3.0          2       2       
-       DOS LM1.2X002                   3       3       
-       MICROSOFT NETWORKS 1.03                         3
-       DOS LANMAN2.1                   4       4       
-       LANMAN1.0                                       4      2      3     2
-       Windows for Workgroups 3.1a     5       5       5      3            3
-       LM1.2X002                                       6      4      4     4
-       LANMAN2.1                                       7      5      5     5
-       NT LM 0.12                              6       8      6            6
-       SMB 2.001                                                           7
+  * product.
+       Protocol                       WfWg Win95 WinNT Win2K OS/2 Vista OSX
+       PC NETWORK PROGRAM 1.0          1     1     1     1     1    1
+       XENIX CORE                                  2           2
+       MICROSOFT NETWORKS 3.0          2     2
+       DOS LM1.2X002                   3     3
+       MICROSOFT NETWORKS 1.03                     3
+       DOS LANMAN2.1                   4     4
+       LANMAN1.0                                   4     2     3    2
+       Windows for Workgroups 3.1a     5     5     5     3          3
+       LM1.2X002                                   6     4     4    4
+       LANMAN2.1                                   7     5     5    5
+       NT LM 0.12                            6     8     6     6    6    1
+       SMB 2.001                                                    7
+       SMB 2.002                                                         2
+       SMB 2.???                                                         3
   *
   *  tim@fsg.com 09/29/95
   *  Win2K added by matty 17/7/99
   */
 
-#define ARCH_WFWG     0x3      /* This is a fudge because WfWg is like Win95 */
-#define ARCH_WIN95    0x2
-#define ARCH_WINNT    0x4
-#define ARCH_WIN2K    0xC      /* Win2K is like NT */
-#define ARCH_OS2      0x14     /* Again OS/2 is like NT */
-#define ARCH_SAMBA    0x20
-#define ARCH_CIFSFS   0x40
-#define ARCH_VISTA    0x8C     /* Vista is like XP/2K */
+#define PROT_PC_NETWORK_PROGRAM_1_0		0x0001
+#define PROT_XENIX_CORE				0x0002
+#define PROT_MICROSOFT_NETWORKS_3_0		0x0004
+#define PROT_DOS_LM1_2X002			0x0008
+#define PROT_MICROSOFT_NETWORKS_1_03		0x0010
+#define PROT_DOS_LANMAN2_1			0x0020
+#define PROT_LANMAN1_0				0x0040
+#define PROT_WFWG				0x0080
+#define PROT_LM1_2X002				0x0100
+#define PROT_LANMAN2_1				0x0200
+#define PROT_NT_LM_0_12				0x0400
+#define PROT_SMB_2_001				0x0800
+#define PROT_SMB_2_002				0x1000
+#define PROT_SMB_2_FF				0x2000
+#define PROT_SAMBA				0x4000
+#define PROT_POSIX_2				0x8000
 
-#define ARCH_ALL      0x7F
+#define ARCH_WFWG     ( PROT_PC_NETWORK_PROGRAM_1_0 | PROT_MICROSOFT_NETWORKS_3_0 | \
+			PROT_DOS_LM1_2X002 | PROT_DOS_LANMAN2_1 | PROT_WFWG )
+#define ARCH_WIN95    ( ARCH_WFWG | PROT_NT_LM_0_12 )
+#define ARCH_WINNT    ( PROT_PC_NETWORK_PROGRAM_1_0 | PROT_XENIX_CORE | \
+			PROT_MICROSOFT_NETWORKS_1_03 | PROT_LANMAN1_0 | PROT_WFWG | \
+			PROT_LM1_2X002 | PROT_LANMAN2_1 | PROT_NT_LM_0_12 )
+#define ARCH_WIN2K    ( ARCH_WINNT & ~(PROT_XENIX_CORE | PROT_MICROSOFT_NETWORKS_1_03) )
+#define ARCH_OS2      ( ARCH_WINNT & ~(PROT_MICROSOFT_NETWORKS_1_03 | PROT_WFWG) )
+#define ARCH_VISTA    ( ARCH_WIN2K | PROT_SMB_2_001 )
+#define ARCH_SAMBA    ( PROT_SAMBA )
+#define ARCH_CIFSFS   ( PROT_POSIX_2 )
+#define ARCH_OSX      ( PROT_NT_LM_0_12 | PROT_SMB_2_002 | PROT_SMB_2_FF )
 
 /* List of supported protocols, most desired first */
 static const struct {
 	const char *proto_name;
 	const char *short_name;
-	void (*proto_reply_fn)(struct smb_request *req, uint16_t choice);
+	NTSTATUS (*proto_reply_fn)(struct smb_request *req, uint16_t choice);
 	int protocol_level;
 } supported_protocols[] = {
 	{"SMB 2.???",               "SMB2_FF",  reply_smb20ff,  PROTOCOL_SMB2_10},
@@ -507,17 +565,22 @@ static const struct {
 
 void reply_negprot(struct smb_request *req)
 {
-	int choice= -1;
+	size_t choice = 0;
 	int chosen_level = -1;
+	bool choice_set = false;
 	int protocol;
 	const char *p;
-	int arch = ARCH_ALL;
+	int protocols = 0;
 	int num_cliprotos;
 	char **cliprotos;
-	int i;
+	size_t i;
 	size_t converted_size;
 	struct smbXsrv_connection *xconn = req->xconn;
 	struct smbd_server_connection *sconn = req->sconn;
+	bool signing_required = true;
+	int max_proto;
+	int min_proto;
+	NTSTATUS status;
 
 	START_PROFILE(SMBnegprot);
 
@@ -525,7 +588,6 @@ void reply_negprot(struct smb_request *req)
 		END_PROFILE(SMBnegprot);
 		exit_server_cleanly("multiple negprot's are not permitted");
 	}
-	xconn->smb1.negprot.done = true;
 
 	if (req->buflen == 0) {
 		DEBUG(0, ("negprot got no protocols\n"));
@@ -579,41 +641,46 @@ void reply_negprot(struct smb_request *req)
 	}
 
 	for (i=0; i<num_cliprotos; i++) {
-		if (strcsequal(cliprotos[i], "Windows for Workgroups 3.1a"))
-			arch &= ( ARCH_WFWG | ARCH_WIN95 | ARCH_WINNT
-				  | ARCH_WIN2K );
-		else if (strcsequal(cliprotos[i], "DOS LM1.2X002"))
-			arch &= ( ARCH_WFWG | ARCH_WIN95 );
-		else if (strcsequal(cliprotos[i], "DOS LANMAN2.1"))
-			arch &= ( ARCH_WFWG | ARCH_WIN95 );
-		else if (strcsequal(cliprotos[i], "NT LM 0.12"))
-			arch &= ( ARCH_WIN95 | ARCH_WINNT | ARCH_WIN2K
-				  | ARCH_CIFSFS);
-		else if (strcsequal(cliprotos[i], "SMB 2.001"))
-			arch = ARCH_VISTA;		
-		else if (strcsequal(cliprotos[i], "LANMAN2.1"))
-			arch &= ( ARCH_WINNT | ARCH_WIN2K | ARCH_OS2 );
-		else if (strcsequal(cliprotos[i], "LM1.2X002"))
-			arch &= ( ARCH_WINNT | ARCH_WIN2K | ARCH_OS2 );
-		else if (strcsequal(cliprotos[i], "MICROSOFT NETWORKS 1.03"))
-			arch &= ARCH_WINNT;
-		else if (strcsequal(cliprotos[i], "XENIX CORE"))
-			arch &= ( ARCH_WINNT | ARCH_OS2 );
-		else if (strcsequal(cliprotos[i], "Samba")) {
-			arch = ARCH_SAMBA;
+		if (strcsequal(cliprotos[i], "Windows for Workgroups 3.1a")) {
+			protocols |= PROT_WFWG;
+		} else if (strcsequal(cliprotos[i], "DOS LM1.2X002")) {
+			protocols |= PROT_DOS_LM1_2X002;
+		} else if (strcsequal(cliprotos[i], "DOS LANMAN2.1")) {
+			protocols |= PROT_DOS_LANMAN2_1;
+		} else if (strcsequal(cliprotos[i], "LANMAN1.0")) {
+			protocols |= PROT_LANMAN1_0;
+		} else if (strcsequal(cliprotos[i], "NT LM 0.12")) {
+			protocols |= PROT_NT_LM_0_12;
+		} else if (strcsequal(cliprotos[i], "SMB 2.001")) {
+			protocols |= PROT_SMB_2_001;
+		} else if (strcsequal(cliprotos[i], "SMB 2.002")) {
+			protocols |= PROT_SMB_2_002;
+		} else if (strcsequal(cliprotos[i], "SMB 2.???")) {
+			protocols |= PROT_SMB_2_FF;
+		} else if (strcsequal(cliprotos[i], "LANMAN2.1")) {
+			protocols |= PROT_LANMAN2_1;
+		} else if (strcsequal(cliprotos[i], "LM1.2X002")) {
+			protocols |= PROT_LM1_2X002;
+		} else if (strcsequal(cliprotos[i], "MICROSOFT NETWORKS 1.03")) {
+			protocols |= PROT_MICROSOFT_NETWORKS_1_03;
+		} else if (strcsequal(cliprotos[i], "MICROSOFT NETWORKS 3.0")) {
+			protocols |= PROT_MICROSOFT_NETWORKS_3_0;
+		} else if (strcsequal(cliprotos[i], "PC NETWORK PROGRAM 1.0")) {
+			protocols |= PROT_PC_NETWORK_PROGRAM_1_0;
+		} else if (strcsequal(cliprotos[i], "XENIX CORE")) {
+			protocols |= PROT_XENIX_CORE;
+		} else if (strcsequal(cliprotos[i], "Samba")) {
+			protocols = PROT_SAMBA;
 			break;
 		} else if (strcsequal(cliprotos[i], "POSIX 2")) {
-			arch = ARCH_CIFSFS;
+			protocols = PROT_POSIX_2;
 			break;
 		}
 	}
 
-	/* CIFSFS can send one arch only, NT LM 0.12. */
-	if (i == 1 && (arch & ARCH_CIFSFS)) {
-		arch = ARCH_CIFSFS;
-	}
-
-	switch ( arch ) {
+	switch ( protocols ) {
+		/* Old CIFSFS can send one arch only, NT LM 0.12. */
+		case PROT_NT_LM_0_12:
 		case ARCH_CIFSFS:
 			set_remote_arch(RA_CIFSFS);
 			break;
@@ -627,22 +694,19 @@ void reply_negprot(struct smb_request *req)
 			set_remote_arch(RA_WIN95);
 			break;
 		case ARCH_WINNT:
-			if(req->flags2 == FLAGS2_WIN2K_SIGNATURE)
-				set_remote_arch(RA_WIN2K);
-			else
-				set_remote_arch(RA_WINNT);
+			set_remote_arch(RA_WINNT);
 			break;
 		case ARCH_WIN2K:
-			/* Vista may have been set in the negprot so don't 
-			   override it here */
-			if ( get_remote_arch() != RA_VISTA )
-				set_remote_arch(RA_WIN2K);
+			set_remote_arch(RA_WIN2K);
 			break;
 		case ARCH_VISTA:
 			set_remote_arch(RA_VISTA);
 			break;
 		case ARCH_OS2:
 			set_remote_arch(RA_OS2);
+			break;
+		case ARCH_OSX:
+			set_remote_arch(RA_OSX);
 			break;
 		default:
 			set_remote_arch(RA_UNKNOWN);
@@ -652,45 +716,72 @@ void reply_negprot(struct smb_request *req)
 	/* possibly reload - change of architecture */
 	reload_services(sconn, conn_snum_used, true);
 
-	/* moved from the netbios session setup code since we don't have that 
-	   when the client connects to port 445.  Of course there is a small
-	   window where we are listening to messages   -- jerry */
-
-	serverid_register(messaging_server_id(sconn->msg_ctx),
-			  FLAG_MSG_GENERAL|FLAG_MSG_SMBD
-			  |FLAG_MSG_PRINT_GENERAL);
+	/*
+	 * Anything higher than PROTOCOL_SMB2_10 still
+	 * needs to go via "SMB 2.???", which is marked
+	 * as PROTOCOL_SMB2_10.
+	 *
+	 * The real negotiation happens via reply_smb20ff()
+	 * using SMB2 Negotiation.
+	 */
+	max_proto = lp_server_max_protocol();
+	if (max_proto > PROTOCOL_SMB2_10) {
+		max_proto = PROTOCOL_SMB2_10;
+	}
+	min_proto = lp_server_min_protocol();
+	if (min_proto > PROTOCOL_SMB2_10) {
+		min_proto = PROTOCOL_SMB2_10;
+	}
 
 	/* Check for protocols, most desirable first */
 	for (protocol = 0; supported_protocols[protocol].proto_name; protocol++) {
 		i = 0;
-		if ((supported_protocols[protocol].protocol_level <= lp_server_max_protocol()) &&
-				(supported_protocols[protocol].protocol_level >= lp_server_min_protocol()))
+		if ((supported_protocols[protocol].protocol_level <= max_proto) &&
+		    (supported_protocols[protocol].protocol_level >= min_proto))
 			while (i < num_cliprotos) {
 				if (strequal(cliprotos[i],supported_protocols[protocol].proto_name)) {
 					choice = i;
 					chosen_level = supported_protocols[protocol].protocol_level;
+					choice_set = true;
 				}
 				i++;
 			}
-		if(choice != -1)
+		if (choice_set) {
 			break;
+		}
 	}
 
-	if(choice != -1) {
-		fstrcpy(remote_proto,supported_protocols[protocol].short_name);
-		reload_services(sconn, conn_snum_used, true);
-		supported_protocols[protocol].proto_reply_fn(req, choice);
-		DEBUG(3,("Selected protocol %s\n",supported_protocols[protocol].proto_name));
-	} else {
-		DEBUG(0,("No protocol supported !\n"));
+	if (!choice_set) {
+		bool ok;
+
+		DBG_NOTICE("No protocol supported !\n");
 		reply_outbuf(req, 1, 0);
-		SSVAL(req->outbuf, smb_vwv0, choice);
+		SSVAL(req->outbuf, smb_vwv0, NO_PROTOCOL_CHOSEN);
+
+		ok = srv_send_smb(xconn, (char *)req->outbuf,
+				  false, 0, false, NULL);
+		if (!ok) {
+			DBG_NOTICE("srv_send_smb failed\n");
+		}
+		exit_server_cleanly("no protocol supported\n");
 	}
 
-	DEBUG( 5, ( "negprot index=%d\n", choice ) );
+	fstrcpy(remote_proto,supported_protocols[protocol].short_name);
+	reload_services(sconn, conn_snum_used, true);
+	status = supported_protocols[protocol].proto_reply_fn(req, choice);
+	if (!NT_STATUS_IS_OK(status)) {
+		exit_server_cleanly("negprot function failed\n");
+	}
 
-	if ((lp_server_signing() == SMB_SIGNING_REQUIRED)
-	    && (chosen_level < PROTOCOL_NT1)) {
+	DEBUG(3,("Selected protocol %s\n",supported_protocols[protocol].proto_name));
+
+	DBG_INFO("negprot index=%zu\n", choice);
+
+	xconn->smb1.negprot.done = true;
+
+	/* We always have xconn->smb1.signing_state also for >= SMB2_02 */
+	signing_required = smb_signing_is_mandatory(xconn->smb1.signing_state);
+	if (signing_required && (chosen_level < PROTOCOL_NT1)) {
 		exit_server_cleanly("SMB signing is required and "
 			"client negotiated a downlevel protocol");
 	}

@@ -108,6 +108,20 @@ int sys_fcntl_long(int fd, int cmd, long arg)
 	return ret;
 }
 
+/*******************************************************************
+A fcntl wrapper that will deal with EINTR.
+********************************************************************/
+
+int sys_fcntl_int(int fd, int cmd, int arg)
+{
+	int ret;
+
+	do {
+		ret = fcntl(fd, cmd, arg);
+	} while (ret == -1 && errno == EINTR);
+	return ret;
+}
+
 /****************************************************************************
  Get/Set all the possible time fields from a stat struct as a timespec.
 ****************************************************************************/
@@ -291,7 +305,7 @@ static void make_create_timespec(const struct stat *pst, struct stat_ex *dst,
 		dst->st_ex_btime.tv_nsec = 0;
 	}
 
-	dst->st_ex_calculated_birthtime = false;
+	dst->st_ex_iflags &= ~ST_EX_IFLAG_CALCULATED_BTIME;
 
 #if defined(HAVE_STRUCT_STAT_ST_BIRTHTIMESPEC_TV_NSEC)
 	dst->st_ex_btime = pst->st_birthtimespec;
@@ -303,7 +317,7 @@ static void make_create_timespec(const struct stat *pst, struct stat_ex *dst,
 	dst->st_ex_btime.tv_nsec = 0;
 #else
 	dst->st_ex_btime = calc_create_time_stat(pst);
-	dst->st_ex_calculated_birthtime = true;
+	dst->st_ex_iflags |= ST_EX_IFLAG_CALCULATED_BTIME;
 #endif
 
 	/* Deal with systems that don't initialize birthtime correctly.
@@ -311,8 +325,11 @@ static void make_create_timespec(const struct stat *pst, struct stat_ex *dst,
 	 */
 	if (null_timespec(dst->st_ex_btime)) {
 		dst->st_ex_btime = calc_create_time_stat(pst);
-		dst->st_ex_calculated_birthtime = true;
+		dst->st_ex_iflags |= ST_EX_IFLAG_CALCULATED_BTIME;
 	}
+
+	dst->st_ex_itime = dst->st_ex_btime;
+	dst->st_ex_iflags |= ST_EX_IFLAG_CALCULATED_ITIME;
 }
 
 /****************************************************************************
@@ -327,7 +344,7 @@ void update_stat_ex_mtime(struct stat_ex *dst,
 	dst->st_ex_mtime = write_ts;
 
 	/* We may have to recalculate btime. */
-	if (dst->st_ex_calculated_birthtime) {
+	if (dst->st_ex_iflags & ST_EX_IFLAG_CALCULATED_BTIME) {
 		dst->st_ex_btime = calc_create_time_stat_ex(dst);
 	}
 }
@@ -336,7 +353,40 @@ void update_stat_ex_create_time(struct stat_ex *dst,
                                 struct timespec create_time)
 {
 	dst->st_ex_btime = create_time;
-	dst->st_ex_calculated_birthtime = false;
+	dst->st_ex_iflags &= ~ST_EX_IFLAG_CALCULATED_BTIME;
+}
+
+void update_stat_ex_itime(struct stat_ex *dst,
+			  struct timespec itime)
+{
+	dst->st_ex_itime = itime;
+	dst->st_ex_iflags &= ~ST_EX_IFLAG_CALCULATED_ITIME;
+}
+
+void update_stat_ex_file_id(struct stat_ex *dst, uint64_t file_id)
+{
+	dst->st_ex_file_id = file_id;
+	dst->st_ex_iflags &= ~ST_EX_IFLAG_CALCULATED_FILE_ID;
+}
+
+void update_stat_ex_from_saved_stat(struct stat_ex *dst,
+				    const struct stat_ex *src)
+{
+	if (!VALID_STAT(*src)) {
+		return;
+	}
+
+	if (!(src->st_ex_iflags & ST_EX_IFLAG_CALCULATED_BTIME)) {
+		update_stat_ex_create_time(dst, src->st_ex_btime);
+	}
+
+	if (!(src->st_ex_iflags & ST_EX_IFLAG_CALCULATED_ITIME)) {
+		update_stat_ex_itime(dst, src->st_ex_itime);
+	}
+
+	if (!(src->st_ex_iflags & ST_EX_IFLAG_CALCULATED_FILE_ID)) {
+		update_stat_ex_file_id(dst, src->st_ex_file_id);
+	}
 }
 
 void init_stat_ex_from_stat (struct stat_ex *dst,
@@ -354,6 +404,7 @@ void init_stat_ex_from_stat (struct stat_ex *dst,
 	dst->st_ex_atime = get_atimespec(src);
 	dst->st_ex_mtime = get_mtimespec(src);
 	dst->st_ex_ctime = get_ctimespec(src);
+	dst->st_ex_iflags = 0;
 	make_create_timespec(src, dst, fake_dir_create_times);
 #ifdef HAVE_STAT_ST_BLKSIZE
 	dst->st_ex_blksize = src->st_blksize;
@@ -372,6 +423,8 @@ void init_stat_ex_from_stat (struct stat_ex *dst,
 #else
 	dst->st_ex_flags = 0;
 #endif
+	dst->st_ex_file_id = dst->st_ex_ino;
+	dst->st_ex_iflags |= ST_EX_IFLAG_CALCULATED_FILE_ID;
 }
 
 /*******************************************************************
@@ -438,7 +491,7 @@ int sys_lstat(const char *fname,SMB_STRUCT_STAT *sbuf,
 ********************************************************************/
 int sys_posix_fallocate(int fd, off_t offset, off_t len)
 {
-#if defined(HAVE_POSIX_FALLOCATE) && !defined(HAVE_BROKEN_POSIX_FALLOCATE)
+#if defined(HAVE_POSIX_FALLOCATE)
 	return posix_fallocate(fd, offset, len);
 #elif defined(F_RESVSP64)
 	/* this handles XFS on IRIX */
@@ -509,7 +562,7 @@ int sys_fallocate(int fd, uint32_t mode, off_t offset, off_t len)
 #endif	/* HAVE_LINUX_FALLOCATE */
 }
 
-#if HAVE_KERNEL_SHARE_MODES
+#ifdef HAVE_KERNEL_SHARE_MODES
 #ifndef LOCK_MAND
 #define LOCK_MAND	32	/* This is a mandatory flock */
 #define LOCK_READ	64	/* ... Which allows concurrent read operations */
@@ -522,15 +575,15 @@ int sys_fallocate(int fd, uint32_t mode, off_t offset, off_t len)
  A flock() wrapper that will perform the kernel flock.
 ********************************************************************/
 
-void kernel_flock(int fd, uint32_t share_mode, uint32_t access_mask)
+void kernel_flock(int fd, uint32_t share_access, uint32_t access_mask)
 {
-#if HAVE_KERNEL_SHARE_MODES
+#ifdef HAVE_KERNEL_SHARE_MODES
 	int kernel_mode = 0;
-	if (share_mode == FILE_SHARE_WRITE) {
+	if (share_access == FILE_SHARE_WRITE) {
 		kernel_mode = LOCK_MAND|LOCK_WRITE;
-	} else if (share_mode == FILE_SHARE_READ) {
+	} else if (share_access == FILE_SHARE_READ) {
 		kernel_mode = LOCK_MAND|LOCK_READ;
-	} else if (share_mode == FILE_SHARE_NONE) {
+	} else if (share_access == FILE_SHARE_NONE) {
 		kernel_mode = LOCK_MAND;
 	}
 	if (kernel_mode) {
@@ -572,16 +625,18 @@ int sys_mknod(const char *path, mode_t mode, SMB_DEV_T dev)
 }
 
 /*******************************************************************
-The wait() calls vary between systems
+ A mknodat() wrapper.
 ********************************************************************/
 
-int sys_waitpid(pid_t pid,int *status,int options)
+int sys_mknodat(int dirfd, const char *path, mode_t mode, SMB_DEV_T dev)
 {
-#ifdef HAVE_WAITPID
-	return waitpid(pid,status,options);
-#else /* HAVE_WAITPID */
-	return wait4(pid, status, options, NULL);
-#endif /* HAVE_WAITPID */
+#if defined(HAVE_MKNODAT)
+	return mknodat(dirfd, path, mode, dev);
+#else
+	/* No mknod system call. */
+	errno = ENOSYS;
+	return -1;
+#endif
 }
 
 /*******************************************************************
@@ -593,7 +648,7 @@ char *sys_getwd(void)
 {
 #ifdef GETCWD_TAKES_NULL
 	return getcwd(NULL, 0);
-#elif HAVE_GETCWD
+#elif defined(HAVE_GETCWD)
 	char *wd = NULL, *s = NULL;
 	size_t allocated = PATH_MAX;
 
@@ -607,7 +662,9 @@ char *sys_getwd(void)
 			break;
 		}
 		if (errno != ERANGE) {
+			int saved_errno = errno;
 			SAFE_FREE(s);
+			errno = saved_errno;
 			break;
 		}
 		allocated *= 2;
@@ -618,11 +675,18 @@ char *sys_getwd(void)
 	}
 	return wd;
 #else
+	char *wd = NULL;
 	char *s = SMB_MALLOC_ARRAY(char, PATH_MAX);
 	if (s == NULL) {
 		return NULL;
 	}
-	return getwd(s);
+	wd = getwd(s);
+	if (wd == NULL) {
+		int saved_errno = errno;
+		SAFE_FREE(s);
+		errno = saved_errno;
+	}
+	return wd;
 #endif
 }
 
@@ -803,12 +867,11 @@ int groups_max(void)
 
 static int sys_broken_getgroups(int setlen, gid_t *gidset)
 {
-	GID_T gid;
 	GID_T *group_list;
 	int i, ngroups;
 
 	if(setlen == 0) {
-		return getgroups(setlen, &gid);
+		return getgroups(0, NULL);
 	}
 
 	/*
@@ -821,9 +884,6 @@ static int sys_broken_getgroups(int setlen, gid_t *gidset)
 		return -1;
 	} 
 
-	if (setlen == 0)
-		setlen = groups_max();
-
 	if((group_list = SMB_MALLOC_ARRAY(GID_T, setlen)) == NULL) {
 		DEBUG(0,("sys_getgroups: Malloc fail.\n"));
 		return -1;
@@ -835,6 +895,12 @@ static int sys_broken_getgroups(int setlen, gid_t *gidset)
 		errno = saved_errno;
 		return -1;
 	}
+
+	/*
+	 * We're safe here as if ngroups > setlen then
+	 * getgroups *must* return EINVAL.
+	 * pubs.opengroup.org/onlinepubs/009695399/functions/getgroups.html
+	 */
 
 	for(i = 0; i < ngroups; i++)
 		gidset[i] = (gid_t)group_list[i];
@@ -979,237 +1045,6 @@ int sys_setgroups(gid_t UNUSED(primary_gid), int setlen, gid_t *gidset)
 #endif
 }
 
-/**************************************************************************
- Extract a command into an arg list.
-****************************************************************************/
-
-static char **extract_args(TALLOC_CTX *mem_ctx, const char *command)
-{
-	char *trunc_cmd;
-	char *saveptr;
-	char *ptr;
-	int argcl;
-	char **argl = NULL;
-	int i;
-
-	if (!(trunc_cmd = talloc_strdup(mem_ctx, command))) {
-		DEBUG(0, ("talloc failed\n"));
-		goto nomem;
-	}
-
-	if(!(ptr = strtok_r(trunc_cmd, " \t", &saveptr))) {
-		TALLOC_FREE(trunc_cmd);
-		errno = EINVAL;
-		return NULL;
-	}
-
-	/*
-	 * Count the args.
-	 */
-
-	for( argcl = 1; ptr; ptr = strtok_r(NULL, " \t", &saveptr))
-		argcl++;
-
-	TALLOC_FREE(trunc_cmd);
-
-	if (!(argl = talloc_array(mem_ctx, char *, argcl + 1))) {
-		goto nomem;
-	}
-
-	/*
-	 * Now do the extraction.
-	 */
-
-	if (!(trunc_cmd = talloc_strdup(mem_ctx, command))) {
-		goto nomem;
-	}
-
-	ptr = strtok_r(trunc_cmd, " \t", &saveptr);
-	i = 0;
-
-	if (!(argl[i++] = talloc_strdup(argl, ptr))) {
-		goto nomem;
-	}
-
-	while((ptr = strtok_r(NULL, " \t", &saveptr)) != NULL) {
-
-		if (!(argl[i++] = talloc_strdup(argl, ptr))) {
-			goto nomem;
-		}
-	}
-
-	argl[i++] = NULL;
-	TALLOC_FREE(trunc_cmd);
-	return argl;
-
- nomem:
-	DEBUG(0, ("talloc failed\n"));
-	TALLOC_FREE(trunc_cmd);
-	TALLOC_FREE(argl);
-	errno = ENOMEM;
-	return NULL;
-}
-
-/**************************************************************************
- Wrapper for popen. Safer as it doesn't search a path.
- Modified from the glibc sources.
- modified by tridge to return a file descriptor. We must kick our FILE* habit
-****************************************************************************/
-
-typedef struct _popen_list
-{
-	int fd;
-	pid_t child_pid;
-	struct _popen_list *next;
-} popen_list;
-
-static popen_list *popen_chain;
-
-int sys_popen(const char *command)
-{
-	int parent_end, child_end;
-	int pipe_fds[2];
-	popen_list *entry = NULL;
-	char **argl = NULL;
-	int ret;
-
-	if (!*command) {
-		errno = EINVAL;
-		return -1;
-	}
-
-	ret = pipe(pipe_fds);
-	if (ret < 0) {
-		DEBUG(0, ("sys_popen: error opening pipe: %s\n",
-			  strerror(errno)));
-		return -1;
-	}
-
-	parent_end = pipe_fds[0];
-	child_end = pipe_fds[1];
-
-	entry = SMB_MALLOC_P(popen_list);
-	if (entry == NULL) {
-		DEBUG(0, ("sys_popen: malloc failed\n"));
-		goto err_exit;
-	}
-
-	ZERO_STRUCTP(entry);
-
-	/*
-	 * Extract the command and args into a NULL terminated array.
-	 */
-
-	argl = extract_args(NULL, command);
-	if (argl == NULL) {
-		DEBUG(0, ("sys_popen: extract_args() failed: %s\n", strerror(errno)));
-		goto err_exit;
-	}
-
-	entry->child_pid = fork();
-
-	if (entry->child_pid == -1) {
-		DEBUG(0, ("sys_popen: fork failed: %s\n", strerror(errno)));
-		goto err_exit;
-	}
-
-	if (entry->child_pid == 0) {
-
-		/*
-		 * Child !
-		 */
-
-		int child_std_end = STDOUT_FILENO;
-		popen_list *p;
-
-		close(parent_end);
-		if (child_end != child_std_end) {
-			dup2 (child_end, child_std_end);
-			close (child_end);
-		}
-
-		/*
-		 * POSIX.2:  "popen() shall ensure that any streams from previous
-		 * popen() calls that remain open in the parent process are closed
-		 * in the new child process."
-		 */
-
-		for (p = popen_chain; p; p = p->next)
-			close(p->fd);
-
-		ret = execv(argl[0], argl);
-		if (ret == -1) {
-			DEBUG(0, ("sys_popen: ERROR executing command "
-				  "'%s': %s\n", command, strerror(errno)));
-		}
-		_exit (127);
-	}
-
-	/*
-	 * Parent.
-	 */
-
-	close (child_end);
-	TALLOC_FREE(argl);
-
-	/* Link into popen_chain. */
-	entry->next = popen_chain;
-	popen_chain = entry;
-	entry->fd = parent_end;
-
-	return entry->fd;
-
-err_exit:
-
-	SAFE_FREE(entry);
-	TALLOC_FREE(argl);
-	close(pipe_fds[0]);
-	close(pipe_fds[1]);
-	return -1;
-}
-
-/**************************************************************************
- Wrapper for pclose. Modified from the glibc sources.
-****************************************************************************/
-
-int sys_pclose(int fd)
-{
-	int wstatus;
-	popen_list **ptr = &popen_chain;
-	popen_list *entry = NULL;
-	pid_t wait_pid;
-	int status = -1;
-
-	/* Unlink from popen_chain. */
-	for ( ; *ptr != NULL; ptr = &(*ptr)->next) {
-		if ((*ptr)->fd == fd) {
-			entry = *ptr;
-			*ptr = (*ptr)->next;
-			status = 0;
-			break;
-		}
-	}
-
-	if (status < 0 || close(entry->fd) < 0)
-		return -1;
-
-	/*
-	 * As Samba is catching and eating child process
-	 * exits we don't really care about the child exit
-	 * code, a -1 with errno = ECHILD will do fine for us.
-	 */
-
-	do {
-		wait_pid = sys_waitpid (entry->child_pid, &wstatus, 0);
-	} while (wait_pid == -1 && errno == EINTR);
-
-	SAFE_FREE(entry);
-
-	if (wait_pid == -1)
-		return -1;
-	return wstatus;
-}
-
 /****************************************************************************
  Return the major devicenumber for UNIX extensions.
 ****************************************************************************/
@@ -1234,6 +1069,31 @@ uint32_t unix_dev_minor(SMB_DEV_T dev)
 #else
         return (uint32_t)(dev & 0xff);
 #endif
+}
+
+/**************************************************************************
+ Wrapper for realpath.
+****************************************************************************/
+
+char *sys_realpath(const char *path)
+{
+	char *result;
+
+#ifdef REALPATH_TAKES_NULL
+	result = realpath(path, NULL);
+#else
+	result = SMB_MALLOC_ARRAY(char, PATH_MAX + 1);
+	if (result) {
+		char *resolved_path = realpath(path, result);
+		if (!resolved_path) {
+			SAFE_FREE(result);
+		} else {
+			/* SMB_ASSERT(result == resolved_path) ? */
+			result = resolved_path;
+		}
+	}
+#endif
+	return result;
 }
 
 #if 0

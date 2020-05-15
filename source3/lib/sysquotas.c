@@ -19,6 +19,7 @@
 
 
 #include "includes.h"
+#include "lib/util_file.h"
 
 #undef DBGC_CLASS
 #define DBGC_CLASS DBGC_QUOTA
@@ -40,35 +41,87 @@
 
 #endif /* NO_QUOTACTL_USED */
 
-#ifdef HAVE_MNTENT
+#if defined(HAVE_MNTENT) && defined(HAVE_REALPATH)
 static int sys_path_to_bdev(const char *path, char **mntpath, char **bdev, char **fs)
 {
 	int ret = -1;
 	SMB_STRUCT_STAT S;
 	FILE *fp;
-	struct mntent *mnt;
+	struct mntent *mnt = NULL;
 	SMB_DEV_T devno;
+	char *stat_mntpath = NULL;
+	char *p;
 
 	/* find the block device file */
-
-	if (!path||!mntpath||!bdev||!fs)
-		smb_panic("sys_path_to_bdev: called with NULL pointer");
-
 	(*mntpath) = NULL;
 	(*bdev) = NULL;
 	(*fs) = NULL;
-	
-	if ( sys_stat(path, &S, false) == -1 )
-		return (-1);
+
+	if (sys_stat(path, &S, false) != 0) {
+		return -1;
+	}
 
 	devno = S.st_ex_dev ;
 
+	stat_mntpath = sys_realpath(path);
+	if (stat_mntpath == NULL) {
+		DBG_WARNING("realpath(%s) failed - %s\n", path,
+			    strerror(errno));
+		goto out;
+	}
+
+	if (sys_stat(stat_mntpath, &S, false) != 0) {
+		DBG_WARNING("cannot stat real path %s - %s\n", stat_mntpath,
+			    strerror(errno));
+		goto out;
+	}
+
+	if (S.st_ex_dev != devno) {
+		DBG_WARNING("device on real path has changed\n");
+		goto out;
+	}
+
+	while (true) {
+		char save_ch;
+
+		p = strrchr(stat_mntpath, '/');
+		if (p == NULL) {
+			DBG_ERR("realpath for %s does not begin with a '/'\n",
+				path);
+			goto out;
+		}
+
+		if (p == stat_mntpath) {
+			++p;
+		}
+
+		save_ch = *p;
+		*p = 0;
+		if (sys_stat(stat_mntpath, &S, false) != 0) {
+			DBG_WARNING("cannot stat real path component %s - %s\n",
+				    stat_mntpath, strerror(errno));
+			goto out;
+		}
+		if (S.st_ex_dev != devno) {
+			*p = save_ch;
+			break;
+		}
+
+		if (p <= stat_mntpath + 1) {
+			break;
+		}
+	}
+
 	fp = setmntent(MOUNTED,"r");
 	if (fp == NULL) {
-		return -1;
+		goto out;
 	}
   
 	while ((mnt = getmntent(fp))) {
+		if (!strequal(mnt->mnt_dir, stat_mntpath)) {
+			continue;
+		}
+
 		if ( sys_stat(mnt->mnt_dir, &S, false) == -1 )
 			continue ;
 
@@ -91,6 +144,8 @@ static int sys_path_to_bdev(const char *path, char **mntpath, char **bdev, char 
 
 	endmntent(fp) ;
 
+out:
+	SAFE_FREE(stat_mntpath);
 	return ret;
 }
 /* #endif HAVE_MNTENT */
@@ -172,6 +227,9 @@ static struct {
 	int (*get_quota)(const char *path, const char *bdev, enum SMB_QUOTA_TYPE qtype, unid_t id, SMB_DISK_QUOTA *dp);
 	int (*set_quota)(const char *path, const char *bdev, enum SMB_QUOTA_TYPE qtype, unid_t id, SMB_DISK_QUOTA *dp);
 } sys_quota_backends[] = {
+#ifdef HAVE_JFS_QUOTA_H
+	{"jfs2", sys_get_jfs2_quota, 	sys_set_jfs2_quota},
+#endif
 #if defined HAVE_XFS_QUOTAS
 	{"xfs", sys_get_xfs_quota, 	sys_set_xfs_quota},
 	{"gfs", sys_get_xfs_quota, 	sys_set_xfs_quota},
@@ -186,15 +244,18 @@ static struct {
 
 static int command_get_quota(const char *path, enum SMB_QUOTA_TYPE qtype, unid_t id, SMB_DISK_QUOTA *dp)
 {
+	const struct loadparm_substitution *lp_sub =
+		loadparm_s3_global_substitution();
 	const char *get_quota_command;
 	char **lines = NULL;
 
-	get_quota_command = lp_get_quota_command(talloc_tos());
+	get_quota_command = lp_get_quota_command(talloc_tos(), lp_sub);
 	if (get_quota_command && *get_quota_command) {
 		const char *p;
 		char *p2;
-		char *syscmd = NULL;
 		int _id = -1;
+		int error = 0;
+		char **argl = NULL;
 
 		switch(qtype) {
 			case SMB_USER_QUOTA_TYPE:
@@ -210,15 +271,40 @@ static int command_get_quota(const char *path, enum SMB_QUOTA_TYPE qtype, unid_t
 				return -1;
 		}
 
-		if (asprintf(&syscmd, "%s %s %d %d",
-			get_quota_command, path, qtype, _id) < 0) {
+		argl = talloc_zero_array(talloc_tos(), char *, 5);
+		if (argl == NULL) {
 			return -1;
 		}
+		argl[0] = talloc_strdup(argl, get_quota_command);
+		if (argl[0] == NULL) {
+			TALLOC_FREE(argl);
+			return -1;
+		}
+		argl[1] = talloc_strdup(argl, path);
+		if (argl[1] == NULL) {
+			TALLOC_FREE(argl);
+			return -1;
+		}
+		argl[2] = talloc_asprintf(argl, "%d", qtype);
+		if (argl[2] == NULL) {
+			TALLOC_FREE(argl);
+			return -1;
+		}
+		argl[3] = talloc_asprintf(argl, "%d", _id);
+		if (argl[3] == NULL) {
+			TALLOC_FREE(argl);
+			return -1;
+		}
+		argl[4] = NULL;
 
-		DEBUG (3, ("get_quota: Running command %s\n", syscmd));
+		DBG_NOTICE("Running command %s %s %d %d\n",
+			get_quota_command,
+			path,
+			qtype,
+			_id);
 
-		lines = file_lines_pload(syscmd, NULL);
-		SAFE_FREE(syscmd);
+		lines = file_lines_ploadv(talloc_tos(), argl, NULL);
+		TALLOC_FREE(argl);
 
 		if (lines) {
 			char *line = lines[0];
@@ -227,7 +313,15 @@ static int command_get_quota(const char *path, enum SMB_QUOTA_TYPE qtype, unid_t
 
 			/* we need to deal with long long unsigned here, if supported */
 
-			dp->qflags = strtoul(line, &p2, 10);
+			dp->qflags = smb_strtoul(line,
+						 &p2,
+						 10,
+						 &error,
+						 SMB_STR_STANDARD);
+			if (error != 0) {
+				goto invalid_param;
+			}
+
 			p = p2;
 			while (p && *p && isspace(*p)) {
 				p++;
@@ -331,13 +425,15 @@ invalid_param:
 
 static int command_set_quota(const char *path, enum SMB_QUOTA_TYPE qtype, unid_t id, SMB_DISK_QUOTA *dp)
 {
+	const struct loadparm_substitution *lp_sub =
+		loadparm_s3_global_substitution();
 	const char *set_quota_command;
 
-	set_quota_command = lp_set_quota_command(talloc_tos());
+	set_quota_command = lp_set_quota_command(talloc_tos(), lp_sub);
 	if (set_quota_command && *set_quota_command) {
 		char **lines = NULL;
-		char *syscmd = NULL;
 		int _id = -1;
+		char **argl = NULL;
 
 		switch(qtype) {
 			case SMB_USER_QUOTA_TYPE:
@@ -352,21 +448,84 @@ static int command_set_quota(const char *path, enum SMB_QUOTA_TYPE qtype, unid_t
 				return -1;
 		}
 
-		if (asprintf(&syscmd,
+		argl = talloc_zero_array(talloc_tos(), char *, 11);
+		if (argl == NULL) {
+			return -1;
+		}
+		argl[0] = talloc_strdup(argl, set_quota_command);
+		if (argl[0] == NULL) {
+			TALLOC_FREE(argl);
+			return -1;
+		}
+		argl[1] = talloc_strdup(argl, path);
+		if (argl[1] == NULL) {
+			TALLOC_FREE(argl);
+			return -1;
+		}
+		argl[2] = talloc_asprintf(argl, "%d", qtype);
+		if (argl[2] == NULL) {
+			TALLOC_FREE(argl);
+			return -1;
+		}
+		argl[3] = talloc_asprintf(argl, "%d", _id);
+		if (argl[3] == NULL) {
+			TALLOC_FREE(argl);
+			return -1;
+		}
+		argl[4] = talloc_asprintf(argl, "%u", dp->qflags);
+		if (argl[4] == NULL) {
+			TALLOC_FREE(argl);
+			return -1;
+		}
+		argl[5] = talloc_asprintf(argl, "%llu",
+				(long long unsigned)dp->softlimit);
+		if (argl[5] == NULL) {
+			TALLOC_FREE(argl);
+			return -1;
+		}
+		argl[6] = talloc_asprintf(argl, "%llu",
+				(long long unsigned)dp->hardlimit);
+		if (argl[6] == NULL) {
+			TALLOC_FREE(argl);
+			return -1;
+		}
+		argl[7] = talloc_asprintf(argl, "%llu",
+				(long long unsigned)dp->isoftlimit);
+		if (argl[7] == NULL) {
+			TALLOC_FREE(argl);
+			return -1;
+		}
+		argl[8] = talloc_asprintf(argl, "%llu",
+				(long long unsigned)dp->ihardlimit);
+		if (argl[8] == NULL) {
+			TALLOC_FREE(argl);
+			return -1;
+		}
+		argl[9] = talloc_asprintf(argl, "%llu",
+				(long long unsigned)dp->bsize);
+		if (argl[9] == NULL) {
+			TALLOC_FREE(argl);
+			return -1;
+		}
+		argl[10] = NULL;
+
+		DBG_NOTICE("Running command "
 			"%s %s %d %d "
 			"%u %llu %llu "
 			"%llu %llu %llu ",
-			set_quota_command, path, qtype, _id, dp->qflags,
-			(long long unsigned)dp->softlimit,(long long unsigned)dp->hardlimit,
-			(long long unsigned)dp->isoftlimit,(long long unsigned)dp->ihardlimit,
-			(long long unsigned)dp->bsize) < 0) {
-			return -1;
-		}
+			set_quota_command,
+			path,
+			qtype,
+			_id,
+			dp->qflags,
+			(long long unsigned)dp->softlimit,
+			(long long unsigned)dp->hardlimit,
+			(long long unsigned)dp->isoftlimit,
+			(long long unsigned)dp->ihardlimit,
+			(long long unsigned)dp->bsize);
 
-		DEBUG (3, ("get_quota: Running command %s\n", syscmd));
-
-		lines = file_lines_pload(syscmd, NULL);
-		SAFE_FREE(syscmd);
+		lines = file_lines_ploadv(talloc_tos(), argl, NULL);
+		TALLOC_FREE(argl);
 		if (lines) {
 			char *line = lines[0];
 
@@ -441,11 +600,6 @@ int sys_get_quota(const char *path, enum SMB_QUOTA_TYPE qtype, unid_t id, SMB_DI
 	SAFE_FREE(bdev);
 	SAFE_FREE(fs);
 
-	if ((ret!=0)&& (errno == EDQUOT)) {
-		DEBUG(10,("sys_get_quota() warning over quota!\n"));
-		return 0;
-	}
-
 	return ret;
 }
 
@@ -507,11 +661,6 @@ int sys_set_quota(const char *path, enum SMB_QUOTA_TYPE qtype, unid_t id, SMB_DI
 	SAFE_FREE(mntpath);
 	SAFE_FREE(bdev);
 	SAFE_FREE(fs);
-
-	if ((ret!=0)&& (errno == EDQUOT)) {
-		DEBUG(10,("sys_set_quota() warning over quota!\n"));
-		return 0;
-	}
 
 	return ret;		
 }

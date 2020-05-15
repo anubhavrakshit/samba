@@ -138,8 +138,8 @@ static int partition_reload_metadata(struct ldb_module *module, struct partition
 	struct ldb_message *msg, *module_msg;
 	struct ldb_result *res;
 	struct ldb_context *ldb = ldb_module_get_ctx(module);
-	const char *attrs[] = { "partition", "replicateEntries", "modules", "ldapBackend",
-				"partialReplica", NULL };
+	const char *attrs[] = { "partition", "replicateEntries", "modules",
+				"partialReplica", "backendStore", NULL };
 	/* perform search for @PARTITION, looking for module, replicateEntries and ldapBackend */
 	ret = dsdb_module_search_dn(module, mem_ctx, &res, 
 				    ldb_dn_new(mem_ctx, ldb, DSDB_PARTITION_DN),
@@ -170,7 +170,6 @@ static int partition_reload_metadata(struct ldb_module *module, struct partition
 		return ret;
 	}
 
-	data->ldapBackend = talloc_steal(data, ldb_msg_find_attr_as_string(msg, "ldapBackend", NULL));
 	if (_msg) {
 		*_msg = msg;
 	} else {
@@ -201,12 +200,14 @@ static const char **find_modules_for_dn(struct partition_private_data *data, str
 static int new_partition_from_dn(struct ldb_context *ldb, struct partition_private_data *data, 
 				 TALLOC_CTX *mem_ctx, 
 				 struct ldb_dn *dn, const char *filename,
+				 const char *backend_db_store,
 				 struct dsdb_partition **partition) {
-	const char *backend_url;
 	struct dsdb_control_current_partition *ctrl;
 	struct ldb_module *backend_module;
+	char *backend_path;
 	struct ldb_module *module_chain;
 	const char **modules;
+	const char **options = NULL;
 	int ret;
 
 	(*partition) = talloc_zero(mem_ctx, struct dsdb_partition);
@@ -220,42 +221,41 @@ static int new_partition_from_dn(struct ldb_context *ldb, struct partition_priva
 		return ldb_oom(ldb);
 	}
 
-	/* See if an LDAP backend has been specified */
-	if (data->ldapBackend) {
-		(*partition)->backend_url = data->ldapBackend;
-	} else {
-		/* the backend LDB is the DN (base64 encoded if not 'plain') followed by .ldb */
-		backend_url = ldb_relative_path(ldb, 
-						  *partition, 
-						  filename);
-		if (!backend_url) {
-			ldb_asprintf_errstring(ldb, 
-					       "partition_init: unable to determine an relative path for partition: %s", filename);
-			talloc_free(*partition);
-			return LDB_ERR_OPERATIONS_ERROR;
+	/* the backend LDB is the DN (base64 encoded if not 'plain') followed by .ldb */
+	backend_path = ldb_relative_path(ldb,
+					 *partition,
+					 filename);
+	if (!backend_path) {
+		ldb_asprintf_errstring(ldb,
+				       "partition_init: unable to determine an relative path for partition: %s",
+				       filename);
+		talloc_free(*partition);
+		return LDB_ERR_OPERATIONS_ERROR;
+	}
+	(*partition)->backend_url = talloc_asprintf(*partition, "%s://%s",
+						    backend_db_store,
+						    backend_path);
+
+	if (!(ldb_module_flags(ldb) & LDB_FLG_RDONLY)) {
+		char *p;
+		char *backend_dir;
+
+		p = strrchr(backend_path, '/');
+		if (p) {
+			p[0] = '\0';
 		}
-		(*partition)->backend_url = talloc_steal((*partition), backend_url);
+		backend_dir = backend_path;
 
-		if (!(ldb_module_flags(ldb) & LDB_FLG_RDONLY)) {
-			char *p;
-			char *backend_dir = talloc_strdup(*partition, backend_url);
-			
-			p = strrchr(backend_dir, '/');
-			if (p) {
-				p[0] = '\0';
-			}
-
-			/* Failure is quite reasonable, it might alredy exist */
-			mkdir(backend_dir, 0700);
-			talloc_free(backend_dir);
-		}
-
+		/* Failure is quite reasonable, it might alredy exist */
+		mkdir(backend_dir, 0700);
 	}
 
 	ctrl->version = DSDB_CONTROL_CURRENT_PARTITION_VERSION;
 	ctrl->dn = talloc_steal(ctrl, dn);
 	
-	ret = ldb_module_connect_backend(ldb, (*partition)->backend_url, NULL, &backend_module);
+	options = ldb_options_get(ldb);
+	ret = ldb_module_connect_backend(
+	    ldb, (*partition)->backend_url, options, &backend_module);
 	if (ret != LDB_SUCCESS) {
 		return ret;
 	}
@@ -407,6 +407,12 @@ int partition_reload_if_required(struct ldb_module *module,
 		return LDB_SUCCESS;
 	}
 
+	/* This loads metadata tdb. If it's missing, creates it */
+	ret = partition_metadata_init(module);
+	if (ret != LDB_SUCCESS) {
+		return ret;
+	}
+
 	ret = partition_reload_metadata(module, data, mem_ctx, &msg, parent);
 	if (ret != LDB_SUCCESS) {
 		talloc_free(mem_ctx);
@@ -417,6 +423,13 @@ int partition_reload_if_required(struct ldb_module *module,
 
 	partition_attributes = ldb_msg_find_element(msg, "partition");
 	partial_replicas     = ldb_msg_find_element(msg, "partialReplica");
+	data->backend_db_store
+		= talloc_strdup(data, ldb_msg_find_attr_as_string(msg, "backendStore", "tdb"));
+
+	if (data->backend_db_store == NULL) {
+		talloc_free(mem_ctx);
+		return ldb_module_oom(module);
+	}
 
 	for (i=0; partition_attributes && i < partition_attributes->num_values; i++) {
 		unsigned int j;
@@ -498,7 +511,7 @@ int partition_reload_if_required(struct ldb_module *module,
 		 * correctly.  We don't want to mess that up as the
 		 * schema isn't loaded yet */
 		ret = new_partition_from_dn(ldb, data, data->partitions, dn, 
-					    filename,
+					    filename, data->backend_db_store,
 					    &partition);
 		if (ret != LDB_SUCCESS) {
 			talloc_free(mem_ctx);
@@ -516,13 +529,6 @@ int partition_reload_if_required(struct ldb_module *module,
 			talloc_free(partition->ctrl->dn);
 			partition->ctrl->dn = talloc_steal(partition->ctrl, dn_res->msgs[0]->dn);
 			talloc_free(dn_res);
-			if (data->ldapBackend) {
-				ret = dsdb_fix_dn_rdncase(ldb, partition->ctrl->dn);
-				if (ret) {
-					talloc_free(mem_ctx);
-					return ret;
-				}
-			}
 		} else if (ret != LDB_ERR_NO_SUCH_OBJECT) {
 			ldb_asprintf_errstring(ldb,
 					       "Failed to search for partition base %s in new partition at %s: %s", 
@@ -816,7 +822,9 @@ int partition_create(struct ldb_module *module, struct ldb_request *req)
 		}
 		
 		/* Make a partition structure for this new partition, so we can copy in the template structure */ 
-		ret = new_partition_from_dn(ldb, data, req, ldb_dn_copy(req, dn), filename, &partition);
+		ret = new_partition_from_dn(ldb, data, req, ldb_dn_copy(req, dn),
+					    filename, data->backend_db_store,
+					    &partition);
 		if (ret != LDB_SUCCESS) {
 			return ret;
 		}
@@ -852,18 +860,9 @@ int partition_init(struct ldb_module *module)
 		return ldb_operr(ldb);
 	}
 
-	data = talloc_zero(mem_ctx, struct partition_private_data);
-	if (data == NULL) {
-		return ldb_operr(ldb);
-	}
-
-	/* When used from Samba4, this message is set by the samba4
-	 * module, as a fixed value not read from the DB.  This avoids
-	 * listing modules in the DB */
-	data->forced_module_msg = talloc_get_type(
-		ldb_get_opaque(ldb,
-			       DSDB_OPAQUE_PARTITION_MODULE_MSG_OPAQUE_NAME),
-		struct ldb_message);
+	/* We actually got this during the read_lock call */
+	data = talloc_get_type_abort(ldb_module_get_private(module),
+				     struct partition_private_data);
 
 	/* This loads the partitions */
 	ret = partition_reload_if_required(module, data, NULL);
@@ -886,12 +885,6 @@ int partition_init(struct ldb_module *module)
 		ldb_debug(ldb, LDB_DEBUG_ERROR,
 			"partition: Unable to register control with rootdse!\n");
 		return ldb_operr(ldb);
-	}
-
-	/* This loads metadata tdb. If it's missing, creates it */
-	ret = partition_metadata_init(module);
-	if (ret != LDB_SUCCESS) {
-		return ret;
 	}
 
 	return ldb_next_init(module);

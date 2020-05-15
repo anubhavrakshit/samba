@@ -101,7 +101,7 @@ static bool test_assoc_ctx1(struct torture_context *tctx)
 	if (!torture_nbt_get_name(tctx, &name, &address))
 		return false;
 
-	torture_comment(tctx, "Test if assoc_ctx is only valid on the conection it was created on\n");
+	torture_comment(tctx, "Test if assoc_ctx is only valid on the connection it was created on\n");
 
 	wrepl_socket1 = wrepl_socket_init(tctx, tctx->ev);
 	wrepl_socket2 = wrepl_socket_init(tctx, tctx->ev);
@@ -125,7 +125,7 @@ static bool test_assoc_ctx1(struct torture_context *tctx)
 
 	torture_comment(tctx, "association context (conn2): 0x%x\n", associate2.out.assoc_ctx);
 
-	torture_comment(tctx, "Send a replication table query, with assoc 1 (conn2), the anwser should be on conn1\n");
+	torture_comment(tctx, "Send a replication table query, with assoc 1 (conn2), the answer should be on conn1\n");
 	ZERO_STRUCT(packet);
 	packet.opcode                      = WREPL_OPCODE_BITS;
 	packet.assoc_ctx                   = associate1.out.assoc_ctx;
@@ -441,7 +441,7 @@ static const struct wrepl_ip addresses_A_3_4_X_3_4_OWNER_B[] = {
 	.ip	= TEST_ADDRESS_X_PREFIX".4"
 	}
 };
-
+/*
 static const struct wrepl_ip addresses_A_3_4_X_1_2[] = {
 	{
 	.owner	= TEST_OWNER_A_ADDRESS,
@@ -460,19 +460,21 @@ static const struct wrepl_ip addresses_A_3_4_X_1_2[] = {
 	.ip	= TEST_ADDRESS_X_PREFIX".2"
 	}
 };
-
+*/
 static const struct wrepl_ip addresses_B_1[] = {
 	{
 	.owner	= TEST_OWNER_B_ADDRESS,
 	.ip	= TEST_ADDRESS_B_PREFIX".1"
 	}
 };
+/*
 static const struct wrepl_ip addresses_B_2[] = {
 	{
 	.owner	= TEST_OWNER_B_ADDRESS,
 	.ip	= TEST_ADDRESS_B_PREFIX".2"
 	}
 };
+*/
 static const struct wrepl_ip addresses_B_3_4[] = {
 	{
 	.owner	= TEST_OWNER_B_ADDRESS,
@@ -520,6 +522,7 @@ static const struct wrepl_ip addresses_B_3_4_X_1_2[] = {
 	}
 };
 
+/*
 static const struct wrepl_ip addresses_X_1_2[] = {
 	{
 	.owner	= TEST_OWNER_X_ADDRESS,
@@ -530,6 +533,8 @@ static const struct wrepl_ip addresses_X_1_2[] = {
 	.ip	= TEST_ADDRESS_X_PREFIX".2"
 	}
 };
+*/
+
 static const struct wrepl_ip addresses_X_3_4[] = {
 	{
 	.owner	= TEST_OWNER_X_ADDRESS,
@@ -550,6 +555,7 @@ static struct test_wrepl_conflict_conn *test_create_conflict_ctx(
 	struct socket_address *nbt_srv_addr;
 	NTSTATUS status;
 	uint32_t i;
+	uint32_t num_ifaces;
 	struct interface *ifaces;
 
 	ctx = talloc_zero(tctx, struct test_wrepl_conflict_conn);
@@ -622,6 +628,7 @@ static struct test_wrepl_conflict_conn *test_create_conflict_ctx(
 	if (!ctx->myaddr) return NULL;
 
 	for (i = 0; i < iface_list_count(ifaces); i++) {
+		if (!iface_list_n_is_v4(ifaces, i)) continue;
 		if (strcmp(ctx->myaddr->addr, iface_list_n_ip(ifaces, i)) == 0) continue;
 		ctx->myaddr2 = socket_address_from_strings(tctx, ctx->nbtsock->sock->backend_name, iface_list_n_ip(ifaces, i), 0);
 		if (!ctx->myaddr2) return NULL;
@@ -680,12 +687,16 @@ static struct test_wrepl_conflict_conn *test_create_conflict_ctx(
 	ctx->addresses_best[0].owner	= ctx->b.address;
 	ctx->addresses_best[0].ip	= ctx->myaddr->addr;
 
-	ctx->addresses_all_num = iface_list_count(ifaces);
-	ctx->addresses_all = talloc_array(ctx, struct wrepl_ip, ctx->addresses_all_num);
+
+	num_ifaces = iface_list_count(ifaces);
+	ctx->addresses_all = talloc_array(ctx, struct wrepl_ip, num_ifaces);
+	ctx->addresses_all_num = 0;
 	if (!ctx->addresses_all) return NULL;
-	for (i=0; i < ctx->addresses_all_num; i++) {
+	for (i=0; i < num_ifaces; i++) {
+		if (!iface_list_n_is_v4(ifaces, i)) continue;
 		ctx->addresses_all[i].owner	= ctx->b.address;
 		ctx->addresses_all[i].ip	= talloc_strdup(ctx->addresses_all, iface_list_n_ip(ifaces, i));
+		ctx->addresses_all_num++;
 		if (!ctx->addresses_all[i].ip) return NULL;
 	}
 

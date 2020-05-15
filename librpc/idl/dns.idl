@@ -8,7 +8,7 @@
    encoding if it doesn't work out
 */
 
-import "misc.idl";
+import "misc.idl", "dnsp.idl";
 [
 	helper("librpc/ndr/ndr_dns.h"),
 	helpstring("DNS records"),
@@ -18,10 +18,12 @@ import "misc.idl";
 interface dns
 {
 	const int DNS_SERVICE_PORT       = 53;
+	const int DNS_MAX_LABELS         = 127;
+	const int DNS_MAX_DOMAIN_LENGTH  = 253;
+	const int DNS_MAX_LABEL_LENGTH   = 63;
 
 	typedef [public,bitmap16bit] bitmap {
-		DNS_RCODE                   = 0x000F,
-		DNS_FLAG_BROADCAST          = 0x0010,
+		DNS_RCODE                   = 0x001F,
 		DNS_FLAG_RECURSION_AVAIL    = 0x0080,
 		DNS_FLAG_RECURSION_DESIRED  = 0x0100,
 		DNS_FLAG_TRUNCATION         = 0x0200,
@@ -152,20 +154,12 @@ interface dns
 	} dns_soa_record;
 
 	typedef [public] struct {
-		[value(strlen(cpu))] uint8 cpu_length;
-		[charset(DOS)] uint8 cpu[cpu_length];
-		[value(strlen(os))] uint8 os_length;
-		[charset(DOS)] uint8 os[os_length];
-	} dns_hinfo_record;
-
-	typedef [public] struct {
 		uint16     preference;
 		dns_string exchange;
 	} dns_mx_record;
 
-	typedef [public] struct {
-		[value(strlen(txt))] uint8 length;
-		[charset(DOS)] uint8 txt[length];
+	typedef [public,nopull] struct {
+		dnsp_string_list txt;
 	} dns_txt_record;
 
 	typedef [public] struct {
@@ -187,7 +181,7 @@ interface dns
 		uint8      option_data[option_length];
 	} dns_opt_record;
 
-	typedef [public] struct {
+	typedef [flag(NDR_NO_COMP),public] struct {
 		dns_string     algorithm;
 		uint32         inception;
 		uint32         expiration;
@@ -199,7 +193,7 @@ interface dns
 		uint8          other_data[other_size];
 	} dns_tkey_record;
 
-	typedef [public] struct {
+	typedef [flag(NDR_NO_COMP),public] struct {
 		dns_string algorithm_name;
 		uint16     time_prefix; /* 0 until February 2106*/
 		uint32     time;
@@ -212,7 +206,7 @@ interface dns
 		uint8      other_data[other_size];
 	} dns_tsig_record;
 
-	typedef [flag(NDR_NOALIGN|NDR_BIG_ENDIAN|NDR_PAHEX),public] struct {
+	typedef [flag(NDR_NO_COMP|NDR_NOALIGN|NDR_BIG_ENDIAN|NDR_PAHEX),public] struct {
 		dns_string	name;
 		dns_qclass 	rr_class;
 		uint32     	ttl;
@@ -220,7 +214,6 @@ interface dns
 		uint16     	time_prefix; /* 0 until February 2106*/
 		uint32     	time;
 		uint16     	fudge;
-		uint16     	original_id;
 		uint16     	error;
 		uint16     	other_size;
 		uint8      	other_data[other_size];
@@ -232,7 +225,7 @@ interface dns
 		[case(DNS_QTYPE_CNAME)] dns_string       cname_record;
 		[case(DNS_QTYPE_SOA)]   dns_soa_record   soa_record;
 		[case(DNS_QTYPE_PTR)]   dns_string       ptr_record;
-		[case(DNS_QTYPE_HINFO)] dns_hinfo_record  hinfo_record;
+		[case(DNS_QTYPE_HINFO)] dnsp_hinfo       hinfo_record;
 		[case(DNS_QTYPE_MX)]    dns_mx_record    mx_record;
 		[case(DNS_QTYPE_TXT)]	dns_txt_record   txt_record;
 		[case(DNS_QTYPE_RP)]	dns_rp_record    rp_record;
@@ -270,7 +263,7 @@ interface dns
         /*
 	   this is a convenience hook for ndrdump
 	*/
-	void decode_dns_name_packet(
+	[nopython] void decode_dns_name_packet(
 				    [in] dns_name_packet packet
 				   );
 }

@@ -64,6 +64,7 @@ static bool run_netbench(struct torture_context *tctx, struct smbcli_state *cli,
 	bool correct = true;
 	double target_rate = torture_setting_double(tctx, "targetrate", 0);	
 	int n = 0;
+	int ret;
 
 	if (target_rate != 0 && client == 0) {
 		printf("Targeting %.4f MByte/sec\n", target_rate);
@@ -77,7 +78,10 @@ static bool run_netbench(struct torture_context *tctx, struct smbcli_state *cli,
 		}
 	}
 
-	asprintf(&cname, "client%d", client+1);
+	ret = asprintf(&cname, "client%d", client+1);
+	if (ret == -1) {
+		return false;
+	}
 
 	f = fopen(loadfile, "r");
 
@@ -92,6 +96,8 @@ again:
 	while (fgets(line, sizeof(line)-1, f)) {
 		NTSTATUS status;
 		const char **params0, **params;
+		unsigned long int tmp;
+		int error = 0;
 
 		nbench_line_count++;
 
@@ -134,7 +140,15 @@ again:
 
 		/* accept numeric or string status codes */
 		if (strncmp(params[i-1], "0x", 2) == 0) {
-			status = NT_STATUS(strtoul(params[i-1], NULL, 16));
+			tmp = smb_strtoul(params[i-1],
+					  NULL,
+					  16,
+					  &error,
+					  SMB_STR_STANDARD);
+			if (error != 0) {
+				tmp = error;
+			}
+			status = NT_STATUS(tmp);
 		} else {
 			status = nt_status_string_to_code(params[i-1]);
 		}
@@ -280,15 +294,15 @@ bool torture_nbench(struct torture_context *torture)
 	return correct;
 }
 
-NTSTATUS torture_nbench_init(void)
+NTSTATUS torture_nbench_init(TALLOC_CTX *ctx)
 {
 	struct torture_suite *suite = torture_suite_create(
-						   talloc_autofree_context(), "bench");
+						   ctx, "bench");
 
 	torture_suite_add_simple_test(suite, "nbench", torture_nbench);
 
 	suite->description = talloc_strdup(suite, "Benchmarks");
 
-	torture_register_suite(suite);
+	torture_register_suite(ctx, suite);
 	return NT_STATUS_OK;
 }

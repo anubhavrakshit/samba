@@ -20,13 +20,17 @@
 #include "includes.h"
 #include "ntdomain.h"
 #include "include/messages.h"
+#include "serverid.h"
 #include "include/auth.h"
 #include "../libcli/security/security.h"
 #include "../libcli/util/hresult.h"
 #include "../lib/smbconf/smbconf.h"
 #include "smbd/proto.h"
 #include "lib/smbconf/smbconf_init.h"
-#include "librpc/gen_ndr/srv_fsrvp.h"
+#include "librpc/rpc/dcesrv_core.h"
+#include "librpc/gen_ndr/ndr_fsrvp_scompat.h"
+#include "librpc/gen_ndr/ndr_fsrvp.h"
+#include "rpc_server/rpc_server.h"
 #include "srv_fss_private.h"
 #include "srv_fss_agent.h"
 
@@ -62,7 +66,7 @@ static const struct {
 
 static uint32_t fss_ntstatus_map(NTSTATUS status)
 {
-	int i;
+	size_t i;
 
 	if (NT_STATUS_IS_OK(status))
 		return 0;
@@ -131,18 +135,16 @@ static NTSTATUS fss_unc_parse(TALLOC_CTX *mem_ctx,
 	return NT_STATUS_OK;
 }
 
-static NTSTATUS fss_vfs_conn_create(TALLOC_CTX *mem_ctx,
-				    struct tevent_context *ev,
-				    struct messaging_context *msg_ctx,
+static NTSTATUS fss_conn_create_tos(struct messaging_context *msg_ctx,
 				    struct auth_session_info *session_info,
 				    int snum,
 				    struct connection_struct **conn_out);
-static void fss_vfs_conn_destroy(struct connection_struct *conn);
 
 /* test if system path exists */
 static bool snap_path_exists(TALLOC_CTX *ctx, struct messaging_context *msg_ctx,
 			     struct fss_sc *sc)
 {
+	TALLOC_CTX *frame = talloc_stackframe();
 	SMB_STRUCT_STAT st;
 	struct connection_struct *conn = NULL;
 	struct smb_filename *smb_fname = NULL;
@@ -160,20 +162,23 @@ static bool snap_path_exists(TALLOC_CTX *ctx, struct messaging_context *msg_ctx,
 	}
 
 	share = sc->smaps->share_name;
-	snum = find_service(ctx, share, &service);
+	snum = find_service(frame, share, &service);
 
 	if ((snum == -1) || (service == NULL)) {
 		goto out;
 	}
 
-	status = fss_vfs_conn_create(ctx, server_event_context(),
-				     msg_ctx, NULL, snum, &conn);
-
+	status = fss_conn_create_tos(msg_ctx, NULL, snum, &conn);
 	if(!NT_STATUS_IS_OK(status)) {
 		goto out;
 	}
 
-	smb_fname = synthetic_smb_fname(service, sc->sc_path, NULL, NULL);
+	smb_fname = synthetic_smb_fname(service,
+					sc->sc_path,
+					NULL,
+					NULL,
+					0,
+					0);
 	if (smb_fname == NULL) {
 		goto out;
 	}
@@ -184,10 +189,7 @@ static bool snap_path_exists(TALLOC_CTX *ctx, struct messaging_context *msg_ctx,
 	}
 	result = true;
 out:
-	if (conn) {
-		fss_vfs_conn_destroy(conn);
-	}
-	TALLOC_FREE(service);
+	TALLOC_FREE(frame);
 	return result;
 }
 
@@ -247,8 +249,7 @@ static NTSTATUS fss_prune_stale(struct messaging_context *msg_ctx,
 			while (sc_smap != NULL) {
 				struct fss_sc_smap *smap_next = sc_smap->next;
 				DLIST_REMOVE(sc->smaps, sc_smap);
-				DLIST_ADD_END(prunable_sc_smaps, sc_smap,
-					      struct fss_sc_smap *);
+				DLIST_ADD_END(prunable_sc_smaps, sc_smap);
 				sc->smaps_count--;
 				sc_smap = smap_next;
 			}
@@ -288,45 +289,36 @@ out:
 	return status;
 }
 
-static NTSTATUS fss_vfs_conn_create(TALLOC_CTX *mem_ctx,
-				    struct tevent_context *ev,
-				    struct messaging_context *msg_ctx,
+static NTSTATUS fss_conn_create_tos(struct messaging_context *msg_ctx,
 				    struct auth_session_info *session_info,
 				    int snum,
 				    struct connection_struct **conn_out)
 {
-	struct connection_struct *conn = NULL;
+	const struct loadparm_substitution *lp_sub =
+		loadparm_s3_global_substitution();
+	struct conn_struct_tos *c = NULL;
 	NTSTATUS status;
 
-	status = create_conn_struct(mem_ctx, ev, msg_ctx, &conn,
-				    snum, lp_path(mem_ctx, snum),
-				    session_info);
+	status = create_conn_struct_tos(msg_ctx,
+					snum,
+					lp_path(talloc_tos(), lp_sub, snum),
+					session_info,
+					&c);
 	if (!NT_STATUS_IS_OK(status)) {
 		DEBUG(0,("failed to create conn for vfs: %s\n",
 			 nt_errstr(status)));
 		return status;
 	}
 
-	status = set_conn_force_user_group(conn, snum);
+	status = set_conn_force_user_group(c->conn, snum);
 	if (!NT_STATUS_IS_OK(status)) {
 		DEBUG(0, ("failed set force user / group\n"));
-		goto err_free_conn;
+		TALLOC_FREE(c);
+		return status;
 	}
 
-	*conn_out = conn;
-
+	*conn_out = c->conn;
 	return NT_STATUS_OK;
-
-err_free_conn:
-	SMB_VFS_DISCONNECT(conn);
-	conn_free(conn);
-	return status;
-}
-
-static void fss_vfs_conn_destroy(struct connection_struct *conn)
-{
-	SMB_VFS_DISCONNECT(conn);
-	conn_free(conn);
 }
 
 static struct fss_sc_set *sc_set_lookup(struct fss_sc_set *sc_set_head,
@@ -412,7 +404,7 @@ NTSTATUS srv_fssa_start(struct messaging_context *msg_ctx)
 		return NT_STATUS_NO_MEMORY;
 	}
 
-	fss_global.db_path = lock_path(FSS_DB_NAME);
+	fss_global.db_path = lock_path(talloc_tos(), FSS_DB_NAME);
 	if (fss_global.db_path == NULL) {
 		talloc_free(fss_global.mem_ctx);
 		return NT_STATUS_NO_MEMORY;
@@ -545,7 +537,7 @@ static void fss_seq_tout_set(TALLOC_CTX *mem_ctx,
 		memcpy(sc_set_id, &sc_set->id, sizeof(*sc_set_id));
 	}
 
-	tmr = tevent_add_timer(server_event_context(),
+	tmr = tevent_add_timer(global_event_context(),
 			      mem_ctx,
 			      timeval_current_ofs(tout, 0),
 			      fss_seq_tout_handler, sc_set_id);
@@ -668,7 +660,7 @@ uint32_t _fss_StartShadowCopySet(struct pipes_struct *p,
 	}
 	sc_set->state = FSS_SC_STARTED;
 	sc_set->context = fss_global.cur_ctx;
-	DLIST_ADD_END(fss_global.sc_sets, sc_set, struct fss_sc_set *);
+	DLIST_ADD_END(fss_global.sc_sets, sc_set);
 	fss_global.sc_sets_count++;
 	DEBUG(6, ("%s: shadow-copy set %u added\n",
 		  sc_set->id_str, fss_global.sc_sets_count));
@@ -747,11 +739,9 @@ uint32_t _fss_AddToShadowCopySet(struct pipes_struct *p,
 	char *path_name;
 	struct connection_struct *conn;
 	NTSTATUS status;
-	TALLOC_CTX *tmp_ctx = talloc_new(p->mem_ctx);
-	if (tmp_ctx == NULL) {
-		ret = HRES_ERROR_V(HRES_E_OUTOFMEMORY);
-		goto err_out;
-	}
+	TALLOC_CTX *frame = talloc_stackframe();
+	const struct loadparm_substitution *lp_sub =
+		loadparm_s3_global_substitution();
 
 	if (!fss_permitted(p)) {
 		ret = HRES_ERROR_V(HRES_E_ACCESSDENIED);
@@ -764,41 +754,38 @@ uint32_t _fss_AddToShadowCopySet(struct pipes_struct *p,
 		goto err_tmp_free;
 	}
 
-	status = fss_unc_parse(tmp_ctx, r->in.ShareName, NULL, &share);
+	status = fss_unc_parse(frame, r->in.ShareName, NULL, &share);
 	if (!NT_STATUS_IS_OK(status)) {
 		ret = fss_ntstatus_map(status);
 		goto err_tmp_free;
 	}
 
-	snum = find_service(tmp_ctx, share, &service);
+	snum = find_service(frame, share, &service);
 	if ((snum == -1) || (service == NULL)) {
 		DEBUG(0, ("share at %s not found\n", r->in.ShareName));
 		ret = HRES_ERROR_V(HRES_E_INVALIDARG);
 		goto err_tmp_free;
 	}
 
-	path_name = lp_path(tmp_ctx, snum);
+	path_name = lp_path(frame, lp_sub, snum);
 	if (path_name == NULL) {
 		ret = HRES_ERROR_V(HRES_E_OUTOFMEMORY);
 		goto err_tmp_free;
 	}
 
-	status = fss_vfs_conn_create(tmp_ctx, server_event_context(),
-				     p->msg_ctx, p->session_info, snum, &conn);
+	status = fss_conn_create_tos(p->msg_ctx, p->session_info, snum, &conn);
 	if (!NT_STATUS_IS_OK(status)) {
 		ret = HRES_ERROR_V(HRES_E_ACCESSDENIED);
 		goto err_tmp_free;
 	}
-	if (!become_user_by_session(conn, p->session_info)) {
+	if (!become_user_without_service_by_session(conn, p->session_info)) {
 		DEBUG(0, ("failed to become user\n"));
-		fss_vfs_conn_destroy(conn);
 		ret = HRES_ERROR_V(HRES_E_ACCESSDENIED);
 		goto err_tmp_free;
 	}
 
-	status = SMB_VFS_SNAP_CHECK_PATH(conn, tmp_ctx, path_name, &base_vol);
-	unbecome_user();
-	fss_vfs_conn_destroy(conn);
+	status = SMB_VFS_SNAP_CHECK_PATH(conn, frame, path_name, &base_vol);
+	unbecome_user_without_service();
 	if (!NT_STATUS_IS_OK(status)) {
 		ret = FSRVP_E_NOT_SUPPORTED;
 		goto err_tmp_free;
@@ -864,10 +851,10 @@ uint32_t _fss_AddToShadowCopySet(struct pipes_struct *p,
 	}
 
 	/* add share map to shadow-copy */
-	DLIST_ADD_END(sc->smaps, sc_smap, struct fss_sc_smap *);
+	DLIST_ADD_END(sc->smaps, sc_smap);
 	sc->smaps_count++;
 	/* add shadow-copy to shadow-copy set */
-	DLIST_ADD_END(sc_set->scs, sc, struct fss_sc *);
+	DLIST_ADD_END(sc_set->scs, sc);
 	sc_set->scs_count++;
 	DEBUG(4, ("added volume %s to shadow copy set with GUID %s\n",
 		  sc->volume_name, sc_set->id_str));
@@ -878,7 +865,7 @@ uint32_t _fss_AddToShadowCopySet(struct pipes_struct *p,
 	sc_set->state = FSS_SC_ADDED;
 	r->out.pShadowCopyId = &sc->id;
 
-	talloc_free(tmp_ctx);
+	TALLOC_FREE(frame);
 	return 0;
 
 err_sc_free:
@@ -886,8 +873,7 @@ err_sc_free:
 err_tmr_restart:
 	fss_seq_tout_set(fss_global.mem_ctx, 180, sc_set, &fss_global.seq_tmr);
 err_tmp_free:
-	talloc_free(tmp_ctx);
-err_out:
+	TALLOC_FREE(frame);
 	return ret;
 }
 
@@ -899,28 +885,29 @@ static NTSTATUS commit_sc_with_conn(TALLOC_CTX *mem_ctx,
 				    char **base_path,
 				    char **snap_path)
 {
+	TALLOC_CTX *frame = talloc_stackframe();
 	NTSTATUS status;
 	bool rw;
 	struct connection_struct *conn;
 	int snum;
 	char *service;
 
-	snum = find_service(mem_ctx, sc->smaps->share_name, &service);
+	snum = find_service(frame, sc->smaps->share_name, &service);
 	if ((snum == -1) || (service == NULL)) {
 		DEBUG(0, ("share at %s not found\n", sc->smaps->share_name));
+		TALLOC_FREE(frame);
 		return NT_STATUS_UNSUCCESSFUL;
 	}
 
-	status = fss_vfs_conn_create(mem_ctx,
-				     ev, msg_ctx, session_info,
-				     snum, &conn);
+	status = fss_conn_create_tos(msg_ctx, session_info, snum, &conn);
 	if (!NT_STATUS_IS_OK(status)) {
+		TALLOC_FREE(frame);
 		return status;
 	}
 
-	if (!become_user_by_session(conn, session_info)) {
+	if (!become_user_without_service_by_session(conn, session_info)) {
 		DEBUG(0, ("failed to become user\n"));
-		fss_vfs_conn_destroy(conn);
+		TALLOC_FREE(frame);
 		return NT_STATUS_ACCESS_DENIED;
 	}
 	rw = ((sc->sc_set->context & ATTR_AUTO_RECOVERY) == ATTR_AUTO_RECOVERY);
@@ -928,13 +915,14 @@ static NTSTATUS commit_sc_with_conn(TALLOC_CTX *mem_ctx,
 				     sc->volume_name,
 				     &sc->create_ts, rw,
 				     base_path, snap_path);
-	unbecome_user();
-	fss_vfs_conn_destroy(conn);
+	unbecome_user_without_service();
 	if (!NT_STATUS_IS_OK(status)) {
 		DEBUG(0, ("snap create failed: %s\n", nt_errstr(status)));
+		TALLOC_FREE(frame);
 		return status;
 	}
 
+	TALLOC_FREE(frame);
 	return status;
 }
 
@@ -946,17 +934,11 @@ uint32_t _fss_CommitShadowCopySet(struct pipes_struct *p,
 	uint32_t commit_count;
 	NTSTATUS status;
 	NTSTATUS saved_status;
-	TALLOC_CTX *tmp_ctx;
+	TALLOC_CTX *frame = talloc_stackframe();
 
 	if (!fss_permitted(p)) {
 		status = NT_STATUS_ACCESS_DENIED;
-		goto err_out;
-	}
-
-	tmp_ctx = talloc_new(p->mem_ctx);
-	if (tmp_ctx == NULL) {
-		status = NT_STATUS_NO_MEMORY;
-		goto err_out;
+		goto err_tmp_free;
 	}
 
 	sc_set = sc_set_lookup(fss_global.sc_sets, &r->in.ShadowCopySetId);
@@ -978,7 +960,7 @@ uint32_t _fss_CommitShadowCopySet(struct pipes_struct *p,
 	for (sc = sc_set->scs; sc; sc = sc->next) {
 		char *base_path;
 		char *snap_path;
-		status = commit_sc_with_conn(tmp_ctx, server_event_context(),
+		status = commit_sc_with_conn(frame, global_event_context(),
 					     p->msg_ctx, p->session_info, sc,
 					     &base_path, &snap_path);
 		if (!NT_STATUS_IS_OK(status)) {
@@ -1012,7 +994,7 @@ uint32_t _fss_CommitShadowCopySet(struct pipes_struct *p,
 
 	fss_seq_tout_set(fss_global.mem_ctx, 180, sc_set,
 			 &fss_global.seq_tmr);
-	talloc_free(tmp_ctx);
+	TALLOC_FREE(frame);
 	return 0;
 
 err_state_revert:
@@ -1020,8 +1002,7 @@ err_state_revert:
 	fss_seq_tout_set(fss_global.mem_ctx, 180, sc_set,
 			 &fss_global.seq_tmr);
 err_tmp_free:
-	talloc_free(tmp_ctx);
-err_out:
+	TALLOC_FREE(frame);
 	return fss_ntstatus_map(status);
 }
 
@@ -1130,10 +1111,10 @@ static uint32_t fss_sc_expose(struct smbconf_ctx *fconf_ctx,
 			DEBUG(2, ("no share SD to clone for %s snapshot\n",
 				  sc_smap->share_name));
 		} else {
-			bool ok;
-			ok = set_share_security(sc_smap->sc_share_name, sd);
+			NTSTATUS status;
+			status = set_share_security(sc_smap->sc_share_name, sd);
 			TALLOC_FREE(sd);
-			if (!ok) {
+			if (!NT_STATUS_IS_OK(status)) {
 				DEBUG(0, ("failed to set %s share SD\n",
 					  sc_smap->sc_share_name));
 				err = HRES_ERROR_V(HRES_E_FAIL);
@@ -1156,10 +1137,7 @@ uint32_t _fss_ExposeShadowCopySet(struct pipes_struct *p,
 	struct smbconf_ctx *rconf_ctx;
 	sbcErr cerr;
 	char *fconf_path;
-	TALLOC_CTX *tmp_ctx = talloc_new(p->mem_ctx);
-	if (tmp_ctx == NULL) {
-		return HRES_ERROR_V(HRES_E_OUTOFMEMORY);
-	}
+	TALLOC_CTX *frame = talloc_stackframe();
 
 	if (!fss_permitted(p)) {
 		ret = HRES_ERROR_V(HRES_E_ACCESSDENIED);
@@ -1186,19 +1164,19 @@ uint32_t _fss_ExposeShadowCopySet(struct pipes_struct *p,
 	 * definition may be located in either. The snapshot share definition
 	 * is always written to the registry.
 	 */
-	cerr = smbconf_init(tmp_ctx, &rconf_ctx, "registry");
+	cerr = smbconf_init(frame, &rconf_ctx, "registry");
 	if (!SBC_ERROR_IS_OK(cerr)) {
 		DEBUG(0, ("failed registry smbconf init: %s\n",
 			  sbcErrorString(cerr)));
 		ret = HRES_ERROR_V(HRES_E_FAIL);
 		goto err_tmr_restart;
 	}
-	fconf_path = talloc_asprintf(tmp_ctx, "file:%s", get_dyn_CONFIGFILE());
+	fconf_path = talloc_asprintf(frame, "file:%s", get_dyn_CONFIGFILE());
 	if (fconf_path == NULL) {
 		ret = HRES_ERROR_V(HRES_E_OUTOFMEMORY);
 		goto err_tmr_restart;
 	}
-	cerr = smbconf_init(tmp_ctx, &fconf_ctx, fconf_path);
+	cerr = smbconf_init(frame, &fconf_ctx, fconf_path);
 	if (!SBC_ERROR_IS_OK(cerr)) {
 		DEBUG(0, ("failed %s smbconf init: %s\n",
 			  fconf_path, sbcErrorString(cerr)));
@@ -1218,7 +1196,7 @@ uint32_t _fss_ExposeShadowCopySet(struct pipes_struct *p,
 	}
 
 	for (sc = sc_set->scs; sc; sc = sc->next) {
-		ret = fss_sc_expose(fconf_ctx, rconf_ctx, tmp_ctx, sc);
+		ret = fss_sc_expose(fconf_ctx, rconf_ctx, frame, sc);
 		if (ret) {
 			DEBUG(0,("failed to expose shadow copy of %s\n",
 				 sc->volume_name));
@@ -1235,7 +1213,7 @@ uint32_t _fss_ExposeShadowCopySet(struct pipes_struct *p,
 	}
 	unbecome_root();
 
-	message_send_all(p->msg_ctx, MSG_SMB_CONF_UPDATED, NULL, 0, NULL);
+	messaging_send_all(p->msg_ctx, MSG_SMB_CONF_UPDATED, NULL, 0);
 	for (sc = sc_set->scs; sc; sc = sc->next) {
 		struct fss_sc_smap *sm;
 		for (sm = sc->smaps; sm; sm = sm->next)
@@ -1252,7 +1230,7 @@ uint32_t _fss_ExposeShadowCopySet(struct pipes_struct *p,
 	}
 	/* start message sequence timer */
 	fss_seq_tout_set(fss_global.mem_ctx, 180, sc_set, &fss_global.seq_tmr);
-	talloc_free(tmp_ctx);
+	TALLOC_FREE(frame);
 	return 0;
 
 err_cancel:
@@ -1261,7 +1239,7 @@ err_cancel:
 err_tmr_restart:
 	fss_seq_tout_set(fss_global.mem_ctx, 180, sc_set, &fss_global.seq_tmr);
 err_out:
-	talloc_free(tmp_ctx);
+	TALLOC_FREE(frame);
 	return ret;
 }
 
@@ -1358,54 +1336,50 @@ uint32_t _fss_IsPathSupported(struct pipes_struct *p,
 	NTSTATUS status;
 	struct connection_struct *conn;
 	char *share;
-	TALLOC_CTX *tmp_ctx = talloc_new(p->mem_ctx);
-	if (tmp_ctx == NULL) {
-		return HRES_ERROR_V(HRES_E_OUTOFMEMORY);
-	}
+	TALLOC_CTX *frame = talloc_stackframe();
+	const struct loadparm_substitution *lp_sub =
+		loadparm_s3_global_substitution();
 
 	if (!fss_permitted(p)) {
-		talloc_free(tmp_ctx);
+		TALLOC_FREE(frame);
 		return HRES_ERROR_V(HRES_E_ACCESSDENIED);
 	}
 
-	status = fss_unc_parse(tmp_ctx, r->in.ShareName, NULL, &share);
+	status = fss_unc_parse(frame, r->in.ShareName, NULL, &share);
 	if (!NT_STATUS_IS_OK(status)) {
-		talloc_free(tmp_ctx);
+		TALLOC_FREE(frame);
 		return fss_ntstatus_map(status);
 	}
 
-	snum = find_service(tmp_ctx, share, &service);
+	snum = find_service(frame, share, &service);
 	if ((snum == -1) || (service == NULL)) {
 		DEBUG(0, ("share at %s not found\n", r->in.ShareName));
-		talloc_free(tmp_ctx);
+		TALLOC_FREE(frame);
 		return HRES_ERROR_V(HRES_E_INVALIDARG);
 	}
 
-	status = fss_vfs_conn_create(tmp_ctx, server_event_context(),
-				     p->msg_ctx, p->session_info, snum, &conn);
+	status = fss_conn_create_tos(p->msg_ctx, p->session_info, snum, &conn);
 	if (!NT_STATUS_IS_OK(status)) {
-		talloc_free(tmp_ctx);
+		TALLOC_FREE(frame);
 		return HRES_ERROR_V(HRES_E_ACCESSDENIED);
 	}
-	if (!become_user_by_session(conn, p->session_info)) {
+	if (!become_user_without_service_by_session(conn, p->session_info)) {
 		DEBUG(0, ("failed to become user\n"));
-		talloc_free(tmp_ctx);
-		fss_vfs_conn_destroy(conn);
+		TALLOC_FREE(frame);
 		return HRES_ERROR_V(HRES_E_ACCESSDENIED);
 	}
-	status = SMB_VFS_SNAP_CHECK_PATH(conn, tmp_ctx,
-					 lp_path(tmp_ctx, snum),
+	status = SMB_VFS_SNAP_CHECK_PATH(conn, frame,
+					 lp_path(frame, lp_sub, snum),
 					 &base_vol);
-	unbecome_user();
-	fss_vfs_conn_destroy(conn);
+	unbecome_user_without_service();
 	if (!NT_STATUS_IS_OK(status)) {
-		talloc_free(tmp_ctx);
+		TALLOC_FREE(frame);
 		return FSRVP_E_NOT_SUPPORTED;
 	}
 
 	*r->out.OwnerMachineName = lp_netbios_name();
 	*r->out.SupportedByThisProvider = 1;
-	talloc_free(tmp_ctx);
+	TALLOC_FREE(frame);
 	return 0;
 }
 
@@ -1429,20 +1403,16 @@ uint32_t _fss_GetShareMapping(struct pipes_struct *p,
 	struct fss_sc_smap *sc_smap;
 	char *share;
 	struct fssagent_share_mapping_1 *sm_out;
-
-	TALLOC_CTX *tmp_ctx = talloc_new(p->mem_ctx);
-	if (tmp_ctx == NULL) {
-		return HRES_ERROR_V(HRES_E_OUTOFMEMORY);
-	}
+	TALLOC_CTX *frame = talloc_stackframe();
 
 	if (!fss_permitted(p)) {
-		talloc_free(tmp_ctx);
+		TALLOC_FREE(frame);
 		return HRES_ERROR_V(HRES_E_ACCESSDENIED);
 	}
 
 	sc_set = sc_set_lookup(fss_global.sc_sets, &r->in.ShadowCopySetId);
 	if (sc_set == NULL) {
-		talloc_free(tmp_ctx);
+		TALLOC_FREE(frame);
 		return HRES_ERROR_V(HRES_E_INVALIDARG);
 	}
 
@@ -1457,36 +1427,36 @@ uint32_t _fss_GetShareMapping(struct pipes_struct *p,
 	 || (sc_set->state == FSS_SC_ADDED)
 	 || (sc_set->state == FSS_SC_CREATING)
 	 || (sc_set->state == FSS_SC_COMMITED)) {
-		talloc_free(tmp_ctx);
+		TALLOC_FREE(frame);
 		return 0x80042311;	/* documented magic value */
 	}
 
 	sc = sc_lookup(sc_set->scs, &r->in.ShadowCopyId);
 	if (sc == NULL) {
-		talloc_free(tmp_ctx);
+		TALLOC_FREE(frame);
 		return HRES_ERROR_V(HRES_E_INVALIDARG);
 	}
 
-	status = fss_unc_parse(tmp_ctx, r->in.ShareName, NULL, &share);
+	status = fss_unc_parse(frame, r->in.ShareName, NULL, &share);
 	if (!NT_STATUS_IS_OK(status)) {
-		talloc_free(tmp_ctx);
+		TALLOC_FREE(frame);
 		return fss_ntstatus_map(status);
 	}
 
 	sc_smap = sc_smap_lookup(sc->smaps, share);
 	if (sc_smap == NULL) {
-		talloc_free(tmp_ctx);
+		TALLOC_FREE(frame);
 		return HRES_ERROR_V(HRES_E_INVALIDARG);
 	}
 
 	if (r->in.Level != 1) {
-		talloc_free(tmp_ctx);
+		TALLOC_FREE(frame);
 		return HRES_ERROR_V(HRES_E_INVALIDARG);
 	}
 
 	sm_out = talloc_zero(p->mem_ctx, struct fssagent_share_mapping_1);
 	if (sm_out == NULL) {
-		talloc_free(tmp_ctx);
+		TALLOC_FREE(frame);
 		return HRES_ERROR_V(HRES_E_OUTOFMEMORY);
 	}
 	sm_out->ShadowCopySetId = sc_set->id;
@@ -1496,13 +1466,13 @@ uint32_t _fss_GetShareMapping(struct pipes_struct *p,
 					       sc_smap->share_name);
 	if (sm_out->ShareNameUNC == NULL) {
 		talloc_free(sm_out);
-		talloc_free(tmp_ctx);
+		TALLOC_FREE(frame);
 		return HRES_ERROR_V(HRES_E_OUTOFMEMORY);
 	}
 	sm_out->ShadowCopyShareName = sc_smap->sc_share_name;
 	unix_to_nt_time(&sm_out->tstamp, sc->create_ts);
 	r->out.ShareMapping->ShareMapping1 = sm_out;
-	talloc_free(tmp_ctx);
+	TALLOC_FREE(frame);
 
 	/* reset msg sequence timer */
 	TALLOC_FREE(fss_global.seq_tmr);
@@ -1518,12 +1488,9 @@ static NTSTATUS sc_smap_unexpose(struct messaging_context *msg_ctx,
 	struct smbconf_ctx *conf_ctx;
 	sbcErr cerr;
 	bool is_modified = false;
-	TALLOC_CTX *tmp_ctx = talloc_new(sc_smap);
-	if (tmp_ctx == NULL) {
-		return NT_STATUS_NO_MEMORY;
-	}
+	TALLOC_CTX *frame = talloc_stackframe();
 
-	cerr = smbconf_init(tmp_ctx, &conf_ctx, "registry");
+	cerr = smbconf_init(frame, &conf_ctx, "registry");
 	if (!SBC_ERROR_IS_OK(cerr)) {
 		DEBUG(0, ("failed registry smbconf init: %s\n",
 			  sbcErrorString(cerr)));
@@ -1577,7 +1544,7 @@ static NTSTATUS sc_smap_unexpose(struct messaging_context *msg_ctx,
 			ret = NT_STATUS_UNSUCCESSFUL;
 			goto err_cancel;
 		}
-		message_send_all(msg_ctx, MSG_SMB_CONF_UPDATED, NULL, 0, NULL);
+		messaging_send_all(msg_ctx, MSG_SMB_CONF_UPDATED, NULL, 0);
 	} else {
 		ret = NT_STATUS_OK;
 		goto err_cancel;
@@ -1588,14 +1555,14 @@ err_conf:
 	talloc_free(conf_ctx);
 	unbecome_root();
 err_tmp:
-	talloc_free(tmp_ctx);
+	TALLOC_FREE(frame);
 	return ret;
 
 err_cancel:
 	smbconf_transaction_cancel(conf_ctx);
 	talloc_free(conf_ctx);
 	unbecome_root();
-	talloc_free(tmp_ctx);
+	TALLOC_FREE(frame);
 	return ret;
 }
 
@@ -1607,20 +1574,14 @@ uint32_t _fss_DeleteShareMapping(struct pipes_struct *p,
 	struct fss_sc_smap *sc_smap;
 	char *share;
 	NTSTATUS status;
-	TALLOC_CTX *tmp_ctx;
+	TALLOC_CTX *frame = talloc_stackframe();
 	struct connection_struct *conn;
 	int snum;
 	char *service;
 
 	if (!fss_permitted(p)) {
 		status = NT_STATUS_ACCESS_DENIED;
-		goto err_out;
-	}
-
-	tmp_ctx = talloc_new(p->mem_ctx);
-	if (tmp_ctx == NULL) {
-		status = NT_STATUS_NO_MEMORY;
-		goto err_out;
+		goto err_tmp_free;
 	}
 
 	sc_set = sc_set_lookup(fss_global.sc_sets, &r->in.ShadowCopySetId);
@@ -1642,7 +1603,7 @@ uint32_t _fss_DeleteShareMapping(struct pipes_struct *p,
 		goto err_tmp_free;
 	}
 
-	status = fss_unc_parse(tmp_ctx, r->in.ShareName, NULL, &share);
+	status = fss_unc_parse(frame, r->in.ShareName, NULL, &share);
 	if (!NT_STATUS_IS_OK(status)) {
 		goto err_tmp_free;
 	}
@@ -1660,8 +1621,9 @@ uint32_t _fss_DeleteShareMapping(struct pipes_struct *p,
 		goto err_tmp_free;
 	}
 
-	message_send_all(p->msg_ctx, MSG_SMB_FORCE_TDIS, sc_smap->sc_share_name,
-			 strlen(sc_smap->sc_share_name) + 1, NULL);
+	messaging_send_all(p->msg_ctx, MSG_SMB_FORCE_TDIS,
+			   sc_smap->sc_share_name,
+			   strlen(sc_smap->sc_share_name) + 1);
 
 	if (sc->smaps_count > 1) {
 		/* do not delete the underlying snapshot - still in use */
@@ -1669,29 +1631,28 @@ uint32_t _fss_DeleteShareMapping(struct pipes_struct *p,
 		goto err_tmp_free;
 	}
 
-	snum = find_service(tmp_ctx, sc_smap->share_name, &service);
+	snum = find_service(frame, sc_smap->share_name, &service);
 	if ((snum == -1) || (service == NULL)) {
 		DEBUG(0, ("share at %s not found\n", sc_smap->share_name));
 		status = NT_STATUS_UNSUCCESSFUL;
 		goto err_tmp_free;
 	}
 
-	status = fss_vfs_conn_create(tmp_ctx, server_event_context(),
-				     p->msg_ctx, p->session_info, snum, &conn);
+	status = fss_conn_create_tos(p->msg_ctx, p->session_info, snum, &conn);
 	if (!NT_STATUS_IS_OK(status)) {
 		goto err_tmp_free;
 	}
-	if (!become_user_by_session(conn, p->session_info)) {
+	if (!become_user_without_service_by_session(conn, p->session_info)) {
 		DEBUG(0, ("failed to become user\n"));
 		status = NT_STATUS_ACCESS_DENIED;
-		goto err_conn_destroy;
+		goto err_tmp_free;
 	}
 
-	status = SMB_VFS_SNAP_DELETE(conn, tmp_ctx, sc->volume_name,
+	status = SMB_VFS_SNAP_DELETE(conn, frame, sc->volume_name,
 				     sc->sc_path);
-	unbecome_user();
+	unbecome_user_without_service();
 	if (!NT_STATUS_IS_OK(status)) {
-		goto err_conn_destroy;
+		goto err_tmp_free;
 	}
 
 	/* XXX set timeout r->in.TimeOutInMilliseconds */
@@ -1721,11 +1682,8 @@ uint32_t _fss_DeleteShareMapping(struct pipes_struct *p,
 	}
 
 	status = NT_STATUS_OK;
-err_conn_destroy:
-	fss_vfs_conn_destroy(conn);
 err_tmp_free:
-	talloc_free(tmp_ctx);
-err_out:
+	TALLOC_FREE(frame);
 	return fss_ntstatus_map(status);
 }
 
@@ -1760,3 +1718,44 @@ uint32_t _fss_PrepareShadowCopySet(struct pipes_struct *p,
 
 	return 0;
 }
+
+static NTSTATUS FileServerVssAgent__op_init_server(
+		struct dcesrv_context *dce_ctx,
+		const struct dcesrv_endpoint_server *ep_server);
+
+static NTSTATUS FileServerVssAgent__op_shutdown_server(
+		struct dcesrv_context *dce_ctx,
+		const struct dcesrv_endpoint_server *ep_server);
+
+#define DCESRV_INTERFACE_FILESERVERVSSAGENT_INIT_SERVER \
+	fileservervssagent_init_server
+
+#define DCESRV_INTERFACE_FILESERVERVSSAGENT_SHUTDOWN_SERVER \
+	fileservervssagent_shutdown_server
+
+
+static NTSTATUS fileservervssagent_shutdown_server(
+		struct dcesrv_context *dce_ctx,
+		const struct dcesrv_endpoint_server *ep_server)
+{
+	srv_fssa_cleanup();
+	return FileServerVssAgent__op_shutdown_server(dce_ctx, ep_server);
+}
+
+static NTSTATUS fileservervssagent_init_server(
+		struct dcesrv_context *dce_ctx,
+		const struct dcesrv_endpoint_server *ep_server)
+{
+	NTSTATUS status;
+	struct messaging_context *msg_ctx = global_messaging_context();
+
+	status = srv_fssa_start(msg_ctx);
+	if (!NT_STATUS_IS_OK(status)) {
+		return status;
+	}
+
+	return FileServerVssAgent__op_init_server(dce_ctx, ep_server);
+}
+
+/* include the generated boilerplate */
+#include "librpc/gen_ndr/ndr_fsrvp_scompat.c"

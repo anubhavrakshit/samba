@@ -91,8 +91,6 @@ static bool token_contains_name(TALLOC_CTX *mem_ctx,
 		smb_panic("substitutions failed");
 	}
 
-	/* check to see is we already have a SID */
-
 	if ( string_to_sid( &sid, name ) ) {
 		DEBUG(5,("token_contains_name: Checking for SID [%s] in token\n", name));
 		return nt_token_check_sid( &sid, token );
@@ -183,7 +181,7 @@ bool token_contains_name_in_list(const char *username,
 /*
  * Check whether the user described by "token" has access to share snum.
  *
- * This looks at "invalid users", "valid users" and "only user/username"
+ * This looks at "invalid users" and "valid users".
  *
  * Please note that the user name and share names passed in here mainly for
  * the substitution routines that expand the parameter values, the decision
@@ -196,9 +194,12 @@ bool token_contains_name_in_list(const char *username,
 bool user_ok_token(const char *username, const char *domain,
 		   const struct security_token *token, int snum)
 {
+	const struct loadparm_substitution *lp_sub =
+		loadparm_s3_global_substitution();
+
 	if (lp_invalid_users(snum) != NULL) {
 		if (token_contains_name_in_list(username, domain,
-						lp_servicename(talloc_tos(), snum),
+						lp_servicename(talloc_tos(), lp_sub, snum),
 						token,
 						lp_invalid_users(snum))) {
 			DEBUG(10, ("User %s in 'invalid users'\n", username));
@@ -208,7 +209,7 @@ bool user_ok_token(const char *username, const char *domain,
 
 	if (lp_valid_users(snum) != NULL) {
 		if (!token_contains_name_in_list(username, domain,
-						 lp_servicename(talloc_tos(), snum),
+						 lp_servicename(talloc_tos(), lp_sub, snum),
 						 token,
 						 lp_valid_users(snum))) {
 			DEBUG(10, ("User %s not in 'valid users'\n",
@@ -217,24 +218,8 @@ bool user_ok_token(const char *username, const char *domain,
 		}
 	}
 
-	if (lp_only_user(snum)) {
-		const char *list[2];
-		list[0] = lp_username(talloc_tos(), snum);
-		list[1] = NULL;
-		if ((list[0] == NULL) || (*list[0] == '\0')) {
-			DEBUG(0, ("'only user = yes' and no 'username ='\n"));
-			return False;
-		}
-		if (!token_contains_name_in_list(NULL, domain,
-						 lp_servicename(talloc_tos(), snum),
-						 token, list)) {
-			DEBUG(10, ("%s != 'username'\n", username));
-			return False;
-		}
-	}
-
 	DEBUG(10, ("user_ok_token: share %s is ok for unix user %s\n",
-		   lp_servicename(talloc_tos(), snum), username));
+		   lp_servicename(talloc_tos(), lp_sub, snum), username));
 
 	return True;
 }
@@ -243,7 +228,7 @@ bool user_ok_token(const char *username, const char *domain,
  * Check whether the user described by "token" is restricted to read-only
  * access on share snum.
  *
- * This looks at "invalid users", "valid users" and "only user/username"
+ * This looks at "read list", "write list" and "read only".
  *
  * Please note that the user name and share names passed in here mainly for
  * the substitution routines that expand the parameter values, the decision
@@ -258,12 +243,14 @@ bool is_share_read_only_for_token(const char *username,
 				  const struct security_token *token,
 				  connection_struct *conn)
 {
+	const struct loadparm_substitution *lp_sub =
+		loadparm_s3_global_substitution();
 	int snum = SNUM(conn);
 	bool result = conn->read_only;
 
 	if (lp_read_list(snum) != NULL) {
 		if (token_contains_name_in_list(username, domain,
-						lp_servicename(talloc_tos(), snum),
+						lp_servicename(talloc_tos(), lp_sub, snum),
 						token,
 						lp_read_list(snum))) {
 			result = True;
@@ -272,7 +259,7 @@ bool is_share_read_only_for_token(const char *username,
 
 	if (lp_write_list(snum) != NULL) {
 		if (token_contains_name_in_list(username, domain,
-						lp_servicename(talloc_tos(), snum),
+						lp_servicename(talloc_tos(), lp_sub, snum),
 						token,
 						lp_write_list(snum))) {
 			result = False;
@@ -280,7 +267,7 @@ bool is_share_read_only_for_token(const char *username,
 	}
 
 	DEBUG(10,("is_share_read_only_for_user: share %s is %s for unix user "
-		  "%s\n", lp_servicename(talloc_tos(), snum),
+		  "%s\n", lp_servicename(talloc_tos(), lp_sub, snum),
 		  result ? "read-only" : "read-write", username));
 
 	return result;

@@ -48,19 +48,22 @@ static void popt_common_credentials_callback(poptContext con,
 						const char *arg, const void *data)
 {
 	if (reason == POPT_CALLBACK_REASON_PRE) {
-		cmdline_credentials = cli_credentials_init(talloc_autofree_context());
+		popt_set_cmdline_credentials(cli_credentials_init(NULL));
 		return;
 	}
 	
 	if (reason == POPT_CALLBACK_REASON_POST) {
-		cli_credentials_guess(cmdline_credentials, cmdline_lp_ctx);
+		cli_credentials_guess(popt_get_cmdline_credentials(),
+				cmdline_lp_ctx);
 
 		if (!dont_ask) {
-			cli_credentials_set_cmdline_callbacks(cmdline_credentials);
+			cli_credentials_set_cmdline_callbacks(
+				popt_get_cmdline_credentials());
 		}
 
 		if (machine_account_pending) {
-			cli_credentials_set_machine_account(cmdline_credentials, cmdline_lp_ctx);
+			cli_credentials_set_machine_account(
+				popt_get_cmdline_credentials(), cmdline_lp_ctx);
 		}
 
 		return;
@@ -72,7 +75,8 @@ static void popt_common_credentials_callback(poptContext con,
 	{
 		char *lp;
 		
-		cli_credentials_parse_string(cmdline_credentials, arg, CRED_SPECIFIED);
+		cli_credentials_parse_string(
+			popt_get_cmdline_credentials(), arg, CRED_SPECIFIED);
 		/* This breaks the abstraction, including the const above */
 		if ((lp=strchr_m(arg,'%'))) {
 			lp[0]='\0';
@@ -84,13 +88,15 @@ static void popt_common_credentials_callback(poptContext con,
 	break;
 
 	case OPT_PASSWORD:
-		cli_credentials_set_password(cmdline_credentials, arg, CRED_SPECIFIED);
+		cli_credentials_set_password(popt_get_cmdline_credentials(),
+			arg, CRED_SPECIFIED);
 		/* Try to prevent this showing up in ps */
 		memset(discard_const(arg),0,strlen(arg));
 		break;
 
 	case 'A':
-		cli_credentials_parse_file(cmdline_credentials, arg, CRED_SPECIFIED);
+		cli_credentials_parse_file(popt_get_cmdline_credentials(),
+			arg, CRED_SPECIFIED);
 		break;
 
 	case 'P':
@@ -111,7 +117,8 @@ static void popt_common_credentials_callback(poptContext con,
 			}
 		}
 		
-		cli_credentials_set_kerberos_state(cmdline_credentials, 
+		cli_credentials_set_kerberos_state(
+			popt_get_cmdline_credentials(),
 						   use_kerberos 
 						   ? CRED_MUST_USE_KERBEROS
 						   : CRED_DONT_USE_KERBEROS);
@@ -120,13 +127,16 @@ static void popt_common_credentials_callback(poptContext con,
 		
 	case OPT_SIMPLE_BIND_DN:
 	{
-		cli_credentials_set_bind_dn(cmdline_credentials, arg);
+		cli_credentials_set_bind_dn(popt_get_cmdline_credentials(),
+				arg);
 		break;
 	}
 	case OPT_KRB5_CCACHE:
 	{
 		const char *error_string;
-		if (cli_credentials_set_ccache(cmdline_credentials, cmdline_lp_ctx, arg, CRED_SPECIFIED,
+		if (cli_credentials_set_ccache(
+			popt_get_cmdline_credentials(), cmdline_lp_ctx,
+			arg, CRED_SPECIFIED,
 					       &error_string) != 0) {
 			fprintf(stderr, "Error reading krb5 credentials cache: '%s' %s", arg, error_string);
 			exit(1);
@@ -137,10 +147,12 @@ static void popt_common_credentials_callback(poptContext con,
 	{
 		uint32_t gensec_features;
 
-		gensec_features = cli_credentials_get_gensec_features(cmdline_credentials);
+		gensec_features = cli_credentials_get_gensec_features(
+					popt_get_cmdline_credentials());
 
 		gensec_features |= GENSEC_FEATURE_SIGN;
-		cli_credentials_set_gensec_features(cmdline_credentials,
+		cli_credentials_set_gensec_features(
+					popt_get_cmdline_credentials(),
 						    gensec_features);
 		break;
 	}
@@ -148,10 +160,12 @@ static void popt_common_credentials_callback(poptContext con,
 	{
 		uint32_t gensec_features;
 
-		gensec_features = cli_credentials_get_gensec_features(cmdline_credentials);
+		gensec_features = cli_credentials_get_gensec_features(
+					popt_get_cmdline_credentials());
 
 		gensec_features |= GENSEC_FEATURE_SEAL;
-		cli_credentials_set_gensec_features(cmdline_credentials,
+		cli_credentials_set_gensec_features(
+					popt_get_cmdline_credentials(),
 						    gensec_features);
 		break;
 	}
@@ -161,16 +175,79 @@ static void popt_common_credentials_callback(poptContext con,
 
 
 struct poptOption popt_common_credentials4[] = {
-	{ NULL, 0, POPT_ARG_CALLBACK|POPT_CBFLAG_PRE|POPT_CBFLAG_POST, (void *)popt_common_credentials_callback },
-	{ "user", 'U', POPT_ARG_STRING, NULL, 'U', "Set the network username", "[DOMAIN/]USERNAME[%PASSWORD]" },
-	{ "no-pass", 'N', POPT_ARG_NONE, &dont_ask, 'N', "Don't ask for a password" },
-	{ "password", 0, POPT_ARG_STRING, NULL, OPT_PASSWORD, "Password" },
-	{ "authentication-file", 'A', POPT_ARG_STRING, NULL, 'A', "Get the credentials from a file", "FILE" },
-	{ "machine-pass", 'P', POPT_ARG_NONE, NULL, 'P', "Use stored machine account password" },
-	{ "simple-bind-dn", 0, POPT_ARG_STRING, NULL, OPT_SIMPLE_BIND_DN, "DN to use for a simple bind" },
-	{ "kerberos", 'k', POPT_ARG_STRING, NULL, OPT_KERBEROS, "Use Kerberos, -k [yes|no]" },
-	{ "krb5-ccache", 0, POPT_ARG_STRING, NULL, OPT_KRB5_CCACHE, "Credentials cache location for Kerberos" },
-	{ "sign", 'S', POPT_ARG_NONE, NULL, OPT_SIGN, "Sign connection to prevent modification in transit" },
-	{ "encrypt", 'e', POPT_ARG_NONE, NULL, OPT_ENCRYPT, "Encrypt connection for privacy" },
-	{ NULL }
+	{
+		.argInfo    = POPT_ARG_CALLBACK|POPT_CBFLAG_PRE|POPT_CBFLAG_POST,
+		.arg        = (void *)popt_common_credentials_callback,
+	},
+	{
+		.longName   = "user",
+		.shortName  = 'U',
+		.argInfo    = POPT_ARG_STRING,
+		.val        = 'U',
+		.descrip    = "Set the network username",
+		.argDescrip = "[DOMAIN/]USERNAME[%PASSWORD]",
+	},
+	{
+		.longName   = "no-pass",
+		.shortName  = 'N',
+		.argInfo    = POPT_ARG_NONE,
+		.arg        = &dont_ask,
+		.val        = 'N',
+		.descrip    = "Don't ask for a password",
+	},
+	{
+		.longName   = "password",
+		.argInfo    = POPT_ARG_STRING,
+		.val        = OPT_PASSWORD,
+		.descrip    = "Password",
+	},
+	{
+		.longName   = "authentication-file",
+		.shortName  = 'A',
+		.argInfo    = POPT_ARG_STRING,
+		.val        = 'A',
+		.descrip    = "Get the credentials from a file",
+		.argDescrip = "FILE",
+	},
+	{
+		.longName   = "machine-pass",
+		.shortName  = 'P',
+		.argInfo    = POPT_ARG_NONE,
+		.val        = 'P',
+		.descrip    = "Use stored machine account password",
+	},
+	{
+		.longName   = "simple-bind-dn",
+		.argInfo    = POPT_ARG_STRING,
+		.val        = OPT_SIMPLE_BIND_DN,
+		.descrip    = "DN to use for a simple bind",
+	},
+	{
+		.longName   = "kerberos",
+		.shortName  = 'k',
+		.argInfo    = POPT_ARG_STRING,
+		.val        = OPT_KERBEROS,
+		.descrip    = "Use Kerberos, -k [yes|no]",
+	},
+	{
+		.longName   = "krb5-ccache",
+		.argInfo    = POPT_ARG_STRING,
+		.val        = OPT_KRB5_CCACHE,
+		.descrip    = "Credentials cache location for Kerberos",
+	},
+	{
+		.longName   = "sign",
+		.shortName  = 'S',
+		.argInfo    = POPT_ARG_NONE,
+		.val        = OPT_SIGN,
+		.descrip    = "Sign connection to prevent modification in transit",
+	},
+	{
+		.longName   = "encrypt",
+		.shortName  = 'e',
+		.argInfo    = POPT_ARG_NONE,
+		.val        = OPT_ENCRYPT,
+		.descrip    = "Encrypt connection for privacy",
+	},
+	POPT_TABLEEND
 };

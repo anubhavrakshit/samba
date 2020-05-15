@@ -38,7 +38,7 @@
 /*
  * DOS Attribute values (used internally)
  */
-typedef struct DOS_ATTR_DESC {
+struct DOS_ATTR_DESC {
 	int mode;
 	off_t size;
 	time_t create_time;
@@ -46,7 +46,7 @@ typedef struct DOS_ATTR_DESC {
 	time_t write_time;
 	time_t change_time;
 	SMB_INO_T inode;
-} DOS_ATTR_DESC;
+};
 
 /*
  * Extension of libsmbclient.h's #defines
@@ -94,6 +94,11 @@ struct smbc_dir_list {
 	struct smbc_dirent *dirent;
 };
 
+struct smbc_dirplus_list {
+	struct smbc_dirplus_list *next;
+	struct libsmb_file_info *smb_finfo;
+	uint64_t ino;
+};
 
 /*
  * Structure for open file management
@@ -110,6 +115,7 @@ struct _SMBCFILE {
 	struct _SMBCSRV *srv;
 	bool file;
 	struct smbc_dir_list *dir_list, *dir_end, *dir_next;
+	struct smbc_dirplus_list *dirplus_list, *dirplus_end, *dirplus_next;
 	int dir_type, dir_error;
 
 	SMBCFILE *next, *prev;
@@ -296,6 +302,15 @@ struct smbc_dirent *
 SMBC_readdir_ctx(SMBCCTX *context,
                  SMBCFILE *dir);
 
+const struct libsmb_file_info *
+SMBC_readdirplus_ctx(SMBCCTX *context,
+                     SMBCFILE *dir);
+
+const struct libsmb_file_info *
+SMBC_readdirplus2_ctx(SMBCCTX *context,
+		SMBCFILE *dir,
+		struct stat *st);
+
 int
 SMBC_getdents_ctx(SMBCCTX *context,
                   SMBCFILE *dir,
@@ -392,20 +407,14 @@ bool
 SMBC_getatr(SMBCCTX * context,
             SMBCSRV *srv,
             const char *path,
-            uint16_t *mode,
-            off_t *size,
-            struct timespec *create_time_ts,
-            struct timespec *access_time_ts,
-            struct timespec *write_time_ts,
-            struct timespec *change_time_ts,
-            SMB_INO_T *ino);
+	    struct stat *sbuf);
 
 bool
 SMBC_setatr(SMBCCTX * context, SMBCSRV *srv, char *path,
-            time_t create_time,
-            time_t access_time,
-            time_t write_time,
-            time_t change_time,
+            struct timespec create_time,
+            struct timespec access_time,
+            struct timespec write_time,
+            struct timespec change_time,
             uint16_t mode);
 
 off_t
@@ -513,6 +522,19 @@ SMBC_attr_server(TALLOC_CTX *ctx,
 
 
 /* Functions in libsmb_stat.c */
+void setup_stat(struct stat *st,
+		const char *fname,
+		off_t size,
+		int mode,
+		ino_t ino,
+		dev_t dev,
+		struct timespec access_time_ts,
+		struct timespec change_time_ts,
+		struct timespec write_time_ts);
+void setup_stat_from_stat_ex(const struct stat_ex *stex,
+			     const char *fname,
+			     struct stat *st);
+
 int
 SMBC_stat_ctx(SMBCCTX *context,
               const char *fname,

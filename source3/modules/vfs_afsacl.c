@@ -666,12 +666,14 @@ static size_t afs_to_nt_acl(struct afs_acl *afs_acl,
 {
 	int ret;
 
+	/*
+	 * We can directly use SMB_VFS_STAT here, as if this was a
+	 * POSIX call on a symlink, we've already refused it.
+	 * For a Windows acl mapped call on a symlink, we want to follow
+	 * it.
+	 */
 	/* Get the stat struct for the owner info. */
-	if (lp_posix_pathnames()) {
-		ret = SMB_VFS_LSTAT(conn, smb_fname);
-	} else {
-		ret = SMB_VFS_STAT(conn, smb_fname);
-	}
+	ret = SMB_VFS_STAT(conn, smb_fname);
 	if (ret == -1) {
 		return 0;
 	}
@@ -759,8 +761,9 @@ static bool nt_to_afs_acl(const char *filename,
 		}
 
 		if (!mappable_sid(&ace->trustee)) {
+			struct dom_sid_buf buf;
 			DEBUG(10, ("Ignoring unmappable SID %s\n",
-				   sid_string_dbg(&ace->trustee)));
+				   dom_sid_str_buf(&ace->trustee, &buf)));
 			continue;
 		}
 
@@ -789,8 +792,9 @@ static bool nt_to_afs_acl(const char *filename,
 
 			if (!lookup_sid(talloc_tos(), &ace->trustee,
 					&dom_name, &name, &name_type)) {
+				struct dom_sid_buf buf;
 				DEBUG(1, ("AFSACL: Could not lookup SID %s on file %s\n",
-					  sid_string_dbg(&ace->trustee),
+					  dom_sid_str_buf(&ace->trustee, &buf),
 					  filename));
 				continue;
 			}
@@ -812,10 +816,11 @@ static bool nt_to_afs_acl(const char *filename,
 			}
 
 			if (sidpts) {
+				struct dom_sid_buf buf;
 				/* Expect all users/groups in pts as SIDs */
 				name = talloc_strdup(
 					talloc_tos(),
-					sid_string_tos(&ace->trustee));
+					dom_sid_str_buf(&ace->trustee, &buf));
 				if (name == NULL) {
 					return false;
 				}
@@ -925,7 +930,7 @@ static NTSTATUS afs_set_nt_acl(vfs_handle_struct *handle, files_struct *fsp,
 		return NT_STATUS_NO_MEMORY;
 	}
 
-	if (!fsp->is_directory) {
+	if (!fsp->fsp_flags.is_directory) {
 		/* We need to get the name of the directory containing the
 		 * file, this is where the AFS acls live */
 		char *p = strrchr(name, '/');
@@ -946,7 +951,7 @@ static NTSTATUS afs_set_nt_acl(vfs_handle_struct *handle, files_struct *fsp,
 
 	split_afs_acl(&old_afs_acl, &dir_acl, &file_acl);
 
-	if (fsp->is_directory) {
+	if (fsp->fsp_flags.is_directory) {
 
 		if (!strequal(fileacls, "yes")) {
 			/* Throw away file acls, we depend on the
@@ -1030,32 +1035,28 @@ static NTSTATUS afsacl_fget_nt_acl(struct vfs_handle_struct *handle,
 	return (sd_size != 0) ? NT_STATUS_OK : NT_STATUS_ACCESS_DENIED;
 }
 
-static NTSTATUS afsacl_get_nt_acl(struct vfs_handle_struct *handle,
-				  const char *name, uint32_t security_info,
-				  TALLOC_CTX *mem_ctx,
-				  struct security_descriptor **ppdesc)
+static NTSTATUS afsacl_get_nt_acl_at(struct vfs_handle_struct *handle,
+				struct files_struct *dirfsp,
+				const struct smb_filename *smb_fname,
+				uint32_t security_info,
+				TALLOC_CTX *mem_ctx,
+				struct security_descriptor **ppdesc)
 {
 	struct afs_acl acl;
 	size_t sd_size;
-	struct smb_filename *smb_fname = NULL;
 
-	DEBUG(5, ("afsacl_get_nt_acl: %s\n", name));
+	SMB_ASSERT(dirfsp == handle->conn->cwd_fsp);
+
+	DEBUG(5, ("afsacl_get_nt_acl: %s\n", smb_fname->base_name));
 
 	sidpts = lp_parm_bool(SNUM(handle->conn), "afsacl", "sidpts", false);
 
-	if (!afs_get_afs_acl(name, &acl)) {
+	if (!afs_get_afs_acl(smb_fname->base_name, &acl)) {
 		return NT_STATUS_ACCESS_DENIED;
-	}
-
-	smb_fname = synthetic_smb_fname(talloc_tos(), name, NULL, NULL);
-	if (smb_fname == NULL) {
-		free_afs_acl(&acl);
-		return NT_STATUS_NO_MEMORY;
 	}
 
 	sd_size = afs_to_nt_acl(&acl, handle->conn, smb_fname, security_info,
 				mem_ctx, ppdesc);
-	TALLOC_FREE(smb_fname);
 
 	free_afs_acl(&acl);
 
@@ -1090,7 +1091,11 @@ static int afsacl_connect(vfs_handle_struct *handle,
 }
 
 /* We don't have a linear form of the AFS ACL yet */
-static int afsacl_sys_acl_blob_get_file(vfs_handle_struct *handle, const char *path_p, TALLOC_CTX *mem_ctx, char **blob_description, DATA_BLOB *blob)
+static int afsacl_sys_acl_blob_get_file(vfs_handle_struct *handle,
+			const struct smb_filename *smb_fname,
+			TALLOC_CTX *mem_ctx,
+			char **blob_description,
+			DATA_BLOB *blob)
 {
 	errno = ENOSYS;
 	return -1;
@@ -1106,14 +1111,14 @@ static int afsacl_sys_acl_blob_get_fd(vfs_handle_struct *handle, files_struct *f
 static struct vfs_fn_pointers vfs_afsacl_fns = {
 	.connect_fn = afsacl_connect,
 	.fget_nt_acl_fn = afsacl_fget_nt_acl,
-	.get_nt_acl_fn = afsacl_get_nt_acl,
+	.get_nt_acl_at_fn = afsacl_get_nt_acl_at,
 	.fset_nt_acl_fn = afsacl_fset_nt_acl,
 	.sys_acl_blob_get_file_fn = afsacl_sys_acl_blob_get_file,
 	.sys_acl_blob_get_fd_fn = afsacl_sys_acl_blob_get_fd
 };
 
-NTSTATUS vfs_afsacl_init(void);
-NTSTATUS vfs_afsacl_init(void)
+static_decl_vfs;
+NTSTATUS vfs_afsacl_init(TALLOC_CTX *ctx)
 {
 	return smb_register_vfs(SMB_VFS_INTERFACE_VERSION, "afsacl",
 				&vfs_afsacl_fns);

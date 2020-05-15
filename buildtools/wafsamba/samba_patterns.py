@@ -1,22 +1,21 @@
 # a waf tool to add extension based build patterns for Samba
 
-import Task
-from TaskGen import extension
-from samba_utils import *
+import sys
+from waflib import Build
 from wafsamba import samba_version_file
 
 def write_version_header(task):
     '''print version.h contents'''
     src = task.inputs[0].srcpath(task.env)
 
-    version = samba_version_file(src, task.env.srcdir, env=task.env, is_install=task.env.is_install)
+    version = samba_version_file(src, task.env.srcdir, env=task.env, is_install=task.generator.bld.is_install)
     string = str(version)
 
     task.outputs[0].write(string)
     return 0
 
 
-def SAMBA_MKVERSION(bld, target):
+def SAMBA_MKVERSION(bld, target, source='VERSION'):
     '''generate the version.h header for Samba'''
 
     # We only force waf to re-generate this file if we are installing,
@@ -24,10 +23,9 @@ def SAMBA_MKVERSION(bld, target):
     # git revision) included in the version.
     t = bld.SAMBA_GENERATOR('VERSION',
                             rule=write_version_header,
-                            source= 'VERSION',
+                            source=source,
                             target=target,
                             always=bld.is_install)
-    t.env.is_install = bld.is_install
 Build.BuildContext.SAMBA_MKVERSION = SAMBA_MKVERSION
 
 
@@ -54,7 +52,6 @@ def write_build_options_header(fp):
     fp.write("*/\n")
     fp.write("\n")
     fp.write("#include \"includes.h\"\n")
-    fp.write("#include \"build_env.h\"\n")
     fp.write("#include \"dynconfig/dynconfig.h\"\n")
     fp.write("#include \"lib/cluster_support.h\"\n")
 
@@ -95,19 +92,6 @@ def write_build_options_header(fp):
     fp.write("              return;\n")
     fp.write("       }\n")
     fp.write("\n")
-    fp.write("#ifdef _BUILD_ENV_H\n")
-    fp.write("       /* Output information about the build environment */\n")
-    fp.write("       output(screen,\"Build environment:\\n\");\n")
-    fp.write("       output(screen,\"   Built by:    %s@%s\\n\",BUILD_ENV_USER,BUILD_ENV_HOST);\n")
-    fp.write("       output(screen,\"   Built on:    %s\\n\",BUILD_ENV_DATE);\n")
-    fp.write("\n")
-    fp.write("       output(screen,\"   Built using: %s\\n\",BUILD_ENV_COMPILER);\n")
-    fp.write("       output(screen,\"   Build host:  %s\\n\",BUILD_ENV_UNAME);\n")
-    fp.write("       output(screen,\"   SRCDIR:      %s\\n\",BUILD_ENV_SRCDIR);\n")
-    fp.write("       output(screen,\"   BUILDDIR:    %s\\n\",BUILD_ENV_BUILDDIR);\n")
-    fp.write("\n")
-    fp.write("\n")
-    fp.write("#endif\n")
     fp.write("\n")
     fp.write("       /* Output various paths to files and directories */\n")
     fp.write("       output(screen,\"\\nPaths:\\n\");\n")
@@ -117,6 +101,8 @@ def write_build_options_header(fp):
     fp.write("       output(screen,\"   LOGFILEBASE: %s\\n\", get_dyn_LOGFILEBASE());\n")
     fp.write("       output(screen,\"   LMHOSTSFILE: %s\\n\",get_dyn_LMHOSTSFILE());\n")
     fp.write("       output(screen,\"   LIBDIR: %s\\n\",get_dyn_LIBDIR());\n")
+    fp.write("       output(screen,\"   DATADIR: %s\\n\",get_dyn_DATADIR());\n")
+    fp.write("       output(screen,\"   SAMBA_DATADIR: %s\\n\",get_dyn_SAMBA_DATADIR());\n")
     fp.write("       output(screen,\"   MODULESDIR: %s\\n\",get_dyn_MODULESDIR());\n")
     fp.write("       output(screen,\"   SHLIBEXT: %s\\n\",get_dyn_SHLIBEXT());\n")
     fp.write("       output(screen,\"   LOCKDIR: %s\\n\",get_dyn_LOCKDIR());\n")
@@ -125,6 +111,7 @@ def write_build_options_header(fp):
     fp.write("       output(screen,\"   PIDDIR: %s\\n\", get_dyn_PIDDIR());\n")
     fp.write("       output(screen,\"   SMB_PASSWD_FILE: %s\\n\",get_dyn_SMB_PASSWD_FILE());\n")
     fp.write("       output(screen,\"   PRIVATE_DIR: %s\\n\",get_dyn_PRIVATE_DIR());\n")
+    fp.write("       output(screen,\"   BINDDNS_DIR: %s\\n\",get_dyn_BINDDNS_DIR());\n")
     fp.write("\n")
 
 def write_build_options_footer(fp):
@@ -162,13 +149,19 @@ def write_build_options_section(fp, keys, section):
     fp.write("\n")
 
 def write_build_options(task):
-    tbl = task.env['defines']
+    tbl = task.env
     keys_option_with = []
     keys_option_utmp = []
     keys_option_have = []
     keys_header_sys = []
     keys_header_other = []
     keys_misc = []
+    if sys.hexversion>0x300000f:
+        trans_table = bytes.maketrans(b'.-()', b'____')
+    else:
+        import string
+        trans_table = string.maketrans('.-()', '____')
+
     for key in tbl:
         if key.startswith("HAVE_UT_UT_") or key.find("UTMP") >= 0:
             keys_option_utmp.append(key)
@@ -181,8 +174,11 @@ def write_build_options(task):
                 keys_header_other.append(key)
             else:
                 keys_option_have.append(key)
+        elif key.startswith("static_init_"):
+            l = key.split("(")
+            keys_misc.append(l[0])
         else:
-            keys_misc.append(key)
+            keys_misc.append(key.translate(trans_table))
 
     tgt = task.outputs[0].bldpath(task.env)
     f = open(tgt, 'w')

@@ -23,7 +23,7 @@
 #ifndef _SMB_LDAP_H
 #define _SMB_LDAP_H
 
-#if HAVE_LBER_H
+#ifdef HAVE_LBER_H
 #include <lber.h>
 #if defined(HPUX) && !defined(_LBER_TYPES_H)
 /* Define ber_tag_t and ber_int_t for using
@@ -39,7 +39,7 @@ typedef int ber_int_t;
 #endif
 #endif /* HAVE_LBER_H */
 
-#if HAVE_LDAP_H
+#ifdef HAVE_LDAP_H
 #include <ldap.h>
 #ifndef LDAP_CONST
 #define LDAP_CONST const
@@ -78,7 +78,7 @@ struct ldapsam_privates;
 
 #define LDAP_DEFAULT_TIMEOUT   15
 #define LDAP_CONNECTION_DEFAULT_TIMEOUT 2
-#define LDAP_PAGE_SIZE 1024
+#define LDAP_PAGE_SIZE 1000
 
 #define ADS_PAGE_CTL_OID 	"1.2.840.113556.1.4.319"
 

@@ -25,7 +25,6 @@
 #include "torture/rpc/torture_rpc.h"
 #include "lib/cmdline/popt_common.h"
 #include "param/param.h"
-#include "../lib/crypto/crypto.h"
 #include "libcli/auth/libcli_auth.h"
 
 #define SMBTORTURE_MACHINE_NAME "smbtrt_name"
@@ -129,7 +128,7 @@ static bool test_NetrWkstaTransportAdd(struct torture_context *tctx,
 	torture_assert_ntstatus_ok(tctx, status,
 				   "NetrWkstaTransportAdd failed");
 	torture_assert_werr_equal(tctx, r.out.result,
-				  WERR_INVALID_PARAM,
+				  WERR_INVALID_PARAMETER,
 				  "NetrWkstaTransportAdd level 0 failed");
 
 	return true;
@@ -218,7 +217,7 @@ static bool test_NetrWkstaUserGetInfo(struct torture_context *tctx,
 	struct wkssvc_NetrWkstaUserGetInfo r;
 	union wkssvc_NetrWkstaUserInfo info;
 	const char *dom = lpcfg_workgroup(tctx->lp_ctx);
-	struct cli_credentials *creds = cmdline_credentials;
+	struct cli_credentials *creds = popt_get_cmdline_credentials();
 	const char *user = cli_credentials_get_username(creds);
 	int i;
 	struct dcerpc_binding_handle *b = p->binding_handle;
@@ -231,12 +230,12 @@ static bool test_NetrWkstaUserGetInfo(struct torture_context *tctx,
 		{ NULL, 0, WERR_NO_SUCH_LOGON_SESSION },
 		{ NULL, 1, WERR_NO_SUCH_LOGON_SESSION },
 		{ NULL, 1101, WERR_OK },
-		{ dom, 0, WERR_INVALID_PARAM },
-		{ dom, 1, WERR_INVALID_PARAM },
-		{ dom, 1101, WERR_INVALID_PARAM },
-		{ user, 0, WERR_INVALID_PARAM },
-		{ user, 1, WERR_INVALID_PARAM },
-		{ user, 1101, WERR_INVALID_PARAM },
+		{ dom, 0, WERR_INVALID_PARAMETER },
+		{ dom, 1, WERR_INVALID_PARAMETER },
+		{ dom, 1101, WERR_INVALID_PARAMETER },
+		{ user, 0, WERR_INVALID_PARAMETER },
+		{ user, 1, WERR_INVALID_PARAMETER },
+		{ user, 1101, WERR_INVALID_PARAMETER },
 	};
 
 	for (i=0; i<ARRAY_SIZE(tests); i++) {
@@ -346,7 +345,7 @@ static bool test_NetrUseAdd(struct torture_context *tctx,
 	status = dcerpc_wkssvc_NetrUseAdd_r(b, tctx, &r);
 	torture_assert_ntstatus_ok(tctx, status,
 				   "NetrUseAdd failed");
-	torture_assert_werr_equal(tctx, r.out.result, WERR_UNKNOWN_LEVEL,
+	torture_assert_werr_equal(tctx, r.out.result, WERR_INVALID_LEVEL,
 			       "NetrUseAdd failed");
 
 	ZERO_STRUCT(r);
@@ -476,7 +475,7 @@ static bool test_NetrUseGetInfo(struct torture_context *tctx,
 
 			if (!test_NetrUseGetInfo_level(tctx, p, use_name,
 						       levels[i],
-						       WERR_NOT_CONNECTED))
+						       WERR_NERR_USENOTFOUND))
 			{
 				if (levels[i] != 0) {
 					return false;
@@ -653,7 +652,7 @@ static bool test_NetrValidateName2(struct torture_context *tctx,
 		torture_assert_ntstatus_ok(tctx, status,
 					   "NetrValidateName2 failed");
 		torture_assert_werr_equal(tctx, r.out.result,
-					  WERR_RPC_E_REMOTE_DISABLED,
+					  W_ERROR(HRES_ERROR_V(HRES_RPC_E_REMOTE_DISABLED)),
 					  "NetrValidateName2 failed");
 	}
 
@@ -1113,7 +1112,7 @@ static bool test_NetrGetJoinableOus2(struct torture_context *tctx,
 	status = dcerpc_wkssvc_NetrGetJoinableOus2_r(b, tctx, &r);
 	torture_assert_ntstatus_ok(tctx, status, "NetrGetJoinableOus2 failed");
 	torture_assert_werr_equal(tctx, r.out.result,
-				  WERR_RPC_E_REMOTE_DISABLED,
+				  W_ERROR(HRES_ERROR_V(HRES_RPC_E_REMOTE_DISABLED)),
 				  "NetrGetJoinableOus2 failed");
 
 	return true;
@@ -1124,7 +1123,7 @@ static bool test_NetrUnjoinDomain(struct torture_context *tctx,
 {
 	NTSTATUS status;
 	struct wkssvc_NetrUnjoinDomain r;
-	struct cli_credentials *creds = cmdline_credentials;
+	struct cli_credentials *creds = popt_get_cmdline_credentials();
 	const char *user = cli_credentials_get_username(creds);
 	const char *admin_account = NULL;
 	struct dcerpc_binding_handle *b = p->binding_handle;
@@ -1153,7 +1152,7 @@ static bool test_NetrJoinDomain(struct torture_context *tctx,
 {
 	NTSTATUS status;
 	struct wkssvc_NetrJoinDomain r;
-	struct cli_credentials *creds = cmdline_credentials;
+	struct cli_credentials *creds = popt_get_cmdline_credentials();
 	const char *user = cli_credentials_get_username(creds);
 	const char *admin_account = NULL;
 	struct dcerpc_binding_handle *b = p->binding_handle;
@@ -1200,11 +1199,12 @@ static bool test_NetrJoinDomain2(struct torture_context *tctx,
 	enum wkssvc_NetJoinStatus join_status;
 	const char *join_name = NULL;
 	WERROR expected_err;
+	WERROR werr;
 	DATA_BLOB session_key;
 	struct dcerpc_binding_handle *b = p->binding_handle;
 
 	/* FIXME: this test assumes to join workstations / servers and does not
-	 * handle DCs (WERR_SETUP_DOMAIN_CONTROLLER) */
+	 * handle DCs (WERR_NERR_SETUPDOMAINCONTROLLER) */
 
 	if (!test_GetJoinInformation(tctx, p, &join_status, &join_name))
 	{
@@ -1213,7 +1213,7 @@ static bool test_NetrJoinDomain2(struct torture_context *tctx,
 
 	switch (join_status) {
 		case NET_SETUP_DOMAIN_NAME:
-			expected_err = WERR_SETUP_ALREADY_JOINED;
+			expected_err = WERR_NERR_SETUPALREADYJOINED;
 			break;
 		case NET_SETUP_UNKNOWN_STATUS:
 		case NET_SETUP_UNJOINED:
@@ -1241,8 +1241,13 @@ static bool test_NetrJoinDomain2(struct torture_context *tctx,
 		return false;
 	}
 
-	encode_wkssvc_join_password_buffer(tctx, domain_admin_password,
-					   &session_key, &pwd_buf);
+	werr = encode_wkssvc_join_password_buffer(tctx,
+						  domain_admin_password,
+						  &session_key,
+						  &pwd_buf);
+	if (!W_ERROR_IS_OK(werr)) {
+		return false;
+	}
 
 	r.in.server_name = dcerpc_server_name(p);
 	r.in.domain_name = domain_name;
@@ -1285,11 +1290,12 @@ static bool test_NetrUnjoinDomain2(struct torture_context *tctx,
 	enum wkssvc_NetJoinStatus join_status;
 	const char *join_name = NULL;
 	WERROR expected_err;
+	WERROR werr;
 	DATA_BLOB session_key;
 	struct dcerpc_binding_handle *b = p->binding_handle;
 
 	/* FIXME: this test assumes to join workstations / servers and does not
-	 * handle DCs (WERR_SETUP_DOMAIN_CONTROLLER) */
+	 * handle DCs (WERR_NERR_SETUPDOMAINCONTROLLER) */
 
 	if (!test_GetJoinInformation(tctx, p, &join_status, &join_name))
 	{
@@ -1298,7 +1304,7 @@ static bool test_NetrUnjoinDomain2(struct torture_context *tctx,
 
 	switch (join_status) {
 		case NET_SETUP_UNJOINED:
-			expected_err = WERR_SETUP_NOT_JOINED;
+			expected_err = WERR_NERR_SETUPNOTJOINED;
 			break;
 		case NET_SETUP_DOMAIN_NAME:
 		case NET_SETUP_UNKNOWN_STATUS:
@@ -1323,8 +1329,13 @@ static bool test_NetrUnjoinDomain2(struct torture_context *tctx,
 		return false;
 	}
 
-	encode_wkssvc_join_password_buffer(tctx, domain_admin_password,
-					   &session_key, &pwd_buf);
+	werr = encode_wkssvc_join_password_buffer(tctx,
+						  domain_admin_password,
+						  &session_key,
+						  &pwd_buf);
+	if (!W_ERROR_IS_OK(werr)) {
+		return false;
+	}
 
 	r.in.server_name = dcerpc_server_name(p);
 	r.in.account = domain_admin_account;

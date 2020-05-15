@@ -21,7 +21,13 @@
 
 import samba
 import samba.tests
-from samba.kcc.graph_utils import *
+from samba.kcc.graph_utils import GraphError
+from samba.kcc.graph_utils import (verify_graph_complete,
+                                   verify_graph_connected,
+                                   verify_graph_connected_under_edge_failures,
+                                   verify_graph_forest,
+                                   verify_graph_connected_under_vertex_failures,
+                                   verify_graph_no_lonely_vertices)
 
 import itertools
 
@@ -54,7 +60,7 @@ class UndirectedGraphTests(samba.tests.TestCase):
         vertices2 = tuple('ijk')
         edges = tuple(itertools.combinations(vertices, 2))
         edges2 = tuple(itertools.combinations(vertices2, 2))
-        line_edges = zip(vertices[1:], vertices[:-1])
+        line_edges = list(zip(vertices[1:], vertices[:-1]))
         ring_edges = line_edges + [(vertices[0], vertices[-1])]
 
         tree = make_tree(vertices)
@@ -130,7 +136,7 @@ class UndirectedGraphTests(samba.tests.TestCase):
         self.assertIsNone(fn(*self.complete_graph))
 
     def test_graph_connected_under_vertex_failures(self):
-        #XXX no tests to distinguish this from the edge_failures case
+        # XXX no tests to distinguish this from the edge_failures case
         fn = verify_graph_connected_under_vertex_failures
 
         self.assertGraphError(fn, *self.line)

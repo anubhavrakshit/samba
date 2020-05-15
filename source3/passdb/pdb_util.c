@@ -38,7 +38,7 @@
 static NTSTATUS add_sid_to_builtin(const struct dom_sid *builtin_sid,
 				   const struct dom_sid *dom_sid)
 {
-	NTSTATUS status = NT_STATUS_OK;
+	NTSTATUS status;
 
 	if (!dom_sid || !builtin_sid) {
 		return NT_STATUS_INVALID_PARAMETER;
@@ -47,16 +47,20 @@ static NTSTATUS add_sid_to_builtin(const struct dom_sid *builtin_sid,
 	status = pdb_add_aliasmem(builtin_sid, dom_sid);
 
 	if (NT_STATUS_EQUAL(status, NT_STATUS_MEMBER_IN_ALIAS)) {
+		struct dom_sid_buf buf1, buf2;
 		DEBUG(5, ("add_sid_to_builtin %s is already a member of %s\n",
-			  sid_string_dbg(dom_sid),
-			  sid_string_dbg(builtin_sid)));
+			  dom_sid_str_buf(dom_sid, &buf1),
+			  dom_sid_str_buf(builtin_sid, &buf2)));
 		return NT_STATUS_OK;
 	}
 
 	if (!NT_STATUS_IS_OK(status)) {
+		struct dom_sid_buf buf1, buf2;
 		DEBUG(4, ("add_sid_to_builtin %s could not be added to %s: "
-			  "%s\n", sid_string_dbg(dom_sid),
-			  sid_string_dbg(builtin_sid), nt_errstr(status)));
+			  "%s\n",
+			  dom_sid_str_buf(dom_sid, &buf1),
+			  dom_sid_str_buf(builtin_sid, &buf2),
+			  nt_errstr(status)));
 	}
 	return status;
 }
@@ -130,8 +134,9 @@ NTSTATUS create_builtin_users(const struct dom_sid *dom_sid)
 	}
 
 	/* add domain users */
-	if ((IS_DC || (lp_server_role() == ROLE_DOMAIN_MEMBER))
-		&& sid_compose(&dom_users, dom_sid, DOMAIN_RID_USERS))
+	if ((IS_DC || (lp_server_role() == ROLE_DOMAIN_MEMBER)) &&
+	    (dom_sid != NULL) &&
+	    sid_compose(&dom_users, dom_sid, DOMAIN_RID_USERS))
 	{
 		status = add_sid_to_builtin(&global_sid_Builtin_Users,
 					    &dom_users);
@@ -159,8 +164,9 @@ NTSTATUS create_builtin_administrators(const struct dom_sid *dom_sid)
 	}
 
 	/* add domain admins */
-	if ((IS_DC || (lp_server_role() == ROLE_DOMAIN_MEMBER))
-		&& sid_compose(&dom_admins, dom_sid, DOMAIN_RID_ADMINS))
+	if ((IS_DC || (lp_server_role() == ROLE_DOMAIN_MEMBER)) &&
+	    (dom_sid != NULL) &&
+	    sid_compose(&dom_admins, dom_sid, DOMAIN_RID_ADMINS))
 	{
 		status = add_sid_to_builtin(&global_sid_Builtin_Administrators,
 					    &dom_admins);
@@ -184,4 +190,56 @@ NTSTATUS create_builtin_administrators(const struct dom_sid *dom_sid)
 	}
 
 	return status;
+}
+
+/*******************************************************************
+*******************************************************************/
+
+NTSTATUS create_builtin_guests(const struct dom_sid *dom_sid)
+{
+	NTSTATUS status;
+	struct dom_sid tmp_sid = { 0, };
+
+	status = pdb_create_builtin(BUILTIN_RID_GUESTS);
+	if (!NT_STATUS_IS_OK(status)) {
+		DEBUG(5,("create_builtin_guests: Failed to create Guests\n"));
+		return status;
+	}
+
+	/* add local guest */
+	if (sid_compose(&tmp_sid, get_global_sam_sid(), DOMAIN_RID_GUEST)) {
+		status = add_sid_to_builtin(&global_sid_Builtin_Guests,
+					    &tmp_sid);
+		if (!NT_STATUS_IS_OK(status)) {
+			return status;
+		}
+	}
+
+	/* add local guests */
+	if (sid_compose(&tmp_sid, get_global_sam_sid(), DOMAIN_RID_GUESTS)) {
+		status = add_sid_to_builtin(&global_sid_Builtin_Guests,
+					    &tmp_sid);
+		if (!NT_STATUS_IS_OK(status)) {
+			return status;
+		}
+	}
+
+	if (lp_server_role() != ROLE_DOMAIN_MEMBER) {
+		return NT_STATUS_OK;
+	}
+
+	if (dom_sid == NULL) {
+		return NT_STATUS_INTERNAL_ERROR;
+	}
+
+	/* add domain guests */
+	if (sid_compose(&tmp_sid, dom_sid, DOMAIN_RID_GUESTS)) {
+		status = add_sid_to_builtin(&global_sid_Builtin_Guests,
+					    &tmp_sid);
+		if (!NT_STATUS_IS_OK(status)) {
+			return status;
+		}
+	}
+
+	return NT_STATUS_OK;
 }

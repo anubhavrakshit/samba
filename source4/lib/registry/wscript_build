@@ -12,10 +12,9 @@ bld.SAMBA_SUBSYSTEM('TDR_REGF',
 
 bld.SAMBA_LIBRARY('registry',
 	source='interface.c util.c samba.c patchfile_dotreg.c patchfile_preg.c patchfile.c regf.c hive.c local.c ldb.c rpc.c',
-	pc_files='registry.pc',
 	public_deps='dcerpc samba-util TDR_REGF ldb RPC_NDR_WINREG ldbsamba util_reg',
-	public_headers='registry.h',
-	vnum='0.0.1'
+	private_headers='registry.h',
+	private_library=True
 	)
 
 
@@ -60,10 +59,11 @@ bld.SAMBA_SUBSYSTEM('torture_registry',
 	deps='torture registry'
 	)
 
+pytalloc_util = bld.pyembed_libname('pytalloc-util')
+pyparam_util = bld.pyembed_libname('pyparam_util')
 
 bld.SAMBA_PYTHON('py_registry',
-	source='pyregistry.c',
-	public_deps='registry pytalloc-util pyparam_util',
-	realname='samba/registry.so'
-	)
-
+		source='pyregistry.c',
+		public_deps='registry %s %s' % (pytalloc_util, pyparam_util),
+		realname='samba/registry.so'
+		)

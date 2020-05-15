@@ -48,33 +48,27 @@ struct tevent_context;
 	SMBPROFILE_STATS_BASIC(syscall_seekdir) \
 	SMBPROFILE_STATS_BASIC(syscall_telldir) \
 	SMBPROFILE_STATS_BASIC(syscall_rewinddir) \
-	SMBPROFILE_STATS_BASIC(syscall_mkdir) \
-	SMBPROFILE_STATS_BASIC(syscall_rmdir) \
+	SMBPROFILE_STATS_BASIC(syscall_mkdirat) \
 	SMBPROFILE_STATS_BASIC(syscall_closedir) \
 	SMBPROFILE_STATS_BASIC(syscall_open) \
 	SMBPROFILE_STATS_BASIC(syscall_createfile) \
 	SMBPROFILE_STATS_BASIC(syscall_close) \
-	SMBPROFILE_STATS_BYTES(syscall_read) \
 	SMBPROFILE_STATS_BYTES(syscall_pread) \
 	SMBPROFILE_STATS_BYTES(syscall_asys_pread) \
-	SMBPROFILE_STATS_BYTES(syscall_write) \
 	SMBPROFILE_STATS_BYTES(syscall_pwrite) \
 	SMBPROFILE_STATS_BYTES(syscall_asys_pwrite) \
 	SMBPROFILE_STATS_BASIC(syscall_lseek) \
 	SMBPROFILE_STATS_BYTES(syscall_sendfile) \
 	SMBPROFILE_STATS_BYTES(syscall_recvfile) \
-	SMBPROFILE_STATS_BASIC(syscall_rename) \
-	SMBPROFILE_STATS_BASIC(syscall_rename_at) \
-	SMBPROFILE_STATS_BASIC(syscall_fsync) \
-	SMBPROFILE_STATS_BASIC(syscall_asys_fsync) \
+	SMBPROFILE_STATS_BASIC(syscall_renameat) \
+	SMBPROFILE_STATS_BYTES(syscall_asys_fsync) \
 	SMBPROFILE_STATS_BASIC(syscall_stat) \
 	SMBPROFILE_STATS_BASIC(syscall_fstat) \
 	SMBPROFILE_STATS_BASIC(syscall_lstat) \
 	SMBPROFILE_STATS_BASIC(syscall_get_alloc_size) \
-	SMBPROFILE_STATS_BASIC(syscall_unlink) \
+	SMBPROFILE_STATS_BASIC(syscall_unlinkat) \
 	SMBPROFILE_STATS_BASIC(syscall_chmod) \
 	SMBPROFILE_STATS_BASIC(syscall_fchmod) \
-	SMBPROFILE_STATS_BASIC(syscall_chown) \
 	SMBPROFILE_STATS_BASIC(syscall_fchown) \
 	SMBPROFILE_STATS_BASIC(syscall_lchown) \
 	SMBPROFILE_STATS_BASIC(syscall_chdir) \
@@ -84,12 +78,13 @@ struct tevent_context;
 	SMBPROFILE_STATS_BASIC(syscall_fallocate) \
 	SMBPROFILE_STATS_BASIC(syscall_fcntl_lock) \
 	SMBPROFILE_STATS_BASIC(syscall_kernel_flock) \
+	SMBPROFILE_STATS_BASIC(syscall_fcntl) \
 	SMBPROFILE_STATS_BASIC(syscall_linux_setlease) \
 	SMBPROFILE_STATS_BASIC(syscall_fcntl_getlock) \
-	SMBPROFILE_STATS_BASIC(syscall_readlink) \
-	SMBPROFILE_STATS_BASIC(syscall_symlink) \
-	SMBPROFILE_STATS_BASIC(syscall_link) \
-	SMBPROFILE_STATS_BASIC(syscall_mknod) \
+	SMBPROFILE_STATS_BASIC(syscall_readlinkat) \
+	SMBPROFILE_STATS_BASIC(syscall_symlinkat) \
+	SMBPROFILE_STATS_BASIC(syscall_linkat) \
+	SMBPROFILE_STATS_BASIC(syscall_mknodat) \
 	SMBPROFILE_STATS_BASIC(syscall_realpath) \
 	SMBPROFILE_STATS_BASIC(syscall_get_quota) \
 	SMBPROFILE_STATS_BASIC(syscall_set_quota) \
@@ -98,41 +93,20 @@ struct tevent_context;
 	SMBPROFILE_STATS_BASIC(syscall_brl_lock) \
 	SMBPROFILE_STATS_BASIC(syscall_brl_unlock) \
 	SMBPROFILE_STATS_BASIC(syscall_brl_cancel) \
+	SMBPROFILE_STATS_BYTES(syscall_asys_getxattrat) \
 	SMBPROFILE_STATS_SECTION_END \
 	\
 	SMBPROFILE_STATS_SECTION_START(acl, "ACL Calls") \
 	SMBPROFILE_STATS_BASIC(get_nt_acl) \
+	SMBPROFILE_STATS_BASIC(get_nt_acl_at) \
 	SMBPROFILE_STATS_BASIC(fget_nt_acl) \
 	SMBPROFILE_STATS_BASIC(fset_nt_acl) \
-	SMBPROFILE_STATS_BASIC(chmod_acl) \
-	SMBPROFILE_STATS_BASIC(fchmod_acl) \
 	SMBPROFILE_STATS_SECTION_END \
 	\
 	SMBPROFILE_STATS_SECTION_START(statcache, "Stat Cache") \
 	SMBPROFILE_STATS_COUNT(statcache_lookups) \
 	SMBPROFILE_STATS_COUNT(statcache_misses) \
 	SMBPROFILE_STATS_COUNT(statcache_hits) \
-	SMBPROFILE_STATS_SECTION_END \
-	\
-	SMBPROFILE_STATS_SECTION_START(writecache, "Write Cache") \
-	SMBPROFILE_STATS_COUNT(writecache_allocations) \
-	SMBPROFILE_STATS_COUNT(writecache_deallocations) \
-	SMBPROFILE_STATS_COUNT(writecache_cached_reads) \
-	SMBPROFILE_STATS_COUNT(writecache_total_writes) \
-	SMBPROFILE_STATS_COUNT(writecache_init_writes) \
-	SMBPROFILE_STATS_COUNT(writecache_abutted_writes) \
-	SMBPROFILE_STATS_COUNT(writecache_non_oplock_writes) \
-	SMBPROFILE_STATS_COUNT(writecache_direct_writes) \
-	SMBPROFILE_STATS_COUNT(writecache_cached_writes) \
-	SMBPROFILE_STATS_COUNT(writecache_perfect_writes) \
-	SMBPROFILE_STATS_COUNT(writecache_flush_reason_seek) \
-	SMBPROFILE_STATS_COUNT(writecache_flush_reason_read) \
-	SMBPROFILE_STATS_COUNT(writecache_flush_reason_readraw) \
-	SMBPROFILE_STATS_COUNT(writecache_flush_reason_write) \
-	SMBPROFILE_STATS_COUNT(writecache_flush_reason_oplock) \
-	SMBPROFILE_STATS_COUNT(writecache_flush_reason_close) \
-	SMBPROFILE_STATS_COUNT(writecache_flush_reason_sync) \
-	SMBPROFILE_STATS_COUNT(writecache_flush_reason_sizechange) \
 	SMBPROFILE_STATS_SECTION_END \
 	\
 	SMBPROFILE_STATS_SECTION_START(SMB, "SMB Calls") \
@@ -533,7 +507,7 @@ static inline bool smbprofile_dump_pending(void)
 
 void smbprofile_dump(void);
 
-void smbprofile_cleanup(pid_t pid);
+void smbprofile_cleanup(pid_t pid, pid_t dst);
 void smbprofile_stats_accumulate(struct profile_stats *acc,
 				 const struct profile_stats *add);
 void smbprofile_collect(struct profile_stats *stats);
@@ -565,6 +539,8 @@ static inline uint64_t profile_timestamp(void)
 #define END_PROFILE_BYTES(x) \
 	SMBPROFILE_BYTES_ASYNC_END(__profasync_##x)
 
+#define PROFILE_TIMESTAMP(x) clock_gettime_mono(x)
+
 #else /* WITH_PROFILE */
 
 #define SMBPROFILE_COUNT_INCREMENT(_name, _area, _v)
@@ -595,6 +571,8 @@ static inline uint64_t profile_timestamp(void)
 #define END_PROFILE(x)
 #define END_PROFILE_BYTES(x)
 
+#define PROFILE_TIMESTAMP(x) (*(x)=(struct timespec){0})
+
 static inline bool smbprofile_dump_pending(void)
 {
 	return false;
@@ -610,7 +588,7 @@ static inline void smbprofile_dump(void)
 	return;
 }
 
-static inline void smbprofile_cleanup(pid_t pid)
+static inline void smbprofile_cleanup(pid_t pid, pid_t dst)
 {
 	return;
 }
@@ -618,8 +596,9 @@ static inline void smbprofile_cleanup(pid_t pid)
 #endif /* WITH_PROFILE */
 
 /* The following definitions come from profile/profile.c  */
+struct server_id;
 
-void set_profile_level(int level, struct server_id src);
+void set_profile_level(int level, const struct server_id *src);
 
 struct messaging_context;
 bool profile_setup(struct messaging_context *msg_ctx, bool rdonly);

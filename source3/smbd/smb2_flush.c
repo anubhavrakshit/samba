@@ -23,6 +23,10 @@
 #include "smbd/globals.h"
 #include "../libcli/smb/smb_common.h"
 #include "../lib/util/tevent_ntstatus.h"
+#include "libcli/security/security.h"
+
+#undef DBGC_CLASS
+#define DBGC_CLASS DBGC_SMB2
 
 static struct tevent_req *smbd_smb2_flush_send(TALLOC_CTX *mem_ctx,
 					       struct tevent_context *ev,
@@ -108,7 +112,10 @@ static void smbd_smb2_request_flush_done(struct tevent_req *subreq)
 
 struct smbd_smb2_flush_state {
 	struct smbd_smb2_request *smb2req;
+	struct files_struct *fsp;
 };
+
+static void smbd_smb2_flush_done(struct tevent_req *subreq);
 
 static struct tevent_req *smbd_smb2_flush_send(TALLOC_CTX *mem_ctx,
 					       struct tevent_context *ev,
@@ -116,8 +123,8 @@ static struct tevent_req *smbd_smb2_flush_send(TALLOC_CTX *mem_ctx,
 					       struct files_struct *fsp)
 {
 	struct tevent_req *req;
+	struct tevent_req *subreq;
 	struct smbd_smb2_flush_state *state;
-	NTSTATUS status;
 	struct smb_request *smbreq;
 
 	req = tevent_req_create(mem_ctx, &state,
@@ -126,6 +133,7 @@ static struct tevent_req *smbd_smb2_flush_send(TALLOC_CTX *mem_ctx,
 		return NULL;
 	}
 	state->smb2req = smb2req;
+	state->fsp = fsp;
 
 	DEBUG(10,("smbd_smb2_flush: %s - %s\n",
 		  fsp_str_dbg(fsp), fsp_fnum_dbg(fsp)));
@@ -141,20 +149,81 @@ static struct tevent_req *smbd_smb2_flush_send(TALLOC_CTX *mem_ctx,
 	}
 
 	if (!CHECK_WRITE(fsp)) {
-		tevent_req_nterror(req, NT_STATUS_ACCESS_DENIED);
+		bool allow_dir_flush = false;
+		uint32_t flush_access = FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY;
+
+		if (!fsp->fsp_flags.is_directory) {
+			tevent_req_nterror(req, NT_STATUS_ACCESS_DENIED);
+			return tevent_req_post(req, ev);
+		}
+
+		/*
+		 * Directories are not writable in the conventional
+		 * sense, but if opened with *either*
+		 * FILE_ADD_FILE or FILE_ADD_SUBDIRECTORY
+		 * they can be flushed.
+		 */
+
+		if ((fsp->access_mask & flush_access) != 0) {
+			allow_dir_flush = true;
+		}
+
+		if (allow_dir_flush == false) {
+			tevent_req_nterror(req, NT_STATUS_ACCESS_DENIED);
+			return tevent_req_post(req, ev);
+		}
+	}
+
+	if (fsp->fh->fd == -1) {
+		tevent_req_nterror(req, NT_STATUS_INVALID_HANDLE);
 		return tevent_req_post(req, ev);
 	}
 
-	status = sync_file(smbreq->conn, fsp, true);
-	if (!NT_STATUS_IS_OK(status)) {
-		DEBUG(5,("smbd_smb2_flush: sync_file for %s returned %s\n",
-			 fsp_str_dbg(fsp), nt_errstr(status)));
-		tevent_req_nterror(req, status);
+	if (!lp_strict_sync(SNUM(smbreq->conn))) {
+		/*
+		 * No strict sync. Don't really do
+		 * anything here.
+		 */
+		tevent_req_done(req);
 		return tevent_req_post(req, ev);
 	}
 
+	subreq = SMB_VFS_FSYNC_SEND(state, ev, fsp);
+	if (tevent_req_nomem(subreq, req)) {
+		return tevent_req_post(req, ev);
+	}
+
+	tevent_req_set_callback(subreq, smbd_smb2_flush_done, req);
+
+	/* Ensure any close request knows about this outstanding IO. */
+	if (!aio_add_req_to_fsp(fsp, req)) {
+		tevent_req_nterror(req, NT_STATUS_NO_MEMORY);
+		return tevent_req_post(req, ev);
+	}
+
+	return req;
+
+}
+
+static void smbd_smb2_flush_done(struct tevent_req *subreq)
+{
+	struct tevent_req *req = tevent_req_callback_data(
+		subreq, struct tevent_req);
+	struct smbd_smb2_flush_state *state = tevent_req_data(
+		req, struct smbd_smb2_flush_state);
+	int ret;
+	struct vfs_aio_state vfs_aio_state;
+
+	ret = SMB_VFS_FSYNC_RECV(subreq, &vfs_aio_state);
+	TALLOC_FREE(subreq);
+	if (ret == -1) {
+		tevent_req_nterror(req, map_nt_error_from_unix(vfs_aio_state.error));
+		return;
+	}
+	if (state->fsp->fsp_flags.modified) {
+		trigger_write_time_update_immediate(state->fsp);
+	}
 	tevent_req_done(req);
-	return tevent_req_post(req, ev);
 }
 
 static NTSTATUS smbd_smb2_flush_recv(struct tevent_req *req)

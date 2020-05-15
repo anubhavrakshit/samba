@@ -33,14 +33,16 @@ struct drsuapi_bind_state {
 	struct ldb_context *sam_ctx;
 	struct ldb_context *sam_ctx_system;
 	struct GUID remote_bind_guid;
-	struct drsuapi_DsBindInfo28 remote_info28;
-	struct drsuapi_DsBindInfo28 local_info28;
+	struct drsuapi_DsBindInfoCtr *remote_info;
+	struct drsuapi_DsBindInfoCtr *local_info;
 	struct drsuapi_getncchanges_state *getncchanges_state;
 };
 
 
 /* prototypes of internal functions */
-WERROR drsuapi_UpdateRefs(struct drsuapi_bind_state *b_state, TALLOC_CTX *mem_ctx,
+WERROR drsuapi_UpdateRefs(struct imessaging_context *msg_ctx,
+			  struct tevent_context *event_ctx,
+			  struct drsuapi_bind_state *b_state, TALLOC_CTX *mem_ctx,
 			  struct drsuapi_DsReplicaUpdateRefsRequest1 *req);
 WERROR dcesrv_drsuapi_DsReplicaUpdateRefs(struct dcesrv_call_state *dce_call, TALLOC_CTX *mem_ctx,
 					  struct drsuapi_DsReplicaUpdateRefs *r);

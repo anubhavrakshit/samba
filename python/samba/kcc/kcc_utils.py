@@ -19,7 +19,8 @@
 #
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
-
+from __future__ import print_function
+import sys
 import ldb
 import uuid
 
@@ -28,9 +29,10 @@ from samba.dcerpc import (
     drsblobs,
     drsuapi,
     misc,
-    )
+)
 from samba.common import dsdb_Dn
 from samba.ndr import ndr_unpack, ndr_pack
+from collections import Counter
 
 
 class KCCError(Exception):
@@ -39,6 +41,7 @@ class KCCError(Exception):
 
 class NCType(object):
     (unknown, schema, domain, config, application) = range(0, 5)
+
 
 # map the NCType enum to strings for debugging
 nctype_lut = dict((v, k) for k, v in NCType.__dict__.items() if k[:2] != '__')
@@ -63,9 +66,9 @@ class NamingContext(object):
 
     def __str__(self):
         '''Debug dump string output of class'''
-        text = "%s:" % (self.__class__.__name__,)
-        text = text + "\n\tnc_dnstr=%s" % self.nc_dnstr
-        text = text + "\n\tnc_guid=%s" % str(self.nc_guid)
+        text = "%s:" % (self.__class__.__name__,) +\
+               "\n\tnc_dnstr=%s" % self.nc_dnstr +\
+               "\n\tnc_guid=%s" % str(self.nc_guid)
 
         if self.nc_sid is None:
             text = text + "\n\tnc_sid=<absent>"
@@ -83,9 +86,10 @@ class NamingContext(object):
             res = samdb.search(base=self.nc_dnstr,
                                scope=ldb.SCOPE_BASE, attrs=attrs)
 
-        except ldb.LdbError, (enum, estr):
-            raise Exception("Unable to find naming context (%s) - (%s)" %
-                            (self.nc_dnstr, estr))
+        except ldb.LdbError as e:
+            (enum, estr) = e.args
+            raise KCCError("Unable to find naming context (%s) - (%s)" %
+                           (self.nc_dnstr, estr))
         msg = res[0]
         if "objectGUID" in msg:
             self.nc_guid = misc.GUID(samdb.schema_format_value("objectGUID",
@@ -94,21 +98,6 @@ class NamingContext(object):
             self.nc_sid = msg["objectSid"][0]
 
         assert self.nc_guid is not None
-
-    def is_schema(self):
-        '''Return True if NC is schema'''
-        assert self.nc_type != NCType.unknown
-        return self.nc_type == NCType.schema
-
-    def is_domain(self):
-        '''Return True if NC is domain'''
-        assert self.nc_type != NCType.unknown
-        return self.nc_type == NCType.domain
-
-    def is_application(self):
-        '''Return True if NC is application'''
-        assert self.nc_type != NCType.unknown
-        return self.nc_type == NCType.application
 
     def is_config(self):
         '''Return True if NC is config'''
@@ -178,14 +167,14 @@ class NCReplica(NamingContext):
     class) and it identifies unique attributes of the DSA's replica for a NC.
     """
 
-    def __init__(self, dsa_dnstr, dsa_guid, nc_dnstr):
+    def __init__(self, dsa, nc_dnstr):
         """Instantiate a Naming Context Replica
 
         :param dsa_guid: GUID of DSA where replica appears
         :param nc_dnstr: NC dn string
         """
-        self.rep_dsa_dnstr = dsa_dnstr
-        self.rep_dsa_guid = dsa_guid
+        self.rep_dsa_dnstr = dsa.dsa_dnstr
+        self.rep_dsa_guid = dsa.dsa_guid
         self.rep_default = False  # replica for DSA's default domain
         self.rep_partial = False
         self.rep_ro = False
@@ -195,6 +184,9 @@ class NCReplica(NamingContext):
 
         # RepsFromTo tuples
         self.rep_repsFrom = []
+
+        # RepsFromTo tuples
+        self.rep_repsTo = []
 
         # The (is present) test is a combination of being
         # enumerated in (hasMasterNCs or msDS-hasFullReplicaNCs or
@@ -208,26 +200,22 @@ class NCReplica(NamingContext):
 
     def __str__(self):
         '''Debug dump string output of class'''
-        text = "%s:" % self.__class__.__name__
-        text = text + "\n\tdsa_dnstr=%s" % self.rep_dsa_dnstr
-        text = text + "\n\tdsa_guid=%s" % self.rep_dsa_guid
-        text = text + "\n\tdefault=%s" % self.rep_default
-        text = text + "\n\tro=%s" % self.rep_ro
-        text = text + "\n\tpartial=%s" % self.rep_partial
-        text = text + "\n\tpresent=%s" % self.is_present()
-        text = text + "\n\tfsmo_role_owner=%s" % self.rep_fsmo_role_owner
-
-        for rep in self.rep_repsFrom:
-            text = text + "\n%s" % rep
+        text = "%s:" % self.__class__.__name__ +\
+               "\n\tdsa_dnstr=%s" % self.rep_dsa_dnstr +\
+               "\n\tdsa_guid=%s" % self.rep_dsa_guid +\
+               "\n\tdefault=%s" % self.rep_default +\
+               "\n\tro=%s" % self.rep_ro +\
+               "\n\tpartial=%s" % self.rep_partial +\
+               "\n\tpresent=%s" % self.is_present() +\
+               "\n\tfsmo_role_owner=%s" % self.rep_fsmo_role_owner +\
+               "".join("\n%s" % rep for rep in self.rep_repsFrom) +\
+               "".join("\n%s" % rep for rep in self.rep_repsTo)
 
         return "%s\n%s" % (NamingContext.__str__(self), text)
 
-    def set_instantiated_flags(self, flags=None):
+    def set_instantiated_flags(self, flags=0):
         '''Set or clear NC replica instantiated flags'''
-        if flags is None:
-            self.rep_instantiated_flags = 0
-        else:
-            self.rep_instantiated_flags = flags
+        self.rep_instantiated_flags = flags
 
     def identify_by_dsa_attr(self, samdb, attr):
         """Given an NC which has been discovered thru the
@@ -313,17 +301,23 @@ class NCReplica(NamingContext):
             res = samdb.search(base=self.nc_dnstr, scope=ldb.SCOPE_BASE,
                                attrs=["repsFrom"])
 
-        except ldb.LdbError, (enum, estr):
-            raise Exception("Unable to find NC for (%s) - (%s)" %
-                            (self.nc_dnstr, estr))
+        except ldb.LdbError as e1:
+            (enum, estr) = e1.args
+            raise KCCError("Unable to find NC for (%s) - (%s)" %
+                           (self.nc_dnstr, estr))
 
         msg = res[0]
 
         # Possibly no repsFrom if this is a singleton DC
         if "repsFrom" in msg:
             for value in msg["repsFrom"]:
-                rep = RepsFromTo(self.nc_dnstr,
-                                 ndr_unpack(drsblobs.repsFromToBlob, value))
+                try:
+                    unpacked = ndr_unpack(drsblobs.repsFromToBlob, value)
+                except RuntimeError as e:
+                    print("bad repsFrom NDR: %r" % (value),
+                          file=sys.stderr)
+                    continue
+                rep = RepsFromTo(self.nc_dnstr, unpacked)
                 self.rep_repsFrom.append(rep)
 
     def commit_repsFrom(self, samdb, ro=False):
@@ -385,9 +379,9 @@ class NCReplica(NamingContext):
         try:
             samdb.modify(m)
 
-        except ldb.LdbError, estr:
-            raise Exception("Could not set repsFrom for (%s) - (%s)" %
-                            (self.nc_dnstr, estr))
+        except ldb.LdbError as estr:
+            raise KCCError("Could not set repsFrom for (%s) - (%s)" %
+                           (self.nc_dnstr, estr))
 
     def load_replUpToDateVector(self, samdb):
         """Given an NC replica which has been discovered thru the nTDSDSA
@@ -401,9 +395,10 @@ class NCReplica(NamingContext):
             res = samdb.search(base=self.nc_dnstr, scope=ldb.SCOPE_BASE,
                                attrs=["replUpToDateVector"])
 
-        except ldb.LdbError, (enum, estr):
-            raise Exception("Unable to find NC for (%s) - (%s)" %
-                            (self.nc_dnstr, estr))
+        except ldb.LdbError as e2:
+            (enum, estr) = e2.args
+            raise KCCError("Unable to find NC for (%s) - (%s)" %
+                           (self.nc_dnstr, estr))
 
         msg = res[0]
 
@@ -435,9 +430,10 @@ class NCReplica(NamingContext):
             res = samdb.search(base=self.nc_dnstr, scope=ldb.SCOPE_BASE,
                                attrs=["fSMORoleOwner"])
 
-        except ldb.LdbError, (enum, estr):
-            raise Exception("Unable to find NC for (%s) - (%s)" %
-                            (self.nc_dnstr, estr))
+        except ldb.LdbError as e3:
+            (enum, estr) = e3.args
+            raise KCCError("Unable to find NC for (%s) - (%s)" %
+                           (self.nc_dnstr, estr))
 
         msg = res[0]
 
@@ -450,6 +446,101 @@ class NCReplica(NamingContext):
            self.rep_fsmo_role_owner == dsa_dnstr:
             return True
         return False
+
+    def load_repsTo(self, samdb):
+        """Given an NC replica which has been discovered thru the nTDSDSA
+        database object, load the repsTo attribute for the local replica.
+        held by my dsa.  The repsTo attribute is not replicated so this
+        attribute is relative only to the local DSA that the samdb exists on
+
+        This is responsible for push replication, not scheduled pull
+        replication. Not to be confused for repsFrom.
+        """
+        try:
+            res = samdb.search(base=self.nc_dnstr, scope=ldb.SCOPE_BASE,
+                               attrs=["repsTo"])
+
+        except ldb.LdbError as e4:
+            (enum, estr) = e4.args
+            raise KCCError("Unable to find NC for (%s) - (%s)" %
+                           (self.nc_dnstr, estr))
+
+        msg = res[0]
+
+        # Possibly no repsTo if this is a singleton DC
+        if "repsTo" in msg:
+            for value in msg["repsTo"]:
+                try:
+                    unpacked = ndr_unpack(drsblobs.repsFromToBlob, value)
+                except RuntimeError as e:
+                    print("bad repsTo NDR: %r" % (value),
+                          file=sys.stderr)
+                    continue
+                rep = RepsFromTo(self.nc_dnstr, unpacked)
+                self.rep_repsTo.append(rep)
+
+    def commit_repsTo(self, samdb, ro=False):
+        """Commit repsTo to the database"""
+
+        # XXX - This is not truly correct according to the MS-TECH
+        #       docs.  To commit a repsTo we should be using RPCs
+        #       IDL_DRSReplicaAdd, IDL_DRSReplicaModify, and
+        #       IDL_DRSReplicaDel to affect a repsTo change.
+        #
+        #       Those RPCs are missing in samba, so I'll have to
+        #       implement them to get this to more accurately
+        #       reflect the reference docs.  As of right now this
+        #       commit to the database will work as its what the
+        #       older KCC also did
+        modify = False
+        newreps = []
+        delreps = []
+
+        for repsTo in self.rep_repsTo:
+
+            # Leave out any to be deleted from
+            # replacement list.  Build a list
+            # of to be deleted reps which we will
+            # remove from rep_repsTo list below
+            if repsTo.to_be_deleted:
+                delreps.append(repsTo)
+                modify = True
+                continue
+
+            if repsTo.is_modified():
+                repsTo.set_unmodified()
+                modify = True
+
+            # current (unmodified) elements also get
+            # appended here but no changes will occur
+            # unless something is "to be modified" or
+            # "to be deleted"
+            newreps.append(ndr_pack(repsTo.ndr_blob))
+
+        # Now delete these from our list of rep_repsTo
+        for repsTo in delreps:
+            self.rep_repsTo.remove(repsTo)
+        delreps = []
+
+        # Nothing to do if no reps have been modified or
+        # need to be deleted or input option has informed
+        # us to be "readonly" (ro).  Leave database
+        # record "as is"
+        if not modify or ro:
+            return
+
+        m = ldb.Message()
+        m.dn = ldb.Dn(samdb, self.nc_dnstr)
+
+        m["repsTo"] = \
+            ldb.MessageElement(newreps, ldb.FLAG_MOD_REPLACE, "repsTo")
+
+        try:
+            samdb.modify(m)
+
+        except ldb.LdbError as estr:
+            raise KCCError("Could not set repsTo for (%s) - (%s)" %
+                           (self.nc_dnstr, estr))
 
 
 class DirectoryServiceAgent(object):
@@ -466,7 +557,7 @@ class DirectoryServiceAgent(object):
         self.dsa_ivid = None
         self.dsa_is_ro = False
         self.dsa_is_istg = False
-        self.dsa_options = 0
+        self.options = 0
         self.dsa_behavior = 0
         self.default_dnstr = None  # default domain dn string for dsa
 
@@ -494,16 +585,15 @@ class DirectoryServiceAgent(object):
         if self.dsa_ivid is not None:
             text = text + "\n\tdsa_ivid=%s" % str(self.dsa_ivid)
 
-        text = text + "\n\tro=%s" % self.is_ro()
-        text = text + "\n\tgc=%s" % self.is_gc()
-        text = text + "\n\tistg=%s" % self.is_istg()
-
-        text = text + "\ncurrent_replica_table:"
-        text = text + "\n%s" % self.dumpstr_current_replica_table()
-        text = text + "\nneeded_replica_table:"
-        text = text + "\n%s" % self.dumpstr_needed_replica_table()
-        text = text + "\nconnect_table:"
-        text = text + "\n%s" % self.dumpstr_connect_table()
+        text += "\n\tro=%s" % self.is_ro() +\
+                "\n\tgc=%s" % self.is_gc() +\
+                "\n\tistg=%s" % self.is_istg() +\
+                "\ncurrent_replica_table:" +\
+                "\n%s" % self.dumpstr_current_replica_table() +\
+                "\nneeded_replica_table:" +\
+                "\n%s" % self.dumpstr_needed_replica_table() +\
+                "\nconnect_table:" +\
+                "\n%s" % self.dumpstr_connect_table()
 
         return text
 
@@ -567,9 +657,10 @@ class DirectoryServiceAgent(object):
             res = samdb.search(base=self.dsa_dnstr, scope=ldb.SCOPE_BASE,
                                attrs=attrs)
 
-        except ldb.LdbError, (enum, estr):
-            raise Exception("Unable to find nTDSDSA for (%s) - (%s)" %
-                            (self.dsa_dnstr, estr))
+        except ldb.LdbError as e5:
+            (enum, estr) = e5.args
+            raise KCCError("Unable to find nTDSDSA for (%s) - (%s)" %
+                           (self.dsa_dnstr, estr))
 
         msg = res[0]
         self.dsa_guid = misc.GUID(samdb.schema_format_value("objectGUID",
@@ -584,7 +675,7 @@ class DirectoryServiceAgent(object):
         if "options" in msg:
             self.options = int(msg["options"][0])
 
-        if "msDS-isRODC" in msg and msg["msDS-isRODC"][0] == "TRUE":
+        if "msDS-isRODC" in msg and str(msg["msDS-isRODC"][0]) == "TRUE":
             self.dsa_is_ro = True
         else:
             self.dsa_is_ro = False
@@ -628,9 +719,10 @@ class DirectoryServiceAgent(object):
             res = samdb.search(base=self.dsa_dnstr, scope=ldb.SCOPE_BASE,
                                attrs=ncattrs)
 
-        except ldb.LdbError, (enum, estr):
-            raise Exception("Unable to find nTDSDSA NCs for (%s) - (%s)" %
-                            (self.dsa_dnstr, estr))
+        except ldb.LdbError as e6:
+            (enum, estr) = e6.args
+            raise KCCError("Unable to find nTDSDSA NCs for (%s) - (%s)" %
+                           (self.dsa_dnstr, estr))
 
         # The table of NCs for the dsa we are searching
         tmp_table = {}
@@ -654,12 +746,12 @@ class DirectoryServiceAgent(object):
                 for value in res[0][k]:
                     # Turn dn into a dsdb_Dn so we can use
                     # its methods to parse a binary DN
-                    dsdn = dsdb_Dn(samdb, value)
+                    dsdn = dsdb_Dn(samdb, value.decode('utf8'))
                     flags = dsdn.get_binary_integer()
                     dnstr = str(dsdn.dn)
 
-                    if not dnstr in tmp_table:
-                        rep = NCReplica(self.dsa_dnstr, self.dsa_guid, dnstr)
+                    if dnstr not in tmp_table:
+                        rep = NCReplica(self, dnstr)
                         tmp_table[dnstr] = rep
                     else:
                         rep = tmp_table[dnstr]
@@ -675,7 +767,7 @@ class DirectoryServiceAgent(object):
                     if rep.is_default():
                         self.default_dnstr = dnstr
         else:
-            raise Exception("No nTDSDSA NCs for (%s)" % self.dsa_dnstr)
+            raise KCCError("No nTDSDSA NCs for (%s)" % self.dsa_dnstr)
 
         # Assign our newly built NC replica table to this dsa
         self.current_rep_table = tmp_table
@@ -696,9 +788,10 @@ class DirectoryServiceAgent(object):
                                scope=ldb.SCOPE_SUBTREE,
                                expression="(objectClass=nTDSConnection)")
 
-        except ldb.LdbError, (enum, estr):
-            raise Exception("Unable to find nTDSConnection for (%s) - (%s)" %
-                            (self.dsa_dnstr, estr))
+        except ldb.LdbError as e7:
+            (enum, estr) = e7.args
+            raise KCCError("Unable to find nTDSConnection for (%s) - (%s)" %
+                           (self.dsa_dnstr, estr))
 
         for msg in res:
             dnstr = str(msg.dn)
@@ -769,7 +862,8 @@ class DirectoryServiceAgent(object):
         '''Debug dump string output of connect table'''
         return '\n'.join(str(x) for x in self.connect_table)
 
-    def new_connection(self, options, flags, transport, from_dnstr, sched):
+    def new_connection(self, options, system_flags, transport, from_dnstr,
+                       sched):
         """Set up a new connection for the DSA based on input
         parameters.  Connection will be added to the DSA
         connect_table and will be marked as "to be added" pending
@@ -782,7 +876,7 @@ class DirectoryServiceAgent(object):
         connect.enabled = True
         connect.from_dnstr = from_dnstr
         connect.options = options
-        connect.flags = flags
+        connect.system_flags = system_flags
 
         if transport is not None:
             connect.transport_dnstr = transport.dnstr
@@ -820,39 +914,38 @@ class NTDSConnection(object):
     def __str__(self):
         '''Debug dump string output of NTDSConnection object'''
 
-        text = "%s:\n\tdn=%s" % (self.__class__.__name__, self.dnstr)
-        text = text + "\n\tenabled=%s" % self.enabled
-        text = text + "\n\tto_be_added=%s" % self.to_be_added
-        text = text + "\n\tto_be_deleted=%s" % self.to_be_deleted
-        text = text + "\n\tto_be_modified=%s" % self.to_be_modified
-        text = text + "\n\toptions=0x%08X" % self.options
-        text = text + "\n\tsystem_flags=0x%08X" % self.system_flags
-        text = text + "\n\twhenCreated=%d" % self.whenCreated
-        text = text + "\n\ttransport_dn=%s" % self.transport_dnstr
+        text = "%s:\n\tdn=%s" % (self.__class__.__name__, self.dnstr) +\
+               "\n\tenabled=%s" % self.enabled +\
+               "\n\tto_be_added=%s" % self.to_be_added +\
+               "\n\tto_be_deleted=%s" % self.to_be_deleted +\
+               "\n\tto_be_modified=%s" % self.to_be_modified +\
+               "\n\toptions=0x%08X" % self.options +\
+               "\n\tsystem_flags=0x%08X" % self.system_flags +\
+               "\n\twhenCreated=%d" % self.whenCreated +\
+               "\n\ttransport_dn=%s" % self.transport_dnstr
 
         if self.guid is not None:
-            text = text + "\n\tguid=%s" % str(self.guid)
+            text += "\n\tguid=%s" % str(self.guid)
 
         if self.transport_guid is not None:
-            text = text + "\n\ttransport_guid=%s" % str(self.transport_guid)
+            text += "\n\ttransport_guid=%s" % str(self.transport_guid)
 
         text = text + "\n\tfrom_dn=%s" % self.from_dnstr
 
         if self.schedule is not None:
-            text += "\n\tschedule.size=%s" % self.schedule.size
-            text += "\n\tschedule.bandwidth=%s" % self.schedule.bandwidth
-            text += ("\n\tschedule.numberOfSchedules=%s" %
+            text += "\n\tschedule.size=%s" % self.schedule.size +\
+                    "\n\tschedule.bandwidth=%s" % self.schedule.bandwidth +\
+                    ("\n\tschedule.numberOfSchedules=%s" %
                      self.schedule.numberOfSchedules)
 
             for i, header in enumerate(self.schedule.headerArray):
                 text += ("\n\tschedule.headerArray[%d].type=%d" %
-                         (i, header.type))
-                text += ("\n\tschedule.headerArray[%d].offset=%d" %
-                         (i, header.offset))
-                text += "\n\tschedule.dataArray[%d].slots[ " % i
-                for slot in self.schedule.dataArray[i].slots:
-                    text = text + "0x%X " % slot
-                text = text + "]"
+                        (i, header.type)) +\
+                        ("\n\tschedule.headerArray[%d].offset=%d" %
+                         (i, header.offset)) +\
+                        "\n\tschedule.dataArray[%d].slots[ " % i +\
+                        "".join("0x%X " % slot for slot in self.schedule.dataArray[i].slots) +\
+                        "]"
 
         return text
 
@@ -873,9 +966,10 @@ class NTDSConnection(object):
             res = samdb.search(base=self.dnstr, scope=ldb.SCOPE_BASE,
                                attrs=attrs)
 
-        except ldb.LdbError, (enum, estr):
-            raise Exception("Unable to find nTDSConnection for (%s) - (%s)" %
-                            (self.dnstr, estr))
+        except ldb.LdbError as e8:
+            (enum, estr) = e8.args
+            raise KCCError("Unable to find nTDSConnection for (%s) - (%s)" %
+                           (self.dnstr, estr))
 
         msg = res[0]
 
@@ -883,29 +977,32 @@ class NTDSConnection(object):
             self.options = int(msg["options"][0])
 
         if "enabledConnection" in msg:
-            if msg["enabledConnection"][0].upper().lstrip().rstrip() == "TRUE":
+            if str(msg["enabledConnection"][0]).upper().lstrip().rstrip() == "TRUE":
                 self.enabled = True
 
         if "systemFlags" in msg:
             self.system_flags = int(msg["systemFlags"][0])
 
-        if "objectGUID" in msg:
+        try:
             self.guid = \
                 misc.GUID(samdb.schema_format_value("objectGUID",
                                                     msg["objectGUID"][0]))
+        except KeyError:
+            raise KCCError("Unable to find objectGUID in nTDSConnection "
+                           "for (%s)" % (self.dnstr))
 
         if "transportType" in msg:
-            dsdn = dsdb_Dn(samdb, msg["transportType"][0])
+            dsdn = dsdb_Dn(samdb, msg["transportType"][0].decode('utf8'))
             self.load_connection_transport(samdb, str(dsdn.dn))
 
         if "schedule" in msg:
             self.schedule = ndr_unpack(drsblobs.schedule, msg["schedule"][0])
 
         if "whenCreated" in msg:
-            self.whenCreated = ldb.string_to_time(msg["whenCreated"][0])
+            self.whenCreated = ldb.string_to_time(str(msg["whenCreated"][0]))
 
         if "fromServer" in msg:
-            dsdn = dsdb_Dn(samdb, msg["fromServer"][0])
+            dsdn = dsdb_Dn(samdb, msg["fromServer"][0].decode('utf8'))
             self.from_dnstr = str(dsdn.dn)
             assert self.from_dnstr is not None
 
@@ -920,9 +1017,10 @@ class NTDSConnection(object):
             res = samdb.search(base=tdnstr,
                                scope=ldb.SCOPE_BASE, attrs=attrs)
 
-        except ldb.LdbError, (enum, estr):
-            raise Exception("Unable to find transport (%s) - (%s)" %
-                            (tdnstr, estr))
+        except ldb.LdbError as e9:
+            (enum, estr) = e9.args
+            raise KCCError("Unable to find transport (%s) - (%s)" %
+                           (tdnstr, estr))
 
         if "objectGUID" in res[0]:
             msg = res[0]
@@ -947,9 +1045,10 @@ class NTDSConnection(object):
 
         try:
             samdb.delete(self.dnstr)
-        except ldb.LdbError, (enum, estr):
-            raise Exception("Could not delete nTDSConnection for (%s) - (%s)" %
-                            (self.dnstr, estr))
+        except ldb.LdbError as e10:
+            (enum, estr) = e10.args
+            raise KCCError("Could not delete nTDSConnection for (%s) - (%s)" %
+                           (self.dnstr, estr))
 
     def commit_added(self, samdb, ro=False):
         """Local helper routine for commit_connections() which
@@ -971,13 +1070,14 @@ class NTDSConnection(object):
             if len(msg) != 0:
                 found = True
 
-        except ldb.LdbError, (enum, estr):
+        except ldb.LdbError as e11:
+            (enum, estr) = e11.args
             if enum != ldb.ERR_NO_SUCH_OBJECT:
-                raise Exception("Unable to search for (%s) - (%s)" %
-                                (self.dnstr, estr))
+                raise KCCError("Unable to search for (%s) - (%s)" %
+                               (self.dnstr, estr))
         if found:
-            raise Exception("nTDSConnection for (%s) already exists!" %
-                            self.dnstr)
+            raise KCCError("nTDSConnection for (%s) already exists!" %
+                           self.dnstr)
 
         if self.enabled:
             enablestr = "TRUE"
@@ -1016,9 +1116,10 @@ class NTDSConnection(object):
                                    ldb.FLAG_MOD_ADD, "schedule")
         try:
             samdb.add(m)
-        except ldb.LdbError, (enum, estr):
-            raise Exception("Could not add nTDSConnection for (%s) - (%s)" %
-                            (self.dnstr, estr))
+        except ldb.LdbError as e12:
+            (enum, estr) = e12.args
+            raise KCCError("Could not add nTDSConnection for (%s) - (%s)" %
+                           (self.dnstr, estr))
 
     def commit_modified(self, samdb, ro=False):
         """Local helper routine for commit_connections() which
@@ -1039,11 +1140,12 @@ class NTDSConnection(object):
             # of self.dnstr in the database.
             samdb.search(base=self.dnstr, scope=ldb.SCOPE_BASE)
 
-        except ldb.LdbError, (enum, estr):
+        except ldb.LdbError as e13:
+            (enum, estr) = e13.args
             if enum == ldb.ERR_NO_SUCH_OBJECT:
                 raise KCCError("nTDSConnection for (%s) doesn't exist!" %
                                self.dnstr)
-            raise KccError("Unable to search for (%s) - (%s)" %
+            raise KCCError("Unable to search for (%s) - (%s)" %
                            (self.dnstr, estr))
 
         if self.enabled:
@@ -1085,18 +1187,13 @@ class NTDSConnection(object):
                 ldb.MessageElement([], ldb.FLAG_MOD_DELETE, "schedule")
         try:
             samdb.modify(m)
-        except ldb.LdbError, (enum, estr):
-            raise Exception("Could not modify nTDSConnection for (%s) - (%s)" %
-                            (self.dnstr, estr))
+        except ldb.LdbError as e14:
+            (enum, estr) = e14.args
+            raise KCCError("Could not modify nTDSConnection for (%s) - (%s)" %
+                           (self.dnstr, estr))
 
     def set_modified(self, truefalse):
         self.to_be_modified = truefalse
-
-    def set_added(self, truefalse):
-        self.to_be_added = truefalse
-
-    def set_deleted(self, truefalse):
-        self.to_be_deleted = truefalse
 
     def is_schedule_minimum_once_per_week(self):
         """Returns True if our schedule includes at least one
@@ -1118,11 +1215,19 @@ class NTDSConnection(object):
 
         :param shed: schedule to compare to
         """
-        if self.schedule is not None:
-            if sched is None:
-                return False
-        elif sched is None:
-            return True
+        # There are 4 cases, where either self.schedule or sched can be None
+        #
+        #                   |  self. is None  |   self. is not None
+        #     --------------+-----------------+--------------------
+        #     sched is None |     True        |     False
+        #     --------------+-----------------+--------------------
+        # sched is not None |    False        |    do calculations
+
+        if self.schedule is None:
+            return sched is None
+
+        if sched is None:
+            return False
 
         if ((self.schedule.size != sched.size or
              self.schedule.bandwidth != sched.bandwidth or
@@ -1243,17 +1348,17 @@ class Partition(NamingContext):
             res = samdb.search(base=self.partstr, scope=ldb.SCOPE_BASE,
                                attrs=attrs)
 
-        except ldb.LdbError, (enum, estr):
-            raise Exception("Unable to find partition for (%s) - (%s)" % (
-                            self.partstr, estr))
-
+        except ldb.LdbError as e15:
+            (enum, estr) = e15.args
+            raise KCCError("Unable to find partition for (%s) - (%s)" %
+                           (self.partstr, estr))
         msg = res[0]
         for k in msg.keys():
             if k == "dn":
                 continue
 
             if k == "Enabled":
-                if msg[k][0].upper().lstrip().rstrip() == "TRUE":
+                if str(msg[k][0]).upper().lstrip().rstrip() == "TRUE":
                     self.enabled = True
                 else:
                     self.enabled = False
@@ -1264,7 +1369,7 @@ class Partition(NamingContext):
                 continue
 
             for value in msg[k]:
-                dsdn = dsdb_Dn(samdb, value)
+                dsdn = dsdb_Dn(samdb, value.decode('utf8'))
                 dnstr = str(dsdn.dn)
 
                 if k == "nCName":
@@ -1347,12 +1452,10 @@ class Partition(NamingContext):
 
     def __str__(self):
         '''Debug dump string output of class'''
-        text = "%s" % NamingContext.__str__(self)
-        text = text + "\n\tpartdn=%s" % self.partstr
-        for k in self.rw_location_list:
-            text = text + "\n\tmsDS-NC-Replica-Locations=%s" % k
-        for k in self.ro_location_list:
-            text = text + "\n\tmsDS-NC-RO-Replica-Locations=%s" % k
+        text = "%s" % NamingContext.__str__(self) +\
+               "\n\tpartdn=%s" % self.partstr +\
+               "".join("\n\tmsDS-NC-Replica-Locations=%s" % k for k in self.rw_location_list) +\
+               "".join("\n\tmsDS-NC-RO-Replica-Locations=%s" % k for k in self.ro_location_list)
         return text
 
 
@@ -1371,7 +1474,7 @@ class Site(object):
         self.nt_now = nt_now
 
     def load_site(self, samdb):
-        """Loads the NTDS Site Settions options attribute for the site
+        """Loads the NTDS Site Settings options attribute for the site
         as well as querying and loading all DSAs that appear within
         the site.
         """
@@ -1384,9 +1487,10 @@ class Site(object):
                                attrs=attrs)
             self_res = samdb.search(base=self.site_dnstr, scope=ldb.SCOPE_BASE,
                                     attrs=['objectGUID'])
-        except ldb.LdbError, (enum, estr):
-            raise Exception("Unable to find site settings for (%s) - (%s)" %
-                            (ssdn, estr))
+        except ldb.LdbError as e16:
+            (enum, estr) = e16.args
+            raise KCCError("Unable to find site settings for (%s) - (%s)" %
+                           (ssdn, estr))
 
         msg = res[0]
         if "options" in msg:
@@ -1415,8 +1519,9 @@ class Site(object):
             res = samdb.search(self.site_dnstr,
                                scope=ldb.SCOPE_SUBTREE,
                                expression="(objectClass=nTDSDSA)")
-        except ldb.LdbError, (enum, estr):
-            raise Exception("Unable to find nTDSDSAs - (%s)" % estr)
+        except ldb.LdbError as e17:
+            (enum, estr) = e17.args
+            raise KCCError("Unable to find nTDSDSAs - (%s)" % estr)
 
         for msg in res:
             dnstr = str(msg.dn)
@@ -1434,12 +1539,6 @@ class Site(object):
             self.dsa_table[dnstr] = dsa
             if not dsa.is_ro():
                 self.rw_dsa_table[dnstr] = dsa
-
-    def get_dsa_by_guidstr(self, guidstr):  # XXX unused
-        for dsa in self.dsa_table.values():
-            if str(dsa.dsa_guid) == guidstr:
-                return dsa
-        return None
 
     def get_dsa(self, dnstr):
         """Return a previously loaded DSA object by consulting
@@ -1486,7 +1585,9 @@ class Site(object):
         # Which is a fancy way of saying "sort all the nTDSDSA objects
         # in the site by guid in ascending order".   Place sorted list
         # in D_sort[]
-        D_sort = sorted(self.rw_dsa_table.values(), cmp=sort_dsa_by_guid)
+        D_sort = sorted(
+            self.rw_dsa_table.values(),
+            key=lambda dsa: ndr_pack(dsa.dsa_guid))
 
         # double word number of 100 nanosecond intervals since 1600s
 
@@ -1548,7 +1649,7 @@ class Site(object):
                 i_idx = j_idx
                 t_time = 0
 
-            #XXX doc says current time < c.timeLastSyncSuccess - f
+            # XXX doc says current time < c.timeLastSyncSuccess - f
             # which is true only if f is negative or clocks are wrong.
             # f is not negative in the default case (2 hours).
             elif self.nt_now - cursor.last_sync_success > f:
@@ -1574,7 +1675,7 @@ class Site(object):
         #
         # Note: We don't want to divide by zero here so they must
         #       have meant "f" instead of "o!interSiteTopologyFailover"
-        k_idx = (i_idx + ((self.nt_now - t_time) / f)) % len(D_sort)
+        k_idx = (i_idx + ((self.nt_now - t_time) // f)) % len(D_sort)
 
         # The local writable DC acts as an ISTG for its site if and
         # only if dk is the nTDSDSA object for the local DC. If the
@@ -1610,8 +1711,8 @@ class Site(object):
         try:
             samdb.modify(m)
 
-        except ldb.LdbError, estr:
-            raise Exception(
+        except ldb.LdbError as estr:
+            raise KCCError(
                 "Could not set interSiteTopologyGenerator for (%s) - (%s)" %
                 (ssdn, estr))
         return True
@@ -1655,11 +1756,11 @@ class Site(object):
 
     def __str__(self):
         '''Debug dump string output of class'''
-        text = "%s:" % self.__class__.__name__
-        text = text + "\n\tdn=%s" % self.site_dnstr
-        text = text + "\n\toptions=0x%X" % self.site_options
-        text = text + "\n\ttopo_generator=%s" % self.site_topo_generator
-        text = text + "\n\ttopo_failover=%d" % self.site_topo_failover
+        text = "%s:" % self.__class__.__name__ +\
+               "\n\tdn=%s" % self.site_dnstr +\
+               "\n\toptions=0x%X" % self.site_options +\
+               "\n\ttopo_generator=%s" % self.site_topo_generator +\
+               "\n\ttopo_failover=%d" % self.site_topo_failover
         for key, dsa in self.dsa_table.items():
             text = text + "\n%s" % dsa
         return text
@@ -1683,12 +1784,14 @@ class GraphNode(object):
         self.edge_from = []
 
     def __str__(self):
-        text = "%s:" % self.__class__.__name__
-        text = text + "\n\tdsa_dnstr=%s" % self.dsa_dnstr
-        text = text + "\n\tmax_edges=%d" % self.max_edges
+        text = "%s:" % self.__class__.__name__ +\
+               "\n\tdsa_dnstr=%s" % self.dsa_dnstr +\
+               "\n\tmax_edges=%d" % self.max_edges
 
         for i, edge in enumerate(self.edge_from):
-            text = text + "\n\tedge_from[%d]=%s" % (i, edge)
+            if isinstance(edge, str):
+                text += "\n\tedge_from[%d]=%s" % (i, edge)
+
         return text
 
     def add_edge_from(self, from_dsa_dnstr):
@@ -1696,7 +1799,7 @@ class GraphNode(object):
 
         :param from_dsa_dnstr: the dsa that the edge emanates from
         """
-        assert from_dsa_dnstr is not None
+        assert isinstance(from_dsa_dnstr, str)
 
         # No edges from myself to myself
         if from_dsa_dnstr == self.dsa_dnstr:
@@ -1722,7 +1825,7 @@ class GraphNode(object):
         for connect in dsa.connect_table.values():
             self.add_edge_from(connect.from_dnstr)
 
-    def add_connections_from_edges(self, dsa):
+    def add_connections_from_edges(self, dsa, transport):
         """For each edge directed to this graph node, ensure there
            is a corresponding nTDSConnection object in the dsa.
         """
@@ -1759,7 +1862,7 @@ class GraphNode(object):
             flags = (dsdb.SYSTEM_FLAG_CONFIG_ALLOW_RENAME |
                      dsdb.SYSTEM_FLAG_CONFIG_ALLOW_MOVE)
 
-            dsa.new_connection(opt, flags, None, edge_dnstr, None)
+            dsa.new_connection(opt, flags, transport, edge_dnstr, None)
 
     def has_sufficient_edges(self):
         '''Return True if we have met the maximum "from edges" criteria'''
@@ -1783,13 +1886,12 @@ class Transport(object):
     def __str__(self):
         '''Debug dump string output of Transport object'''
 
-        text = "%s:\n\tdn=%s" % (self.__class__.__name__, self.dnstr)
-        text = text + "\n\tguid=%s" % str(self.guid)
-        text = text + "\n\toptions=%d" % self.options
-        text = text + "\n\taddress_attr=%s" % self.address_attr
-        text = text + "\n\tname=%s" % self.name
-        for dnstr in self.bridgehead_list:
-            text = text + "\n\tbridgehead_list=%s" % dnstr
+        text = "%s:\n\tdn=%s" % (self.__class__.__name__, self.dnstr) +\
+               "\n\tguid=%s" % str(self.guid) +\
+               "\n\toptions=%d" % self.options +\
+               "\n\taddress_attr=%s" % self.address_attr +\
+               "\n\tname=%s" % self.name +\
+               "".join("\n\tbridgehead_list=%s" % dnstr for dnstr in self.bridgehead_list)
 
         return text
 
@@ -1807,9 +1909,10 @@ class Transport(object):
             res = samdb.search(base=self.dnstr, scope=ldb.SCOPE_BASE,
                                attrs=attrs)
 
-        except ldb.LdbError, (enum, estr):
-            raise Exception("Unable to find Transport for (%s) - (%s)" %
-                            (self.dnstr, estr))
+        except ldb.LdbError as e18:
+            (enum, estr) = e18.args
+            raise KCCError("Unable to find Transport for (%s) - (%s)" %
+                           (self.dnstr, estr))
 
         msg = res[0]
         self.guid = misc.GUID(samdb.schema_format_value("objectGUID",
@@ -1826,7 +1929,7 @@ class Transport(object):
 
         if "bridgeheadServerListBL" in msg:
             for value in msg["bridgeheadServerListBL"]:
-                dsdn = dsdb_Dn(samdb, value)
+                dsdn = dsdb_Dn(samdb, value.decode('utf8'))
                 dnstr = str(dsdn.dn)
                 if dnstr not in self.bridgehead_list:
                     self.bridgehead_list.append(dnstr)
@@ -1894,25 +1997,24 @@ class RepsFromTo(object):
     def __str__(self):
         '''Debug dump string output of class'''
 
-        text = "%s:" % self.__class__.__name__
-        text += "\n\tdnstr=%s" % self.nc_dnstr
-        text += "\n\tupdate_flags=0x%X" % self.update_flags
-        text += "\n\tversion=%d" % self.version
-        text += "\n\tsource_dsa_obj_guid=%s" % self.source_dsa_obj_guid
-        text += ("\n\tsource_dsa_invocation_id=%s" %
-                 self.source_dsa_invocation_id)
-        text += "\n\ttransport_guid=%s" % self.transport_guid
-        text += "\n\treplica_flags=0x%X" % self.replica_flags
-        text += ("\n\tconsecutive_sync_failures=%d" %
-                 self.consecutive_sync_failures)
-        text += "\n\tlast_success=%s" % self.last_success
-        text += "\n\tlast_attempt=%s" % self.last_attempt
-        text += "\n\tdns_name1=%s" % self.dns_name1
-        text += "\n\tdns_name2=%s" % self.dns_name2
-        text += "\n\tschedule[ "
-        for slot in self.schedule:
-            text += "0x%X " % slot
-        text += "]"
+        text = "%s:" % self.__class__.__name__ +\
+               "\n\tdnstr=%s" % self.nc_dnstr +\
+               "\n\tupdate_flags=0x%X" % self.update_flags +\
+               "\n\tversion=%d" % self.version +\
+               "\n\tsource_dsa_obj_guid=%s" % self.source_dsa_obj_guid +\
+               ("\n\tsource_dsa_invocation_id=%s" %
+                 self.source_dsa_invocation_id) +\
+               "\n\ttransport_guid=%s" % self.transport_guid +\
+               "\n\treplica_flags=0x%X" % self.replica_flags +\
+               ("\n\tconsecutive_sync_failures=%d" %
+                 self.consecutive_sync_failures) +\
+               "\n\tlast_success=%s" % self.last_success +\
+               "\n\tlast_attempt=%s" % self.last_attempt +\
+               "\n\tdns_name1=%s" % self.dns_name1 +\
+               "\n\tdns_name2=%s" % self.dns_name2 +\
+               "\n\tschedule[ " +\
+               "".join("0x%X " % slot for slot in self.schedule) +\
+               "]"
 
         return text
 
@@ -2026,30 +2128,29 @@ class SiteLink(object):
     def __str__(self):
         '''Debug dump string output of Transport object'''
 
-        text = "%s:\n\tdn=%s" % (self.__class__.__name__, self.dnstr)
-        text = text + "\n\toptions=%d" % self.options
-        text = text + "\n\tsystem_flags=%d" % self.system_flags
-        text = text + "\n\tcost=%d" % self.cost
-        text = text + "\n\tinterval=%s" % self.interval
+        text = "%s:\n\tdn=%s" % (self.__class__.__name__, self.dnstr) +\
+               "\n\toptions=%d" % self.options +\
+               "\n\tsystem_flags=%d" % self.system_flags +\
+               "\n\tcost=%d" % self.cost +\
+               "\n\tinterval=%s" % self.interval
 
         if self.schedule is not None:
-            text += "\n\tschedule.size=%s" % self.schedule.size
-            text += "\n\tschedule.bandwidth=%s" % self.schedule.bandwidth
-            text += ("\n\tschedule.numberOfSchedules=%s" %
+            text += "\n\tschedule.size=%s" % self.schedule.size +\
+                    "\n\tschedule.bandwidth=%s" % self.schedule.bandwidth +\
+                    ("\n\tschedule.numberOfSchedules=%s" %
                      self.schedule.numberOfSchedules)
 
             for i, header in enumerate(self.schedule.headerArray):
                 text += ("\n\tschedule.headerArray[%d].type=%d" %
-                         (i, header.type))
-                text += ("\n\tschedule.headerArray[%d].offset=%d" %
-                         (i, header.offset))
-                text = text + "\n\tschedule.dataArray[%d].slots[ " % i
-                for slot in self.schedule.dataArray[i].slots:
-                    text = text + "0x%X " % slot
-                text = text + "]"
+                         (i, header.type)) +\
+                        ("\n\tschedule.headerArray[%d].offset=%d" %
+                         (i, header.offset)) +\
+                        "\n\tschedule.dataArray[%d].slots[ " % i +\
+                        "".join("0x%X " % slot for slot in self.schedule.dataArray[i].slots) +\
+                        "]"
 
-        for dnstr in self.site_list:
-            text = text + "\n\tsite_list=%s" % dnstr
+        for guid, dn in self.site_list:
+            text = text + "\n\tsite_list=%s (%s)" % (guid, dn)
         return text
 
     def load_sitelink(self, samdb):
@@ -2067,9 +2168,10 @@ class SiteLink(object):
             res = samdb.search(base=self.dnstr, scope=ldb.SCOPE_BASE,
                                attrs=attrs, controls=['extended_dn:0'])
 
-        except ldb.LdbError, (enum, estr):
-            raise Exception("Unable to find SiteLink for (%s) - (%s)" %
-                            (self.dnstr, estr))
+        except ldb.LdbError as e19:
+            (enum, estr) = e19.args
+            raise KCCError("Unable to find SiteLink for (%s) - (%s)" %
+                           (self.dnstr, estr))
 
         msg = res[0]
 
@@ -2087,10 +2189,11 @@ class SiteLink(object):
 
         if "siteList" in msg:
             for value in msg["siteList"]:
-                dsdn = dsdb_Dn(samdb, value)
+                dsdn = dsdb_Dn(samdb, value.decode('utf8'))
                 guid = misc.GUID(dsdn.dn.get_extended_component('GUID'))
-                if guid not in self.site_list:
-                    self.site_list.append(guid)
+                dnstr = str(dsdn.dn)
+                if (guid, dnstr) not in self.site_list:
+                    self.site_list.append((guid, dnstr))
 
         if "schedule" in msg:
             self.schedule = ndr_unpack(drsblobs.schedule, value)
@@ -2122,11 +2225,6 @@ def get_dsa_config_rep(dsa):
                    dsa.dsa_dnstr)
 
 
-def sort_dsa_by_guid(dsa1, dsa2):
-    "use ndr_pack for GUID comparison, as appears correct in some places"""
-    return cmp(ndr_pack(dsa1.dsa_guid), ndr_pack(dsa2.dsa_guid))
-
-
 def new_connection_schedule():
     """Create a default schedule for an NTDSConnection or Sitelink. This
     is packed differently from the repltimes schedule used elsewhere
@@ -2154,3 +2252,114 @@ def new_connection_schedule():
 
     schedule.dataArray = [data]
     return schedule
+
+
+##################################################
+# DNS related calls
+##################################################
+
+def uncovered_sites_to_cover(samdb, site_name):
+    """
+    Discover which sites have no DCs and whose lowest single-hop cost
+    distance for any link attached to that site is linked to the site supplied.
+
+    We compare the lowest cost of your single-hop link to this site to all of
+    those available (if it exists). This means that a lower ranked siteLink
+    with only the uncovered site can trump any available links (but this can
+    only be done with specific, poorly enacted user configuration).
+
+    If the site is connected to more than one other site with the same
+    siteLink, only the largest site (failing that sorted alphabetically)
+    creates the DNS records.
+
+    :param samdb database
+    :param site_name origin site (with a DC)
+
+    :return a list of sites this site should be covering (for DNS)
+    """
+    sites_to_cover = []
+
+    server_res = samdb.search(base=samdb.get_config_basedn(),
+                              scope=ldb.SCOPE_SUBTREE,
+                              expression="(&(objectClass=server)"
+                              "(serverReference=*))")
+
+    site_res = samdb.search(base=samdb.get_config_basedn(),
+                            scope=ldb.SCOPE_SUBTREE,
+                            expression="(objectClass=site)")
+
+    sites_in_use = Counter()
+    dc_count = 0
+
+    # Assume server is of form DC,Servers,Site-ABCD because of schema
+    for msg in server_res:
+        site_dn = msg.dn.parent().parent()
+        sites_in_use[site_dn.canonical_str()] += 1
+
+        if site_dn.get_rdn_value().lower() == site_name.lower():
+            dc_count += 1
+
+    if len(sites_in_use) != len(site_res):
+        # There is a possible uncovered site
+        sites_uncovered = []
+
+        for msg in site_res:
+            if msg.dn.canonical_str() not in sites_in_use:
+                sites_uncovered.append(msg)
+
+        own_site_dn = "CN={},CN=Sites,{}".format(
+            ldb.binary_encode(site_name),
+            ldb.binary_encode(str(samdb.get_config_basedn()))
+        )
+
+        for site in sites_uncovered:
+            encoded_dn = ldb.binary_encode(str(site.dn))
+
+            # Get a sorted list of all siteLinks featuring the uncovered site
+            link_res1 = samdb.search(base=samdb.get_config_basedn(),
+                                     scope=ldb.SCOPE_SUBTREE, attrs=["cost"],
+                                     expression="(&(objectClass=siteLink)"
+                                     "(siteList={}))".format(encoded_dn),
+                                     controls=["server_sort:1:0:cost"])
+
+            # Get a sorted list of all siteLinks connecting this an the
+            # uncovered site
+            link_res2 = samdb.search(base=samdb.get_config_basedn(),
+                                     scope=ldb.SCOPE_SUBTREE,
+                                     attrs=["cost", "siteList"],
+                                     expression="(&(objectClass=siteLink)"
+                                     "(siteList={})(siteList={}))".format(
+                                         own_site_dn,
+                                         encoded_dn),
+                                     controls=["server_sort:1:0:cost"])
+
+            # Add to list if your link is equal in cost to lowest cost link
+            if len(link_res1) > 0 and len(link_res2) > 0:
+                cost1 = int(link_res1[0]['cost'][0])
+                cost2 = int(link_res2[0]['cost'][0])
+
+                # Own siteLink must match the lowest cost link
+                if cost1 != cost2:
+                    continue
+
+                # In a siteLink with more than 2 sites attached, only pick the
+                # largest site, and if there are multiple, the earliest
+                # alphabetically.
+                to_cover = True
+                for site_val in link_res2[0]['siteList']:
+                    site_dn = ldb.Dn(samdb, str(site_val))
+                    site_dn_str = site_dn.canonical_str()
+                    site_rdn = site_dn.get_rdn_value().lower()
+                    if sites_in_use[site_dn_str] > dc_count:
+                        to_cover = False
+                        break
+                    elif (sites_in_use[site_dn_str] == dc_count and
+                          site_rdn < site_name.lower()):
+                        to_cover = False
+                        break
+
+                if to_cover:
+                    site_cover_rdn = site.dn.get_rdn_value()
+                    sites_to_cover.append(site_cover_rdn.lower())
+
+    return sites_to_cover

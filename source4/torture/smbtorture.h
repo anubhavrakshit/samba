@@ -34,13 +34,15 @@ extern int torture_failures;
 extern int torture_numasync;
 
 struct torture_test;
-int torture_init(void);
-bool torture_register_suite(struct torture_suite *suite);
+int torture_init(TALLOC_CTX *);
+bool torture_register_suite(TALLOC_CTX *, struct torture_suite *suite);
 void torture_shell(struct torture_context *tctx);
 void torture_print_testsuites(bool structured);
 bool torture_run_named_tests(struct torture_context *torture, const char *name,
 			    const char **restricted);
-bool torture_parse_target(struct loadparm_context *lp_ctx, const char *target);
+bool torture_parse_target(TALLOC_CTX *ctx,
+			struct loadparm_context *lp_ctx,
+			const char *target);
 
 /* Server Functionality Support */
 
@@ -57,14 +59,6 @@ bool torture_parse_target(struct loadparm_context *lp_ctx, const char *target);
  *
  * Because we use parametric options we do not need to define these parameters
  * anywhere, we just define the meaning of each here.*/
-
-/* torture:cn_max_buffer_size
- *
- * This parameter specifies the maximum buffer size given in a change notify
- * request.  If an overly large buffer is requested by a client, the server
- * will return a STATUS_INVALID_PARAMETER.  The max buffer size on Windows
- * server pre-Win7 was 0x00080000.  In Win7 this was reduced to 0x00010000.
- */
 
 /* torture:invalid_lock_range_support
  *

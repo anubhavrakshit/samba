@@ -1,6 +1,7 @@
 # simple makefile wrapper to run waf
 
-WAF=WAF_MAKE=1 PATH=buildtools/bin:../buildtools/bin:$$PATH waf
+WAF_BINARY=$(PYTHON) ../buildtools/bin/waf
+WAF=WAF_MAKE=1 $(WAF_BINARY)
 
 all:
 	$(WAF) build
@@ -26,6 +27,10 @@ quicktest:
 show_version:
 	@touch .tmplock
 	@WAFLOCK=.tmplock $(WAF) show_version
+
+manpages:
+	touch .tmplock
+	WAFLOCK=.tmplock $(WAF) manpages
 
 dist:
 	touch .tmplock

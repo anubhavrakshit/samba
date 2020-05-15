@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 #
 # Unix SMB/CIFS implementation.
@@ -26,30 +26,32 @@
 #  PYTHONPATH="$PYTHONPATH:$samba4srcdir/torture/drs/python" $SUBUNITRUN delete_object -U"$DOMAIN/$DC_USERNAME"%"$DC_PASSWORD"
 #
 
+from __future__ import print_function
 import time
 
 
 from ldb import (
     SCOPE_SUBTREE,
-    )
+)
 
-import drs_base, ldb
+import drs_base
+import ldb
 
 
 class DrsDeleteObjectTestCase(drs_base.DrsBaseTestCase):
 
     def setUp(self):
         super(DrsDeleteObjectTestCase, self).setUp()
+        # disable automatic replication temporary
+        self._disable_all_repl(self.dnsname_dc1)
+        self._disable_all_repl(self.dnsname_dc2)
         # make sure DCs are synchronized before the test
         self._net_drs_replicate(DC=self.dnsname_dc2, fromDC=self.dnsname_dc1, forced=True)
         self._net_drs_replicate(DC=self.dnsname_dc1, fromDC=self.dnsname_dc2, forced=True)
-        # disable automatic replication temporary
-        self._disable_inbound_repl(self.dnsname_dc1)
-        self._disable_inbound_repl(self.dnsname_dc2)
 
     def tearDown(self):
-        self._enable_inbound_repl(self.dnsname_dc1)
-        self._enable_inbound_repl(self.dnsname_dc2)
+        self._enable_all_repl(self.dnsname_dc1)
+        self._enable_all_repl(self.dnsname_dc2)
         super(DrsDeleteObjectTestCase, self).tearDown()
 
     def _make_username(self):
@@ -63,15 +65,17 @@ class DrsDeleteObjectTestCase(drs_base.DrsBaseTestCase):
         res = sam_ldb.search(base=self.domain_dn,
                              expression=expression,
                              controls=["show_deleted:1"])
-        self.assertEquals(len(res), 1)
+        self.assertEqual(len(res), 1)
         user_cur = res[0]
         # Deleted Object base DN
         dodn = self._deleted_objects_dn(sam_ldb)
         # now check properties of the user
-        name_orig = obj_orig["cn"][0]
-        name_cur  = user_cur["cn"][0]
+        cn_orig = str(obj_orig["cn"][0])
+        cn_cur  = str(user_cur["cn"][0])
+        name_orig = str(obj_orig["name"][0])
+        name_cur  = str(user_cur["name"][0])
         if is_deleted:
-            self.assertEquals(user_cur["isDeleted"][0],"TRUE")
+            self.assertEqual(str(user_cur["isDeleted"][0]), "TRUE")
             self.assertFalse("objectCategory" in user_cur)
             self.assertFalse("sAMAccountType" in user_cur)
             self.assertFalse("description" in user_cur)
@@ -79,11 +83,17 @@ class DrsDeleteObjectTestCase(drs_base.DrsBaseTestCase):
             self.assertFalse("member" in user_cur)
             self.assertTrue(dodn in str(user_cur["dn"]),
                             "User %s is deleted but it is not located under %s (found at %s)!" % (name_orig, dodn, user_cur["dn"]))
-            self.assertEquals(name_cur, name_orig + "\nDEL:" + guid_str)
+            self.assertEqual(name_cur, name_orig + "\nDEL:" + guid_str)
+            self.assertEqual(name_cur, user_cur.dn.get_rdn_value())
+            self.assertEqual(cn_cur, cn_orig + "\nDEL:" + guid_str)
+            self.assertEqual(name_cur, cn_cur)
         else:
             self.assertFalse("isDeleted" in user_cur)
-            self.assertEquals(name_cur, name_orig)
-            self.assertEquals(obj_orig["dn"], user_cur["dn"])
+            self.assertEqual(name_cur, name_orig)
+            self.assertEqual(name_cur, user_cur.dn.get_rdn_value())
+            self.assertEqual(cn_cur, cn_orig)
+            self.assertEqual(name_cur, cn_cur)
+            self.assertEqual(obj_orig["dn"], user_cur["dn"])
             self.assertTrue(dodn not in str(user_cur["dn"]))
         return user_cur
 
@@ -108,12 +118,12 @@ class DrsDeleteObjectTestCase(drs_base.DrsBaseTestCase):
         ldb_res = self.ldb_dc1.search(base=self.domain_dn,
                                       scope=SCOPE_SUBTREE,
                                       expression="(samAccountName=%s)" % username)
-        self.assertEquals(len(ldb_res), 1)
+        self.assertEqual(len(ldb_res), 1)
         user_orig = ldb_res[0]
         user_dn   = ldb_res[0]["dn"]
 
         # check user info on DC1
-        print "Testing for %s with GUID %s" % (username, self._GUID_string(user_orig["objectGUID"][0]))
+        print("Testing for %s with GUID %s" % (username, self._GUID_string(user_orig["objectGUID"][0])))
         self._check_obj(sam_ldb=self.ldb_dc1, obj_orig=user_orig, is_deleted=False)
 
         # trigger replication from DC1 to DC2
@@ -151,7 +161,7 @@ class DrsDeleteObjectTestCase(drs_base.DrsBaseTestCase):
         m = ldb.Message()
         m.dn = group_dn
         m["member"] = ldb.MessageElement(str(user_dn),
-                                           ldb.FLAG_MOD_ADD, "member")
+                                         ldb.FLAG_MOD_ADD, "member")
         self.ldb_dc2.modify(m)
 
         ldb_res = self.ldb_dc2.search(base=self.domain_dn,
@@ -264,12 +274,12 @@ class DrsDeleteObjectTestCase(drs_base.DrsBaseTestCase):
         ldb_res = self.ldb_dc1.search(base=self.domain_dn,
                                       scope=SCOPE_SUBTREE,
                                       expression="(samAccountName=%s)" % username)
-        self.assertEquals(len(ldb_res), 1)
+        self.assertEqual(len(ldb_res), 1)
         user_orig = ldb_res[0]
         user_dn   = ldb_res[0]["dn"]
 
         # check user info on DC1
-        print "Testing for %s with GUID %s" % (username, self._GUID_string(user_orig["objectGUID"][0]))
+        print("Testing for %s with GUID %s" % (username, self._GUID_string(user_orig["objectGUID"][0])))
         self._check_obj(sam_ldb=self.ldb_dc1, obj_orig=user_orig, is_deleted=False)
 
         # trigger replication from DC1 to DC2
@@ -307,7 +317,7 @@ class DrsDeleteObjectTestCase(drs_base.DrsBaseTestCase):
         m = ldb.Message()
         m.dn = group_dn
         m["member"] = ldb.MessageElement(str(user_dn),
-                                           ldb.FLAG_MOD_ADD, "member")
+                                         ldb.FLAG_MOD_ADD, "member")
         self.ldb_dc2.modify(m)
 
         ldb_res = self.ldb_dc2.search(base=self.domain_dn,
@@ -367,4 +377,3 @@ class DrsDeleteObjectTestCase(drs_base.DrsBaseTestCase):
 
         # trigger replication from DC1 to DC2, for cleanup
         self._net_drs_replicate(DC=self.dnsname_dc2, fromDC=self.dnsname_dc1, forced=True)
-

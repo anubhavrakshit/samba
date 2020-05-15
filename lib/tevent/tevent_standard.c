@@ -63,7 +63,6 @@ static bool std_fallback_to_poll(struct tevent_context *ev, bool replay)
 		struct std_event_glue);
 	int ret;
 	struct tevent_fd *fde;
-	struct tevent_fd *fde_next;
 
 	glue->fallback_replay = replay;
 
@@ -86,17 +85,14 @@ static bool std_fallback_to_poll(struct tevent_context *ev, bool replay)
 	 * Now we have to change all the existing file descriptor
 	 * events from the epoll backend to the poll backend.
 	 */
-	for (fde = ev->fd_events; fde; fde = fde_next) {
-		/*
-		 * We must remove this fde off the ev->fd_events list.
-		 */
-		fde_next = fde->next;
-
-		/* Remove from the ev->fd_events list. */
-		DLIST_REMOVE(ev->fd_events, fde);
+	for (fde = ev->fd_events; fde; fde = fde->next) {
+		bool ok;
 
 		/* Re-add this event as a poll backend event. */
-		tevent_poll_event_add_fd_internal(ev, fde);
+		ok = tevent_poll_event_add_fd_internal(ev, fde);
+		if (!ok) {
+			return false;
+		}
 	}
 
 	return true;
@@ -112,6 +108,11 @@ static int std_event_loop_once(struct tevent_context *ev, const char *location)
 	int ret;
 
 	ret = glue->epoll_ops->loop_once(ev, location);
+	/*
+	 * If the above hasn't panicked due to an epoll interface failure,
+	 * std_fallback_to_poll() wasn't called, and hasn't cleared epoll_ops to
+	 * signify fallback to poll_ops.
+	 */
 	if (glue->epoll_ops != NULL) {
 		/* No fallback */
 		return ret;
@@ -138,6 +139,11 @@ static int std_event_loop_wait(struct tevent_context *ev, const char *location)
 	int ret;
 
 	ret = glue->epoll_ops->loop_wait(ev, location);
+	/*
+	 * If the above hasn't panicked due to an epoll interface failure,
+	 * std_fallback_to_poll() wasn't called, and hasn't cleared epoll_ops to
+	 * signify fallback to poll_ops.
+	 */
 	if (glue->epoll_ops != NULL) {
 		/* No fallback */
 		return ret;

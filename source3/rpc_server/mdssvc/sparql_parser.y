@@ -20,20 +20,21 @@
 
 %{
 	#include "includes.h"
-	#include "mdssvc.h"
-	#include "sparql_parser.h"
-	#include "sparql_mapping.h"
+	#include "rpc_server/mdssvc/mdssvc.h"
+	#include "rpc_server/mdssvc/mdssvc_tracker.h"
+	#include "rpc_server/mdssvc/sparql_parser.tab.h"
+	#include "rpc_server/mdssvc/sparql_mapping.h"
 
 	#define YYMALLOC SMB_MALLOC
 	#define YYREALLOC SMB_REALLOC
 
 	struct yy_buffer_state;
 	typedef struct yy_buffer_state *YY_BUFFER_STATE;
-	extern int yylex (void);
-	extern void yyerror (char const *);
-	extern void *yyterminate(void);
-	extern YY_BUFFER_STATE yy_scan_string( const char *str);
-	extern void yy_delete_buffer ( YY_BUFFER_STATE buffer );
+	extern int mdsyylex (void);
+	extern void mdsyyerror (char const *);
+	extern void *mdsyyterminate(void);
+	extern YY_BUFFER_STATE mdsyy_scan_string( const char *str);
+	extern void mdsyy_delete_buffer ( YY_BUFFER_STATE buffer );
 
 	/* forward declarations */
 	static const char *map_expr(const char *attr, char op, const char *val);
@@ -52,9 +53,9 @@
 
 %code provides {
 	#include <stdbool.h>
-	#include "mdssvc.h"
+	#include "rpc_server/mdssvc/mdssvc.h"
 	#define SPRAW_TIME_OFFSET 978307200
-	extern int yywrap(void);
+	extern int mdsyywrap(void);
 	extern bool map_spotlight_to_sparql_query(struct sl_query *slq);
 }
 
@@ -65,6 +66,7 @@
 	time_t tval;
 }
 
+%name-prefix "mdsyy"
 %expect 5
 %error-verbose
 
@@ -430,12 +432,12 @@ static const char *map_expr(const char *attr, char op, const char *val)
 	return sparql;
 }
 
-void yyerror(const char *str)
+void mdsyyerror(const char *str)
 {
-	DEBUG(1, ("yyerror: %s\n", str));
+	DEBUG(1, ("mdsyyerror: %s\n", str));
 }
 
-int yywrap(void)
+int mdsyywrap(void)
 {
 	return 1;
 }
@@ -445,33 +447,35 @@ int yywrap(void)
  **/
 bool map_spotlight_to_sparql_query(struct sl_query *slq)
 {
+	struct sl_tracker_query *tq = talloc_get_type_abort(
+		slq->backend_private, struct sl_tracker_query);
 	struct sparql_parser_state s = {
 		.frame = talloc_stackframe(),
 		.var = 'a',
 	};
 	int result;
 
-	s.s = yy_scan_string(slq->query_string);
+	s.s = mdsyy_scan_string(slq->query_string);
 	if (s.s == NULL) {
 		TALLOC_FREE(s.frame);
 		return false;
 	}
 	global_sparql_parser_state = &s;
-	result = yyparse();
+	result = mdsyyparse();
 	global_sparql_parser_state = NULL;
-	yy_delete_buffer(s.s);
+	mdsyy_delete_buffer(s.s);
 
 	if (result != 0) {
 		TALLOC_FREE(s.frame);
 		return false;
 	}
 
-	slq->sparql_query = talloc_asprintf(slq,
+	tq->sparql_query = talloc_asprintf(slq,
 		"SELECT ?url WHERE { %s . ?obj nie:url ?url . "
 		"FILTER(tracker:uri-is-descendant('file://%s/', ?url)) }",
-		s.result, slq->path_scope);
+		s.result, tq->path_scope);
 	TALLOC_FREE(s.frame);
-	if (slq->sparql_query == NULL) {
+	if (tq->sparql_query == NULL) {
 		return false;
 	}
 

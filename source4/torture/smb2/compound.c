@@ -184,10 +184,10 @@ static bool test_compound_break(struct torture_context *tctx,
 
 	ZERO_STRUCT(gf);
 	gf.in.file.handle = h;
-	gf.in.info_type = SMB2_GETINFO_FILE;
+	gf.in.info_type = SMB2_0_INFO_FILE;
 	gf.in.info_class = 0x16;
 	gf.in.output_buffer_length = 0x1000;
-	gf.in.input_buffer_length = 0;
+	gf.in.input_buffer = data_blob_null;
 
 	req[1] = smb2_getinfo_send(tree, &gf);
 
@@ -262,7 +262,7 @@ static bool test_compound_related1(struct torture_context *tctx,
 				0, /* capabilities */
 				0 /* maximal_access */);
 
-	tree->session->smbXcli = smbXcli_session_copy(tree->session,
+	tree->session->smbXcli = smbXcli_session_shallow_copy(tree->session,
 							tree->session->smbXcli);
 	smb2cli_session_set_id_and_flags(tree->session->smbXcli, UINT64_MAX, 0);
 
@@ -341,7 +341,7 @@ static bool test_compound_related2(struct torture_context *tctx,
 				0, /* capabilities */
 				0 /* maximal_access */);
 
-	tree->session->smbXcli = smbXcli_session_copy(tree->session,
+	tree->session->smbXcli = smbXcli_session_shallow_copy(tree->session,
 							tree->session->smbXcli);
 	smb2cli_session_set_id_and_flags(tree->session->smbXcli, UINT64_MAX, 0);
 
@@ -415,8 +415,8 @@ static bool test_compound_related3(struct torture_context *tctx,
 	ZERO_STRUCT(io);
 	io.in.function = FSCTL_CREATE_OR_GET_OBJECT_ID;
 	io.in.file.handle = hd;
-	io.in.unknown2 = 0;
-	io.in.max_response_size = 64;
+	io.in.reserved2 = 0;
+	io.in.max_output_response = 64;
 	io.in.flags = 1;
 
 	req[1] = smb2_ioctl_send(tree, &io);
@@ -671,6 +671,77 @@ done:
 	return ret;
 }
 
+static bool test_compound_create_write_close(struct torture_context *tctx,
+					     struct smb2_tree *tree)
+{
+	struct smb2_handle handle = { .data = { UINT64_MAX, UINT64_MAX } };
+	struct smb2_create create;
+	struct smb2_write write;
+	struct smb2_close close;
+	const char *fname = "compound_create_write_close.dat";
+	struct smb2_request *req[3];
+	NTSTATUS status;
+	bool ret = false;
+
+	smb2_util_unlink(tree, fname);
+
+	ZERO_STRUCT(create);
+	create.in.security_flags = 0x00;
+	create.in.oplock_level = 0;
+	create.in.impersonation_level = NTCREATEX_IMPERSONATION_IMPERSONATION;
+	create.in.create_flags = 0x00000000;
+	create.in.reserved = 0x00000000;
+	create.in.desired_access = SEC_RIGHTS_FILE_ALL;
+	create.in.file_attributes = FILE_ATTRIBUTE_NORMAL;
+	create.in.share_access = NTCREATEX_SHARE_ACCESS_READ |
+		NTCREATEX_SHARE_ACCESS_WRITE |
+		NTCREATEX_SHARE_ACCESS_DELETE;
+	create.in.create_disposition = NTCREATEX_DISP_OPEN_IF;
+	create.in.create_options = NTCREATEX_OPTIONS_SEQUENTIAL_ONLY |
+		NTCREATEX_OPTIONS_ASYNC_ALERT |
+		NTCREATEX_OPTIONS_NON_DIRECTORY_FILE |
+		0x00200000;
+	create.in.fname = fname;
+
+	smb2_transport_compound_start(tree->session->transport, 3);
+
+	req[0] = smb2_create_send(tree, &create);
+
+	smb2_transport_compound_set_related(tree->session->transport, true);
+
+	ZERO_STRUCT(write);
+	write.in.file.handle = handle;
+	write.in.offset = 0;
+	write.in.data = data_blob_talloc(tctx, NULL, 1024);
+
+	req[1] = smb2_write_send(tree, &write);
+
+	ZERO_STRUCT(close);
+	close.in.file.handle = handle;
+
+	req[2] = smb2_close_send(tree, &close);
+
+	status = smb2_create_recv(req[0], tree, &create);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"CREATE failed.");
+
+	status = smb2_write_recv(req[1], &write);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"WRITE failed.");
+
+	status = smb2_close_recv(req[2], &close);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"CLOSE failed.");
+
+	status = smb2_util_unlink(tree, fname);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"File deletion failed.");
+
+	ret = true;
+done:
+	return ret;
+}
+
 static bool test_compound_unrelated1(struct torture_context *tctx,
 				     struct smb2_tree *tree)
 {
@@ -859,7 +930,7 @@ static bool test_compound_invalid2(struct torture_context *tctx,
 				0, /* capabilities */
 				0 /* maximal_access */);
 
-	tree->session->smbXcli = smbXcli_session_copy(tree->session,
+	tree->session->smbXcli = smbXcli_session_shallow_copy(tree->session,
 							tree->session->smbXcli);
 	smb2cli_session_set_id_and_flags(tree->session->smbXcli, UINT64_MAX, 0);
 
@@ -953,6 +1024,81 @@ static bool test_compound_invalid3(struct torture_context *tctx,
 	CHECK_STATUS(status, NT_STATUS_FILE_CLOSED);
 	status = smb2_close_recv(req[4], &cl);
 	CHECK_STATUS(status, NT_STATUS_FILE_CLOSED);
+
+	smb2_util_unlink(tree, fname);
+done:
+	return ret;
+}
+
+static bool test_compound_invalid4(struct torture_context *tctx,
+				   struct smb2_tree *tree)
+{
+	struct smb2_create cr;
+	struct smb2_read rd;
+	NTSTATUS status;
+	const char *fname = "compound_invalid4.dat";
+	struct smb2_close cl;
+	bool ret = true;
+	bool ok;
+	struct smb2_request *req[2];
+
+	smb2_transport_credits_ask_num(tree->session->transport, 2);
+
+	smb2_util_unlink(tree, fname);
+
+	ZERO_STRUCT(cr);
+	cr.in.security_flags	  = 0x00;
+	cr.in.oplock_level	  = 0;
+	cr.in.impersonation_level = NTCREATEX_IMPERSONATION_IMPERSONATION;
+	cr.in.create_flags	  = 0x00000000;
+	cr.in.reserved		  = 0x00000000;
+	cr.in.desired_access	  = SEC_RIGHTS_FILE_ALL;
+	cr.in.file_attributes	  = FILE_ATTRIBUTE_NORMAL;
+	cr.in.share_access	  = NTCREATEX_SHARE_ACCESS_READ |
+				    NTCREATEX_SHARE_ACCESS_WRITE |
+				    NTCREATEX_SHARE_ACCESS_DELETE;
+	cr.in.create_disposition  = NTCREATEX_DISP_OPEN_IF;
+	cr.in.create_options	  = NTCREATEX_OPTIONS_SEQUENTIAL_ONLY |
+				    NTCREATEX_OPTIONS_ASYNC_ALERT	|
+				    NTCREATEX_OPTIONS_NON_DIRECTORY_FILE |
+				    0x00200000;
+	cr.in.fname		  = fname;
+
+	status = smb2_create(tree, tctx, &cr);
+	CHECK_STATUS(status, NT_STATUS_OK);
+
+	smb2_transport_compound_start(tree->session->transport, 2);
+
+	ZERO_STRUCT(rd);
+	rd.in.file.handle = cr.out.file.handle;
+	rd.in.length      = 1;
+	rd.in.offset      = 0;
+	req[0] = smb2_read_send(tree, &rd);
+
+	smb2_transport_compound_set_related(tree->session->transport, true);
+
+	/*
+	 * Send a completely bogus request as second compound
+	 * element. This triggers smbd_smb2_request_error() in in
+	 * smbd_smb2_request_dispatch() before calling
+	 * smbd_smb2_request_dispatch_update_counts().
+	 */
+
+	req[1] = smb2_request_init_tree(tree, 0xff, 0x04, false, 0);
+	smb2_transport_send(req[1]);
+
+	status = smb2_read_recv(req[0], tctx, &rd);
+	CHECK_STATUS(status, NT_STATUS_END_OF_FILE);
+
+	ok = smb2_request_receive(req[1]);
+	torture_assert(tctx, ok, "Invalid request failed\n");
+	CHECK_STATUS(req[1]->status, NT_STATUS_INVALID_PARAMETER);
+
+	ZERO_STRUCT(cl);
+	cl.in.file.handle = cr.out.file.handle;
+
+	status = smb2_close(tree, &cl);
+	CHECK_STATUS(status, NT_STATUS_OK);
 
 	smb2_util_unlink(tree, fname);
 done:
@@ -1080,10 +1226,10 @@ static bool test_compound_interim2(struct torture_context *tctx,
 
     ZERO_STRUCT(gf);
     gf.in.file.handle = hd;
-    gf.in.info_type   = SMB2_GETINFO_FILE;
+    gf.in.info_type   = SMB2_0_INFO_FILE;
     gf.in.info_class  = 0x04; /* FILE_BASIC_INFORMATION */
     gf.in.output_buffer_length = 0x1000;
-    gf.in.input_buffer_length = 0;
+    gf.in.input_buffer = data_blob_null;
 
     req[2] = smb2_getinfo_send(tree, &gf);
 
@@ -1103,9 +1249,188 @@ done:
     return ret;
 }
 
-struct torture_suite *torture_smb2_compound_init(void)
+/* Test compound related finds */
+static bool test_compound_find_related(struct torture_context *tctx,
+				       struct smb2_tree *tree)
 {
-	struct torture_suite *suite = torture_suite_create(talloc_autofree_context(), "compound");
+	TALLOC_CTX *mem_ctx = talloc_new(tctx);
+	const char *dname = "compound_find_dir";
+	struct smb2_create create;
+	struct smb2_find f;
+	struct smb2_handle h;
+	struct smb2_request *req[2];
+	NTSTATUS status;
+	bool ret = true;
+
+	smb2_deltree(tree, dname);
+
+	ZERO_STRUCT(create);
+	create.in.desired_access = SEC_RIGHTS_DIR_ALL;
+	create.in.create_options = NTCREATEX_OPTIONS_DIRECTORY;
+	create.in.file_attributes = FILE_ATTRIBUTE_DIRECTORY;
+	create.in.share_access = NTCREATEX_SHARE_ACCESS_READ |
+				 NTCREATEX_SHARE_ACCESS_WRITE |
+				 NTCREATEX_SHARE_ACCESS_DELETE;
+	create.in.create_disposition = NTCREATEX_DISP_CREATE;
+	create.in.fname = dname;
+
+	status = smb2_create(tree, mem_ctx, &create);
+	h = create.out.file.handle;
+
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done, "smb2_create failed\n");
+
+	smb2_transport_compound_start(tree->session->transport, 2);
+
+	ZERO_STRUCT(f);
+	f.in.file.handle	= h;
+	f.in.pattern		= "*";
+	f.in.max_response_size	= 0x100;
+	f.in.level              = SMB2_FIND_BOTH_DIRECTORY_INFO;
+
+	req[0] = smb2_find_send(tree, &f);
+
+	smb2_transport_compound_set_related(tree->session->transport, true);
+
+	req[1] = smb2_find_send(tree, &f);
+
+	status = smb2_find_recv(req[0], mem_ctx, &f);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done, "smb2_find_recv failed\n");
+
+	status = smb2_find_recv(req[1], mem_ctx, &f);
+	torture_assert_ntstatus_equal_goto(tctx, status, STATUS_NO_MORE_FILES, ret, done, "smb2_find_recv failed\n");
+
+done:
+	smb2_util_close(tree, h);
+	smb2_deltree(tree, dname);
+	TALLOC_FREE(mem_ctx);
+	return ret;
+}
+
+/* Test compound related finds */
+static bool test_compound_find_close(struct torture_context *tctx,
+				     struct smb2_tree *tree)
+{
+	TALLOC_CTX *mem_ctx = talloc_new(tctx);
+	const char *dname = "compound_find_dir";
+	struct smb2_create create;
+	struct smb2_find f;
+	struct smb2_handle h;
+	struct smb2_request *req = NULL;
+	const int num_files = 5000;
+	int i;
+	NTSTATUS status;
+	bool ret = true;
+
+	smb2_deltree(tree, dname);
+
+	ZERO_STRUCT(create);
+	create.in.desired_access = SEC_RIGHTS_DIR_ALL;
+	create.in.create_options = NTCREATEX_OPTIONS_DIRECTORY;
+	create.in.file_attributes = FILE_ATTRIBUTE_DIRECTORY;
+	create.in.share_access = NTCREATEX_SHARE_ACCESS_READ |
+				 NTCREATEX_SHARE_ACCESS_WRITE |
+				 NTCREATEX_SHARE_ACCESS_DELETE;
+	create.in.create_disposition = NTCREATEX_DISP_CREATE;
+	create.in.fname = dname;
+
+	smb2cli_conn_set_max_credits(tree->session->transport->conn, 256);
+
+	status = smb2_create(tree, mem_ctx, &create);
+	h = create.out.file.handle;
+
+	ZERO_STRUCT(create);
+	create.in.desired_access = SEC_RIGHTS_FILE_ALL;
+	create.in.file_attributes = FILE_ATTRIBUTE_NORMAL;
+	create.in.create_disposition = NTCREATEX_DISP_CREATE;
+
+	for (i = 0; i < num_files; i++) {
+		create.in.fname = talloc_asprintf(mem_ctx, "%s\\file%d",
+						  dname, i);
+		status = smb2_create(tree, mem_ctx, &create);
+		torture_assert_ntstatus_ok_goto(tctx, status, ret, done, "");
+		smb2_util_close(tree, create.out.file.handle);
+	}
+
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done, "smb2_create failed\n");
+
+	ZERO_STRUCT(f);
+	f.in.file.handle	= h;
+	f.in.pattern		= "*";
+	f.in.max_response_size	= 8*1024*1024;
+	f.in.level              = SMB2_FIND_BOTH_DIRECTORY_INFO;
+
+	req = smb2_find_send(tree, &f);
+
+	status = smb2_util_close(tree, h);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done, "smb2_util_close failed\n");
+
+	status = smb2_find_recv(req, mem_ctx, &f);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done, "smb2_find_recv failed\n");
+
+done:
+	smb2_util_close(tree, h);
+	smb2_deltree(tree, dname);
+	TALLOC_FREE(mem_ctx);
+	return ret;
+}
+
+/* Test compound unrelated finds */
+static bool test_compound_find_unrelated(struct torture_context *tctx,
+					 struct smb2_tree *tree)
+{
+	TALLOC_CTX *mem_ctx = talloc_new(tctx);
+	const char *dname = "compound_find_dir";
+	struct smb2_create create;
+	struct smb2_find f;
+	struct smb2_handle h;
+	struct smb2_request *req[2];
+	NTSTATUS status;
+	bool ret = true;
+
+	smb2_deltree(tree, dname);
+
+	ZERO_STRUCT(create);
+	create.in.desired_access = SEC_RIGHTS_DIR_ALL;
+	create.in.create_options = NTCREATEX_OPTIONS_DIRECTORY;
+	create.in.file_attributes = FILE_ATTRIBUTE_DIRECTORY;
+	create.in.share_access = NTCREATEX_SHARE_ACCESS_READ |
+				 NTCREATEX_SHARE_ACCESS_WRITE |
+				 NTCREATEX_SHARE_ACCESS_DELETE;
+	create.in.create_disposition = NTCREATEX_DISP_CREATE;
+	create.in.fname = dname;
+
+	status = smb2_create(tree, mem_ctx, &create);
+	h = create.out.file.handle;
+
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done, "smb2_create failed\n");
+
+	smb2_transport_compound_start(tree->session->transport, 2);
+
+	ZERO_STRUCT(f);
+	f.in.file.handle	= h;
+	f.in.pattern		= "*";
+	f.in.max_response_size	= 0x100;
+	f.in.level              = SMB2_FIND_BOTH_DIRECTORY_INFO;
+
+	req[0] = smb2_find_send(tree, &f);
+	req[1] = smb2_find_send(tree, &f);
+
+	status = smb2_find_recv(req[0], mem_ctx, &f);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done, "smb2_find_recv failed\n");
+
+	status = smb2_find_recv(req[1], mem_ctx, &f);
+	torture_assert_ntstatus_equal_goto(tctx, status, STATUS_NO_MORE_FILES, ret, done, "smb2_find_recv failed\n");
+
+done:
+	smb2_util_close(tree, h);
+	smb2_deltree(tree, dname);
+	TALLOC_FREE(mem_ctx);
+	return ret;
+}
+
+struct torture_suite *torture_smb2_compound_init(TALLOC_CTX *ctx)
+{
+	struct torture_suite *suite = torture_suite_create(ctx, "compound");
 
 	torture_suite_add_1smb2_test(suite, "related1", test_compound_related1);
 	torture_suite_add_1smb2_test(suite, "related2", test_compound_related2);
@@ -1115,12 +1440,29 @@ struct torture_suite *torture_smb2_compound_init(void)
 	torture_suite_add_1smb2_test(suite, "invalid1", test_compound_invalid1);
 	torture_suite_add_1smb2_test(suite, "invalid2", test_compound_invalid2);
 	torture_suite_add_1smb2_test(suite, "invalid3", test_compound_invalid3);
+	torture_suite_add_1smb2_test(
+		suite, "invalid4", test_compound_invalid4);
 	torture_suite_add_1smb2_test(suite, "interim1",  test_compound_interim1);
 	torture_suite_add_1smb2_test(suite, "interim2",  test_compound_interim2);
 	torture_suite_add_1smb2_test(suite, "compound-break", test_compound_break);
 	torture_suite_add_1smb2_test(suite, "compound-padding", test_compound_padding);
+	torture_suite_add_1smb2_test(suite, "create-write-close",
+				     test_compound_create_write_close);
 
 	suite->description = talloc_strdup(suite, "SMB2-COMPOUND tests");
+
+	return suite;
+}
+
+struct torture_suite *torture_smb2_compound_find_init(TALLOC_CTX *ctx)
+{
+	struct torture_suite *suite = torture_suite_create(ctx, "compound_find");
+
+	torture_suite_add_1smb2_test(suite, "compound_find_related", test_compound_find_related);
+	torture_suite_add_1smb2_test(suite, "compound_find_unrelated", test_compound_find_unrelated);
+	torture_suite_add_1smb2_test(suite, "compound_find_close", test_compound_find_close);
+
+	suite->description = talloc_strdup(suite, "SMB2-COMPOUND-FIND tests");
 
 	return suite;
 }

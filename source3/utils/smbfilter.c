@@ -20,9 +20,10 @@
 #include "includes.h"
 #include "system/filesys.h"
 #include "system/select.h"
+#include "libsmb/namequery.h"
 #include "../lib/util/select.h"
 #include "libsmb/nmblib.h"
-#include "lib/sys_rw_data.h"
+#include "lib/util/sys_rw_data.h"
 
 #define SECURITY_MASK 0
 #define SECURITY_SET  0
@@ -88,6 +89,7 @@ static void filter_request(char *buf, size_t buf_len)
 	int name_len1 = 0;
 	int name_len2;
 	int name_type1, name_type2;
+	int ret;
 
 	if (msg_type) {
 		/* it's a netbios special */
@@ -142,7 +144,10 @@ static void filter_request(char *buf, size_t buf_len)
 		x = IVAL(buf,smb_vwv11);
 		d_printf("SMBsesssetupX cap=0x%08x\n", x);
 		d_printf("pwlen=%d/%d\n", SVAL(buf, smb_vwv7), SVAL(buf, smb_vwv8));
-		system("mv sessionsetup.dat sessionsetup1.dat");
+		ret = system("mv sessionsetup.dat sessionsetup1.dat");
+		if (ret == -1) {
+			DBG_ERR("failed to call mv command\n");
+		}
 		save_file("sessionsetup.dat", smb_buf(buf), SVAL(buf, smb_vwv7));
 		x = (x | CLI_CAPABILITY_SET) & ~CLI_CAPABILITY_MASK;
 		SIVAL(buf, smb_vwv11, x);
@@ -304,6 +309,7 @@ static void start_filter(char *desthost)
 		if ((num > 0) && (revents & (POLLIN|POLLHUP|POLLERR))) {
 			c = accept(s, (struct sockaddr *)&ss, &in_addrlen);
 			if (c != -1) {
+				smb_set_close_on_exec(c);
 				if (fork() == 0) {
 					close(s);
 					filter_child(c, &dest_ss);

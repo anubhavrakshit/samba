@@ -25,6 +25,9 @@
 #include "../libcli/smb/smb_common.h"
 #include "../lib/util/tevent_ntstatus.h"
 
+#undef DBGC_CLASS
+#define DBGC_CLASS DBGC_SMB2
+
 struct smbd_smb2_notify_state {
 	struct smbd_smb2_request *smb2req;
 	struct smb_request *smbreq;
@@ -252,7 +255,7 @@ static struct tevent_req *smbd_smb2_notify_send(TALLOC_CTX *mem_ctx,
 		TALLOC_FREE(filter_string);
 	}
 
-	if ((!fsp->is_directory) || (conn != fsp->conn)) {
+	if ((!fsp->fsp_flags.is_directory) || (conn != fsp->conn)) {
 		tevent_req_nterror(req, NT_STATUS_INVALID_PARAMETER);
 		return tevent_req_post(req, ev);
 	}
@@ -260,6 +263,7 @@ static struct tevent_req *smbd_smb2_notify_send(TALLOC_CTX *mem_ctx,
 	if (fsp->notify == NULL) {
 
 		status = change_notify_create(fsp,
+					      in_output_buffer_length,
 					      in_completion_filter,
 					      recursive);
 		if (!NT_STATUS_IS_OK(status)) {

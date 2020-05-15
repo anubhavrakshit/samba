@@ -174,14 +174,14 @@ int cbuf_puts(cbuf* b, const char* str, size_t len);
 int cbuf_putdw(cbuf* b, uint32_t u);
 
 /**
- * Print formated to a character buffer.
+ * Print formatted to a character buffer.
  *
  * @param b a charcter buffer
  * @param fmt a printf format string
  *
  * @return number of characters written, negative on error
  */
-int cbuf_printf(cbuf* b, const char* fmt, ...);
+int cbuf_printf(cbuf* b, const char* fmt, ...) PRINTF_ATTRIBUTE(2,3);
 
 
 /**

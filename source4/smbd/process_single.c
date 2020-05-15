@@ -26,7 +26,7 @@
 #include "system/filesys.h"
 #include "cluster/cluster.h"
 
-NTSTATUS process_model_single_init(void);
+NTSTATUS process_model_single_init(TALLOC_CTX *);
 
 /*
   called when the process model is selected
@@ -44,8 +44,10 @@ static void single_accept_connection(struct tevent_context *ev,
 				     void (*new_conn)(struct tevent_context *, 
 						      struct loadparm_context *,
 						      struct socket_context *, 
-						      struct server_id , void *), 
-				     void *private_data)
+						      struct server_id, void *,
+						      void *),
+				     void *private_data,
+				     void *process_context)
 {
 	NTSTATUS status;
 	struct socket_context *connected_socket;
@@ -54,7 +56,8 @@ static void single_accept_connection(struct tevent_context *ev,
 	/* accept an incoming connection. */
 	status = socket_accept(listen_socket, &connected_socket);
 	if (!NT_STATUS_IS_OK(status)) {
-		DEBUG(0,("single_accept_connection: accept: %s\n", nt_errstr(status)));
+		DBG_ERR("single_accept_connection: accept: %s\n",
+			nt_errstr(status));
 		/* this looks strange, but is correct. 
 
 		   We can only be here if woken up from select, due to
@@ -79,22 +82,27 @@ static void single_accept_connection(struct tevent_context *ev,
 	 * combination of pid/fd should be unique system-wide
 	 */
 	new_conn(ev, lp_ctx, connected_socket,
-		 cluster_id(pid, socket_get_fd(connected_socket)), private_data);
+		 cluster_id(pid, socket_get_fd(connected_socket)), private_data,
+			    process_context);
 }
 
 /*
   called to startup a new task
 */
-static void single_new_task(struct tevent_context *ev, 
+static void single_new_task(struct tevent_context *ev,
 			    struct loadparm_context *lp_ctx,
 			    const char *service_name,
-			    void (*new_task)(struct tevent_context *, struct loadparm_context *, struct server_id, void *), 
-			    void *private_data)
+			    struct task_server *(*new_task)(struct tevent_context *,
+				             struct loadparm_context *,
+					     struct server_id, void *, void *),
+			    void *private_data,
+			    const struct service_details *service_details,
+			    int from_parent_fd)
 {
 	pid_t pid = getpid();
 	/* start our taskids at MAX_INT32, the first 2^31 tasks are is reserved for fd numbers */
 	static uint32_t taskid = INT32_MAX;
-       
+	struct task_server *task = NULL;
 	/*
 	 * We use the PID so we cannot collide in with cluster ids
 	 * generated in other single mode tasks, and, and won't
@@ -104,14 +112,33 @@ static void single_new_task(struct tevent_context *ev,
 	 * Using the pid unaltered makes debugging of which process
 	 * owns the messaging socket easier.
 	 */
-	new_task(ev, lp_ctx, cluster_id(pid, taskid++), private_data);
+	task = new_task(ev, lp_ctx, cluster_id(pid, taskid++), private_data, NULL);
+	if (task != NULL && service_details->post_fork != NULL) {
+		struct process_details pd = initial_process_details;
+		service_details->post_fork(task, &pd);
+	}
 }
 
-
-/* called when a task goes down */
-static void single_terminate(struct tevent_context *ev, struct loadparm_context *lp_ctx, const char *reason)
+/*
+ * Called when a task goes down
+ */
+static void single_terminate_task(struct tevent_context *ev,
+				  struct loadparm_context *lp_ctx,
+				  const char *reason,
+				  bool fatal,
+				  void *process_context)
 {
-	DEBUG(3,("single_terminate: reason[%s]\n",reason));
+	DBG_NOTICE("single_terminate: reason[%s]\n",reason);
+}
+
+/*
+ * Called when a connection has ended
+ */
+static void single_terminate_connection(struct tevent_context *ev,
+					struct loadparm_context *lp_ctx,
+					const char *reason,
+					void *process_context)
+{
 }
 
 /* called to set a title of a task or connection */
@@ -122,9 +149,10 @@ static void single_set_title(struct tevent_context *ev, const char *title)
 const struct model_ops single_ops = {
 	.name			= "single",
 	.model_init		= single_model_init,
-	.new_task               = single_new_task,
+	.new_task		= single_new_task,
 	.accept_connection	= single_accept_connection,
-	.terminate              = single_terminate,
+	.terminate_task		= single_terminate_task,
+	.terminate_connection	= single_terminate_connection,
 	.set_title		= single_set_title,
 };
 
@@ -132,7 +160,7 @@ const struct model_ops single_ops = {
   initialise the single process model, registering ourselves with the
   process model subsystem
  */
-NTSTATUS process_model_single_init(void)
+NTSTATUS process_model_single_init(TALLOC_CTX *ctx)
 {
 	return register_process_model(&single_ops);
 }

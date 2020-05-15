@@ -95,6 +95,7 @@ struct smbcli_options {
 	unsigned int use_spnego:1;
 	unsigned int unicode:1;
 	unsigned int ntstatus_support:1;
+	int min_protocol;
 	int max_protocol;
 	uint32_t max_xmit;
 	uint16_t max_mux;
@@ -102,6 +103,7 @@ struct smbcli_options {
 	enum smb_signing_setting signing;
 	uint32_t smb2_capabilities;
 	struct GUID client_guid;
+	uint64_t max_credits;
 };
 
 /* this is the context for the client transport layer */
@@ -270,7 +272,6 @@ struct smbcli_request *smb_raw_read_send(struct smbcli_tree *tree, union smb_rea
 NTSTATUS smb_raw_trans_recv(struct smbcli_request *req,
 			     TALLOC_CTX *mem_ctx,
 			     struct smb_trans2 *parms);
-size_t smb_raw_max_trans_data(struct smbcli_tree *tree, size_t param_size);
 struct smbcli_request *smb_raw_trans_send(struct smbcli_tree *tree, struct smb_trans2 *parms);
 NTSTATUS smbcli_request_destroy(struct smbcli_request *req);
 struct smbcli_request *smb_raw_write_send(struct smbcli_tree *tree, union smb_write *parms);

@@ -81,6 +81,7 @@ enum ndr_err_code ndr_pull_security_ace(struct ndr_pull *ndr, int ndr_flags, str
 		ndr->offset += pad;
 	}
 	if (ndr_flags & NDR_BUFFERS) {
+		NDR_CHECK(ndr_pull_set_switch_value(ndr, &r->object, r->type));
 		NDR_CHECK(ndr_pull_security_ace_object_ctr(ndr, NDR_BUFFERS, &r->object));
 	}
 	return NDR_ERR_SUCCESS;
@@ -128,13 +129,9 @@ size_t ndr_size_dom_sid(const struct dom_sid *sid, int flags)
 
 size_t ndr_size_dom_sid28(const struct dom_sid *sid, int flags)
 {
-	struct dom_sid zero_sid;
-
 	if (!sid) return 0;
 
-	ZERO_STRUCT(zero_sid);
-
-	if (memcmp(&zero_sid, sid, sizeof(zero_sid)) == 0) {
+	if (all_zero((const uint8_t *)sid, sizeof(struct dom_sid))) {
 		return 0;
 	}
 
@@ -151,7 +148,8 @@ size_t ndr_size_dom_sid0(const struct dom_sid *sid, int flags)
 */
 void ndr_print_dom_sid(struct ndr_print *ndr, const char *name, const struct dom_sid *sid)
 {
-	ndr->print(ndr, "%-25s: %s", name, dom_sid_string(ndr, sid));
+	struct dom_sid_buf buf;
+	ndr->print(ndr, "%-25s: %s", name, dom_sid_str_buf(sid, &buf));
 }
 
 void ndr_print_dom_sid2(struct ndr_print *ndr, const char *name, const struct dom_sid *sid)
@@ -202,7 +200,7 @@ enum ndr_err_code ndr_push_dom_sid2(struct ndr_push *ndr, int ndr_flags, const s
 }
 
 /*
-  parse a dom_sid28 - this is a dom_sid in a fixed 28 byte buffer, so we need to ensure there are only upto 5 sub_auth
+  parse a dom_sid28 - this is a dom_sid in a fixed 28 byte buffer, so we need to ensure there are only up to 5 sub_auth
 */
 enum ndr_err_code ndr_pull_dom_sid28(struct ndr_pull *ndr, int ndr_flags, struct dom_sid *sid)
 {
@@ -249,7 +247,7 @@ enum ndr_err_code ndr_push_dom_sid28(struct ndr_push *ndr, int ndr_flags, const 
 
 	if (sid->num_auths > 5) {
 		return ndr_push_error(ndr, NDR_ERR_RANGE, 
-				      "dom_sid28 allows only upto 5 sub auth [%u]", 
+				      "dom_sid28 allows only up to 5 sub auth [%u]", 
 				      sid->num_auths);
 	}
 
@@ -287,8 +285,6 @@ enum ndr_err_code ndr_pull_dom_sid0(struct ndr_pull *ndr, int ndr_flags, struct 
 */
 enum ndr_err_code ndr_push_dom_sid0(struct ndr_push *ndr, int ndr_flags, const struct dom_sid *sid)
 {
-	struct dom_sid zero_sid;
-
 	if (!(ndr_flags & NDR_SCALARS)) {
 		return NDR_ERR_SUCCESS;
 	}
@@ -297,9 +293,7 @@ enum ndr_err_code ndr_push_dom_sid0(struct ndr_push *ndr, int ndr_flags, const s
 		return NDR_ERR_SUCCESS;
 	}
 
-	ZERO_STRUCT(zero_sid);
-
-	if (memcmp(&zero_sid, sid, sizeof(zero_sid)) == 0) {
+	if (all_zero((const uint8_t *)sid, sizeof(struct dom_sid))) {
 		return NDR_ERR_SUCCESS;
 	}
 

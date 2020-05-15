@@ -58,20 +58,29 @@ struct security_acl *security_acl_dup(TALLOC_CTX *mem_ctx,
 		return NULL;
 	}
 
+	if (oacl->aces == NULL && oacl->num_aces > 0) {
+		return NULL;
+	}
+
 	nacl = talloc (mem_ctx, struct security_acl);
 	if (nacl == NULL) {
 		return NULL;
 	}
 
+	*nacl = (struct security_acl) {
+		.revision = oacl->revision,
+		.size     = oacl->size,
+		.num_aces = oacl->num_aces,
+	};
+	if (nacl->num_aces == 0) {
+		return nacl;
+	}
+
 	nacl->aces = (struct security_ace *)talloc_memdup (nacl, oacl->aces, sizeof(struct security_ace) * oacl->num_aces);
-	if ((nacl->aces == NULL) && (oacl->num_aces > 0)) {
+	if (nacl->aces == NULL) {
 		goto failed;
 	}
 
-	nacl->revision = oacl->revision;
-	nacl->size = oacl->size;
-	nacl->num_aces = oacl->num_aces;
-	
 	return nacl;
 
  failed:
@@ -357,8 +366,7 @@ static NTSTATUS security_descriptor_acl_del(struct security_descriptor *sd,
 	/* there can be multiple ace's for one trustee */
 	for (i=0;i<acl->num_aces;i++) {
 		if (dom_sid_equal(trustee, &acl->aces[i].trustee)) {
-			memmove(&acl->aces[i], &acl->aces[i+1],
-				sizeof(acl->aces[i]) * (acl->num_aces - (i+1)));
+			ARRAY_DEL_ELEMENT(acl->aces, i, acl->num_aces);
 			acl->num_aces--;
 			if (acl->num_aces == 0) {
 				acl->aces = NULL;
@@ -671,7 +679,7 @@ struct security_ace *security_ace_create(TALLOC_CTX *mem_ctx,
 *******************************************************************/
 bool security_descriptor_with_ms_nfs(const struct security_descriptor *psd)
 {
-	int i;
+	uint32_t i;
 
 	if (psd->dacl == NULL) {
 		return false;

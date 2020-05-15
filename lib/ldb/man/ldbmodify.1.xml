@@ -56,7 +56,7 @@
 
 	<variablelist>
 		<varlistentry><term>LDB_URL</term>
-			<listitem><para>LDB URL to connect to (can be overrided by using the 
+			<listitem><para>LDB URL to connect to (can be overridden by using the 
 					-H command-line option.)</para></listitem>
 		</varlistentry>
 	</variablelist>
@@ -80,7 +80,7 @@
 	<title>AUTHOR</title>
 
 	<para> ldb was written by 
-		 <ulink url="http://samba.org/~tridge/">Andrew Tridgell</ulink>.
+		 <ulink url="https://www.samba.org/~tridge/">Andrew Tridgell</ulink>.
 	</para>
 
 	<para>

@@ -29,14 +29,17 @@ from base64 import b64encode
 import subprocess
 import samba
 from samba.tdb_util import tdb_copy
+from samba.mdb_util import mdb_copy
 from samba.ndr import ndr_pack, ndr_unpack
 from samba import setup_file
 from samba.dcerpc import dnsp, misc, security
 from samba.dsdb import (
     DS_DOMAIN_FUNCTION_2000,
     DS_DOMAIN_FUNCTION_2003,
-    DS_DOMAIN_FUNCTION_2008_R2
-    )
+    DS_DOMAIN_FUNCTION_2008_R2,
+    DS_DOMAIN_FUNCTION_2012_R2,
+    DS_DOMAIN_FUNCTION_2016
+)
 from samba.descriptor import (
     get_domain_descriptor,
     get_domain_delete_protected1_descriptor,
@@ -44,7 +47,7 @@ from samba.descriptor import (
     get_dns_partition_descriptor,
     get_dns_forest_microsoft_dns_descriptor,
     get_dns_domain_microsoft_dns_descriptor
-    )
+)
 from samba.provision.common import (
     setup_path,
     setup_add_ldif,
@@ -54,12 +57,14 @@ from samba.provision.common import (
     FILL_SUBDOMAIN,
     FILL_NT4SYNC,
     FILL_DRS,
-    )
+)
 
+from samba.samdb import get_default_backend_store
+from samba.compat import get_string
 
 def get_domainguid(samdb, domaindn):
     res = samdb.search(base=domaindn, scope=ldb.SCOPE_BASE, attrs=["objectGUID"])
-    domainguid =  str(ndr_unpack(misc.GUID, res[0]["objectGUID"][0]))
+    domainguid = str(ndr_unpack(misc.GUID, res[0]["objectGUID"][0]))
     return domainguid
 
 
@@ -137,7 +142,7 @@ class SOARecord(dnsp.DnssrvRpcRecord):
 class SRVRecord(dnsp.DnssrvRpcRecord):
 
     def __init__(self, target, port, priority=0, weight=100, serial=1, ttl=900,
-                rank=dnsp.DNS_RANK_ZONE):
+                 rank=dnsp.DNS_RANK_ZONE):
         super(SRVRecord, self).__init__()
         self.wType = dnsp.DNS_TYPE_SRV
         self.rank = rank
@@ -230,7 +235,7 @@ class AgingEnabledTimeProperty(dnsp.DnsProperty):
     def __init__(self, next_cycle_hours=0):
         super(AgingEnabledTimeProperty, self).__init__()
         self.wDataLength = 1
-        self.version = 1;
+        self.version = 1
         self.id = dnsp.DSPROPERTY_ZONE_AGING_ENABLED_TIME
         self.data = next_cycle_hours
 
@@ -243,12 +248,12 @@ def setup_dns_partitions(samdb, domainsid, domaindn, forestdn, configdn,
 
     setup_add_ldif(samdb, setup_path("provision_dnszones_partitions.ldif"), {
         "ZONE_DN": domainzone_dn,
-        "SECDESC"      : b64encode(descriptor)
-        })
+        "SECDESC": b64encode(descriptor).decode('utf8')
+    })
     if fill_level != FILL_SUBDOMAIN:
         setup_add_ldif(samdb, setup_path("provision_dnszones_partitions.ldif"), {
             "ZONE_DN": forestzone_dn,
-            "SECDESC"      : b64encode(descriptor)
+            "SECDESC": b64encode(descriptor).decode('utf8')
         })
 
     domainzone_guid = get_domainguid(samdb, domainzone_dn)
@@ -263,9 +268,9 @@ def setup_dns_partitions(samdb, domainsid, domaindn, forestdn, configdn,
         "ZONE_DNS": domainzone_dns,
         "CONFIGDN": configdn,
         "SERVERDN": serverdn,
-        "LOSTANDFOUND_DESCRIPTOR": b64encode(protected2_desc),
-        "INFRASTRUCTURE_DESCRIPTOR": b64encode(protected1_desc),
-        })
+        "LOSTANDFOUND_DESCRIPTOR": b64encode(protected2_desc).decode('utf8'),
+        "INFRASTRUCTURE_DESCRIPTOR": b64encode(protected1_desc).decode('utf8'),
+    })
     setup_modify_ldif(samdb, setup_path("provision_dnszones_modify.ldif"), {
         "CONFIGDN": configdn,
         "SERVERDN": serverdn,
@@ -283,8 +288,8 @@ def setup_dns_partitions(samdb, domainsid, domaindn, forestdn, configdn,
             "ZONE_DNS": forestzone_dns,
             "CONFIGDN": configdn,
             "SERVERDN": serverdn,
-            "LOSTANDFOUND_DESCRIPTOR": b64encode(protected2_desc),
-            "INFRASTRUCTURE_DESCRIPTOR": b64encode(protected1_desc),
+            "LOSTANDFOUND_DESCRIPTOR": b64encode(protected2_desc).decode('utf8'),
+            "INFRASTRUCTURE_DESCRIPTOR": b64encode(protected1_desc).decode('utf8'),
         })
         setup_modify_ldif(samdb, setup_path("provision_dnszones_modify.ldif"), {
             "CONFIGDN": configdn,
@@ -296,7 +301,7 @@ def setup_dns_partitions(samdb, domainsid, domaindn, forestdn, configdn,
 def add_dns_accounts(samdb, domaindn):
     setup_add_ldif(samdb, setup_path("provision_dns_accounts_add.ldif"), {
         "DOMAINDN": domaindn,
-        })
+    })
 
 
 def add_dns_container(samdb, domaindn, prefix, domain_sid, dnsadmins_sid, forest=False):
@@ -310,21 +315,23 @@ def add_dns_container(samdb, domaindn, prefix, domain_sid, dnsadmins_sid, forest
     # CN=MicrosoftDNS,<PREFIX>,<DOMAINDN>
     msg = ldb.Message(ldb.Dn(samdb, "CN=MicrosoftDNS,%s,%s" % (prefix, domaindn)))
     msg["objectClass"] = ["top", "container"]
-    msg["nTSecurityDescriptor"] = ldb.MessageElement(sd_val, ldb.FLAG_MOD_ADD,
-        "nTSecurityDescriptor")
+    msg["nTSecurityDescriptor"] = \
+        ldb.MessageElement(sd_val, ldb.FLAG_MOD_ADD,
+                           "nTSecurityDescriptor")
     samdb.add(msg)
 
 
 def add_rootservers(samdb, domaindn, prefix):
+    # https://www.internic.net/zones/named.root
     rootservers = {}
     rootservers["a.root-servers.net"] = "198.41.0.4"
     rootservers["b.root-servers.net"] = "192.228.79.201"
     rootservers["c.root-servers.net"] = "192.33.4.12"
-    rootservers["d.root-servers.net"] = "128.8.10.90"
+    rootservers["d.root-servers.net"] = "199.7.91.13"
     rootservers["e.root-servers.net"] = "192.203.230.10"
     rootservers["f.root-servers.net"] = "192.5.5.241"
     rootservers["g.root-servers.net"] = "192.112.36.4"
-    rootservers["h.root-servers.net"] = "128.63.2.53"
+    rootservers["h.root-servers.net"] = "198.97.190.53"
     rootservers["i.root-servers.net"] = "192.36.148.17"
     rootservers["j.root-servers.net"] = "192.58.128.30"
     rootservers["k.root-servers.net"] = "193.0.14.129"
@@ -333,10 +340,17 @@ def add_rootservers(samdb, domaindn, prefix):
 
     rootservers_v6 = {}
     rootservers_v6["a.root-servers.net"] = "2001:503:ba3e::2:30"
+    rootservers_v6["b.root-servers.net"] = "2001:500:84::b"
+    rootservers_v6["c.root-servers.net"] = "2001:500:2::c"
+    rootservers_v6["d.root-servers.net"] = "2001:500:2d::d"
+    rootservers_v6["e.root-servers.net"] = "2001:500:a8::e"
     rootservers_v6["f.root-servers.net"] = "2001:500:2f::f"
-    rootservers_v6["h.root-servers.net"] = "2001:500:1::803f:235"
+    rootservers_v6["g.root-servers.net"] = "2001:500:12::d0d"
+    rootservers_v6["h.root-servers.net"] = "2001:500:1::53"
+    rootservers_v6["i.root-servers.net"] = "2001:7fe::53"
     rootservers_v6["j.root-servers.net"] = "2001:503:c27::2:30"
     rootservers_v6["k.root-servers.net"] = "2001:7fd::1"
+    rootservers_v6["l.root-servers.net"] = "2001:500:9f::42"
     rootservers_v6["m.root-servers.net"] = "2001:dc3::35"
 
     container_dn = "DC=RootDNSServers,CN=MicrosoftDNS,%s,%s" % (prefix, domaindn)
@@ -370,12 +384,13 @@ def add_rootservers(samdb, domaindn, prefix):
     for rserver in rootservers:
         record = [ndr_pack(ARecord(rootservers[rserver], serial=0, ttl=0, rank=dnsp.DNS_RANK_ROOT_HINT))]
         # Add AAAA record as well (How does W2K* add IPv6 records?)
-        #if rserver in rootservers_v6:
+        # if rserver in rootservers_v6:
         #    record.append(ndr_pack(AAAARecord(rootservers_v6[rserver], serial=0, ttl=0)))
         msg = ldb.Message(ldb.Dn(samdb, "DC=%s,%s" % (rserver, container_dn)))
         msg["objectClass"] = ["top", "dnsNode"]
         msg["dnsRecord"] = ldb.MessageElement(record, ldb.FLAG_MOD_ADD, "dnsRecord")
         samdb.add(msg)
+
 
 def add_at_record(samdb, container_dn, prefix, hostname, dnsdomain, hostip, hostip6):
 
@@ -457,18 +472,18 @@ def add_host_record(samdb, container_dn, prefix, hostip, hostip6):
 def add_domain_record(samdb, domaindn, prefix, dnsdomain, domainsid, dnsadmins_sid):
     # DC=<DNSDOMAIN>,CN=MicrosoftDNS,<PREFIX>,<DOMAINDN>
     sddl = "O:SYG:BAD:AI" \
-    "(A;;RPWPCRCCDCLCLORCWOWDSDDTSW;;;DA)" \
-    "(A;;CC;;;AU)" \
-    "(A;;RPLCLORC;;;WD)" \
-    "(A;;RPWPCRCCDCLCLORCWOWDSDDTSW;;;SY)" \
-    "(A;CI;RPWPCRCCDCLCRCWOWDSDDTSW;;;ED)" \
-    "(A;CIID;RPWPCRCCDCLCRCWOWDSDDTSW;;;%s)" \
-    "(A;CIID;RPWPCRCCDCLCRCWOWDSDDTSW;;;ED)" \
-    "(OA;CIID;RPWPCR;91e647de-d96f-4b70-9557-d63ff4f3ccd8;;PS)" \
-    "(A;CIID;RPWPCRCCDCLCLORCWOWDSDDTSW;;;EA)" \
-    "(A;CIID;LC;;;RU)" \
-    "(A;CIID;RPWPCRCCLCLORCWOWDSDSW;;;BA)" \
-    "S:AI" % dnsadmins_sid
+        "(A;;RPWPCRCCDCLCLORCWOWDSDDTSW;;;DA)" \
+        "(A;;CC;;;AU)" \
+        "(A;;RPLCLORC;;;WD)" \
+        "(A;;RPWPCRCCDCLCLORCWOWDSDDTSW;;;SY)" \
+        "(A;CI;RPWPCRCCDCLCRCWOWDSDDTSW;;;ED)" \
+        "(A;CIID;RPWPCRCCDCLCRCWOWDSDDTSW;;;%s)" \
+        "(A;CIID;RPWPCRCCDCLCRCWOWDSDDTSW;;;ED)" \
+        "(OA;CIID;RPWPCR;91e647de-d96f-4b70-9557-d63ff4f3ccd8;;PS)" \
+        "(A;CIID;RPWPCRCCDCLCLORCWOWDSDDTSW;;;EA)" \
+        "(A;CIID;LC;;;RU)" \
+        "(A;CIID;RPWPCRCCLCLORCWOWDSDSW;;;BA)" \
+        "S:AI" % dnsadmins_sid
     sec = security.descriptor.from_sddl(sddl, domainsid)
     props = []
     props.append(ndr_pack(TypeProperty()))
@@ -480,8 +495,10 @@ def add_domain_record(samdb, domaindn, prefix, dnsdomain, domainsid, dnsadmins_s
     props.append(ndr_pack(AgingEnabledTimeProperty()))
     msg = ldb.Message(ldb.Dn(samdb, "DC=%s,CN=MicrosoftDNS,%s,%s" % (dnsdomain, prefix, domaindn)))
     msg["objectClass"] = ["top", "dnsZone"]
-    msg["ntSecurityDescriptor"] = ldb.MessageElement(ndr_pack(sec), ldb.FLAG_MOD_ADD,
-        "nTSecurityDescriptor")
+    msg["ntSecurityDescriptor"] = \
+        ldb.MessageElement(ndr_pack(sec),
+                           ldb.FLAG_MOD_ADD,
+                           "nTSecurityDescriptor")
     msg["dNSProperty"] = ldb.MessageElement(props, ldb.FLAG_MOD_ADD, "dNSProperty")
     samdb.add(msg)
 
@@ -495,49 +512,49 @@ def add_msdcs_record(samdb, forestdn, prefix, dnsforest):
 
 
 def add_dc_domain_records(samdb, domaindn, prefix, site, dnsdomain, hostname,
-        hostip, hostip6):
+                          hostip, hostip6):
 
     fqdn_hostname = "%s.%s" % (hostname, dnsdomain)
 
     # Set up domain container - DC=<DNSDOMAIN>,CN=MicrosoftDNS,<PREFIX>,<DOMAINDN>
     domain_container_dn = ldb.Dn(samdb, "DC=%s,CN=MicrosoftDNS,%s,%s" %
-                                    (dnsdomain, prefix, domaindn))
+                                 (dnsdomain, prefix, domaindn))
 
     # DC=@ record
     add_at_record(samdb, domain_container_dn, "DC=@", hostname, dnsdomain,
-            hostip, hostip6)
+                  hostip, hostip6)
 
     # DC=<HOSTNAME> record
     add_host_record(samdb, domain_container_dn, "DC=%s" % hostname, hostip,
-            hostip6)
+                    hostip6)
 
     # DC=_kerberos._tcp record
     add_srv_record(samdb, domain_container_dn, "DC=_kerberos._tcp",
-            fqdn_hostname, 88)
+                   fqdn_hostname, 88)
 
     # DC=_kerberos._tcp.<SITENAME>._sites record
     add_srv_record(samdb, domain_container_dn, "DC=_kerberos._tcp.%s._sites" %
-            site, fqdn_hostname, 88)
+                   site, fqdn_hostname, 88)
 
     # DC=_kerberos._udp record
     add_srv_record(samdb, domain_container_dn, "DC=_kerberos._udp",
-            fqdn_hostname, 88)
+                   fqdn_hostname, 88)
 
     # DC=_kpasswd._tcp record
     add_srv_record(samdb, domain_container_dn, "DC=_kpasswd._tcp",
-            fqdn_hostname, 464)
+                   fqdn_hostname, 464)
 
     # DC=_kpasswd._udp record
     add_srv_record(samdb, domain_container_dn, "DC=_kpasswd._udp",
-            fqdn_hostname, 464)
+                   fqdn_hostname, 464)
 
     # DC=_ldap._tcp record
     add_srv_record(samdb, domain_container_dn, "DC=_ldap._tcp", fqdn_hostname,
-            389)
+                   389)
 
     # DC=_ldap._tcp.<SITENAME>._sites record
     add_srv_record(samdb, domain_container_dn, "DC=_ldap._tcp.%s._sites" %
-            site, fqdn_hostname, 389)
+                   site, fqdn_hostname, 389)
 
     # FIXME: The number of SRV records depend on the various roles this DC has.
     #        _gc and _msdcs records are added if the we are the forest dc and not subdomain dc
@@ -546,11 +563,11 @@ def add_dc_domain_records(samdb, domaindn, prefix, site, dnsdomain, hostname,
 
     # DC=_gc._tcp record
     add_srv_record(samdb, domain_container_dn, "DC=_gc._tcp", fqdn_hostname,
-            3268)
+                   3268)
 
     # DC=_gc._tcp.<SITENAME>,_sites record
     add_srv_record(samdb, domain_container_dn, "DC=_gc._tcp.%s._sites" % site,
-            fqdn_hostname, 3268)
+                   fqdn_hostname, 3268)
 
     # DC=_msdcs record
     add_ns_glue_record(samdb, domain_container_dn, "DC=_msdcs", fqdn_hostname)
@@ -562,85 +579,85 @@ def add_dc_domain_records(samdb, domaindn, prefix, site, dnsdomain, hostname,
 
     # DC=_ldap._tcp.<SITENAME>._sites.DomainDnsZones
     add_srv_record(samdb, domain_container_dn,
-            "DC=_ldap._tcp.%s._sites.DomainDnsZones" % site, fqdn_hostname,
-            389)
+                   "DC=_ldap._tcp.%s._sites.DomainDnsZones" % site, fqdn_hostname,
+                   389)
 
     # DC=_ldap._tcp.<SITENAME>._sites.ForestDnsZones
     add_srv_record(samdb, domain_container_dn,
-            "DC=_ldap._tcp.%s._sites.ForestDnsZones" % site, fqdn_hostname,
-            389)
+                   "DC=_ldap._tcp.%s._sites.ForestDnsZones" % site, fqdn_hostname,
+                   389)
 
     # DC=_ldap._tcp.DomainDnsZones
     add_srv_record(samdb, domain_container_dn, "DC=_ldap._tcp.DomainDnsZones",
-                    fqdn_hostname, 389)
+                   fqdn_hostname, 389)
 
     # DC=_ldap._tcp.ForestDnsZones
     add_srv_record(samdb, domain_container_dn, "DC=_ldap._tcp.ForestDnsZones",
-                    fqdn_hostname, 389)
+                   fqdn_hostname, 389)
 
     # DC=DomainDnsZones
     add_host_record(samdb, domain_container_dn, "DC=DomainDnsZones", hostip,
-            hostip6)
+                    hostip6)
 
     # DC=ForestDnsZones
     add_host_record(samdb, domain_container_dn, "DC=ForestDnsZones", hostip,
-            hostip6)
+                    hostip6)
 
 
 def add_dc_msdcs_records(samdb, forestdn, prefix, site, dnsforest, hostname,
-                            hostip, hostip6, domainguid, ntdsguid):
+                         hostip, hostip6, domainguid, ntdsguid):
 
     fqdn_hostname = "%s.%s" % (hostname, dnsforest)
 
     # Set up forest container - DC=<DNSDOMAIN>,CN=MicrosoftDNS,<PREFIX>,<DOMAINDN>
     forest_container_dn = ldb.Dn(samdb, "DC=_msdcs.%s,CN=MicrosoftDNS,%s,%s" %
-                                    (dnsforest, prefix, forestdn))
+                                 (dnsforest, prefix, forestdn))
 
     # DC=@ record
     add_at_record(samdb, forest_container_dn, "DC=@", hostname, dnsforest,
-            None, None)
+                  None, None)
 
     # DC=_kerberos._tcp.dc record
     add_srv_record(samdb, forest_container_dn, "DC=_kerberos._tcp.dc",
-            fqdn_hostname, 88)
+                   fqdn_hostname, 88)
 
     # DC=_kerberos._tcp.<SITENAME>._sites.dc record
     add_srv_record(samdb, forest_container_dn,
-            "DC=_kerberos._tcp.%s._sites.dc" % site, fqdn_hostname, 88)
+                   "DC=_kerberos._tcp.%s._sites.dc" % site, fqdn_hostname, 88)
 
     # DC=_ldap._tcp.dc record
     add_srv_record(samdb, forest_container_dn, "DC=_ldap._tcp.dc",
-            fqdn_hostname, 389)
+                   fqdn_hostname, 389)
 
     # DC=_ldap._tcp.<SITENAME>._sites.dc record
     add_srv_record(samdb, forest_container_dn, "DC=_ldap._tcp.%s._sites.dc" %
-            site, fqdn_hostname, 389)
+                   site, fqdn_hostname, 389)
 
     # DC=_ldap._tcp.<SITENAME>._sites.gc record
     add_srv_record(samdb, forest_container_dn, "DC=_ldap._tcp.%s._sites.gc" %
-            site, fqdn_hostname, 3268)
+                   site, fqdn_hostname, 3268)
 
     # DC=_ldap._tcp.gc record
     add_srv_record(samdb, forest_container_dn, "DC=_ldap._tcp.gc",
-            fqdn_hostname, 3268)
+                   fqdn_hostname, 3268)
 
     # DC=_ldap._tcp.pdc record
     add_srv_record(samdb, forest_container_dn, "DC=_ldap._tcp.pdc",
-            fqdn_hostname, 389)
+                   fqdn_hostname, 389)
 
     # DC=gc record
     add_host_record(samdb, forest_container_dn, "DC=gc", hostip, hostip6)
 
     # DC=_ldap._tcp.<DOMAINGUID>.domains record
     add_srv_record(samdb, forest_container_dn,
-            "DC=_ldap._tcp.%s.domains" % domainguid, fqdn_hostname, 389)
+                   "DC=_ldap._tcp.%s.domains" % domainguid, fqdn_hostname, 389)
 
     # DC=<NTDSGUID>
     add_cname_record(samdb, forest_container_dn, "DC=%s" % ntdsguid,
-            fqdn_hostname)
+                     fqdn_hostname)
 
 
-def secretsdb_setup_dns(secretsdb, names, private_dir, realm,
+def secretsdb_setup_dns(secretsdb, names, private_dir, binddns_dir, realm,
                         dnsdomain, dns_keytab_path, dnspass, key_version_number):
     """Add DNS specific bits to a secrets database.
 
@@ -650,20 +667,23 @@ def secretsdb_setup_dns(secretsdb, names, private_dir, realm,
     """
     try:
         os.unlink(os.path.join(private_dir, dns_keytab_path))
+        os.unlink(os.path.join(binddns_dir, dns_keytab_path))
     except OSError:
         pass
 
     if key_version_number is None:
         key_version_number = 1
 
+    # This will create the dns.keytab file in the private_dir when it is
+    # commited!
     setup_ldb(secretsdb, setup_path("secrets_dns.ldif"), {
             "REALM": realm,
             "DNSDOMAIN": dnsdomain,
             "DNS_KEYTAB": dns_keytab_path,
-            "DNSPASS_B64": b64encode(dnspass),
+            "DNSPASS_B64": b64encode(dnspass.encode('utf-8')).decode('utf8'),
             "KEY_VERSION_NUMBER": str(key_version_number),
             "HOSTNAME": names.hostname,
-            "DNSNAME" : '%s.%s' % (
+            "DNSNAME": '%s.%s' % (
                 names.netbiosname.lower(), names.dnsdomain.lower())
             })
 
@@ -681,15 +701,15 @@ def create_dns_dir(logger, paths):
     except OSError:
         pass
 
-    os.mkdir(dns_dir, 0770)
+    os.mkdir(dns_dir, 0o770)
 
     if paths.bind_gid is not None:
         try:
             os.chown(dns_dir, -1, paths.bind_gid)
             # chmod needed to cope with umask
-            os.chmod(dns_dir, 0770)
+            os.chmod(dns_dir, 0o770)
         except OSError:
-            if not os.environ.has_key('SAMBA_SELFTEST'):
+            if 'SAMBA_SELFTEST' not in os.environ:
                 logger.error("Failed to chown %s to bind gid %u" % (
                     dns_dir, paths.bind_gid))
 
@@ -729,11 +749,6 @@ def create_zone_file(lp, logger, paths, targetdir, dnsdomain,
         hostip_host_line = ""
         gc_msdcs_ip_line = ""
 
-    # we need to freeze the zone while we update the contents
-    if targetdir is None:
-        rndc = ' '.join(lp.get("rndc command"))
-        os.system(rndc + " freeze " + lp.get("realm"))
-
     setup_file(setup_path("provision.zone"), paths.dns, {
             "HOSTNAME": hostname,
             "DNSDOMAIN": dnsdomain,
@@ -748,20 +763,17 @@ def create_zone_file(lp, logger, paths, targetdir, dnsdomain,
             "HOSTIP6_HOST_LINE": hostip6_host_line,
             "GC_MSDCS_IP_LINE": gc_msdcs_ip_line,
             "GC_MSDCS_IP6_LINE": gc_msdcs_ip6_line,
-        })
+    })
 
     if paths.bind_gid is not None:
         try:
             os.chown(paths.dns, -1, paths.bind_gid)
             # chmod needed to cope with umask
-            os.chmod(paths.dns, 0664)
+            os.chmod(paths.dns, 0o664)
         except OSError:
-            if not os.environ.has_key('SAMBA_SELFTEST'):
+            if 'SAMBA_SELFTEST' not in os.environ:
                 logger.error("Failed to chown %s to bind gid %u" % (
                     paths.dns, paths.bind_gid))
-
-    if targetdir is None:
-        os.system(rndc + " unfreeze " + lp.get("realm"))
 
 
 def create_samdb_copy(samdb, logger, paths, names, domainsid, domainguid):
@@ -774,29 +786,43 @@ def create_samdb_copy(samdb, logger, paths, names, domainsid, domainguid):
 
     # Find the partitions and corresponding filenames
     partfile = {}
-    res = samdb.search(base="@PARTITION", scope=ldb.SCOPE_BASE, attrs=["partition"])
+    res = samdb.search(base="@PARTITION",
+                       scope=ldb.SCOPE_BASE,
+                       attrs=["partition", "backendStore"])
     for tmp in res[0]["partition"]:
-        (nc, fname) = tmp.split(':')
+        (nc, fname) = str(tmp).split(':')
         partfile[nc.upper()] = fname
 
+    backend_store = get_default_backend_store()
+    if "backendStore" in res[0]:
+        backend_store = str(res[0]["backendStore"][0])
+
     # Create empty domain partition
+
     domaindn = names.domaindn.upper()
     domainpart_file = os.path.join(dns_dir, partfile[domaindn])
     try:
         os.mkdir(dns_samldb_dir)
-        file(domainpart_file, 'w').close()
+        open(domainpart_file, 'w').close()
 
         # Fill the basedn and @OPTION records in domain partition
-        dom_ldb = samba.Ldb(domainpart_file)
+        dom_url = "%s://%s" % (backend_store, domainpart_file)
+        dom_ldb = samba.Ldb(dom_url)
+
+        # We need the dummy main-domain DB to have the correct @INDEXLIST
+        index_res = samdb.search(base="@INDEXLIST", scope=ldb.SCOPE_BASE)
+        dom_ldb.add(index_res[0])
+
         domainguid_line = "objectGUID: %s\n-" % domainguid
-        descr = b64encode(get_domain_descriptor(domainsid))
+        descr = b64encode(get_domain_descriptor(domainsid)).decode('utf8')
         setup_add_ldif(dom_ldb, setup_path("provision_basedn.ldif"), {
-            "DOMAINDN" : names.domaindn,
-            "DOMAINGUID" : domainguid_line,
-            "DOMAINSID" : str(domainsid),
-            "DESCRIPTOR" : descr})
+            "DOMAINDN": names.domaindn,
+            "DOMAINGUID": domainguid_line,
+            "DOMAINSID": str(domainsid),
+            "DESCRIPTOR": descr})
         setup_add_ldif(dom_ldb,
-            setup_path("provision_basedn_options.ldif"), None)
+                       setup_path("provision_basedn_options.ldif"), None)
+
     except:
         logger.error(
             "Failed to setup database for BIND, AD based DNS cannot be used")
@@ -821,12 +847,22 @@ def create_samdb_copy(samdb, logger, paths, names, domainsid, domainguid):
     metadata_file = "metadata.tdb"
     try:
         os.link(os.path.join(samldb_dir, metadata_file),
-            os.path.join(dns_samldb_dir, metadata_file))
+                os.path.join(dns_samldb_dir, metadata_file))
         os.link(os.path.join(private_dir, domainzone_file),
-            os.path.join(dns_dir, domainzone_file))
+                os.path.join(dns_dir, domainzone_file))
+        if backend_store == "mdb":
+            # If the file is an lmdb data file need to link the
+            # lock file as well
+            os.link(os.path.join(private_dir, domainzone_file + "-lock"),
+                    os.path.join(dns_dir, domainzone_file + "-lock"))
         if forestzone_file:
             os.link(os.path.join(private_dir, forestzone_file),
                     os.path.join(dns_dir, forestzone_file))
+            if backend_store == "mdb":
+                # If the database file is an lmdb data file need to link the
+                # lock file as well
+                os.link(os.path.join(private_dir, forestzone_file + "-lock"),
+                        os.path.join(dns_dir, forestzone_file + "-lock"))
     except OSError:
         logger.error(
             "Failed to setup database for BIND, AD based DNS cannot be used")
@@ -842,8 +878,12 @@ def create_samdb_copy(samdb, logger, paths, names, domainsid, domainguid):
                  os.path.join(dns_dir, "sam.ldb"))
         for nc in partfile:
             pfile = partfile[nc]
-            tdb_copy(os.path.join(private_dir, pfile),
-                     os.path.join(dns_dir, pfile))
+            if backend_store == "mdb":
+                mdb_copy(os.path.join(private_dir, pfile),
+                         os.path.join(dns_dir, pfile))
+            else:
+                tdb_copy(os.path.join(private_dir, pfile),
+                         os.path.join(dns_dir, pfile))
     except:
         logger.error(
             "Failed to setup database for BIND, AD based DNS cannot be used")
@@ -852,25 +892,22 @@ def create_samdb_copy(samdb, logger, paths, names, domainsid, domainguid):
     # Give bind read/write permissions dns partitions
     if paths.bind_gid is not None:
         try:
-            os.chown(samldb_dir, -1, paths.bind_gid)
-            os.chmod(samldb_dir, 0750)
-
             for dirname, dirs, files in os.walk(dns_dir):
                 for d in dirs:
                     dpath = os.path.join(dirname, d)
                     os.chown(dpath, -1, paths.bind_gid)
-                    os.chmod(dpath, 0770)
+                    os.chmod(dpath, 0o770)
                 for f in files:
-                    if f.endswith('.ldb') or f.endswith('.tdb'):
+                    if f.endswith(('.ldb', '.tdb', 'ldb-lock')):
                         fpath = os.path.join(dirname, f)
                         os.chown(fpath, -1, paths.bind_gid)
-                        os.chmod(fpath, 0660)
+                        os.chmod(fpath, 0o660)
         except OSError:
-            if not os.environ.has_key('SAMBA_SELFTEST'):
+            if 'SAMBA_SELFTEST' not in os.environ:
                 logger.error(
                     "Failed to set permissions to sam.ldb* files, fix manually")
     else:
-        if not os.environ.has_key('SAMBA_SELFTEST'):
+        if 'SAMBA_SELFTEST' not in os.environ:
             logger.warning("""Unable to find group id for BIND,
                 set permissions to sam.ldb* files manually""")
 
@@ -919,47 +956,57 @@ def create_named_conf(paths, realm, dnsdomain, dns_backend, logger):
                                      stdout=subprocess.PIPE,
                                      stderr=subprocess.STDOUT,
                                      cwd='.').communicate()[0]
+        bind_info = get_string(bind_info)
         bind9_8 = '#'
         bind9_9 = '#'
         bind9_10 = '#'
+        bind9_11 = '#'
+        bind9_12 = '#'
         if bind_info.upper().find('BIND 9.8') != -1:
             bind9_8 = ''
         elif bind_info.upper().find('BIND 9.9') != -1:
             bind9_9 = ''
         elif bind_info.upper().find('BIND 9.10') != -1:
             bind9_10 = ''
+        elif bind_info.upper().find('BIND 9.11') != -1:
+            bind9_11 = ''
+        elif bind_info.upper().find('BIND 9.12') != -1:
+            bind9_12 = ''
         elif bind_info.upper().find('BIND 9.7') != -1:
             raise ProvisioningError("DLZ option incompatible with BIND 9.7.")
         else:
             logger.warning("BIND version unknown, please modify %s manually." % paths.namedconf)
         setup_file(setup_path("named.conf.dlz"), paths.namedconf, {
                     "NAMED_CONF": paths.namedconf,
-                    "MODULESDIR" : samba.param.modules_dir(),
-                    "BIND9_8" : bind9_8,
-                    "BIND9_9" : bind9_9,
-                    "BIND9_10" : bind9_10
+                    "MODULESDIR": samba.param.modules_dir(),
+                    "BIND9_8": bind9_8,
+                    "BIND9_9": bind9_9,
+                    "BIND9_10": bind9_10,
+                    "BIND9_11": bind9_11,
+                    "BIND9_12": bind9_12
+
                     })
 
 
-def create_named_txt(path, realm, dnsdomain, dnsname, private_dir,
-    keytab_name):
+def create_named_txt(path, realm, dnsdomain, dnsname, binddns_dir,
+                     keytab_name):
     """Write out a file containing zone statements suitable for inclusion in a
     named.conf file (including GSS-TSIG configuration).
 
     :param path: Path of the new named.conf file.
     :param realm: Realm name
     :param dnsdomain: DNS Domain name
-    :param private_dir: Path to private directory
+    :param binddns_dir: Path to bind dns directory
     :param keytab_name: File name of DNS keytab file
     """
     setup_file(setup_path("named.txt"), path, {
             "DNSDOMAIN": dnsdomain,
-            "DNSNAME" : dnsname,
+            "DNSNAME": dnsname,
             "REALM": realm,
             "DNS_KEYTAB": keytab_name,
-            "DNS_KEYTAB_ABS": os.path.join(private_dir, keytab_name),
-            "PRIVATE_DIR": private_dir
-        })
+            "DNS_KEYTAB_ABS": os.path.join(binddns_dir, keytab_name),
+            "PRIVATE_DIR": binddns_dir
+    })
 
 
 def is_valid_dns_backend(dns_backend):
@@ -967,7 +1014,7 @@ def is_valid_dns_backend(dns_backend):
 
 
 def is_valid_os_level(os_level):
-    return DS_DOMAIN_FUNCTION_2000 <= os_level <= DS_DOMAIN_FUNCTION_2008_R2
+    return DS_DOMAIN_FUNCTION_2000 <= os_level <= DS_DOMAIN_FUNCTION_2016
 
 
 def create_dns_legacy(samdb, domainsid, forestdn, dnsadmins_sid):
@@ -992,7 +1039,7 @@ def create_dns_partitions(samdb, domainsid, names, domaindn, forestdn,
                           dnsadmins_sid, fill_level):
     # Set up additional partitions (DomainDnsZones, ForstDnsZones)
     setup_dns_partitions(samdb, domainsid, domaindn, forestdn,
-                        names.configdn, names.serverdn, fill_level)
+                         names.configdn, names.serverdn, fill_level)
 
     # Set up MicrosoftDNS containers
     add_dns_container(samdb, domaindn, "DC=DomainDnsZones", domainsid,
@@ -1005,7 +1052,7 @@ def create_dns_partitions(samdb, domainsid, names, domaindn, forestdn,
 def fill_dns_data_partitions(samdb, domainsid, site, domaindn, forestdn,
                              dnsdomain, dnsforest, hostname, hostip, hostip6,
                              domainguid, ntdsguid, dnsadmins_sid, autofill=True,
-                             fill_level=FILL_FULL):
+                             fill_level=FILL_FULL, add_root=True):
     """Fill data in various AD partitions
 
     :param samdb: LDB object connected to sam.ldb file
@@ -1024,9 +1071,10 @@ def fill_dns_data_partitions(samdb, domainsid, site, domaindn, forestdn,
     :param autofill: Create DNS records (using fixed template)
     """
 
-    ##### Set up DC=DomainDnsZones,<DOMAINDN>
+    # Set up DC=DomainDnsZones,<DOMAINDN>
     # Add rootserver records
-    add_rootservers(samdb, domaindn, "DC=DomainDnsZones")
+    if add_root:
+        add_rootservers(samdb, domaindn, "DC=DomainDnsZones")
 
     # Add domain record
     add_domain_record(samdb, domaindn, "DC=DomainDnsZones", dnsdomain,
@@ -1038,7 +1086,7 @@ def fill_dns_data_partitions(samdb, domainsid, site, domaindn, forestdn,
                               dnsdomain, hostname, hostip, hostip6)
 
     if fill_level != FILL_SUBDOMAIN:
-        ##### Set up DC=ForestDnsZones,<FORESTDN>
+        # Set up DC=ForestDnsZones,<FORESTDN>
         # Add _msdcs record
         add_msdcs_record(samdb, forestdn, "DC=ForestDnsZones", dnsforest)
 
@@ -1050,8 +1098,8 @@ def fill_dns_data_partitions(samdb, domainsid, site, domaindn, forestdn,
 
 
 def setup_ad_dns(samdb, secretsdb, names, paths, lp, logger,
-        dns_backend, os_level, dnspass=None, hostip=None, hostip6=None,
-        targetdir=None, fill_level=FILL_FULL):
+                 dns_backend, os_level, dnspass=None, hostip=None, hostip6=None,
+                 targetdir=None, fill_level=FILL_FULL, backend_store=None):
     """Provision DNS information (assuming GC role)
 
     :param samdb: LDB object connected to sam.ldb file
@@ -1110,40 +1158,50 @@ def setup_ad_dns(samdb, secretsdb, names, paths, lp, logger,
     dnsadmins_sid = get_dnsadmins_sid(samdb, domaindn)
     domainguid = get_domainguid(samdb, domaindn)
 
-    # Create CN=System
-    logger.info("Creating CN=MicrosoftDNS,CN=System,%s" % domaindn)
-    create_dns_legacy(samdb, names.domainsid, domaindn, dnsadmins_sid)
+    samdb.transaction_start()
+    try:
+        # Create CN=System
+        logger.info("Creating CN=MicrosoftDNS,CN=System,%s" % domaindn)
+        create_dns_legacy(samdb, names.domainsid, domaindn, dnsadmins_sid)
 
-    if os_level == DS_DOMAIN_FUNCTION_2000:
-        # Populating legacy dns
-        logger.info("Populating CN=MicrosoftDNS,CN=System,%s" % domaindn)
-        fill_dns_data_legacy(samdb, names.domainsid, domaindn, dnsdomain, site,
-                             hostname, hostip, hostip6, dnsadmins_sid)
+        if os_level == DS_DOMAIN_FUNCTION_2000:
+            # Populating legacy dns
+            logger.info("Populating CN=MicrosoftDNS,CN=System,%s" % domaindn)
+            fill_dns_data_legacy(samdb, names.domainsid, domaindn, dnsdomain, site,
+                                 hostname, hostip, hostip6, dnsadmins_sid)
 
-    elif dns_backend in ("SAMBA_INTERNAL", "BIND9_DLZ") and \
-            os_level >= DS_DOMAIN_FUNCTION_2003:
+        elif dns_backend in ("SAMBA_INTERNAL", "BIND9_DLZ") and \
+                os_level >= DS_DOMAIN_FUNCTION_2003:
 
-        # Create DNS partitions
-        logger.info("Creating DomainDnsZones and ForestDnsZones partitions")
-        create_dns_partitions(samdb, names.domainsid, names, domaindn, forestdn,
-                              dnsadmins_sid, fill_level)
+            # Create DNS partitions
+            logger.info("Creating DomainDnsZones and ForestDnsZones partitions")
+            create_dns_partitions(samdb, names.domainsid, names, domaindn, forestdn,
+                                  dnsadmins_sid, fill_level)
 
-        # Populating dns partitions
-        logger.info("Populating DomainDnsZones and ForestDnsZones partitions")
-        fill_dns_data_partitions(samdb, names.domainsid, site, domaindn, forestdn,
-                                 dnsdomain, dnsforest, hostname, hostip, hostip6,
-                                 domainguid, names.ntdsguid, dnsadmins_sid,
-                                 fill_level=fill_level)
+            # Populating dns partitions
+            logger.info("Populating DomainDnsZones and ForestDnsZones partitions")
+            fill_dns_data_partitions(samdb, names.domainsid, site, domaindn, forestdn,
+                                     dnsdomain, dnsforest, hostname, hostip, hostip6,
+                                     domainguid, names.ntdsguid, dnsadmins_sid,
+                                     fill_level=fill_level)
+
+    except:
+        samdb.transaction_cancel()
+        raise
+    else:
+        samdb.transaction_commit()
 
     if dns_backend.startswith("BIND9_"):
         setup_bind9_dns(samdb, secretsdb, names, paths, lp, logger,
                         dns_backend, os_level, site=site, dnspass=dnspass, hostip=hostip,
-                        hostip6=hostip6, targetdir=targetdir)
+                        hostip6=hostip6, targetdir=targetdir,
+                        backend_store=backend_store)
 
 
 def setup_bind9_dns(samdb, secretsdb, names, paths, lp, logger,
-        dns_backend, os_level, site=None, dnspass=None, hostip=None,
-        hostip6=None, targetdir=None, key_version_number=None):
+                    dns_backend, os_level, site=None, dnspass=None, hostip=None,
+                    hostip6=None, targetdir=None, key_version_number=None,
+                    backend_store=None):
     """Provision DNS information (assuming BIND9 backend in DC role)
 
     :param samdb: LDB object connected to sam.ldb file
@@ -1173,7 +1231,9 @@ def setup_bind9_dns(samdb, secretsdb, names, paths, lp, logger,
     domainguid = get_domainguid(samdb, domaindn)
 
     secretsdb_setup_dns(secretsdb, names,
-                        paths.private_dir, realm=names.realm,
+                        paths.private_dir,
+                        paths.binddns_dir,
+                        realm=names.realm,
                         dnsdomain=names.dnsdomain,
                         dns_keytab_path=paths.dns_keytab, dnspass=dnspass,
                         key_version_number=key_version_number)
@@ -1188,7 +1248,8 @@ def setup_bind9_dns(samdb, secretsdb, names, paths, lp, logger,
                          ntdsguid=names.ntdsguid)
 
     if dns_backend == "BIND9_DLZ" and os_level >= DS_DOMAIN_FUNCTION_2003:
-        create_samdb_copy(samdb, logger, paths, names, names.domainsid, domainguid)
+        create_samdb_copy(samdb, logger, paths,
+                          names, names.domainsid, domainguid)
 
     create_named_conf(paths, realm=names.realm,
                       dnsdomain=names.dnsdomain, dns_backend=dns_backend,
@@ -1196,8 +1257,8 @@ def setup_bind9_dns(samdb, secretsdb, names, paths, lp, logger,
 
     create_named_txt(paths.namedtxt,
                      realm=names.realm, dnsdomain=names.dnsdomain,
-                     dnsname = "%s.%s" % (names.hostname, names.dnsdomain),
-                     private_dir=paths.private_dir,
+                     dnsname="%s.%s" % (names.hostname, names.dnsdomain),
+                     binddns_dir=paths.binddns_dir,
                      keytab_name=paths.dns_keytab)
     logger.info("See %s for an example configuration include file for BIND",
                 paths.namedconf)

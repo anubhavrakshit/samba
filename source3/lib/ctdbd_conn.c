@@ -18,24 +18,32 @@
    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-#include "includes.h"
+#include "replace.h"
+#include <tevent.h>
 #include "util_tdb.h"
 #include "serverid.h"
 #include "ctdbd_conn.h"
 #include "system/select.h"
-#include "lib/sys_rw_data.h"
+#include "lib/util/sys_rw_data.h"
 #include "lib/util/iov_buf.h"
-
-#include "messages.h"
+#include "lib/util/select.h"
+#include "lib/util/debug.h"
+#include "lib/util/talloc_stack.h"
+#include "lib/util/genrand.h"
+#include "lib/util/fault.h"
+#include "lib/util/dlinklist.h"
+#include "lib/util/tevent_unix.h"
+#include "lib/util/sys_rw.h"
+#include "lib/util/blocking.h"
+#include "ctdb/include/ctdb_protocol.h"
+#include "lib/async_req/async_sock.h"
 
 /* paths to these include files come from --with-ctdb= in configure */
 
-#include "ctdb.h"
-#include "ctdb_private.h"
-
 struct ctdbd_srvid_cb {
 	uint64_t srvid;
-	int (*cb)(uint32_t src_vnn, uint32_t dst_vnn,
+	int (*cb)(struct tevent_context *ev,
+		  uint32_t src_vnn, uint32_t dst_vnn,
 		  uint64_t dst_srvid,
 		  const uint8_t *msg, size_t msglen,
 		  void *private_data);
@@ -43,14 +51,26 @@ struct ctdbd_srvid_cb {
 };
 
 struct ctdbd_connection {
-	struct messaging_context *msg_ctx;
 	uint32_t reqid;
 	uint32_t our_vnn;
 	uint64_t rand_srvid;
 	struct ctdbd_srvid_cb *callbacks;
 	int fd;
-	struct tevent_fd *fde;
+	int timeout;
+
+	/*
+	 * Outgoing queue for writev_send of asynchronous ctdb requests
+	 */
+	struct tevent_queue *outgoing;
+	struct tevent_req **pending;
+	struct tevent_req *read_req;
 };
+
+static bool ctdbd_conn_has_async_reqs(struct ctdbd_connection *conn)
+{
+	size_t len = talloc_array_length(conn->pending);
+	return (len != 0);
+}
 
 static uint32_t ctdbd_next_reqid(struct ctdbd_connection *conn)
 {
@@ -61,11 +81,12 @@ static uint32_t ctdbd_next_reqid(struct ctdbd_connection *conn)
 	return conn->reqid;
 }
 
-static NTSTATUS ctdbd_control(struct ctdbd_connection *conn,
-			      uint32_t vnn, uint32_t opcode,
-			      uint64_t srvid, uint32_t flags, TDB_DATA data,
-			      TALLOC_CTX *mem_ctx, TDB_DATA *outdata,
-			      int *cstatus);
+static int ctdbd_control(struct ctdbd_connection *conn,
+			 uint32_t vnn, uint32_t opcode,
+			 uint64_t srvid, uint32_t flags,
+			 TDB_DATA data,
+			 TALLOC_CTX *mem_ctx, TDB_DATA *outdata,
+			 int32_t *cstatus);
 
 /*
  * exit on fatal communications errors with the ctdbd daemon
@@ -88,33 +109,37 @@ static void ctdb_packet_dump(struct ctdb_req_header *hdr)
 	if (DEBUGLEVEL < 11) {
 		return;
 	}
-	DEBUGADD(11, ("len=%d, magic=%x, vers=%d, gen=%d, op=%d, reqid=%d\n",
-		      (int)hdr->length, (int)hdr->ctdb_magic,
-		      (int)hdr->ctdb_version, (int)hdr->generation,
-		      (int)hdr->operation, (int)hdr->reqid));
+	DEBUGADD(11, ("len=%"PRIu32", magic=%"PRIu32", vers=%"PRIu32", "
+		      "gen=%"PRIu32", op=%"PRIu32", reqid=%"PRIu32"\n",
+		      hdr->length,
+		      hdr->ctdb_magic,
+		      hdr->ctdb_version,
+		      hdr->generation,
+		      hdr->operation,
+		      hdr->reqid));
 }
 
 /*
  * Register a srvid with ctdbd
  */
-NTSTATUS register_with_ctdbd(struct ctdbd_connection *conn, uint64_t srvid,
-			     int (*cb)(uint32_t src_vnn, uint32_t dst_vnn,
-				       uint64_t dst_srvid,
-				       const uint8_t *msg, size_t msglen,
-				       void *private_data),
-			     void *private_data)
+int register_with_ctdbd(struct ctdbd_connection *conn, uint64_t srvid,
+			int (*cb)(struct tevent_context *ev,
+				  uint32_t src_vnn, uint32_t dst_vnn,
+				  uint64_t dst_srvid,
+				  const uint8_t *msg, size_t msglen,
+				  void *private_data),
+			void *private_data)
 {
 
-	NTSTATUS status;
-	int cstatus;
+	int ret;
+	int32_t cstatus;
 	size_t num_callbacks;
 	struct ctdbd_srvid_cb *tmp;
 
-	status = ctdbd_control(conn, CTDB_CURRENT_NODE,
-			       CTDB_CONTROL_REGISTER_SRVID, srvid, 0,
-			       tdb_null, NULL, NULL, &cstatus);
-	if (!NT_STATUS_IS_OK(status)) {
-		return status;
+	ret = ctdbd_control_local(conn, CTDB_CONTROL_REGISTER_SRVID, srvid, 0,
+				  tdb_null, NULL, NULL, &cstatus);
+	if (ret != 0) {
+		return ret;
 	}
 
 	num_callbacks = talloc_array_length(conn->callbacks);
@@ -122,7 +147,7 @@ NTSTATUS register_with_ctdbd(struct ctdbd_connection *conn, uint64_t srvid,
 	tmp = talloc_realloc(conn, conn->callbacks, struct ctdbd_srvid_cb,
 			     num_callbacks + 1);
 	if (tmp == NULL) {
-		return NT_STATUS_NO_MEMORY;
+		return ENOMEM;
 	}
 	conn->callbacks = tmp;
 
@@ -130,26 +155,26 @@ NTSTATUS register_with_ctdbd(struct ctdbd_connection *conn, uint64_t srvid,
 		.srvid = srvid, .cb = cb, .private_data = private_data
 	};
 
-	return NT_STATUS_OK;
+	return 0;
 }
 
-static int ctdbd_msg_call_back(struct ctdbd_connection *conn,
-			       struct ctdb_req_message *msg)
+static int ctdbd_msg_call_back(struct tevent_context *ev,
+			       struct ctdbd_connection *conn,
+			       struct ctdb_req_message_old *msg)
 {
-	size_t msg_len;
+	uint32_t msg_len;
 	size_t i, num_callbacks;
 
 	msg_len = msg->hdr.length;
-	if (msg_len < offsetof(struct ctdb_req_message, data)) {
-		DEBUG(10, ("%s: len %u too small\n", __func__,
-			   (unsigned)msg_len));
+	if (msg_len < offsetof(struct ctdb_req_message_old, data)) {
+		DBG_DEBUG("len %"PRIu32" too small\n", msg_len);
 		return 0;
 	}
-	msg_len -= offsetof(struct ctdb_req_message, data);
+	msg_len -= offsetof(struct ctdb_req_message_old, data);
 
 	if (msg_len < msg->datalen) {
-		DEBUG(10, ("%s: msg_len=%u < msg->datalen=%u\n", __func__,
-			   (unsigned)msg_len, (unsigned)msg->datalen));
+		DBG_DEBUG("msg_len=%"PRIu32" < msg->datalen=%"PRIu32"\n",
+			  msg_len, msg->datalen);
 		return 0;
 	}
 
@@ -161,7 +186,8 @@ static int ctdbd_msg_call_back(struct ctdbd_connection *conn,
 		if ((cb->srvid == msg->srvid) && (cb->cb != NULL)) {
 			int ret;
 
-			ret = cb->cb(msg->hdr.srcnode, msg->hdr.destnode,
+			ret = cb->cb(ev,
+				     msg->hdr.srcnode, msg->hdr.destnode,
 				     msg->srvid, msg->data, msg->datalen,
 				     cb->private_data);
 			if (ret != 0) {
@@ -175,19 +201,18 @@ static int ctdbd_msg_call_back(struct ctdbd_connection *conn,
 /*
  * get our vnn from the cluster
  */
-static NTSTATUS get_cluster_vnn(struct ctdbd_connection *conn, uint32_t *vnn)
+static int get_cluster_vnn(struct ctdbd_connection *conn, uint32_t *vnn)
 {
 	int32_t cstatus=-1;
-	NTSTATUS status;
-	status = ctdbd_control(conn,
-			       CTDB_CURRENT_NODE, CTDB_CONTROL_GET_PNN, 0, 0,
-			       tdb_null, NULL, NULL, &cstatus);
-	if (!NT_STATUS_IS_OK(status)) {
-		DEBUG(1, ("ctdbd_control failed: %s\n", nt_errstr(status)));
-		return status;
+	int ret;
+	ret = ctdbd_control_local(conn, CTDB_CONTROL_GET_PNN, 0, 0,
+				  tdb_null, NULL, NULL, &cstatus);
+	if (ret != 0) {
+		DEBUG(1, ("ctdbd_control failed: %s\n", strerror(ret)));
+		return ret;
 	}
 	*vnn = (uint32_t)cstatus;
-	return status;
+	return ret;
 }
 
 /*
@@ -196,26 +221,24 @@ static NTSTATUS get_cluster_vnn(struct ctdbd_connection *conn, uint32_t *vnn)
 static bool ctdbd_working(struct ctdbd_connection *conn, uint32_t vnn)
 {
 	int32_t cstatus=-1;
-	NTSTATUS status;
-	TDB_DATA outdata;
-	struct ctdb_node_map *m;
-	uint32_t failure_flags;
-	bool ret = false;
-	int i;
+	TDB_DATA outdata = {0};
+	struct ctdb_node_map_old *m;
+	bool ok = false;
+	uint32_t i;
+	int ret;
 
-	status = ctdbd_control(conn, CTDB_CURRENT_NODE,
-			       CTDB_CONTROL_GET_NODEMAP, 0, 0,
-			       tdb_null, talloc_tos(), &outdata, &cstatus);
-	if (!NT_STATUS_IS_OK(status)) {
-		DEBUG(1, ("ctdbd_control failed: %s\n", nt_errstr(status)));
+	ret = ctdbd_control_local(conn, CTDB_CONTROL_GET_NODEMAP, 0, 0,
+				  tdb_null, talloc_tos(), &outdata, &cstatus);
+	if (ret != 0) {
+		DEBUG(1, ("ctdbd_control failed: %s\n", strerror(ret)));
 		return false;
 	}
 	if ((cstatus != 0) || (outdata.dptr == NULL)) {
 		DEBUG(2, ("Received invalid ctdb data\n"));
-		return false;
+		goto fail;
 	}
 
-	m = (struct ctdb_node_map *)outdata.dptr;
+	m = (struct ctdb_node_map_old *)outdata.dptr;
 
 	for (i=0; i<m->num; i++) {
 		if (vnn == m->nodes[i].pnn) {
@@ -229,19 +252,16 @@ static bool ctdbd_working(struct ctdbd_connection *conn, uint32_t vnn)
 		goto fail;
 	}
 
-	failure_flags = NODE_FLAGS_BANNED | NODE_FLAGS_DISCONNECTED
-		| NODE_FLAGS_PERMANENTLY_DISABLED | NODE_FLAGS_STOPPED;
-
-	if ((m->nodes[i].flags & failure_flags) != 0) {
+	if ((m->nodes[i].flags & NODE_FLAGS_INACTIVE) != 0) {
 		DEBUG(2, ("Node has status %x, not active\n",
 			  (int)m->nodes[i].flags));
 		goto fail;
 	}
 
-	ret = true;
+	ok = true;
 fail:
 	TALLOC_FREE(outdata.dptr);
-	return ret;
+	return ok;
 }
 
 uint32_t ctdbd_vnn(const struct ctdbd_connection *conn)
@@ -249,25 +269,12 @@ uint32_t ctdbd_vnn(const struct ctdbd_connection *conn)
 	return conn->our_vnn;
 }
 
-const char *lp_ctdbd_socket(void)
-{
-	const char *ret;
-
-	ret = lp__ctdbd_socket();
-	if (ret != NULL && strlen(ret) > 0) {
-		return ret;
-	}
-
-	return CTDB_SOCKET;
-}
-
 /*
  * Get us a ctdb connection
  */
 
-static int ctdbd_connect(int *pfd)
+static int ctdbd_connect(const char *sockname, int *pfd)
 {
-	const char *sockname = lp_ctdbd_socket();
 	struct sockaddr_un addr = { 0, };
 	int fd;
 	socklen_t salen;
@@ -304,21 +311,18 @@ static int ctdbd_connect(int *pfd)
 	return 0;
 }
 
-static int ctdb_read_packet(int fd, TALLOC_CTX *mem_ctx,
+static int ctdb_read_packet(int fd, int timeout, TALLOC_CTX *mem_ctx,
 			    struct ctdb_req_header **result)
 {
-	int timeout = lp_ctdb_timeout();
 	struct ctdb_req_header *req;
-	int ret, revents;
 	uint32_t msglen;
 	ssize_t nread;
 
-	if (timeout == 0) {
-		timeout = -1;
-	}
-
 	if (timeout != -1) {
-		ret = poll_one_fd(fd, POLLIN, timeout, &revents);
+		struct pollfd pfd = { .fd = fd, .events = POLLIN };
+		int ret;
+
+		ret = sys_poll_intr(&pfd, 1, timeout);
 		if (ret == -1) {
 			return errno;
 		}
@@ -353,9 +357,11 @@ static int ctdb_read_packet(int fd, TALLOC_CTX *mem_ctx,
 	nread = read_data(fd, ((char *)req) + sizeof(msglen),
 			  msglen - sizeof(msglen));
 	if (nread == -1) {
+		TALLOC_FREE(req);
 		return errno;
 	}
 	if (nread == 0) {
+		TALLOC_FREE(req);
 		return EIO;
 	}
 
@@ -371,32 +377,26 @@ static int ctdb_read_packet(int fd, TALLOC_CTX *mem_ctx,
 static int ctdb_read_req(struct ctdbd_connection *conn, uint32_t reqid,
 			 TALLOC_CTX *mem_ctx, struct ctdb_req_header **result)
 {
-	struct ctdb_req_header *hdr;
+	struct ctdb_req_header *hdr = NULL;
 	int ret;
 
  next_pkt:
 
-	ret = ctdb_read_packet(conn->fd, mem_ctx, &hdr);
+	ret = ctdb_read_packet(conn->fd, conn->timeout, mem_ctx, &hdr);
 	if (ret != 0) {
-		DEBUG(0, ("ctdb_read_packet failed: %s\n", strerror(ret)));
-		cluster_fatal("ctdbd died\n");
+		DBG_ERR("ctdb_read_packet failed: %s\n", strerror(ret));
+		cluster_fatal("failed to read data from ctdbd\n");
+		return -1;
 	}
+	SMB_ASSERT(hdr != NULL);
 
 	DEBUG(11, ("Received ctdb packet\n"));
 	ctdb_packet_dump(hdr);
 
 	if (hdr->operation == CTDB_REQ_MESSAGE) {
-		struct ctdb_req_message *msg = (struct ctdb_req_message *)hdr;
+		struct ctdb_req_message_old *msg = (struct ctdb_req_message_old *)hdr;
 
-		if (conn->msg_ctx == NULL) {
-			DEBUG(1, ("Got a message without having a msg ctx, "
-				  "dropping msg %llu\n",
-				  (long long unsigned)msg->srvid));
-			TALLOC_FREE(hdr);
-			goto next_pkt;
-		}
-
-		ret = ctdbd_msg_call_back(conn, msg);
+		ret = ctdbd_msg_call_back(NULL, conn, msg);
 		if (ret != 0) {
 			TALLOC_FREE(hdr);
 			return ret;
@@ -419,99 +419,138 @@ static int ctdb_read_req(struct ctdbd_connection *conn, uint32_t reqid,
 	return 0;
 }
 
-static int ctdbd_connection_destructor(struct ctdbd_connection *c)
-{
-	close(c->fd);
-	return 0;
-}
+static int ctdbd_connection_destructor(struct ctdbd_connection *c);
+
 /*
  * Get us a ctdbd connection
  */
 
-static NTSTATUS ctdbd_init_connection(TALLOC_CTX *mem_ctx,
-				      struct ctdbd_connection **pconn)
+static int ctdbd_init_connection_internal(TALLOC_CTX *mem_ctx,
+					  const char *sockname, int timeout,
+					  struct ctdbd_connection *conn)
 {
-	struct ctdbd_connection *conn;
 	int ret;
-	NTSTATUS status;
 
-	if (!(conn = talloc_zero(mem_ctx, struct ctdbd_connection))) {
-		DEBUG(0, ("talloc failed\n"));
-		return NT_STATUS_NO_MEMORY;
+	conn->timeout = timeout;
+	if (conn->timeout == 0) {
+		conn->timeout = -1;
 	}
 
-	ret = ctdbd_connect(&conn->fd);
+	ret = ctdbd_connect(sockname, &conn->fd);
 	if (ret != 0) {
-		status = map_nt_error_from_unix(ret);
 		DEBUG(1, ("ctdbd_connect failed: %s\n", strerror(ret)));
-		goto fail;
+		return ret;
 	}
 	talloc_set_destructor(conn, ctdbd_connection_destructor);
 
-	status = get_cluster_vnn(conn, &conn->our_vnn);
-
-	if (!NT_STATUS_IS_OK(status)) {
-		DEBUG(10, ("get_cluster_vnn failed: %s\n", nt_errstr(status)));
-		goto fail;
+	ret = get_cluster_vnn(conn, &conn->our_vnn);
+	if (ret != 0) {
+		DEBUG(10, ("get_cluster_vnn failed: %s\n", strerror(ret)));
+		return ret;
 	}
 
 	if (!ctdbd_working(conn, conn->our_vnn)) {
 		DEBUG(2, ("Node is not working, can not connect\n"));
-		status = NT_STATUS_INTERNAL_DB_ERROR;
-		goto fail;
+		return EIO;
 	}
 
 	generate_random_buffer((unsigned char *)&conn->rand_srvid,
 			       sizeof(conn->rand_srvid));
 
-	status = register_with_ctdbd(conn, conn->rand_srvid, NULL, NULL);
-
-	if (!NT_STATUS_IS_OK(status)) {
+	ret = register_with_ctdbd(conn, conn->rand_srvid, NULL, NULL);
+	if (ret != 0) {
 		DEBUG(5, ("Could not register random srvid: %s\n",
-			  nt_errstr(status)));
+			  strerror(ret)));
+		return ret;
+	}
+
+	return 0;
+}
+
+int ctdbd_init_connection(TALLOC_CTX *mem_ctx,
+			  const char *sockname, int timeout,
+			  struct ctdbd_connection **pconn)
+{
+	struct ctdbd_connection *conn;
+	int ret;
+
+	if (!(conn = talloc_zero(mem_ctx, struct ctdbd_connection))) {
+		DEBUG(0, ("talloc failed\n"));
+		return ENOMEM;
+	}
+
+	ret = ctdbd_init_connection_internal(mem_ctx,
+					     sockname,
+					     timeout,
+					     conn);
+	if (ret != 0) {
+		DBG_ERR("ctdbd_init_connection_internal failed (%s)\n",
+			strerror(ret));
 		goto fail;
 	}
 
 	*pconn = conn;
-	return NT_STATUS_OK;
+	return 0;
 
  fail:
 	TALLOC_FREE(conn);
-	return status;
+	return ret;
 }
 
-/*
- * Get us a ctdbd connection and register us as a process
- */
-
-NTSTATUS ctdbd_messaging_connection(TALLOC_CTX *mem_ctx,
-				    struct ctdbd_connection **pconn)
+int ctdbd_reinit_connection(TALLOC_CTX *mem_ctx,
+			    const char *sockname, int timeout,
+			    struct ctdbd_connection *conn)
 {
-        struct ctdbd_connection *conn;
-	NTSTATUS status;
+	int ret;
 
-	status = ctdbd_init_connection(mem_ctx, &conn);
-
-	if (!NT_STATUS_IS_OK(status)) {
-		return status;
+	ret = ctdbd_connection_destructor(conn);
+	if (ret != 0) {
+		DBG_ERR("ctdbd_connection_destructor failed\n");
+		return ret;
 	}
 
-	status = register_with_ctdbd(conn, MSG_SRVID_SAMBA, NULL, NULL);
-	if (!NT_STATUS_IS_OK(status)) {
-		goto fail;
+	ret = ctdbd_init_connection_internal(mem_ctx,
+					     sockname,
+					     timeout,
+					     conn);
+	if (ret != 0) {
+		DBG_ERR("ctdbd_init_connection_internal failed (%s)\n",
+			strerror(ret));
+		return ret;
+	}
+
+	return 0;
+}
+
+int ctdbd_init_async_connection(
+	TALLOC_CTX *mem_ctx,
+	const char *sockname,
+	int timeout,
+	struct ctdbd_connection **pconn)
+{
+	struct ctdbd_connection *conn = NULL;
+	int ret;
+
+	ret = ctdbd_init_connection(mem_ctx, sockname, timeout, &conn);
+	if (ret != 0) {
+		return ret;
+	}
+
+	ret = set_blocking(conn->fd, false);
+	if (ret == -1) {
+		int err = errno;
+		TALLOC_FREE(conn);
+		return err;
+	}
+
+	conn->outgoing = tevent_queue_create(conn, "ctdb async outgoing");
+	if (conn->outgoing == NULL) {
+		TALLOC_FREE(conn);
+		return ENOMEM;
 	}
 
 	*pconn = conn;
-	return NT_STATUS_OK;
-
- fail:
-	TALLOC_FREE(conn);
-	return status;
-}
-
-struct messaging_context *ctdb_conn_msg_ctx(struct ctdbd_connection *conn)
-{
-	return conn->msg_ctx;
+	return 0;
 }
 
 int ctdbd_conn_get_fd(struct ctdbd_connection *conn)
@@ -522,10 +561,11 @@ int ctdbd_conn_get_fd(struct ctdbd_connection *conn)
 /*
  * Packet handler to receive and handle a ctdb message
  */
-static int ctdb_handle_message(struct ctdbd_connection *conn,
+static int ctdb_handle_message(struct tevent_context *ev,
+			       struct ctdbd_connection *conn,
 			       struct ctdb_req_header *hdr)
 {
-	struct ctdb_req_message *msg;
+	struct ctdb_req_message_old *msg;
 
 	if (hdr->operation != CTDB_REQ_MESSAGE) {
 		DEBUG(0, ("Received async msg of type %u, discarding\n",
@@ -533,34 +573,27 @@ static int ctdb_handle_message(struct ctdbd_connection *conn,
 		return EINVAL;
 	}
 
-	msg = (struct ctdb_req_message *)hdr;
+	msg = (struct ctdb_req_message_old *)hdr;
 
-	ctdbd_msg_call_back(conn, msg);
+	ctdbd_msg_call_back(ev, conn, msg);
 
 	return 0;
 }
 
-/*
- * The ctdbd socket is readable asynchronuously
- */
-
-static void ctdbd_socket_handler(struct tevent_context *event_ctx,
-				 struct tevent_fd *event,
-				 uint16_t flags,
-				 void *private_data)
+void ctdbd_socket_readable(struct tevent_context *ev,
+			   struct ctdbd_connection *conn)
 {
-	struct ctdbd_connection *conn = talloc_get_type_abort(
-		private_data, struct ctdbd_connection);
 	struct ctdb_req_header *hdr = NULL;
 	int ret;
 
-	ret = ctdb_read_packet(conn->fd, talloc_tos(), &hdr);
+	ret = ctdb_read_packet(conn->fd, conn->timeout, talloc_tos(), &hdr);
 	if (ret != 0) {
-		DEBUG(0, ("ctdb_read_packet failed: %s\n", strerror(ret)));
-		cluster_fatal("ctdbd died\n");
+		DBG_ERR("ctdb_read_packet failed: %s\n", strerror(ret));
+		cluster_fatal("failed to read data from ctdbd\n");
 	}
+	SMB_ASSERT(hdr != NULL);
 
-	ret = ctdb_handle_message(conn, hdr);
+	ret = ctdb_handle_message(ev, conn, hdr);
 
 	TALLOC_FREE(hdr);
 
@@ -570,41 +603,16 @@ static void ctdbd_socket_handler(struct tevent_context *event_ctx,
 	}
 }
 
-/*
- * Prepare a ctdbd connection to receive messages
- */
-
-NTSTATUS ctdbd_register_msg_ctx(struct ctdbd_connection *conn,
-				struct messaging_context *msg_ctx)
+int ctdbd_messaging_send_iov(struct ctdbd_connection *conn,
+			     uint32_t dst_vnn, uint64_t dst_srvid,
+			     const struct iovec *iov, int iovlen)
 {
-	SMB_ASSERT(conn->msg_ctx == NULL);
-	SMB_ASSERT(conn->fde == NULL);
-
-	if (!(conn->fde = tevent_add_fd(messaging_tevent_context(msg_ctx),
-				       conn,
-				       conn->fd,
-				       TEVENT_FD_READ,
-				       ctdbd_socket_handler,
-				       conn))) {
-		DEBUG(0, ("event_add_fd failed\n"));
-		return NT_STATUS_NO_MEMORY;
-	}
-
-	conn->msg_ctx = msg_ctx;
-
-	return NT_STATUS_OK;
-}
-
-NTSTATUS ctdbd_messaging_send_iov(struct ctdbd_connection *conn,
-				  uint32_t dst_vnn, uint64_t dst_srvid,
-				  const struct iovec *iov, int iovlen)
-{
-	struct ctdb_req_message r;
+	struct ctdb_req_message_old r;
 	struct iovec iov2[iovlen+1];
 	size_t buflen = iov_buflen(iov, iovlen);
 	ssize_t nwritten;
 
-	r.hdr.length = offsetof(struct ctdb_req_message, data) + buflen;
+	r.hdr.length = offsetof(struct ctdb_req_message_old, data) + buflen;
 	r.hdr.ctdb_magic = CTDB_MAGIC;
 	r.hdr.ctdb_version = CTDB_PROTOCOL;
 	r.hdr.generation = 1;
@@ -619,7 +627,7 @@ NTSTATUS ctdbd_messaging_send_iov(struct ctdbd_connection *conn,
 	ctdb_packet_dump(&r.hdr);
 
 	iov2[0].iov_base = &r;
-	iov2[0].iov_len = offsetof(struct ctdb_req_message, data);
+	iov2[0].iov_len = offsetof(struct ctdb_req_message_old, data);
 	memcpy(&iov2[1], iov, iovlen * sizeof(struct iovec));
 
 	nwritten = write_data_iov(conn->fd, iov2, iovlen+1);
@@ -628,42 +636,39 @@ NTSTATUS ctdbd_messaging_send_iov(struct ctdbd_connection *conn,
 		cluster_fatal("cluster dispatch daemon msg write error\n");
 	}
 
-	return NT_STATUS_OK;
+	return 0;
 }
 
 /*
  * send/recv a generic ctdb control message
  */
-static NTSTATUS ctdbd_control(struct ctdbd_connection *conn,
-			      uint32_t vnn, uint32_t opcode,
-			      uint64_t srvid, uint32_t flags,
-			      TDB_DATA data,
-			      TALLOC_CTX *mem_ctx, TDB_DATA *outdata,
-			      int *cstatus)
+static int ctdbd_control(struct ctdbd_connection *conn,
+			 uint32_t vnn, uint32_t opcode,
+			 uint64_t srvid, uint32_t flags,
+			 TDB_DATA data,
+			 TALLOC_CTX *mem_ctx, TDB_DATA *outdata,
+			 int32_t *cstatus)
 {
-	struct ctdb_req_control req;
+	struct ctdb_req_control_old req;
 	struct ctdb_req_header *hdr;
-	struct ctdb_reply_control *reply = NULL;
-	struct ctdbd_connection *new_conn = NULL;
+	struct ctdb_reply_control_old *reply = NULL;
 	struct iovec iov[2];
 	ssize_t nwritten;
-	NTSTATUS status;
 	int ret;
 
-	if (conn == NULL) {
-		status = ctdbd_init_connection(NULL, &new_conn);
-
-		if (!NT_STATUS_IS_OK(status)) {
-			DEBUG(10, ("Could not init temp connection: %s\n",
-				   nt_errstr(status)));
-			goto fail;
-		}
-
-		conn = new_conn;
+	if (ctdbd_conn_has_async_reqs(conn)) {
+		/*
+		 * Can't use sync call while an async call is in flight. Adding
+		 * this check as a safety net. We'll be using different
+		 * connections for sync and async requests, so this shouldn't
+		 * happen, but who knows...
+		 */
+		DBG_ERR("Async ctdb req on sync connection\n");
+		return EINVAL;
 	}
 
 	ZERO_STRUCT(req);
-	req.hdr.length = offsetof(struct ctdb_req_control, data) + data.dsize;
+	req.hdr.length = offsetof(struct ctdb_req_control_old, data) + data.dsize;
 	req.hdr.ctdb_magic   = CTDB_MAGIC;
 	req.hdr.ctdb_version = CTDB_PROTOCOL;
 	req.hdr.operation    = CTDB_REQ_CONTROL;
@@ -674,11 +679,13 @@ static NTSTATUS ctdbd_control(struct ctdbd_connection *conn,
 	req.datalen          = data.dsize;
 	req.flags            = flags;
 
-	DEBUG(10, ("ctdbd_control: Sending ctdb packet\n"));
+	DBG_DEBUG("Sending ctdb packet reqid=%"PRIu32", vnn=%"PRIu32", "
+		  "opcode=%"PRIu32", srvid=%"PRIu64"\n", req.hdr.reqid,
+		  req.hdr.destnode, req.opcode, req.srvid);
 	ctdb_packet_dump(&req.hdr);
 
 	iov[0].iov_base = &req;
-	iov[0].iov_len = offsetof(struct ctdb_req_control, data);
+	iov[0].iov_len = offsetof(struct ctdb_req_control_old, data);
 	iov[1].iov_base = data.dptr;
 	iov[1].iov_len = data.dsize;
 
@@ -689,31 +696,30 @@ static NTSTATUS ctdbd_control(struct ctdbd_connection *conn,
 	}
 
 	if (flags & CTDB_CTRL_FLAG_NOREPLY) {
-		TALLOC_FREE(new_conn);
 		if (cstatus) {
 			*cstatus = 0;
 		}
-		return NT_STATUS_OK;
+		return 0;
 	}
 
 	ret = ctdb_read_req(conn, req.hdr.reqid, NULL, &hdr);
 	if (ret != 0) {
 		DEBUG(10, ("ctdb_read_req failed: %s\n", strerror(ret)));
-		status = map_nt_error_from_unix(ret);
-		goto fail;
+		return ret;
 	}
 
 	if (hdr->operation != CTDB_REPLY_CONTROL) {
 		DEBUG(0, ("received invalid reply\n"));
-		goto fail;
+		TALLOC_FREE(hdr);
+		return EIO;
 	}
-	reply = (struct ctdb_reply_control *)hdr;
+	reply = (struct ctdb_reply_control_old *)hdr;
 
 	if (outdata) {
 		if (!(outdata->dptr = (uint8_t *)talloc_memdup(
 			      mem_ctx, reply->data, reply->datalen))) {
 			TALLOC_FREE(reply);
-			return NT_STATUS_NO_MEMORY;
+			return ENOMEM;
 		}
 		outdata->dsize = reply->datalen;
 	}
@@ -721,382 +727,42 @@ static NTSTATUS ctdbd_control(struct ctdbd_connection *conn,
 		(*cstatus) = reply->status;
 	}
 
-	status = NT_STATUS_OK;
-
- fail:
-	TALLOC_FREE(new_conn);
 	TALLOC_FREE(reply);
-	return status;
+	return ret;
 }
 
 /*
  * see if a remote process exists
  */
-bool ctdbd_process_exists(struct ctdbd_connection *conn, uint32_t vnn, pid_t pid)
+bool ctdbd_process_exists(struct ctdbd_connection *conn, uint32_t vnn,
+			  pid_t pid, uint64_t unique_id)
 {
-	struct server_id id;
-	bool result;
+	uint8_t buf[sizeof(pid)+sizeof(unique_id)];
+	int32_t cstatus = 0;
+	int ret;
 
-	id.pid = pid;
-	id.vnn = vnn;
+	if (unique_id == SERVERID_UNIQUE_ID_NOT_TO_VERIFY) {
+		ret = ctdbd_control(conn, vnn, CTDB_CONTROL_PROCESS_EXISTS,
+				    0, 0,
+				    (TDB_DATA) { .dptr = (uint8_t *)&pid,
+						    .dsize = sizeof(pid) },
+				    NULL, NULL, &cstatus);
+		if (ret != 0) {
+			return false;
+		}
+		return (cstatus == 0);
+	}
 
-	if (!ctdb_processes_exist(conn, &id, 1, &result)) {
-		DEBUG(10, ("ctdb_processes_exist failed\n"));
+	memcpy(buf, &pid, sizeof(pid));
+	memcpy(buf+sizeof(pid), &unique_id, sizeof(unique_id));
+
+	ret = ctdbd_control(conn, vnn, CTDB_CONTROL_CHECK_PID_SRVID, 0, 0,
+			    (TDB_DATA) { .dptr = buf, .dsize = sizeof(buf) },
+			    NULL, NULL, &cstatus);
+	if (ret != 0) {
 		return false;
 	}
-	return result;
-}
-
-bool ctdb_processes_exist(struct ctdbd_connection *conn,
-			  const struct server_id *pids, int num_pids,
-			  bool *results)
-{
-	TALLOC_CTX *frame = talloc_stackframe();
-	int i, num_received;
-	uint32_t *reqids;
-	bool result = false;
-
-	reqids = talloc_array(talloc_tos(), uint32_t, num_pids);
-	if (reqids == NULL) {
-		goto fail;
-	}
-
-	for (i=0; i<num_pids; i++) {
-		struct ctdb_req_control req;
-		pid_t pid;
-		struct iovec iov[2];
-		ssize_t nwritten;
-
-		results[i] = false;
-		reqids[i] = ctdbd_next_reqid(conn);
-
-		ZERO_STRUCT(req);
-
-		/*
-		 * pids[i].pid is uint64_t, scale down to pid_t which
-		 * is the wire protocol towards ctdb.
-		 */
-		pid = pids[i].pid;
-
-		DEBUG(10, ("Requesting PID %d/%d, reqid=%d\n",
-			   (int)pids[i].vnn, (int)pid,
-			   (int)reqids[i]));
-
-		req.hdr.length = offsetof(struct ctdb_req_control, data);
-		req.hdr.length += sizeof(pid);
-		req.hdr.ctdb_magic   = CTDB_MAGIC;
-		req.hdr.ctdb_version = CTDB_PROTOCOL;
-		req.hdr.operation    = CTDB_REQ_CONTROL;
-		req.hdr.reqid        = reqids[i];
-		req.hdr.destnode     = pids[i].vnn;
-		req.opcode           = CTDB_CONTROL_PROCESS_EXISTS;
-		req.srvid            = 0;
-		req.datalen          = sizeof(pid);
-		req.flags            = 0;
-
-		DEBUG(10, ("ctdbd_control: Sending ctdb packet\n"));
-		ctdb_packet_dump(&req.hdr);
-
-		iov[0].iov_base = &req;
-		iov[0].iov_len = offsetof(struct ctdb_req_control, data);
-		iov[1].iov_base = &pid;
-		iov[1].iov_len = sizeof(pid);
-
-		nwritten = write_data_iov(conn->fd, iov, ARRAY_SIZE(iov));
-		if (nwritten == -1) {
-			DEBUG(10, ("write_data_iov failed: %s\n",
-				   strerror(errno)));
-			goto fail;
-		}
-	}
-
-	num_received = 0;
-
-	while (num_received < num_pids) {
-		struct ctdb_req_header *hdr;
-		struct ctdb_reply_control *reply;
-		uint32_t reqid;
-		int ret;
-
-		ret = ctdb_read_req(conn, 0, talloc_tos(), &hdr);
-		if (ret != 0) {
-			DEBUG(10, ("ctdb_read_req failed: %s\n",
-				   strerror(ret)));
-			goto fail;
-		}
-
-		if (hdr->operation != CTDB_REPLY_CONTROL) {
-			DEBUG(10, ("Received invalid reply\n"));
-			goto fail;
-		}
-		reply = (struct ctdb_reply_control *)hdr;
-
-		reqid = reply->hdr.reqid;
-
-		DEBUG(10, ("Received reqid %d\n", (int)reqid));
-
-		for (i=0; i<num_pids; i++) {
-			if (reqid == reqids[i]) {
-				break;
-			}
-		}
-		if (i == num_pids) {
-			DEBUG(10, ("Received unknown record number %u\n",
-				   (unsigned)reqid));
-			goto fail;
-		}
-		results[i] = ((reply->status) == 0);
-		TALLOC_FREE(reply);
-		num_received += 1;
-	}
-
-	result = true;
-fail:
-	TALLOC_FREE(frame);
-	return result;
-}
-
-struct ctdb_vnn_list {
-	uint32_t vnn;
-	uint32_t reqid;
-	unsigned num_srvids;
-	unsigned num_filled;
-	uint64_t *srvids;
-	unsigned *pid_indexes;
-};
-
-/*
- * Get a list of all vnns mentioned in a list of
- * server_ids. vnn_indexes tells where in the vnns array we have to
- * place the pids.
- */
-static bool ctdb_collect_vnns(TALLOC_CTX *mem_ctx,
-			      const struct server_id *pids, unsigned num_pids,
-			      struct ctdb_vnn_list **pvnns,
-			      unsigned *pnum_vnns)
-{
-	struct ctdb_vnn_list *vnns = NULL;
-	unsigned *vnn_indexes = NULL;
-	unsigned i, num_vnns = 0;
-
-	vnn_indexes = talloc_array(mem_ctx, unsigned, num_pids);
-	if (vnn_indexes == NULL) {
-		DEBUG(1, ("talloc_array failed\n"));
-		goto fail;
-	}
-
-	for (i=0; i<num_pids; i++) {
-		unsigned j;
-		uint32_t vnn = pids[i].vnn;
-
-		for (j=0; j<num_vnns; j++) {
-			if (vnn == vnns[j].vnn) {
-				break;
-			}
-		}
-		vnn_indexes[i] = j;
-
-		if (j < num_vnns) {
-			/*
-			 * Already in the array
-			 */
-			vnns[j].num_srvids += 1;
-			continue;
-		}
-		vnns = talloc_realloc(mem_ctx, vnns, struct ctdb_vnn_list,
-				      num_vnns+1);
-		if (vnns == NULL) {
-			DEBUG(1, ("talloc_realloc failed\n"));
-			goto fail;
-		}
-		vnns[num_vnns].vnn = vnn;
-		vnns[num_vnns].num_srvids = 1;
-		vnns[num_vnns].num_filled = 0;
-		num_vnns += 1;
-	}
-	for (i=0; i<num_vnns; i++) {
-		struct ctdb_vnn_list *vnn = &vnns[i];
-
-		vnn->srvids = talloc_array(vnns, uint64_t, vnn->num_srvids);
-		if (vnn->srvids == NULL) {
-			DEBUG(1, ("talloc_array failed\n"));
-			goto fail;
-		}
-		vnn->pid_indexes = talloc_array(vnns, unsigned,
-						vnn->num_srvids);
-		if (vnn->pid_indexes == NULL) {
-			DEBUG(1, ("talloc_array failed\n"));
-			goto fail;
-		}
-	}
-	for (i=0; i<num_pids; i++) {
-		struct ctdb_vnn_list *vnn = &vnns[vnn_indexes[i]];
-		vnn->srvids[vnn->num_filled] = pids[i].unique_id;
-		vnn->pid_indexes[vnn->num_filled] = i;
-		vnn->num_filled += 1;
-	}
-
-	TALLOC_FREE(vnn_indexes);
-	*pvnns = vnns;
-	*pnum_vnns = num_vnns;
-	return true;
-fail:
-	TALLOC_FREE(vnns);
-	TALLOC_FREE(vnn_indexes);
-	return false;
-}
-
-bool ctdb_serverids_exist_supported(struct ctdbd_connection *conn)
-{
-	return true;
-}
-
-bool ctdb_serverids_exist(struct ctdbd_connection *conn,
-			  const struct server_id *pids, unsigned num_pids,
-			  bool *results)
-{
-	unsigned i, num_received;
-	struct ctdb_vnn_list *vnns = NULL;
-	unsigned num_vnns;
-
-	if (!ctdb_collect_vnns(talloc_tos(), pids, num_pids,
-			       &vnns, &num_vnns)) {
-		DEBUG(1, ("ctdb_collect_vnns failed\n"));
-		goto fail;
-	}
-
-	for (i=0; i<num_vnns; i++) {
-		struct ctdb_vnn_list *vnn = &vnns[i];
-		struct ctdb_req_control req;
-		struct iovec iov[2];
-		ssize_t nwritten;
-
-		vnn->reqid = ctdbd_next_reqid(conn);
-
-		ZERO_STRUCT(req);
-
-		DEBUG(10, ("Requesting VNN %d, reqid=%d, num_srvids=%u\n",
-			   (int)vnn->vnn, (int)vnn->reqid, vnn->num_srvids));
-
-		req.hdr.length = offsetof(struct ctdb_req_control, data);
-		req.hdr.ctdb_magic   = CTDB_MAGIC;
-		req.hdr.ctdb_version = CTDB_PROTOCOL;
-		req.hdr.operation    = CTDB_REQ_CONTROL;
-		req.hdr.reqid        = vnn->reqid;
-		req.hdr.destnode     = vnn->vnn;
-		req.opcode           = CTDB_CONTROL_CHECK_SRVIDS;
-		req.srvid            = 0;
-		req.datalen          = sizeof(uint64_t) * vnn->num_srvids;
-		req.hdr.length	    += req.datalen;
-		req.flags            = 0;
-
-		DEBUG(10, ("ctdbd_control: Sending ctdb packet\n"));
-		ctdb_packet_dump(&req.hdr);
-
-		iov[0].iov_base = &req;
-		iov[0].iov_len = offsetof(struct ctdb_req_control, data);
-		iov[1].iov_base = vnn->srvids;
-		iov[1].iov_len = req.datalen;
-
-		nwritten = write_data_iov(conn->fd, iov, ARRAY_SIZE(iov));
-		if (nwritten == -1) {
-			DEBUG(10, ("write_data_iov failed: %s\n",
-				   strerror(errno)));
-			goto fail;
-		}
-	}
-
-	num_received = 0;
-
-	while (num_received < num_vnns) {
-		struct ctdb_req_header *hdr;
-		struct ctdb_reply_control *reply;
-		struct ctdb_vnn_list *vnn;
-		uint32_t reqid;
-		uint8_t *reply_data;
-		int ret;
-
-		ret = ctdb_read_req(conn, 0, talloc_tos(), &hdr);
-		if (ret != 0) {
-			DEBUG(10, ("ctdb_read_req failed: %s\n",
-				   strerror(ret)));
-			goto fail;
-		}
-
-		if (hdr->operation != CTDB_REPLY_CONTROL) {
-			DEBUG(1, ("Received invalid reply %u\n",
-				  (unsigned)hdr->operation));
-			goto fail;
-		}
-		reply = (struct ctdb_reply_control *)hdr;
-
-		reqid = reply->hdr.reqid;
-
-		DEBUG(10, ("Received reqid %d\n", (int)reqid));
-
-		for (i=0; i<num_vnns; i++) {
-			if (reqid == vnns[i].reqid) {
-				break;
-			}
-		}
-		if (i == num_vnns) {
-			DEBUG(1, ("Received unknown reqid number %u\n",
-				  (unsigned)reqid));
-			goto fail;
-		}
-
-		DEBUG(10, ("Found index %u\n", i));
-
-		vnn = &vnns[i];
-
-		DEBUG(10, ("Received vnn %u, vnn->num_srvids %u, datalen %u\n",
-			   (unsigned)vnn->vnn, vnn->num_srvids,
-			   (unsigned)reply->datalen));
-
-		if (reply->datalen >= ((vnn->num_srvids+7)/8)) {
-			/*
-			 * Got a real reply
-			 */
-			reply_data = reply->data;
-		} else {
-			/*
-			 * Got an error reply
-			 */
-			DEBUG(5, ("Received short reply len %d, status %u, "
-				  "errorlen %u\n",
-				  (unsigned)reply->datalen,
-				  (unsigned)reply->status,
-				  (unsigned)reply->errorlen));
-			dump_data(5, reply->data, reply->errorlen);
-
-			/*
-			 * This will trigger everything set to false
-			 */
-			reply_data = NULL;
-		}
-
-		for (i=0; i<vnn->num_srvids; i++) {
-			int idx = vnn->pid_indexes[i];
-
-			if (pids[i].unique_id ==
-			    SERVERID_UNIQUE_ID_NOT_TO_VERIFY) {
-				results[idx] = true;
-				continue;
-			}
-			results[idx] =
-				(reply_data != NULL) &&
-				((reply_data[i/8] & (1<<(i%8))) != 0);
-		}
-
-		TALLOC_FREE(reply);
-		num_received += 1;
-	}
-
-	TALLOC_FREE(vnns);
-	return true;
-fail:
-	cluster_fatal("serverids_exist failed");
-	return false;
+	return (cstatus == 0);
 }
 
 /*
@@ -1105,7 +771,7 @@ fail:
 char *ctdbd_dbpath(struct ctdbd_connection *conn,
 		   TALLOC_CTX *mem_ctx, uint32_t db_id)
 {
-	NTSTATUS status;
+	int ret;
 	TDB_DATA data;
 	TDB_DATA rdata = {0};
 	int32_t cstatus = 0;
@@ -1113,12 +779,12 @@ char *ctdbd_dbpath(struct ctdbd_connection *conn,
 	data.dptr = (uint8_t*)&db_id;
 	data.dsize = sizeof(db_id);
 
-	status = ctdbd_control(conn, CTDB_CURRENT_NODE,
-			       CTDB_CONTROL_GETDBPATH, 0, 0, data,
-			       mem_ctx, &rdata, &cstatus);
-	if (!NT_STATUS_IS_OK(status) || cstatus != 0) {
-		DEBUG(0,(__location__ " ctdb_control for getdbpath failed\n"));
-		return NULL;
+	ret = ctdbd_control_local(conn, CTDB_CONTROL_GETDBPATH, 0, 0, data,
+				  mem_ctx, &rdata, &cstatus);
+	if ((ret != 0) || cstatus != 0) {
+		DEBUG(0, (__location__ " ctdb_control for getdbpath failed: %s\n",
+			  strerror(ret)));
+		TALLOC_FREE(rdata.dptr);
 	}
 
 	return (char *)rdata.dptr;
@@ -1127,71 +793,63 @@ char *ctdbd_dbpath(struct ctdbd_connection *conn,
 /*
  * attach to a ctdb database
  */
-NTSTATUS ctdbd_db_attach(struct ctdbd_connection *conn,
-			 const char *name, uint32_t *db_id, int tdb_flags)
+int ctdbd_db_attach(struct ctdbd_connection *conn,
+		    const char *name, uint32_t *db_id, bool persistent)
 {
-	NTSTATUS status;
-	TDB_DATA data;
+	int ret;
+	TDB_DATA data = {0};
 	int32_t cstatus;
-	bool persistent = (tdb_flags & TDB_CLEAR_IF_FIRST) == 0;
 
 	data = string_term_tdb_data(name);
 
-	status = ctdbd_control(conn, CTDB_CURRENT_NODE,
-			       persistent
-			       ? CTDB_CONTROL_DB_ATTACH_PERSISTENT
-			       : CTDB_CONTROL_DB_ATTACH,
-			       tdb_flags, 0, data, NULL, &data, &cstatus);
-	if (!NT_STATUS_IS_OK(status)) {
+	ret = ctdbd_control_local(conn,
+				  persistent
+				  ? CTDB_CONTROL_DB_ATTACH_PERSISTENT
+				  : CTDB_CONTROL_DB_ATTACH,
+				  0, 0, data, NULL, &data, &cstatus);
+	if (ret != 0) {
 		DEBUG(0, (__location__ " ctdb_control for db_attach "
-			  "failed: %s\n", nt_errstr(status)));
-		return status;
+			  "failed: %s\n", strerror(ret)));
+		return ret;
 	}
 
 	if (cstatus != 0 || data.dsize != sizeof(uint32_t)) {
 		DEBUG(0,(__location__ " ctdb_control for db_attach failed\n"));
-		return NT_STATUS_INTERNAL_ERROR;
+		TALLOC_FREE(data.dptr);
+		return EIO;
 	}
 
 	*db_id = *(uint32_t *)data.dptr;
 	talloc_free(data.dptr);
 
-	if (!(tdb_flags & TDB_SEQNUM)) {
-		return NT_STATUS_OK;
-	}
-
-	data.dptr = (uint8_t *)db_id;
-	data.dsize = sizeof(*db_id);
-
-	status = ctdbd_control(conn, CTDB_CURRENT_NODE,
-			       CTDB_CONTROL_ENABLE_SEQNUM, 0, 0, data,
-			       NULL, NULL, &cstatus);
-	if (!NT_STATUS_IS_OK(status) || cstatus != 0) {
-		DEBUG(0,(__location__ " ctdb_control for enable seqnum "
-			 "failed\n"));
-		return NT_STATUS_IS_OK(status) ? NT_STATUS_INTERNAL_ERROR :
-			status;
-	}
-
-	return NT_STATUS_OK;
+	return 0;
 }
 
 /*
  * force the migration of a record to this node
  */
-NTSTATUS ctdbd_migrate(struct ctdbd_connection *conn, uint32_t db_id,
-		       TDB_DATA key)
+int ctdbd_migrate(struct ctdbd_connection *conn, uint32_t db_id, TDB_DATA key)
 {
-	struct ctdb_req_call req;
-	struct ctdb_req_header *hdr;
+	struct ctdb_req_call_old req;
+	struct ctdb_req_header *hdr = NULL;
 	struct iovec iov[2];
 	ssize_t nwritten;
-	NTSTATUS status;
 	int ret;
+
+	if (ctdbd_conn_has_async_reqs(conn)) {
+		/*
+		 * Can't use sync call while an async call is in flight. Adding
+		 * this check as a safety net. We'll be using different
+		 * connections for sync and async requests, so this shouldn't
+		 * happen, but who knows...
+		 */
+		DBG_ERR("Async ctdb req on sync connection\n");
+		return EINVAL;
+	}
 
 	ZERO_STRUCT(req);
 
-	req.hdr.length = offsetof(struct ctdb_req_call, data) + key.dsize;
+	req.hdr.length = offsetof(struct ctdb_req_call_old, data) + key.dsize;
 	req.hdr.ctdb_magic   = CTDB_MAGIC;
 	req.hdr.ctdb_version = CTDB_PROTOCOL;
 	req.hdr.operation    = CTDB_REQ_CALL;
@@ -1205,7 +863,7 @@ NTSTATUS ctdbd_migrate(struct ctdbd_connection *conn, uint32_t db_id,
 	ctdb_packet_dump(&req.hdr);
 
 	iov[0].iov_base = &req;
-	iov[0].iov_len = offsetof(struct ctdb_req_call, data);
+	iov[0].iov_len = offsetof(struct ctdb_req_call_old, data);
 	iov[1].iov_base = key.dptr;
 	iov[1].iov_len = key.dsize;
 
@@ -1218,46 +876,58 @@ NTSTATUS ctdbd_migrate(struct ctdbd_connection *conn, uint32_t db_id,
 	ret = ctdb_read_req(conn, req.hdr.reqid, NULL, &hdr);
 	if (ret != 0) {
 		DEBUG(10, ("ctdb_read_req failed: %s\n", strerror(ret)));
-		status = map_nt_error_from_unix(ret);
 		goto fail;
 	}
 
 	if (hdr->operation != CTDB_REPLY_CALL) {
-		DEBUG(0, ("received invalid reply\n"));
-		status = NT_STATUS_INTERNAL_ERROR;
+		if (hdr->operation == CTDB_REPLY_ERROR) {
+			DBG_ERR("received error from ctdb\n");
+		} else {
+			DBG_ERR("received invalid reply\n");
+		}
+		ret = EIO;
 		goto fail;
 	}
 
-	status = NT_STATUS_OK;
  fail:
 
 	TALLOC_FREE(hdr);
-	return status;
+	return ret;
 }
 
 /*
  * Fetch a record and parse it
  */
-NTSTATUS ctdbd_parse(struct ctdbd_connection *conn, uint32_t db_id,
-		     TDB_DATA key, bool local_copy,
-		     void (*parser)(TDB_DATA key, TDB_DATA data,
-				    void *private_data),
-		     void *private_data)
+int ctdbd_parse(struct ctdbd_connection *conn, uint32_t db_id,
+		TDB_DATA key, bool local_copy,
+		void (*parser)(TDB_DATA key, TDB_DATA data,
+			       void *private_data),
+		void *private_data)
 {
-	struct ctdb_req_call req;
+	struct ctdb_req_call_old req;
 	struct ctdb_req_header *hdr = NULL;
-	struct ctdb_reply_call *reply;
+	struct ctdb_reply_call_old *reply;
 	struct iovec iov[2];
 	ssize_t nwritten;
-	NTSTATUS status;
 	uint32_t flags;
 	int ret;
+
+	if (ctdbd_conn_has_async_reqs(conn)) {
+		/*
+		 * Can't use sync call while an async call is in flight. Adding
+		 * this check as a safety net. We'll be using different
+		 * connections for sync and async requests, so this shouldn't
+		 * happen, but who knows...
+		 */
+		DBG_ERR("Async ctdb req on sync connection\n");
+		return EINVAL;
+	}
 
 	flags = local_copy ? CTDB_WANT_READONLY : 0;
 
 	ZERO_STRUCT(req);
 
-	req.hdr.length = offsetof(struct ctdb_req_call, data) + key.dsize;
+	req.hdr.length = offsetof(struct ctdb_req_call_old, data) + key.dsize;
 	req.hdr.ctdb_magic   = CTDB_MAGIC;
 	req.hdr.ctdb_version = CTDB_PROTOCOL;
 	req.hdr.operation    = CTDB_REQ_CALL;
@@ -1268,7 +938,7 @@ NTSTATUS ctdbd_parse(struct ctdbd_connection *conn, uint32_t db_id,
 	req.keylen           = key.dsize;
 
 	iov[0].iov_base = &req;
-	iov[0].iov_len = offsetof(struct ctdb_req_call, data);
+	iov[0].iov_len = offsetof(struct ctdb_req_call_old, data);
 	iov[1].iov_base = key.dptr;
 	iov[1].iov_len = key.dsize;
 
@@ -1281,59 +951,58 @@ NTSTATUS ctdbd_parse(struct ctdbd_connection *conn, uint32_t db_id,
 	ret = ctdb_read_req(conn, req.hdr.reqid, NULL, &hdr);
 	if (ret != 0) {
 		DEBUG(10, ("ctdb_read_req failed: %s\n", strerror(ret)));
-		status = map_nt_error_from_unix(ret);
 		goto fail;
 	}
 
 	if ((hdr == NULL) || (hdr->operation != CTDB_REPLY_CALL)) {
 		DEBUG(0, ("received invalid reply\n"));
-		status = NT_STATUS_INTERNAL_ERROR;
+		ret = EIO;
 		goto fail;
 	}
-	reply = (struct ctdb_reply_call *)hdr;
+	reply = (struct ctdb_reply_call_old *)hdr;
 
 	if (reply->datalen == 0) {
 		/*
 		 * Treat an empty record as non-existing
 		 */
-		status = NT_STATUS_NOT_FOUND;
+		ret = ENOENT;
 		goto fail;
 	}
 
 	parser(key, make_tdb_data(&reply->data[0], reply->datalen),
 	       private_data);
 
-	status = NT_STATUS_OK;
+	ret = 0;
  fail:
 	TALLOC_FREE(hdr);
-	return status;
+	return ret;
 }
 
 /*
-  Traverse a ctdb database. This uses a kind-of hackish way to open a second
-  connection to ctdbd to avoid the hairy recursive and async problems with
-  everything in-line.
+  Traverse a ctdb database. "conn" must be an otherwise unused
+  ctdb_connection where no other messages but the traverse ones are
+  expected.
 */
 
-NTSTATUS ctdbd_traverse(uint32_t db_id,
+int ctdbd_traverse(struct ctdbd_connection *conn, uint32_t db_id,
 			void (*fn)(TDB_DATA key, TDB_DATA data,
 				   void *private_data),
 			void *private_data)
 {
-	struct ctdbd_connection *conn;
-	NTSTATUS status;
-
+	int ret;
 	TDB_DATA key, data;
 	struct ctdb_traverse_start t;
-	int cstatus;
+	int32_t cstatus = 0;
 
-	become_root();
-	status = ctdbd_init_connection(NULL, &conn);
-	unbecome_root();
-	if (!NT_STATUS_IS_OK(status)) {
-		DEBUG(0, ("ctdbd_init_connection failed: %s\n",
-			  nt_errstr(status)));
-		return status;
+	if (ctdbd_conn_has_async_reqs(conn)) {
+		/*
+		 * Can't use sync call while an async call is in flight. Adding
+		 * this check as a safety net. We'll be using different
+		 * connections for sync and async requests, so this shouldn't
+		 * happen, but who knows...
+		 */
+		DBG_ERR("Async ctdb req on sync connection\n");
+		return EINVAL;
 	}
 
 	t.db_id = db_id;
@@ -1343,52 +1012,47 @@ NTSTATUS ctdbd_traverse(uint32_t db_id,
 	data.dptr = (uint8_t *)&t;
 	data.dsize = sizeof(t);
 
-	status = ctdbd_control(conn, CTDB_CURRENT_NODE,
-			       CTDB_CONTROL_TRAVERSE_START, conn->rand_srvid, 0,
-			       data, NULL, NULL, &cstatus);
+	ret = ctdbd_control_local(conn, CTDB_CONTROL_TRAVERSE_START,
+				  conn->rand_srvid,
+				  0, data, NULL, NULL, &cstatus);
 
-	if (!NT_STATUS_IS_OK(status) || (cstatus != 0)) {
-
-		DEBUG(0,("ctdbd_control failed: %s, %d\n", nt_errstr(status),
+	if ((ret != 0) || (cstatus != 0)) {
+		DEBUG(0,("ctdbd_control failed: %s, %d\n", strerror(ret),
 			 cstatus));
 
-		if (NT_STATUS_IS_OK(status)) {
+		if (ret == 0) {
 			/*
 			 * We need a mapping here
 			 */
-			status = NT_STATUS_UNSUCCESSFUL;
+			ret = EIO;
 		}
-		TALLOC_FREE(conn);
-		return status;
+		return ret;
 	}
 
-	while (True) {
+	while (true) {
 		struct ctdb_req_header *hdr = NULL;
-		struct ctdb_req_message *m;
-		struct ctdb_rec_data *d;
-		int ret;
+		struct ctdb_req_message_old *m;
+		struct ctdb_rec_data_old *d;
 
-		ret = ctdb_read_packet(conn->fd, conn, &hdr);
+		ret = ctdb_read_packet(conn->fd, conn->timeout, conn, &hdr);
 		if (ret != 0) {
-			DEBUG(0, ("ctdb_read_packet failed: %s\n",
-				  strerror(ret)));
-			cluster_fatal("ctdbd died\n");
+			DBG_ERR("ctdb_read_packet failed: %s\n", strerror(ret));
+			cluster_fatal("failed to read data from ctdbd\n");
 		}
+		SMB_ASSERT(hdr != NULL);
 
 		if (hdr->operation != CTDB_REQ_MESSAGE) {
 			DEBUG(0, ("Got operation %u, expected a message\n",
 				  (unsigned)hdr->operation));
-			TALLOC_FREE(conn);
-			return NT_STATUS_UNEXPECTED_IO_ERROR;
+			return EIO;
 		}
 
-		m = (struct ctdb_req_message *)hdr;
-		d = (struct ctdb_rec_data *)&m->data[0];
+		m = (struct ctdb_req_message_old *)hdr;
+		d = (struct ctdb_rec_data_old *)&m->data[0];
 		if (m->datalen < sizeof(uint32_t) || m->datalen != d->length) {
 			DEBUG(0, ("Got invalid traverse data of length %d\n",
 				  (int)m->datalen));
-			TALLOC_FREE(conn);
-			return NT_STATUS_UNEXPECTED_IO_ERROR;
+			return EIO;
 		}
 
 		key.dsize = d->keylen;
@@ -1398,15 +1062,13 @@ NTSTATUS ctdbd_traverse(uint32_t db_id,
 
 		if (key.dsize == 0 && data.dsize == 0) {
 			/* end of traverse */
-			TALLOC_FREE(conn);
-			return NT_STATUS_OK;
+			return 0;
 		}
 
 		if (data.dsize < sizeof(struct ctdb_ltdb_header)) {
 			DEBUG(0, ("Got invalid ltdb header length %d\n",
 				  (int)data.dsize));
-			TALLOC_FREE(conn);
-			return NT_STATUS_UNEXPECTED_IO_ERROR;
+			return EIO;
 		}
 		data.dsize -= sizeof(struct ctdb_ltdb_header);
 		data.dptr += sizeof(struct ctdb_ltdb_header);
@@ -1415,7 +1077,7 @@ NTSTATUS ctdbd_traverse(uint32_t db_id,
 			fn(key, data, private_data);
 		}
 	}
-	return NT_STATUS_OK;
+	return 0;
 }
 
 /*
@@ -1449,18 +1111,19 @@ static void smbd_ctdb_canonicalize_ip(const struct sockaddr_storage *in,
  * Register us as a server for a particular tcp connection
  */
 
-NTSTATUS ctdbd_register_ips(struct ctdbd_connection *conn,
-			    const struct sockaddr_storage *_server,
-			    const struct sockaddr_storage *_client,
-			    int (*cb)(uint32_t src_vnn, uint32_t dst_vnn,
-				      uint64_t dst_srvid,
-				      const uint8_t *msg, size_t msglen,
-				      void *private_data),
-			    void *private_data)
+int ctdbd_register_ips(struct ctdbd_connection *conn,
+		       const struct sockaddr_storage *_server,
+		       const struct sockaddr_storage *_client,
+		       int (*cb)(struct tevent_context *ev,
+				 uint32_t src_vnn, uint32_t dst_vnn,
+				 uint64_t dst_srvid,
+				 const uint8_t *msg, size_t msglen,
+				 void *private_data),
+		       void *private_data)
 {
-	struct ctdb_control_tcp_addr p;
+	struct ctdb_connection p;
 	TDB_DATA data = { .dptr = (uint8_t *)&p, .dsize = sizeof(p) };
-	NTSTATUS status;
+	int ret;
 	struct sockaddr_storage client;
 	struct sockaddr_storage server;
 
@@ -1473,25 +1136,25 @@ NTSTATUS ctdbd_register_ips(struct ctdbd_connection *conn,
 
 	switch (client.ss_family) {
 	case AF_INET:
-		memcpy(&p.dest.ip, &server, sizeof(p.dest.ip));
+		memcpy(&p.dst.ip, &server, sizeof(p.dst.ip));
 		memcpy(&p.src.ip, &client, sizeof(p.src.ip));
 		break;
 	case AF_INET6:
-		memcpy(&p.dest.ip6, &server, sizeof(p.dest.ip6));
+		memcpy(&p.dst.ip6, &server, sizeof(p.dst.ip6));
 		memcpy(&p.src.ip6, &client, sizeof(p.src.ip6));
 		break;
 	default:
-		return NT_STATUS_INTERNAL_ERROR;
+		return EIO;
 	}
 
 	/*
 	 * We want to be told about IP releases
 	 */
 
-	status = register_with_ctdbd(conn, CTDB_SRVID_RELEASE_IP,
-				     cb, private_data);
-	if (!NT_STATUS_IS_OK(status)) {
-		return status;
+	ret = register_with_ctdbd(conn, CTDB_SRVID_RELEASE_IP,
+				  cb, private_data);
+	if (ret != 0) {
+		return ret;
 	}
 
 	/*
@@ -1499,81 +1162,574 @@ NTSTATUS ctdbd_register_ips(struct ctdbd_connection *conn,
 	 * can send an extra ack to trigger a reset for our client, so it
 	 * immediately reconnects
 	 */
-	return ctdbd_control(conn, CTDB_CURRENT_NODE,
-			     CTDB_CONTROL_TCP_CLIENT, 0,
-			     CTDB_CTRL_FLAG_NOREPLY, data, NULL, NULL, NULL);
+	ret = ctdbd_control(conn, CTDB_CURRENT_NODE,
+			    CTDB_CONTROL_TCP_CLIENT, 0,
+			    CTDB_CTRL_FLAG_NOREPLY, data, NULL, NULL,
+			    NULL);
+	if (ret != 0) {
+		return ret;
+	}
+	return 0;
 }
 
 /*
   call a control on the local node
  */
-NTSTATUS ctdbd_control_local(struct ctdbd_connection *conn, uint32_t opcode,
-			     uint64_t srvid, uint32_t flags, TDB_DATA data,
-			     TALLOC_CTX *mem_ctx, TDB_DATA *outdata,
-			     int *cstatus)
+int ctdbd_control_local(struct ctdbd_connection *conn, uint32_t opcode,
+			uint64_t srvid, uint32_t flags, TDB_DATA data,
+			TALLOC_CTX *mem_ctx, TDB_DATA *outdata,
+			int32_t *cstatus)
 {
-	return ctdbd_control(conn, CTDB_CURRENT_NODE, opcode, srvid, flags, data, mem_ctx, outdata, cstatus);
+	return ctdbd_control(conn, CTDB_CURRENT_NODE, opcode, srvid, flags, data,
+			     mem_ctx, outdata, cstatus);
 }
 
-NTSTATUS ctdb_watch_us(struct ctdbd_connection *conn)
+int ctdb_watch_us(struct ctdbd_connection *conn)
 {
-	struct ctdb_client_notify_register reg_data;
+	struct ctdb_notify_data_old reg_data;
 	size_t struct_len;
-	NTSTATUS status;
-	int cstatus;
+	int ret;
+	int32_t cstatus;
 
 	reg_data.srvid = CTDB_SRVID_SAMBA_NOTIFY;
 	reg_data.len = 1;
 	reg_data.notify_data[0] = 0;
 
-	struct_len = offsetof(struct ctdb_client_notify_register,
+	struct_len = offsetof(struct ctdb_notify_data_old,
 			      notify_data) + reg_data.len;
 
-	status = ctdbd_control_local(
+	ret = ctdbd_control_local(
 		conn, CTDB_CONTROL_REGISTER_NOTIFY, conn->rand_srvid, 0,
 		make_tdb_data((uint8_t *)&reg_data, struct_len),
 		NULL, NULL, &cstatus);
-	if (!NT_STATUS_IS_OK(status)) {
+	if (ret != 0) {
 		DEBUG(1, ("ctdbd_control_local failed: %s\n",
-			  nt_errstr(status)));
+			  strerror(ret)));
 	}
-	return status;
+	return ret;
 }
 
-NTSTATUS ctdb_unwatch(struct ctdbd_connection *conn)
+int ctdb_unwatch(struct ctdbd_connection *conn)
 {
-	struct ctdb_client_notify_deregister dereg_data;
-	NTSTATUS status;
-	int cstatus;
+	uint64_t srvid = CTDB_SRVID_SAMBA_NOTIFY;
+	int ret;
+	int32_t cstatus;
 
-	dereg_data.srvid = CTDB_SRVID_SAMBA_NOTIFY;
-
-	status = ctdbd_control_local(
+	ret = ctdbd_control_local(
 		conn, CTDB_CONTROL_DEREGISTER_NOTIFY, conn->rand_srvid, 0,
-		make_tdb_data((uint8_t *)&dereg_data, sizeof(dereg_data)),
+		make_tdb_data((uint8_t *)&srvid, sizeof(srvid)),
 		NULL, NULL, &cstatus);
-	if (!NT_STATUS_IS_OK(status)) {
+	if (ret != 0) {
 		DEBUG(1, ("ctdbd_control_local failed: %s\n",
-			  nt_errstr(status)));
+			  strerror(ret)));
 	}
-	return status;
+	return ret;
 }
 
-NTSTATUS ctdbd_probe(void)
+int ctdbd_probe(const char *sockname, int timeout)
 {
 	/*
 	 * Do a very early check if ctdbd is around to avoid an abort and core
 	 * later
 	 */
 	struct ctdbd_connection *conn = NULL;
-	NTSTATUS status;
+	int ret;
 
-	status = ctdbd_messaging_connection(talloc_tos(), &conn);
+	ret = ctdbd_init_connection(talloc_tos(), sockname, timeout,
+				    &conn);
 
 	/*
 	 * We only care if we can connect.
 	 */
 	TALLOC_FREE(conn);
 
-	return status;
+	return ret;
+}
+
+static int ctdbd_connection_destructor(struct ctdbd_connection *c)
+{
+	if (c->fd != -1) {
+		close(c->fd);
+		c->fd = -1;
+	}
+	return 0;
+}
+
+void ctdbd_prep_hdr_next_reqid(
+	struct ctdbd_connection *conn, struct ctdb_req_header *hdr)
+{
+	*hdr = (struct ctdb_req_header) {
+		.ctdb_magic = CTDB_MAGIC,
+		.ctdb_version = CTDB_PROTOCOL,
+		.reqid = ctdbd_next_reqid(conn),
+		.destnode = CTDB_CURRENT_NODE,
+	};
+}
+
+struct ctdbd_pkt_read_state {
+	uint8_t *pkt;
+};
+
+static ssize_t ctdbd_pkt_read_more(
+	uint8_t *buf, size_t buflen, void *private_data);
+static void ctdbd_pkt_read_done(struct tevent_req *subreq);
+
+static struct tevent_req *ctdbd_pkt_read_send(
+	TALLOC_CTX *mem_ctx, struct tevent_context *ev, int fd)
+{
+	struct tevent_req *req = NULL, *subreq = NULL;
+	struct ctdbd_pkt_read_state *state = NULL;
+
+	req = tevent_req_create(mem_ctx, &state, struct ctdbd_pkt_read_state);
+	if (req == NULL) {
+		return NULL;
+	}
+	subreq = read_packet_send(state, ev, fd, 4, ctdbd_pkt_read_more, NULL);
+	if (tevent_req_nomem(subreq, req)) {
+		return tevent_req_post(req, ev);
+	}
+	tevent_req_set_callback(subreq, ctdbd_pkt_read_done, req);
+	return req;
+}
+
+static ssize_t ctdbd_pkt_read_more(
+	uint8_t *buf, size_t buflen, void *private_data)
+{
+	uint32_t msglen;
+	if (buflen < 4) {
+		return -1;
+	}
+	if (buflen > 4) {
+		return 0; 	/* Been here, done */
+	}
+	memcpy(&msglen, buf, 4);
+
+	if (msglen < sizeof(struct ctdb_req_header)) {
+		return -1;
+	}
+	return msglen - sizeof(msglen);
+}
+
+static void ctdbd_pkt_read_done(struct tevent_req *subreq)
+{
+	struct tevent_req *req = tevent_req_callback_data(
+		subreq, struct tevent_req);
+	struct ctdbd_pkt_read_state *state = tevent_req_data(
+		req, struct ctdbd_pkt_read_state);
+	ssize_t nread;
+	int err;
+
+	nread = read_packet_recv(subreq, state, &state->pkt, &err);
+	TALLOC_FREE(subreq);
+	if (nread == -1) {
+		tevent_req_error(req, err);
+		return;
+	}
+	tevent_req_done(req);
+}
+
+static int ctdbd_pkt_read_recv(
+	struct tevent_req *req, TALLOC_CTX *mem_ctx, uint8_t **pkt)
+{
+	struct ctdbd_pkt_read_state *state = tevent_req_data(
+		req, struct ctdbd_pkt_read_state);
+	int err;
+
+	if (tevent_req_is_unix_error(req, &err)) {
+		return err;
+	}
+	*pkt = talloc_move(mem_ctx, &state->pkt);
+	tevent_req_received(req);
+	return 0;
+}
+
+static bool ctdbd_conn_receive_next(struct ctdbd_connection *conn);
+static void ctdbd_conn_received(struct tevent_req *subreq);
+
+struct ctdbd_req_state {
+	struct ctdbd_connection *conn;
+	struct tevent_context *ev;
+	uint32_t reqid;
+	struct ctdb_req_header *reply;
+};
+
+static void ctdbd_req_unset_pending(struct tevent_req *req)
+{
+	struct ctdbd_req_state *state = tevent_req_data(
+		req, struct ctdbd_req_state);
+	struct ctdbd_connection *conn = state->conn;
+	size_t num_pending = talloc_array_length(conn->pending);
+	size_t i, num_after;
+
+	tevent_req_set_cleanup_fn(req, NULL);
+
+	if (num_pending == 1) {
+		/*
+		 * conn->read_req is a child of conn->pending
+		 */
+		TALLOC_FREE(conn->pending);
+		conn->read_req = NULL;
+		return;
+	}
+
+	for (i=0; i<num_pending; i++) {
+		if (req == conn->pending[i]) {
+			break;
+		}
+	}
+	if (i == num_pending) {
+		/*
+		 * Something's seriously broken. Just returning here is the
+		 * right thing nevertheless, the point of this routine is to
+		 * remove ourselves from conn->pending.
+		 */
+		return;
+	}
+
+	num_after = num_pending - i - 1;
+	if (num_after > 0) {
+		memmove(&conn->pending[i],
+			&conn->pending[i] + 1,
+			sizeof(*conn->pending) * num_after);
+	}
+	conn->pending = talloc_realloc(
+		NULL, conn->pending, struct tevent_req *, num_pending - 1);
+}
+
+static void ctdbd_req_cleanup(
+	struct tevent_req *req, enum tevent_req_state req_state)
+{
+	ctdbd_req_unset_pending(req);
+}
+
+static bool ctdbd_req_set_pending(struct tevent_req *req)
+{
+	struct ctdbd_req_state *state = tevent_req_data(
+		req, struct ctdbd_req_state);
+	struct ctdbd_connection *conn = state->conn;
+	struct tevent_req **pending = NULL;
+	size_t num_pending = talloc_array_length(conn->pending);
+	bool ok;
+
+	pending = talloc_realloc(
+		conn, conn->pending, struct tevent_req *, num_pending + 1);
+	if (pending == NULL) {
+		return false;
+	}
+	pending[num_pending] = req;
+	conn->pending = pending;
+
+	tevent_req_set_cleanup_fn(req, ctdbd_req_cleanup);
+
+	ok = ctdbd_conn_receive_next(conn);
+	if (!ok) {
+		ctdbd_req_unset_pending(req);
+		return false;
+	}
+
+	return true;
+}
+
+static bool ctdbd_conn_receive_next(struct ctdbd_connection *conn)
+{
+	size_t num_pending = talloc_array_length(conn->pending);
+	struct tevent_req *req = NULL;
+	struct ctdbd_req_state *state = NULL;
+
+	if (conn->read_req != NULL) {
+		return true;
+	}
+	if (num_pending == 0) {
+		/*
+		 * done for now
+		 */
+		return true;
+	}
+
+	req = conn->pending[0];
+	state = tevent_req_data(req, struct ctdbd_req_state);
+
+	conn->read_req = ctdbd_pkt_read_send(
+		conn->pending, state->ev, conn->fd);
+	if (conn->read_req == NULL) {
+		return false;
+	}
+	tevent_req_set_callback(conn->read_req, ctdbd_conn_received, conn);
+	return true;
+}
+
+static void ctdbd_conn_received(struct tevent_req *subreq)
+{
+	struct ctdbd_connection *conn = tevent_req_callback_data(
+		subreq, struct ctdbd_connection);
+	TALLOC_CTX *frame = talloc_stackframe();
+	uint8_t *pkt = NULL;
+	int ret;
+	struct ctdb_req_header *hdr = NULL;
+	uint32_t reqid;
+	struct tevent_req *req = NULL;
+	struct ctdbd_req_state *state = NULL;
+	size_t i, num_pending;
+	bool ok;
+
+	SMB_ASSERT(subreq == conn->read_req);
+	conn->read_req = NULL;
+
+	ret = ctdbd_pkt_read_recv(subreq, frame, &pkt);
+	TALLOC_FREE(subreq);
+	if (ret != 0) {
+		cluster_fatal("ctdbd_pkt_read failed\n");
+	}
+
+	hdr = (struct ctdb_req_header *)pkt;
+	reqid = hdr->reqid;
+	num_pending = talloc_array_length(conn->pending);
+
+	for (i=0; i<num_pending; i++) {
+		req = conn->pending[i];
+		state = tevent_req_data(req, struct ctdbd_req_state);
+		if (state->reqid == reqid) {
+			break;
+		}
+	}
+
+	if (i == num_pending) {
+		/* not found */
+		TALLOC_FREE(frame);
+		return;
+	}
+
+	state->reply = talloc_move(state, &hdr);
+	tevent_req_defer_callback(req, state->ev);
+	tevent_req_done(req);
+
+	TALLOC_FREE(frame);
+
+	ok = ctdbd_conn_receive_next(conn);
+	if (!ok) {
+		cluster_fatal("ctdbd_conn_receive_next failed\n");
+	}
+}
+
+static void ctdbd_req_written(struct tevent_req *subreq);
+
+struct tevent_req *ctdbd_req_send(
+	TALLOC_CTX *mem_ctx,
+	struct tevent_context *ev,
+	struct ctdbd_connection *conn,
+	struct iovec *iov,
+	size_t num_iov)
+{
+	struct tevent_req *req = NULL, *subreq = NULL;
+	struct ctdbd_req_state *state = NULL;
+	struct ctdb_req_header *hdr = NULL;
+	bool ok;
+
+	req = tevent_req_create(mem_ctx, &state, struct ctdbd_req_state);
+	if (req == NULL) {
+		return NULL;
+	}
+	state->conn = conn;
+	state->ev = ev;
+
+	if ((num_iov == 0) ||
+	    (iov[0].iov_len < sizeof(struct ctdb_req_header))) {
+		tevent_req_error(req, EINVAL);
+		return tevent_req_post(req, ev);
+	}
+	hdr = iov[0].iov_base;
+	state->reqid = hdr->reqid;
+
+	ok = ctdbd_req_set_pending(req);
+	if (!ok) {
+		tevent_req_oom(req);
+		return tevent_req_post(req, ev);
+	}
+
+	subreq = writev_send(
+		state, ev, conn->outgoing, conn->fd, false, iov, num_iov);
+	if (tevent_req_nomem(subreq, req)) {
+		return tevent_req_post(req, ev);
+	}
+	tevent_req_set_callback(subreq, ctdbd_req_written, req);
+
+	return req;
+}
+
+static void ctdbd_req_written(struct tevent_req *subreq)
+{
+	struct tevent_req *req = tevent_req_callback_data(
+		subreq, struct tevent_req);
+	ssize_t nwritten;
+	int err;
+
+	nwritten = writev_recv(subreq, &err);
+	TALLOC_FREE(subreq);
+	if (nwritten == -1) {
+		tevent_req_error(req, err);
+		return;
+	}
+}
+
+int ctdbd_req_recv(
+	struct tevent_req *req,
+	TALLOC_CTX *mem_ctx,
+	struct ctdb_req_header **reply)
+{
+	struct ctdbd_req_state *state = tevent_req_data(
+		req, struct ctdbd_req_state);
+	int err;
+
+	if (tevent_req_is_unix_error(req, &err)) {
+		return err;
+	}
+	*reply = talloc_move(mem_ctx, &state->reply);
+	tevent_req_received(req);
+	return 0;
+}
+
+struct ctdbd_parse_state {
+	struct tevent_context *ev;
+	struct ctdbd_connection *conn;
+	uint32_t reqid;
+	TDB_DATA key;
+	uint8_t _keybuf[64];
+	struct ctdb_req_call_old ctdb_req;
+	struct iovec iov[2];
+	void (*parser)(TDB_DATA key,
+		       TDB_DATA data,
+		       void *private_data);
+	void *private_data;
+};
+
+static void ctdbd_parse_done(struct tevent_req *subreq);
+
+struct tevent_req *ctdbd_parse_send(TALLOC_CTX *mem_ctx,
+				    struct tevent_context *ev,
+				    struct ctdbd_connection *conn,
+				    uint32_t db_id,
+				    TDB_DATA key,
+				    bool local_copy,
+				    void (*parser)(TDB_DATA key,
+						   TDB_DATA data,
+						   void *private_data),
+				    void *private_data,
+				    enum dbwrap_req_state *req_state)
+{
+	struct tevent_req *req = NULL;
+	struct ctdbd_parse_state *state = NULL;
+	uint32_t flags;
+	uint32_t packet_length;
+	struct tevent_req *subreq = NULL;
+
+	req = tevent_req_create(mem_ctx, &state, struct ctdbd_parse_state);
+	if (req == NULL) {
+		*req_state = DBWRAP_REQ_ERROR;
+		return NULL;
+	}
+
+	*req_state = DBWRAP_REQ_DISPATCHED;
+
+	*state = (struct ctdbd_parse_state) {
+		.ev = ev,
+		.conn = conn,
+		.reqid = ctdbd_next_reqid(conn),
+		.parser = parser,
+		.private_data = private_data,
+	};
+
+	flags = local_copy ? CTDB_WANT_READONLY : 0;
+	packet_length = offsetof(struct ctdb_req_call_old, data) + key.dsize;
+
+	/*
+	 * Copy the key into our state, as ctdb_pkt_send_cleanup() requires that
+	 * all passed iov elements have a lifetime longer that the tevent_req
+	 * returned by ctdb_pkt_send_send(). This is required continue sending a
+	 * the low level request into the ctdb socket, if a higher level
+	 * ('this') request is canceled (or talloc free'd) by the application
+	 * layer, without sending invalid packets to ctdb.
+	 */
+	if (key.dsize > sizeof(state->_keybuf)) {
+		state->key.dptr = talloc_memdup(state, key.dptr, key.dsize);
+		if (tevent_req_nomem(state->key.dptr, req)) {
+			return tevent_req_post(req, ev);
+		}
+	} else {
+		memcpy(state->_keybuf, key.dptr, key.dsize);
+		state->key.dptr = state->_keybuf;
+	}
+	state->key.dsize = key.dsize;
+
+	state->ctdb_req.hdr.length       = packet_length;
+	state->ctdb_req.hdr.ctdb_magic   = CTDB_MAGIC;
+	state->ctdb_req.hdr.ctdb_version = CTDB_PROTOCOL;
+	state->ctdb_req.hdr.operation    = CTDB_REQ_CALL;
+	state->ctdb_req.hdr.reqid        = state->reqid;
+	state->ctdb_req.flags            = flags;
+	state->ctdb_req.callid           = CTDB_FETCH_FUNC;
+	state->ctdb_req.db_id            = db_id;
+	state->ctdb_req.keylen           = state->key.dsize;
+
+	state->iov[0].iov_base = &state->ctdb_req;
+	state->iov[0].iov_len = offsetof(struct ctdb_req_call_old, data);
+	state->iov[1].iov_base = state->key.dptr;
+	state->iov[1].iov_len = state->key.dsize;
+
+	subreq = ctdbd_req_send(
+		state, ev, conn, state->iov, ARRAY_SIZE(state->iov));
+	if (tevent_req_nomem(subreq, req)) {
+		*req_state = DBWRAP_REQ_ERROR;
+		return tevent_req_post(req, ev);
+	}
+	tevent_req_set_callback(subreq, ctdbd_parse_done, req);
+
+	return req;
+}
+
+static void ctdbd_parse_done(struct tevent_req *subreq)
+{
+	struct tevent_req *req = tevent_req_callback_data(
+		subreq, struct tevent_req);
+	struct ctdbd_parse_state *state = tevent_req_data(
+		req, struct ctdbd_parse_state);
+	struct ctdb_req_header *hdr = NULL;
+	struct ctdb_reply_call_old *reply = NULL;
+	int ret;
+
+	ret = ctdbd_req_recv(subreq, state, &hdr);
+	TALLOC_FREE(subreq);
+	if (tevent_req_error(req, ret)) {
+		DBG_DEBUG("ctdb_req_recv failed %s\n", strerror(ret));
+		return;
+	}
+	SMB_ASSERT(hdr != NULL);
+
+	if (hdr->operation != CTDB_REPLY_CALL) {
+		DBG_ERR("received invalid reply\n");
+		ctdb_packet_dump(hdr);
+		tevent_req_error(req, EIO);
+		return;
+	}
+
+	reply = (struct ctdb_reply_call_old *)hdr;
+
+	if (reply->datalen == 0) {
+		/*
+		 * Treat an empty record as non-existing
+		 */
+		tevent_req_error(req, ENOENT);
+		return;
+	}
+
+	state->parser(state->key,
+		      make_tdb_data(&reply->data[0], reply->datalen),
+		      state->private_data);
+
+	tevent_req_done(req);
+	return;
+}
+
+int ctdbd_parse_recv(struct tevent_req *req)
+{
+	return tevent_req_simple_recv_unix(req);
 }

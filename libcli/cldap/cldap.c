@@ -111,6 +111,11 @@ struct cldap_search_state {
 	struct tevent_req *req;
 };
 
+/*
+ * For CLDAP we limit the maximum search request size to 4kb
+ */
+#define MAX_SEARCH_REQUEST 4096
+
 static int cldap_socket_destructor(struct cldap_socket *c)
 {
 	while (c->searches.list) {
@@ -141,6 +146,10 @@ static bool cldap_recvfrom_setup(struct cldap_socket *c)
 
 	ev = c->incoming.ev;
 	if (ev == NULL) {
+		/* this shouldn't happen but should be protected against */
+		if (c->searches.list == NULL) {
+			return false;
+		}
 		ev = c->searches.list->caller.ev;
 	}
 
@@ -220,26 +229,24 @@ nomem:
 static bool cldap_socket_recv_dgram(struct cldap_socket *c,
 				    struct cldap_incoming *in)
 {
-	DATA_BLOB blob;
 	struct asn1_data *asn1;
 	void *p;
 	struct cldap_search_state *search;
 	NTSTATUS status;
+	struct ldap_request_limits limits = {
+		.max_search_size = MAX_SEARCH_REQUEST
+	};
 
 	if (in->recv_errno != 0) {
 		goto error;
 	}
 
-	blob = data_blob_const(in->buf, in->len);
-
-	asn1 = asn1_init(in);
+	asn1 = asn1_init(in, ASN1_MAX_TREE_DEPTH);
 	if (!asn1) {
 		goto nomem;
 	}
 
-	if (!asn1_load(asn1, blob)) {
-		goto nomem;
-	}
+	asn1_load_nocopy(asn1, in->buf, in->len);
 
 	in->ldap_msg = talloc(in, struct ldap_message);
 	if (in->ldap_msg == NULL) {
@@ -247,7 +254,7 @@ static bool cldap_socket_recv_dgram(struct cldap_socket *c,
 	}
 
 	/* this initial decode is used to find the message id */
-	status = ldap_decode(asn1, NULL, in->ldap_msg);
+	status = ldap_decode(asn1, &limits, NULL, in->ldap_msg);
 	if (!NT_STATUS_IS_OK(status)) {
 		goto nterror;
 	}
@@ -267,8 +274,11 @@ static bool cldap_socket_recv_dgram(struct cldap_socket *c,
 
 	search = talloc_get_type_abort(p, struct cldap_search_state);
 	search->response.in = talloc_move(search, &in);
+
 	search->response.asn1 = asn1;
-	search->response.asn1->ofs = 0;
+
+	asn1_load_nocopy(search->response.asn1,
+			 search->response.in->buf, search->response.in->len);
 
 	DLIST_REMOVE(c->searches.list, search);
 
@@ -579,13 +589,17 @@ struct tevent_req *cldap_search_send(TALLOC_CTX *mem_ctx,
 	if (!req) {
 		return NULL;
 	}
-	ZERO_STRUCTP(state);
 	state->caller.ev = ev;
 	state->req = req;
 	state->caller.cldap = cldap;
 	state->message_id = -1;
 
 	talloc_set_destructor(state, cldap_search_state_destructor);
+
+	if (state->caller.cldap == NULL) {
+		tevent_req_nterror(req, NT_STATUS_INVALID_PARAMETER);
+		goto post;
+	}
 
 	if (io->in.dest_address) {
 		if (cldap->connected) {
@@ -661,7 +675,6 @@ struct tevent_req *cldap_search_send(TALLOC_CTX *mem_ctx,
 	}
 
 	if (!tevent_req_set_endtime(req, state->caller.ev, end)) {
-		tevent_req_oom(req);
 		goto post;
 	}
 
@@ -677,7 +690,7 @@ struct tevent_req *cldap_search_send(TALLOC_CTX *mem_ctx,
 	}
 	tevent_req_set_callback(subreq, cldap_search_state_queue_done, req);
 
-	DLIST_ADD_END(cldap->searches.list, state, struct cldap_search_state *);
+	DLIST_ADD_END(cldap->searches.list, state);
 
 	return req;
 
@@ -769,6 +782,9 @@ NTSTATUS cldap_search_recv(struct tevent_req *req,
 					   struct cldap_search_state);
 	struct ldap_message *ldap_msg;
 	NTSTATUS status;
+	struct ldap_request_limits limits = {
+		.max_search_size = MAX_SEARCH_REQUEST
+	};
 
 	if (tevent_req_is_nterror(req, &status)) {
 		goto failed;
@@ -779,7 +795,7 @@ NTSTATUS cldap_search_recv(struct tevent_req *req,
 		goto nomem;
 	}
 
-	status = ldap_decode(state->response.asn1, NULL, ldap_msg);
+	status = ldap_decode(state->response.asn1, &limits, NULL, ldap_msg);
 	if (!NT_STATUS_IS_OK(status)) {
 		goto failed;
 	}
@@ -795,7 +811,8 @@ NTSTATUS cldap_search_recv(struct tevent_req *req,
 		*io->out.response = ldap_msg->r.SearchResultEntry;
 
 		/* decode the 2nd part */
-		status = ldap_decode(state->response.asn1, NULL, ldap_msg);
+		status = ldap_decode(
+			state->response.asn1, &limits, NULL, ldap_msg);
 		if (!NT_STATUS_IS_OK(status)) {
 			goto failed;
 		}

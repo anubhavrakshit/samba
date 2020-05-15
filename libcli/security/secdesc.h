@@ -84,11 +84,6 @@ struct security_descriptor *make_standard_sec_desc(TALLOC_CTX *ctx, const struct
 ********************************************************************/
 struct sec_desc_buf *make_sec_desc_buf(TALLOC_CTX *ctx, size_t len, struct security_descriptor *sec_desc);
 
-/*******************************************************************
- Duplicates a struct sec_desc_buf structure.
-********************************************************************/
-struct sec_desc_buf *dup_sec_desc_buf(TALLOC_CTX *ctx, struct sec_desc_buf *src);
-
 bool sd_has_inheritable_components(const struct security_descriptor *parent_ctr, bool container);
 NTSTATUS se_create_child_secdesc(TALLOC_CTX *ctx,
 					struct security_descriptor **ppsd,
@@ -96,10 +91,6 @@ NTSTATUS se_create_child_secdesc(TALLOC_CTX *ctx,
 					const struct security_descriptor *parent_ctr,
 					const struct dom_sid *owner_sid,
 					const struct dom_sid *group_sid,
-					bool container);
-NTSTATUS se_create_child_secdesc_buf(TALLOC_CTX *ctx,
-					struct sec_desc_buf **ppsdb,
-					const struct security_descriptor *parent_ctr,
 					bool container);
 
 #endif /* _SECDESC_H_ */

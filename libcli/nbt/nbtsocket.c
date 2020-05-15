@@ -45,10 +45,7 @@ static int nbt_name_request_destructor(struct nbt_name_request *req)
 		idr_remove(req->nbtsock->idr, req->name_trn_id);
 		req->name_trn_id = 0;
 	}
-	if (req->te) {
-		talloc_free(req->te);
-		req->te = NULL;
-	}
+	TALLOC_FREE(req->te);
 	if (req->nbtsock->send_queue == NULL) {
 		TEVENT_FD_NOT_WRITEABLE(req->nbtsock->fde);
 	}
@@ -65,7 +62,7 @@ static int nbt_name_request_destructor(struct nbt_name_request *req)
 */
 static void nbt_name_socket_send(struct nbt_name_socket *nbtsock)
 {
-	struct nbt_name_request *req = nbtsock->send_queue;
+	struct nbt_name_request *req;
 	TALLOC_CTX *tmp_ctx = talloc_new(nbtsock);
 	NTSTATUS status;
 
@@ -127,8 +124,7 @@ static void nbt_name_socket_timeout(struct tevent_context *ev, struct tevent_tim
 					   nbt_name_socket_timeout, req);
 		if (req->state != NBT_REQUEST_SEND) {
 			req->state = NBT_REQUEST_SEND;
-			DLIST_ADD_END(req->nbtsock->send_queue, req,
-				      struct nbt_name_request *);
+			DLIST_ADD_END(req->nbtsock->send_queue, req);
 		}
 		TEVENT_FD_WRITEABLE(req->nbtsock->fde);
 		return;
@@ -343,12 +339,11 @@ _PUBLIC_ struct nbt_name_socket *nbt_name_socket_init(TALLOC_CTX *mem_ctx,
 	nbtsock->event_ctx = event_ctx;
 	if (nbtsock->event_ctx == NULL) goto failed;
 
-	status = socket_create("ip", SOCKET_TYPE_DGRAM, &nbtsock->sock, 0);
+	status = socket_create(nbtsock, "ip", SOCKET_TYPE_DGRAM,
+			       &nbtsock->sock, 0);
 	if (!NT_STATUS_IS_OK(status)) goto failed;
 
 	socket_set_option(nbtsock->sock, "SO_BROADCAST", "1");
-
-	talloc_steal(nbtsock, nbtsock->sock);
 
 	nbtsock->idr = idr_init(nbtsock);
 	if (nbtsock->idr == NULL) goto failed;
@@ -372,7 +367,8 @@ failed:
 /*
   send off a nbt name request
 */
-struct nbt_name_request *nbt_name_request_send(struct nbt_name_socket *nbtsock,
+struct nbt_name_request *nbt_name_request_send(TALLOC_CTX *mem_ctx,
+					       struct nbt_name_socket *nbtsock,
 					       struct socket_address *dest,
 					       struct nbt_name_packet *request,
 					       int timeout, int retries,
@@ -382,7 +378,7 @@ struct nbt_name_request *nbt_name_request_send(struct nbt_name_socket *nbtsock,
 	int id;
 	enum ndr_err_code ndr_err;
 
-	req = talloc_zero(nbtsock, struct nbt_name_request);
+	req = talloc_zero(mem_ctx, struct nbt_name_request);
 	if (req == NULL) goto failed;
 
 	req->nbtsock                = nbtsock;
@@ -391,8 +387,8 @@ struct nbt_name_request *nbt_name_request_send(struct nbt_name_socket *nbtsock,
 	req->is_reply               = false;
 	req->timeout                = timeout;
 	req->num_retries            = retries;
-	req->dest                   = dest;
-	if (talloc_reference(req, dest) == NULL) goto failed;
+	req->dest                   = socket_address_copy(req, dest);
+	if (req->dest == NULL) goto failed;
 
 	/* we select a random transaction id unless the user supplied one */
 	if (request->name_trn_id == 0) {
@@ -418,7 +414,7 @@ struct nbt_name_request *nbt_name_request_send(struct nbt_name_socket *nbtsock,
 				       (ndr_push_flags_fn_t)ndr_push_nbt_name_packet);
 	if (!NDR_ERR_CODE_IS_SUCCESS(ndr_err)) goto failed;
 
-	DLIST_ADD_END(nbtsock->send_queue, req, struct nbt_name_request *);
+	DLIST_ADD_END(nbtsock->send_queue, req);
 
 	if (DEBUGLVL(10)) {
 		DEBUG(10,("Queueing nbt packet to %s:%d\n",
@@ -450,8 +446,8 @@ _PUBLIC_ NTSTATUS nbt_name_reply_send(struct nbt_name_socket *nbtsock,
 	NT_STATUS_HAVE_NO_MEMORY(req);
 
 	req->nbtsock   = nbtsock;
-	req->dest = dest;
-	if (talloc_reference(req, dest) == NULL) goto failed;
+	req->dest = socket_address_copy(req, dest);
+	if (req->dest == NULL) goto failed;
 	req->state     = NBT_REQUEST_SEND;
 	req->is_reply = true;
 
@@ -469,7 +465,7 @@ _PUBLIC_ NTSTATUS nbt_name_reply_send(struct nbt_name_socket *nbtsock,
 		return ndr_map_error2ntstatus(ndr_err);
 	}
 
-	DLIST_ADD_END(nbtsock->send_queue, req, struct nbt_name_request *);
+	DLIST_ADD_END(nbtsock->send_queue, req);
 
 	TEVENT_FD_WRITEABLE(nbtsock->fde);
 
@@ -531,7 +527,7 @@ NTSTATUS nbt_set_unexpected_handler(struct nbt_name_socket *nbtsock,
 */
 _PUBLIC_ NTSTATUS nbt_rcode_to_ntstatus(uint8_t rcode)
 {
-	int i;
+	size_t i;
 	struct {
 		enum nbt_rcode rcode;
 		NTSTATUS status;

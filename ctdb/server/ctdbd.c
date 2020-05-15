@@ -17,50 +17,32 @@
    along with this program; if not, see <http://www.gnu.org/licenses/>.
 */
 
-#include "includes.h"
+#include "replace.h"
 #include "system/filesys.h"
-#include "popt.h"
 #include "system/time.h"
 #include "system/wait.h"
 #include "system/network.h"
-#include "cmdline.h"
-#include "../include/ctdb_private.h"
+#include "system/syslog.h"
 
-static struct {
-	const char *nlist;
-	const char *transport;
-	const char *myaddress;
-	const char *public_address_list;
-	const char *event_script_dir;
-	const char *notification_script;
-	const char *logging;
-	const char *recovery_lock_file;
-	const char *db_dir;
-	const char *db_dir_persistent;
-	const char *db_dir_state;
-	const char *public_interface;
-	const char *single_public_ip;
-	int         valgrinding;
-	int         nosetsched;
-	int         start_as_disabled;
-	int         start_as_stopped;
-	int         no_lmaster;
-	int         no_recmaster;
-	int         lvs;
-	int	    script_log_level;
-	int         no_publicipcheck;
-	int         max_persistent_check_errors;
-} options = {
-	.nlist = NULL,
-	.public_address_list = NULL,
-	.transport = "tcp",
-	.event_script_dir = NULL,
-	.logging = "file:" LOGDIR "/log.ctdb",
-	.db_dir = CTDB_VARDIR,
-	.db_dir_persistent = CTDB_VARDIR "/persistent",
-	.db_dir_state = CTDB_VARDIR "/state",
-	.script_log_level = DEBUG_ERR,
-};
+#include <popt.h>
+#include <talloc.h>
+/* Allow use of deprecated function tevent_loop_allow_nesting() */
+#define TEVENT_DEPRECATED
+#include <tevent.h>
+
+#include "lib/util/debug.h"
+#include "lib/util/samba_util.h"
+
+#include "ctdb_private.h"
+
+#include "common/reqid.h"
+#include "common/system.h"
+#include "common/common.h"
+#include "common/path.h"
+#include "common/logging.h"
+#include "common/logging_conf.h"
+
+#include "ctdb_config.h"
 
 int script_log_level;
 bool fast_start;
@@ -78,7 +60,7 @@ static void ctdb_recv_pkt(struct ctdb_context *ctdb, uint8_t *data, uint32_t len
 	if (ctdb_validate_pnn(ctdb, hdr->srcnode)) {
 		/* as a special case, redirected calls don't increment the rx_cnt */
 		if (hdr->operation != CTDB_REQ_CALL ||
-		    ((struct ctdb_req_call *)hdr)->hopcount == 0) {
+		    ((struct ctdb_req_call_old *)hdr)->hopcount == 0) {
 			ctdb->nodes[hdr->srcnode]->rx_cnt++;
 		}
 	}
@@ -92,6 +74,76 @@ static const struct ctdb_upcalls ctdb_upcalls = {
 	.node_connected = ctdb_node_connected
 };
 
+static struct ctdb_context *ctdb_init(struct tevent_context *ev)
+{
+	int ret;
+	struct ctdb_context *ctdb;
+
+	ctdb = talloc_zero(ev, struct ctdb_context);
+	if (ctdb == NULL) {
+		DBG_ERR("Memory error\n");
+		return NULL;
+	}
+	ctdb->ev  = ev;
+
+	/* Wrap early to exercise code. */
+	ret = reqid_init(ctdb, INT_MAX-200, &ctdb->idr);
+	if (ret != 0) {
+		D_ERR("reqid_init failed (%s)\n", strerror(ret));
+		talloc_free(ctdb);
+		return NULL;
+	}
+
+	ret = srvid_init(ctdb, &ctdb->srv);
+	if (ret != 0) {
+		D_ERR("srvid_init failed (%s)\n", strerror(ret));
+		talloc_free(ctdb);
+		return NULL;
+	}
+
+	ctdb->daemon.name = path_socket(ctdb, "ctdbd");
+	if (ctdb->daemon.name == NULL) {
+		DBG_ERR("Memory allocation error\n");
+		talloc_free(ctdb);
+		return NULL;
+	}
+
+	ctdbd_pidfile = path_pidfile(ctdb, "ctdbd");
+	if (ctdbd_pidfile == NULL) {
+		DBG_ERR("Memory allocation error\n");
+		talloc_free(ctdb);
+		return NULL;
+	}
+
+	gettimeofday(&ctdb->ctdbd_start_time, NULL);
+
+	gettimeofday(&ctdb->last_recovery_started, NULL);
+	gettimeofday(&ctdb->last_recovery_finished, NULL);
+
+	ctdb->recovery_mode    = CTDB_RECOVERY_NORMAL;
+	ctdb->recovery_master  = (uint32_t)-1;
+
+	ctdb->upcalls = &ctdb_upcalls;
+
+	ctdb->statistics.statistics_start_time = timeval_current();
+
+	ctdb->capabilities = CTDB_CAP_DEFAULT;
+
+	/*
+	 * Initialise this node's PNN to the unknown value.  This will
+	 * be set to the correct value by either ctdb_add_node() as
+	 * part of loading the nodes file or by
+	 * ctdb_tcp_listen_automatic() when the transport is
+	 * initialised.  At some point we should de-optimise this and
+	 * pull it out into ctdb_start_daemon() so it is done clearly
+	 * and only in one place.
+	 */
+	ctdb->pnn = CTDB_UNKNOWN_PNN;
+
+	ctdb->do_checkpublicip = true;
+
+	return ctdb;
+}
 
 
 /*
@@ -99,47 +151,58 @@ static const struct ctdb_upcalls ctdb_upcalls = {
 */
 int main(int argc, const char *argv[])
 {
-	struct ctdb_context *ctdb;
-	int interactive = 0;
+	struct ctdb_context *ctdb = NULL;
+	int interactive_opt = 0;
+	bool interactive = false;
 
 	struct poptOption popt_options[] = {
 		POPT_AUTOHELP
-		POPT_CTDB_CMDLINE
-		{ "interactive", 'i', POPT_ARG_NONE, &interactive, 0, "don't fork", NULL },
-		{ "public-addresses", 0, POPT_ARG_STRING, &options.public_address_list, 0, "public address list file", "filename" },
-		{ "public-interface", 0, POPT_ARG_STRING, &options.public_interface, 0, "public interface", "interface"},
-		{ "single-public-ip", 0, POPT_ARG_STRING, &options.single_public_ip, 0, "single public ip", "ip-address"},
-		{ "event-script-dir", 0, POPT_ARG_STRING, &options.event_script_dir, 0, "event script directory", "dirname" },
-		{ "logging", 0, POPT_ARG_STRING, &options.logging, 0, "logging method to be used", NULL },
-		{ "nlist", 0, POPT_ARG_STRING, &options.nlist, 0, "node list file", "filename" },
-		{ "notification-script", 0, POPT_ARG_STRING, &options.notification_script, 0, "notification script", "filename" },
-		{ "listen", 0, POPT_ARG_STRING, &options.myaddress, 0, "address to listen on", "address" },
-		{ "transport", 0, POPT_ARG_STRING, &options.transport, 0, "protocol transport", NULL },
-		{ "dbdir", 0, POPT_ARG_STRING, &options.db_dir, 0, "directory for the tdb files", NULL },
-		{ "dbdir-persistent", 0, POPT_ARG_STRING, &options.db_dir_persistent, 0, "directory for persistent tdb files", NULL },
-		{ "dbdir-state", 0, POPT_ARG_STRING, &options.db_dir_state, 0, "directory for internal state tdb files", NULL },
-		{ "reclock", 0, POPT_ARG_STRING, &options.recovery_lock_file, 0, "location of recovery lock file", "filename" },
-		{ "pidfile", 0, POPT_ARG_STRING, &ctdbd_pidfile, 0, "location of PID file", "filename" },
-		{ "valgrinding", 0, POPT_ARG_NONE, &options.valgrinding, 0, "disable setscheduler SCHED_FIFO call, use mmap for tdbs", NULL },
-		{ "nosetsched", 0, POPT_ARG_NONE, &options.nosetsched, 0, "disable setscheduler SCHED_FIFO call, use mmap for tdbs", NULL },
-		{ "start-as-disabled", 0, POPT_ARG_NONE, &options.start_as_disabled, 0, "Node starts in disabled state", NULL },
-		{ "start-as-stopped", 0, POPT_ARG_NONE, &options.start_as_stopped, 0, "Node starts in stopped state", NULL },
-		{ "no-lmaster", 0, POPT_ARG_NONE, &options.no_lmaster, 0, "disable lmaster role on this node", NULL },
-		{ "no-recmaster", 0, POPT_ARG_NONE, &options.no_recmaster, 0, "disable recmaster role on this node", NULL },
-		{ "lvs", 0, POPT_ARG_NONE, &options.lvs, 0, "lvs is enabled on this node", NULL },
-		{ "script-log-level", 0, POPT_ARG_INT, &options.script_log_level, 0, "log level of event script output", NULL },
-		{ "nopublicipcheck", 0, POPT_ARG_NONE, &options.no_publicipcheck, 0, "don't check we have/don't have the correct public ip addresses", NULL },
-		{ "max-persistent-check-errors", 0, POPT_ARG_INT,
-		  &options.max_persistent_check_errors, 0,
-		  "max allowed persistent check errors (default 0)", NULL },
-		{ "sloppy-start", 0, POPT_ARG_NONE, &fast_start, 0, "Do not perform full recovery on start", NULL },
+		{ "interactive", 'i', POPT_ARG_NONE, &interactive_opt, 0,
+		  "don't fork, log to stderr", NULL },
 		POPT_TABLEEND
 	};
 	int opt, ret;
 	const char **extra_argv;
-	int extra_argc = 0;
 	poptContext pc;
-	struct event_context *ev;
+	struct tevent_context *ev;
+	const char *ctdb_base;
+	struct conf_context *conf;
+	const char *logging_location;
+	const char *test_mode;
+	bool ok;
+
+	/*
+	 * Basic setup
+	 */
+
+	talloc_enable_null_tracking();
+
+	fault_setup();
+
+	ev = tevent_context_init(NULL);
+	if (ev == NULL) {
+		fprintf(stderr, "tevent_context_init() failed\n");
+		exit(1);
+	}
+	tevent_loop_allow_nesting(ev);
+
+	ctdb = ctdb_init(ev);
+	if (ctdb == NULL) {
+		fprintf(stderr, "Failed to init ctdb\n");
+		exit(1);
+	}
+
+	/* Default value for CTDB_BASE - don't override */
+	setenv("CTDB_BASE", CTDB_ETCDIR, 0);
+	ctdb_base = getenv("CTDB_BASE");
+	if (ctdb_base == NULL) {
+		D_ERR("CTDB_BASE not set\n");
+		exit(1);
+	}
+
+	/*
+	 * Command-line option handling
+	 */
 
 	pc = poptGetContext(argv[0], argc, argv, popt_options, POPT_CONTEXT_KEEP_FIRST);
 
@@ -148,170 +211,193 @@ int main(int argc, const char *argv[])
 		default:
 			fprintf(stderr, "Invalid option %s: %s\n", 
 				poptBadOption(pc, 0), poptStrerror(opt));
-			exit(1);
+			goto fail;
 		}
 	}
 
-	/* setup the remaining options for the main program to use */
+	/* If there are extra arguments then exit with usage message */
 	extra_argv = poptGetArgs(pc);
 	if (extra_argv) {
 		extra_argv++;
-		while (extra_argv[extra_argc]) extra_argc++;
+		if (extra_argv[0])  {
+			poptPrintHelp(pc, stdout, 0);
+			goto fail;
+		}
 	}
 
-	talloc_enable_null_tracking();
+	interactive = (interactive_opt != 0);
 
-	fault_setup();
+	/*
+	 * Configuration file handling
+	 */
 
-	ev = event_context_init(NULL);
-	tevent_loop_allow_nesting(ev);
-
-	ctdb = ctdb_cmdline_init(ev);
-
-	ctdb->start_as_disabled = options.start_as_disabled;
-	ctdb->start_as_stopped  = options.start_as_stopped;
-
-	script_log_level = options.script_log_level;
-
-	if (!ctdb_logging_init(ctdb, options.logging)) {
-		exit(1);
+	ret = ctdbd_config_load(ctdb, &conf);
+	if (ret != 0) {
+		/* ctdbd_config_load() logs the failure */
+		goto fail;
 	}
 
-	DEBUG(DEBUG_NOTICE,("CTDB starting on node\n"));
+	/*
+	 * Logging setup/options
+	 */
 
-	gettimeofday(&ctdb->ctdbd_start_time, NULL);
-	gettimeofday(&ctdb->last_recovery_started, NULL);
-	gettimeofday(&ctdb->last_recovery_finished, NULL);
-	ctdb->recovery_mode    = CTDB_RECOVERY_NORMAL;
-	ctdb->recovery_master  = (uint32_t)-1;
-	ctdb->upcalls          = &ctdb_upcalls;
-	ctdb->idr              = idr_init(ctdb);
-	ctdb->recovery_lock_fd = -1;
+	test_mode = getenv("CTDB_TEST_MODE");
 
-	ctdb_tunables_set_defaults(ctdb);
+	/* Log to stderr (ignoring configuration) when running as interactive */
+	if (interactive) {
+		logging_location = "file:";
+		setenv("CTDB_INTERACTIVE", "true", 1);
+	} else {
+		logging_location = logging_conf_location(conf);
+	}
 
-	ret = ctdb_set_recovery_lock_file(ctdb, options.recovery_lock_file);
+	if (strcmp(logging_location, "syslog") != 0 && test_mode == NULL) {
+		/* This can help when CTDB logging is misconfigured */
+		syslog(LOG_DAEMON|LOG_NOTICE,
+		       "CTDB logging to location %s",
+		       logging_location);
+	}
+
+	/* Initialize logging and set the debug level */
+	ok = ctdb_logging_init(ctdb,
+			       logging_location,
+			       logging_conf_log_level(conf));
+	if (!ok) {
+		goto fail;
+	}
+	setenv("CTDB_LOGGING", logging_location, 1);
+	setenv("CTDB_DEBUGLEVEL", debug_level_to_string(DEBUGLEVEL), 1);
+
+	script_log_level = debug_level_from_string(
+					ctdb_config.script_log_level);
+
+	D_NOTICE("CTDB starting on node\n");
+
+	/*
+	 * Cluster setup/options
+	 */
+
+	ret = ctdb_set_transport(ctdb, ctdb_config.transport);
 	if (ret == -1) {
-		DEBUG(DEBUG_ALERT,("ctdb_set_recovery_lock_file failed - %s\n", ctdb_errstr(ctdb)));
-		exit(1);
+		D_ERR("ctdb_set_transport failed - %s\n", ctdb_errstr(ctdb));
+		goto fail;
 	}
 
-	ret = ctdb_set_transport(ctdb, options.transport);
-	if (ret == -1) {
-		DEBUG(DEBUG_ALERT,("ctdb_set_transport failed - %s\n", ctdb_errstr(ctdb)));
-		exit(1);
+	if (ctdb_config.recovery_lock == NULL) {
+		D_WARNING("Recovery lock not set\n");
 	}
+	ctdb->recovery_lock = ctdb_config.recovery_lock;
 
 	/* tell ctdb what address to listen on */
-	if (options.myaddress) {
-		ret = ctdb_set_address(ctdb, options.myaddress);
+	if (ctdb_config.node_address) {
+		ret = ctdb_set_address(ctdb, ctdb_config.node_address);
 		if (ret == -1) {
-			DEBUG(DEBUG_ALERT,("ctdb_set_address failed - %s\n", ctdb_errstr(ctdb)));
-			exit(1);
+			D_ERR("ctdb_set_address failed - %s\n",
+			      ctdb_errstr(ctdb));
+			goto fail;
 		}
 	}
-
-	/* set ctdbd capabilities */
-	ctdb->capabilities = 0;
-	if (options.no_lmaster == 0) {
-		ctdb->capabilities |= CTDB_CAP_LMASTER;
-	}
-	if (options.no_recmaster == 0) {
-		ctdb->capabilities |= CTDB_CAP_RECMASTER;
-	}
-	if (options.lvs != 0) {
-		ctdb->capabilities |= CTDB_CAP_LVS;
-	}
-
-	/* Initialise this node's PNN to the unknown value.  This will
-	 * be set to the correct value by either ctdb_add_node() as
-	 * part of loading the nodes file or by
-	 * ctdb_tcp_listen_automatic() when the transport is
-	 * initialised.  At some point we should de-optimise this and
-	 * pull it out into ctdb_start_daemon() so it is done clearly
-	 * and only in one place.
-	 */
-	ctdb->pnn = -1;
-
-	/* Default value for CTDB_BASE - don't override */
-	setenv("CTDB_BASE", CTDB_ETCDIR, 0);
 
 	/* tell ctdb what nodes are available */
-	if (options.nlist != NULL) {
-		ctdb->nodes_file = options.nlist;
-	} else {
-		ctdb->nodes_file =
-			talloc_asprintf(ctdb, "%s/nodes", getenv("CTDB_BASE"));
-		if (ctdb->nodes_file == NULL) {
-			DEBUG(DEBUG_ALERT,(__location__ " Out of memory\n"));
-			exit(1);
-		}
+	ctdb->nodes_file = talloc_asprintf(ctdb, "%s/nodes", ctdb_base);
+	if (ctdb->nodes_file == NULL) {
+		DBG_ERR(" Out of memory\n");
+		goto fail;
 	}
 	ctdb_load_nodes_file(ctdb);
 
-	ctdb->db_directory = options.db_dir;
-	mkdir_p_or_die(ctdb->db_directory, 0700);
+	/*
+	 * Database setup/options
+	 */
 
-	ctdb->db_directory_persistent = options.db_dir_persistent;
-	mkdir_p_or_die(ctdb->db_directory_persistent, 0700);
-
-	ctdb->db_directory_state = options.db_dir_state;
-	mkdir_p_or_die(ctdb->db_directory_state, 0700);
-
-	if (options.public_interface) {
-		ctdb->default_public_interface = talloc_strdup(ctdb, options.public_interface);
-		CTDB_NO_MEMORY(ctdb, ctdb->default_public_interface);
+	ctdb->db_directory = ctdb_config.dbdir_volatile;
+	ok = directory_exist(ctdb->db_directory);
+	if (! ok) {
+		D_ERR("Volatile database directory %s does not exist\n",
+		      ctdb->db_directory);
+		goto fail;
 	}
 
-	if (options.single_public_ip) {
-		if (options.public_interface == NULL) {
-			DEBUG(DEBUG_ALERT,("--single_public_ip used but --public_interface is not specified. You must specify the public interface when using single public ip. Exiting\n"));
-			exit(10);
-		}
+	ctdb->db_directory_persistent = ctdb_config.dbdir_persistent;
+	ok = directory_exist(ctdb->db_directory_persistent);
+	if (! ok) {
+		D_ERR("Persistent database directory %s does not exist\n",
+		      ctdb->db_directory_persistent);
+		goto fail;
+	}
 
-		ret = ctdb_set_single_public_ip(ctdb, options.public_interface,
-						options.single_public_ip);
+	ctdb->db_directory_state = ctdb_config.dbdir_state;
+	ok = directory_exist(ctdb->db_directory_state);
+	if (! ok) {
+		D_ERR("State database directory %s does not exist\n",
+		      ctdb->db_directory_state);
+		goto fail;
+	}
+
+	if (ctdb_config.lock_debug_script != NULL) {
+		ret = setenv("CTDB_DEBUG_LOCKS",
+			     ctdb_config.lock_debug_script,
+			     1);
 		if (ret != 0) {
-			DEBUG(DEBUG_ALERT,("Invalid --single-public-ip argument : %s . This is not a valid ip address. Exiting.\n", options.single_public_ip));
-			exit(10);
+			D_ERR("Failed to set up lock debugging (%s)\n",
+			      strerror(errno));
+			goto fail;
 		}
 	}
 
-	if (options.event_script_dir != NULL) {
-		ctdb->event_script_dir = options.event_script_dir;
-	} else {
-		ctdb->event_script_dir = talloc_asprintf(ctdb, "%s/events.d",
-							 getenv("CTDB_BASE"));
-		if (ctdb->event_script_dir == NULL) {
-			DEBUG(DEBUG_ALERT,(__location__ " Out of memory\n"));
-			exit(1);
-		}
+	/*
+	 * Legacy setup/options
+	 */
+
+	ctdb->start_as_disabled = (int)ctdb_config.start_as_disabled;
+	ctdb->start_as_stopped  = (int)ctdb_config.start_as_stopped;
+
+	/* set ctdbd capabilities */
+	if (!ctdb_config.lmaster_capability) {
+		ctdb->capabilities &= ~CTDB_CAP_LMASTER;
+	}
+	if (!ctdb_config.recmaster_capability) {
+		ctdb->capabilities &= ~CTDB_CAP_RECMASTER;
 	}
 
-	if (options.notification_script != NULL) {
-		ret = ctdb_set_notification_script(ctdb, options.notification_script);
-		if (ret == -1) {
-			DEBUG(DEBUG_ALERT,("Unable to setup notification script\n"));
-			exit(1);
-		}
+	ctdb->do_setsched = ctdb_config.realtime_scheduling;
+
+	/*
+	 * Miscellaneous setup
+	 */
+
+	ctdb_tunables_set_defaults(ctdb);
+
+	ctdb->event_script_dir = talloc_asprintf(ctdb,
+						 "%s/events/legacy",
+						 ctdb_base);
+	if (ctdb->event_script_dir == NULL) {
+		DBG_ERR("Out of memory\n");
+		goto fail;
 	}
 
-	ctdb->valgrinding = options.valgrinding;
-	if (options.valgrinding || options.nosetsched) {
-		ctdb->do_setsched = 0;
-	} else {
-		ctdb->do_setsched = 1;
+	ctdb->notification_script = talloc_asprintf(ctdb,
+						    "%s/notify.sh",
+						    ctdb_base);
+	if (ctdb->notification_script == NULL) {
+		D_ERR("Unable to set notification script\n");
+		goto fail;
 	}
 
-	ctdb->public_addresses_file = options.public_address_list;
-	ctdb->do_checkpublicip = !options.no_publicipcheck;
+	/*
+	 * Testing and debug options
+	 */
 
-	if (options.max_persistent_check_errors < 0) {
-		ctdb->max_persistent_check_errors = 0xFFFFFFFFFFFFFFFFLL;
-	} else {
-		ctdb->max_persistent_check_errors = (uint64_t)options.max_persistent_check_errors;
+	if (test_mode != NULL) {
+		ctdb->do_setsched = false;
+		ctdb->do_checkpublicip = false;
+		fast_start = true;
 	}
 
 	/* start the protocol running (as a child) */
-	return ctdb_start_daemon(ctdb, interactive?false:true);
+	return ctdb_start_daemon(ctdb, interactive, test_mode != NULL);
+
+fail:
+	talloc_free(ctdb);
+	exit(1);
 }

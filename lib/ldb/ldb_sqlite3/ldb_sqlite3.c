@@ -323,6 +323,9 @@ static char *parsetree_to_sql(struct ldb_module *module,
 		 	const char *cdn = ldb_dn_get_casefold(
 						ldb_dn_new(mem_ctx, ldb,
 							      (const char *)value.data));
+			if (cdn == NULL) {
+				return NULL;
+			}
 
 			return lsqlite3_tprintf(mem_ctx,
 						"SELECT eid FROM ldb_entry "
@@ -1152,12 +1155,24 @@ static int lsql_modify(struct lsql_context *ctx)
 		switch (flags) {
 
 		case LDB_FLAG_MOD_REPLACE:
+			struct ldb_val *duplicate = NULL;
 
-			for (j=0; j<el->num_values; j++) {
-				if (ldb_msg_find_val(el, &el->values[j]) != &el->values[j]) {
-					ldb_asprintf_errstring(ldb, "%s: value #%d provided more than once", el->name, j);
-					return LDB_ERR_ATTRIBUTE_OR_VALUE_EXISTS;
-				}
+			ret = ldb_msg_find_duplicate_val(ldb, el, el,
+							 &duplicate, 0);
+			if (ret != LDB_SUCCESS) {
+				return ret;
+			}
+			if (duplicate != NULL) {
+				ldb_asprintf_errstring(
+					ldb,
+					"attribute '%s': value '%.*s' "
+					"on '%s' provided more than "
+					"once in REPLACE",
+					el->name,
+					(int)duplicate->length,
+					duplicate->data,
+					ldb_dn_get_linearized(msg2->dn));
+				return LDB_ERR_ATTRIBUTE_OR_VALUE_EXISTS;
 			}
 
 			/* remove all attributes before adding the replacements */
@@ -1566,10 +1581,13 @@ static int lsql_handle_request(struct ldb_module *module, struct ldb_request *re
 		return LDB_ERR_OPERATIONS_ERROR;
 	}
 
-	tv.tv_sec = req->starttime + req->timeout;
-	ac->timeout_event = tevent_add_timer(ev, ac, tv, lsql_timeout, ac);
-	if (NULL == ac->timeout_event) {
-		return LDB_ERR_OPERATIONS_ERROR;
+	if (req->timeout > 0) {
+		tv.tv_sec = req->starttime + req->timeout;
+		tv.tv_usec = 0;
+		ac->timeout_event = tevent_add_timer(ev, ac, tv, lsql_timeout, ac);
+		if (NULL == ac->timeout_event) {
+			return LDB_ERR_OPERATIONS_ERROR;
+		}
 	}
 
 	return LDB_SUCCESS;

@@ -34,7 +34,11 @@
 #include "auth/gensec/gensec_internal.h"
 #include "auth/common_auth.h"
 #include "param/param.h"
+#include "param/loadparm.h"
+#include "libds/common/roles.h"
 
+#undef DBGC_CLASS
+#define DBGC_CLASS DBGC_AUTH
 
 /**
  * Return the credentials of a logged on user, including session keys
@@ -61,6 +65,7 @@ NTSTATUS gensec_ntlmssp_session_info(struct gensec_security *gensec_security,
 	}
 
 	session_info_flags |= AUTH_SESSION_INFO_DEFAULT_GROUPS;
+	session_info_flags |= AUTH_SESSION_INFO_NTLM;
 
 	if (gensec_security->auth_context && gensec_security->auth_context->generate_session_info) {
 		nt_status = gensec_security->auth_context->generate_session_info(gensec_security->auth_context, mem_ctx, 
@@ -98,6 +103,9 @@ NTSTATUS gensec_ntlmssp_server_start(struct gensec_security *gensec_security)
 	const char *netbios_domain;
 	const char *dns_name;
 	const char *dns_domain;
+	enum server_role role;
+
+	role = lpcfg_server_role(gensec_security->settings->lp_ctx);
 
 	nt_status = gensec_ntlmssp_start(gensec_security);
 	NT_STATUS_NOT_OK_RETURN(nt_status);
@@ -117,11 +125,23 @@ NTSTATUS gensec_ntlmssp_server_start(struct gensec_security *gensec_security)
 
 	ntlmssp_state->expected_state = NTLMSSP_NEGOTIATE;
 
-	if (lpcfg_lanman_auth(gensec_security->settings->lp_ctx) &&
+	ntlmssp_state->allow_lm_response =
+		lpcfg_lanman_auth(gensec_security->settings->lp_ctx);
+
+	if (ntlmssp_state->allow_lm_response &&
 	    gensec_setting_bool(gensec_security->settings,
 				"ntlmssp_server", "allow_lm_key", false))
 	{
 		ntlmssp_state->allow_lm_key = true;
+	}
+
+	ntlmssp_state->force_old_spnego = false;
+
+	if (gensec_setting_bool(gensec_security->settings, "ntlmssp_server", "force_old_spnego", false)) {
+		/*
+		 * For testing Windows 2000 mode
+		 */
+		ntlmssp_state->force_old_spnego = true;
 	}
 
 	ntlmssp_state->neg_flags =
@@ -147,18 +167,20 @@ NTSTATUS gensec_ntlmssp_server_start(struct gensec_security *gensec_security)
 		ntlmssp_state->neg_flags |= NTLMSSP_NEGOTIATE_NTLM2;
 	}
 
-	if (gensec_security->want_features & GENSEC_FEATURE_SESSION_KEY) {
-		ntlmssp_state->neg_flags |= NTLMSSP_NEGOTIATE_SIGN;
-	}
-	if (gensec_security->want_features & GENSEC_FEATURE_SIGN) {
-		ntlmssp_state->neg_flags |= NTLMSSP_NEGOTIATE_SIGN;
-	}
-	if (gensec_security->want_features & GENSEC_FEATURE_SEAL) {
-		ntlmssp_state->neg_flags |= NTLMSSP_NEGOTIATE_SIGN;
-		ntlmssp_state->neg_flags |= NTLMSSP_NEGOTIATE_SEAL;
+	if (ntlmssp_state->allow_lm_key) {
+		ntlmssp_state->neg_flags |= NTLMSSP_NEGOTIATE_LM_KEY;
 	}
 
-	if (lpcfg_server_role(gensec_security->settings->lp_ctx) == ROLE_STANDALONE) {
+	/*
+	 * We always allow NTLMSSP_NEGOTIATE_SIGN and NTLMSSP_NEGOTIATE_SEAL.
+	 *
+	 * These will be removed if the client doesn't want them.
+	 */
+	ntlmssp_state->neg_flags |= NTLMSSP_NEGOTIATE_SIGN;
+	ntlmssp_state->neg_flags |= NTLMSSP_NEGOTIATE_SEAL;
+
+
+	if (role == ROLE_STANDALONE) {
 		ntlmssp_state->server.is_standalone = true;
 	} else {
 		ntlmssp_state->server.is_standalone = false;
@@ -214,6 +236,9 @@ NTSTATUS gensec_ntlmssp_server_start(struct gensec_security *gensec_security)
 
 	ntlmssp_state->server.dns_domain = talloc_strdup(ntlmssp_state, dns_domain);
 	NT_STATUS_HAVE_NO_MEMORY(ntlmssp_state->server.dns_domain);
+
+	ntlmssp_state->neg_flags |= ntlmssp_state->required_flags;
+	ntlmssp_state->conf_flags = ntlmssp_state->neg_flags;
 
 	return NT_STATUS_OK;
 }

@@ -1,4 +1,4 @@
-/* 
+/*
    ldb database library
 
    Copyright (C) Andrew Tridgell  2004
@@ -6,7 +6,7 @@
      ** NOTE! The following LGPL license applies to the ldb
      ** library. This does NOT imply that all of Samba is released
      ** under the LGPL
-   
+
    This library is free software; you can redistribute it and/or
    modify it under the terms of the GNU Lesser General Public
    License as published by the Free Software Foundation; either
@@ -39,7 +39,7 @@
 #include "system/locale.h"
 
 /*
-  
+
 */
 static int ldb_read_data_file(TALLOC_CTX *mem_ctx, struct ldb_val *value)
 {
@@ -216,7 +216,8 @@ static int fold_string(int (*fprintf_fn)(void *, const char *, ...), void *priva
 			const char *buf, size_t length, int start_pos)
 {
 	size_t i;
-	int total=0, ret;
+	size_t total = 0;
+	int ret;
 
 	for (i=0;i<length;i++) {
 		ret = fprintf_fn(private_data, "%c", buf[i]);
@@ -236,7 +237,7 @@ static int fold_string(int (*fprintf_fn)(void *, const char *, ...), void *priva
   encode as base64 to a file
 */
 static int base64_encode_f(struct ldb_context *ldb,
-			   int (*fprintf_fn)(void *, const char *, ...), 
+			   int (*fprintf_fn)(void *, const char *, ...),
 			   void *private_data,
 			   const char *buf, int len, int start_pos)
 {
@@ -273,14 +274,15 @@ static const struct {
   write to ldif, using a caller supplied write method, and only printing secrets if we are not in a trace
 */
 static int ldb_ldif_write_trace(struct ldb_context *ldb,
-				int (*fprintf_fn)(void *, const char *, ...), 
+				int (*fprintf_fn)(void *, const char *, ...),
 				void *private_data,
-				const struct ldb_ldif *ldif, 
+				const struct ldb_ldif *ldif,
 				bool in_trace)
 {
 	TALLOC_CTX *mem_ctx;
 	unsigned int i, j;
-	int total=0, ret;
+	size_t total = 0;
+	int ret;
 	char *p;
 	const struct ldb_message *msg;
 	const char * const * secret_attributes = ldb_get_opaque(ldb, LDB_SECRET_ATTRIBUTE_LIST_OPAQUE);
@@ -311,6 +313,7 @@ static int ldb_ldif_write_trace(struct ldb_context *ldb,
 
 	for (i=0;i<msg->num_elements;i++) {
 		const struct ldb_schema_attribute *a;
+		size_t namelen;
 
 		if (msg->elements[i].name == NULL) {
 			ldb_debug(ldb, LDB_DEBUG_ERROR,
@@ -319,25 +322,26 @@ static int ldb_ldif_write_trace(struct ldb_context *ldb,
 			return -1;
 		}
 
+		namelen = strlen(msg->elements[i].name);
 		a = ldb_schema_attribute_by_name(ldb, msg->elements[i].name);
 
 		if (ldif->changetype == LDB_CHANGETYPE_MODIFY) {
 			switch (msg->elements[i].flags & LDB_FLAG_MOD_MASK) {
 			case LDB_FLAG_MOD_ADD:
-				fprintf_fn(private_data, "add: %s\n", 
+				fprintf_fn(private_data, "add: %s\n",
 					   msg->elements[i].name);
 				break;
 			case LDB_FLAG_MOD_DELETE:
-				fprintf_fn(private_data, "delete: %s\n", 
+				fprintf_fn(private_data, "delete: %s\n",
 					   msg->elements[i].name);
 				break;
 			case LDB_FLAG_MOD_REPLACE:
-				fprintf_fn(private_data, "replace: %s\n", 
+				fprintf_fn(private_data, "replace: %s\n",
 					   msg->elements[i].name);
 				break;
 			}
 		}
-		
+
 		if (in_trace && secret_attributes && ldb_attr_in_list(secret_attributes, msg->elements[i].name)) {
 			/* Deliberatly skip printing this password */
 			ret = fprintf_fn(private_data, "# %s::: REDACTED SECRET ATTRIBUTE\n",
@@ -345,36 +349,49 @@ static int ldb_ldif_write_trace(struct ldb_context *ldb,
 			CHECK_RET;
 			continue;
 		}
-
 		for (j=0;j<msg->elements[i].num_values;j++) {
 			struct ldb_val v;
-			bool use_b64_encode;
+			bool use_b64_encode = false;
+			bool copy_raw_bytes = false;
+
 			ret = a->syntax->ldif_write_fn(ldb, mem_ctx, &msg->elements[i].values[j], &v);
 			if (ret != LDB_SUCCESS) {
 				v = msg->elements[i].values[j];
 			}
-			use_b64_encode = !(ldb->flags & LDB_FLG_SHOW_BINARY)
-					&& ldb_should_b64_encode(ldb, &v);
+
+			if (ldb->flags & LDB_FLG_SHOW_BINARY) {
+				use_b64_encode = false;
+				copy_raw_bytes = true;
+			} else if (a->flags & LDB_ATTR_FLAG_FORCE_BASE64_LDIF) {
+				use_b64_encode = true;
+			} else if (msg->elements[i].flags &
+			           LDB_FLAG_FORCE_NO_BASE64_LDIF) {
+				use_b64_encode = false;
+				copy_raw_bytes = true;
+			} else {
+				use_b64_encode = ldb_should_b64_encode(ldb, &v);
+			}
+
 			if (ret != LDB_SUCCESS || use_b64_encode) {
-				ret = fprintf_fn(private_data, "%s:: ", 
+				ret = fprintf_fn(private_data, "%s:: ",
 						 msg->elements[i].name);
 				CHECK_RET;
-				ret = base64_encode_f(ldb, fprintf_fn, private_data, 
+				ret = base64_encode_f(ldb, fprintf_fn, private_data,
 						      (char *)v.data, v.length,
-						      strlen(msg->elements[i].name)+3);
+						      namelen + 3);
 				CHECK_RET;
 				ret = fprintf_fn(private_data, "\n");
 				CHECK_RET;
 			} else {
 				ret = fprintf_fn(private_data, "%s: ", msg->elements[i].name);
 				CHECK_RET;
-				if (ldb->flags & LDB_FLG_SHOW_BINARY) {
-					ret = fprintf_fn(private_data, "%*.*s", 
+				if (copy_raw_bytes) {
+					ret = fprintf_fn(private_data, "%*.*s",
 							 v.length, v.length, (char *)v.data);
 				} else {
 					ret = fold_string(fprintf_fn, private_data,
 							  (char *)v.data, v.length,
-							  strlen(msg->elements[i].name)+2);
+							  namelen + 2);
 				}
 				CHECK_RET;
 				ret = fprintf_fn(private_data, "\n");
@@ -403,7 +420,7 @@ static int ldb_ldif_write_trace(struct ldb_context *ldb,
   write to ldif, using a caller supplied write method
 */
 int ldb_ldif_write(struct ldb_context *ldb,
-		   int (*fprintf_fn)(void *, const char *, ...), 
+		   int (*fprintf_fn)(void *, const char *, ...),
 		   void *private_data,
 		   const struct ldb_ldif *ldif)
 {
@@ -417,7 +434,7 @@ int ldb_ldif_write(struct ldb_context *ldb,
 
   caller frees
 */
-static char *next_chunk(struct ldb_context *ldb, 
+static char *next_chunk(struct ldb_context *ldb, TALLOC_CTX *mem_ctx,
 			int (*fgetc_fn)(void *), void *private_data)
 {
 	size_t alloc_size=0, chunk_size = 0;
@@ -429,7 +446,7 @@ static char *next_chunk(struct ldb_context *ldb,
 		if (chunk_size+1 >= alloc_size) {
 			char *c2;
 			alloc_size += 1024;
-			c2 = talloc_realloc(ldb, chunk, char, alloc_size);
+			c2 = talloc_realloc(mem_ctx, chunk, char, alloc_size);
 			if (!c2) {
 				talloc_free(chunk);
 				errno = ENOMEM;
@@ -442,15 +459,15 @@ static char *next_chunk(struct ldb_context *ldb,
 			if (c == '\n') {
 				in_comment = 0;
 			}
-			continue;			
+			continue;
 		}
-		
+
 		/* handle continuation lines - see RFC2849 */
 		if (c == ' ' && chunk_size > 1 && chunk[chunk_size-1] == '\n') {
 			chunk_size--;
 			continue;
 		}
-		
+
 		/* chunks are terminated by a double line-feed */
 		if (c == '\n' && chunk_size > 0 && chunk[chunk_size-1] == '\n') {
 			chunk[chunk_size-1] = 0;
@@ -717,7 +734,7 @@ int ldb_ldif_parse_modrdn(struct ldb_context *ldb,
 	if (_deleteoldrdn) {
 		*_deleteoldrdn = deleteoldrdn;
 	}
-	if (_newsuperior) {
+	if (_newsuperior != NULL && _newrdn != NULL) {
 		if (newsuperior_val) {
 			*_newrdn = talloc_move(mem_ctx, &newrdn);
 		} else {
@@ -761,7 +778,7 @@ struct ldb_ldif *ldb_ldif_read(struct ldb_context *ldb,
 	ldif = talloc(ldb, struct ldb_ldif);
 	if (!ldif) return NULL;
 
-	ldif->msg = talloc(ldif, struct ldb_message);
+	ldif->msg = ldb_msg_new(ldif);
 	if (ldif->msg == NULL) {
 		talloc_free(ldif);
 		return NULL;
@@ -770,22 +787,17 @@ struct ldb_ldif *ldb_ldif_read(struct ldb_context *ldb,
 	ldif->changetype = LDB_CHANGETYPE_NONE;
 	msg = ldif->msg;
 
-	msg->dn = NULL;
-	msg->elements = NULL;
-	msg->num_elements = 0;
-
-	chunk = next_chunk(ldb, fgetc_fn, private_data);
+	chunk = next_chunk(ldb, ldif, fgetc_fn, private_data);
 	if (!chunk) {
 		goto failed;
 	}
-	talloc_steal(ldif, chunk);
 
 	s = chunk;
 
 	if (next_attr(ldif, &s, &attr, &value) != 0) {
 		goto failed;
 	}
-	
+
 	/* first line must be a dn */
 	if (ldb_attr_cmp(attr, "dn") != 0) {
 		ldb_debug(ldb, LDB_DEBUG_ERROR, "Error: First line of ldif must be a dn not '%s'",
@@ -845,7 +857,7 @@ struct ldb_ldif *ldb_ldif_read(struct ldb_context *ldb,
 			}
 			continue;
 		}
-		
+
 		el = &msg->elements[msg->num_elements-1];
 
 		a = ldb_schema_attribute_by_name(ldb, attr);
@@ -853,8 +865,8 @@ struct ldb_ldif *ldb_ldif_read(struct ldb_context *ldb,
 		if (msg->num_elements > 0 && ldb_attr_cmp(attr, el->name) == 0 &&
 		    flags == el->flags) {
 			/* its a continuation */
-			el->values = 
-				talloc_realloc(msg->elements, el->values, 
+			el->values =
+				talloc_realloc(msg->elements, el->values,
 						 struct ldb_val, el->num_values+1);
 			if (!el->values) {
 				goto failed;
@@ -874,8 +886,8 @@ struct ldb_ldif *ldb_ldif_read(struct ldb_context *ldb,
 			el->num_values++;
 		} else {
 			/* its a new attribute */
-			msg->elements = talloc_realloc(msg, msg->elements, 
-							 struct ldb_message_element, 
+			msg->elements = talloc_realloc(msg, msg->elements,
+							 struct ldb_message_element,
 							 msg->num_elements+1);
 			if (!msg->elements) {
 				goto failed;
@@ -934,7 +946,7 @@ static int fgetc_file(void *private_data)
 	return c;
 }
 
-struct ldb_ldif *ldb_ldif_read_file_state(struct ldb_context *ldb, 
+struct ldb_ldif *ldb_ldif_read_file_state(struct ldb_context *ldb,
 					  struct ldif_read_file_state *state)
 {
 	return ldb_ldif_read(ldb, fgetc_file, state);
@@ -1020,7 +1032,7 @@ static int ldif_printf_string(void *private_data, const char *fmt, ...)
 	va_list ap;
 	size_t oldlen = talloc_get_size(state->string);
 	va_start(ap, fmt);
-	
+
 	state->string = talloc_vasprintf_append(state->string, fmt, ap);
 	va_end(ap);
 	if (!state->string) {
@@ -1030,7 +1042,7 @@ static int ldif_printf_string(void *private_data, const char *fmt, ...)
 	return talloc_get_size(state->string) - oldlen;
 }
 
-char *ldb_ldif_write_redacted_trace_string(struct ldb_context *ldb, TALLOC_CTX *mem_ctx, 
+char *ldb_ldif_write_redacted_trace_string(struct ldb_context *ldb, TALLOC_CTX *mem_ctx,
 					   const struct ldb_ldif *ldif)
 {
 	struct ldif_write_string_state state;
@@ -1044,7 +1056,7 @@ char *ldb_ldif_write_redacted_trace_string(struct ldb_context *ldb, TALLOC_CTX *
 	return state.string;
 }
 
-char *ldb_ldif_write_string(struct ldb_context *ldb, TALLOC_CTX *mem_ctx, 
+char *ldb_ldif_write_string(struct ldb_context *ldb, TALLOC_CTX *mem_ctx,
 			    const struct ldb_ldif *ldif)
 {
 	struct ldif_write_string_state state;
@@ -1062,7 +1074,7 @@ char *ldb_ldif_write_string(struct ldb_context *ldb, TALLOC_CTX *mem_ctx,
   convenient function to turn a ldb_message into a string. Useful for
   debugging
  */
-char *ldb_ldif_message_string(struct ldb_context *ldb, TALLOC_CTX *mem_ctx, 
+char *ldb_ldif_message_string(struct ldb_context *ldb, TALLOC_CTX *mem_ctx,
 			      enum ldb_changetype changetype,
 			      const struct ldb_message *msg)
 {
@@ -1072,4 +1084,25 @@ char *ldb_ldif_message_string(struct ldb_context *ldb, TALLOC_CTX *mem_ctx,
 	ldif.msg = discard_const_p(struct ldb_message, msg);
 
 	return ldb_ldif_write_string(ldb, mem_ctx, &ldif);
+}
+
+/*
+ * convenient function to turn a ldb_message into a string. Useful for
+ * debugging but also safer if some of the LDIF could be sensitive.
+ *
+ * The secret attributes are specified in a 'const char * const *' within
+ * the LDB_SECRET_ATTRIBUTE_LIST opaque set on the ldb
+ *
+ */
+char *ldb_ldif_message_redacted_string(struct ldb_context *ldb,
+				       TALLOC_CTX *mem_ctx,
+				       enum ldb_changetype changetype,
+				       const struct ldb_message *msg)
+{
+	struct ldb_ldif ldif;
+
+	ldif.changetype = changetype;
+	ldif.msg = discard_const_p(struct ldb_message, msg);
+
+	return ldb_ldif_write_redacted_trace_string(ldb, mem_ctx, &ldif);
 }

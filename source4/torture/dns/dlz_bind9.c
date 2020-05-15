@@ -19,7 +19,7 @@
 
 #include "includes.h"
 #include "torture/smbtorture.h"
-#include "dlz_minimal.h"
+#include "dns_server/dlz_minimal.h"
 #include <talloc.h>
 #include <ldb.h>
 #include "lib/param/param.h"
@@ -30,7 +30,13 @@
 #include "auth/credentials/credentials.h"
 #include "lib/cmdline/popt_common.h"
 
+/* Tests that configure multiple DLZs will use this. Increase to add stress. */
+#define NUM_DLZS_TO_CONFIGURE 4
+
 struct torture_context *tctx_static;
+
+static void dlz_bind9_log_wrapper(int level, const char *fmt, ...)
+				  PRINTF_ATTRIBUTE(2,3);
 
 static void dlz_bind9_log_wrapper(int level, const char *fmt, ...)
 {
@@ -51,13 +57,22 @@ static bool test_dlz_bind9_version(struct torture_context *tctx)
 	return true;
 }
 
+static char *test_dlz_bind9_binddns_dir(struct torture_context *tctx,
+					const char *file)
+{
+	return talloc_asprintf(tctx,
+			       "ldb://%s/%s",
+			       lpcfg_binddns_dir(tctx->lp_ctx),
+			       file);
+}
+
 static bool test_dlz_bind9_create(struct torture_context *tctx)
 {
 	void *dbdata;
 	const char *argv[] = {
 		"samba_dlz",
 		"-H",
-		lpcfg_private_path(tctx, tctx->lp_ctx, "dns/sam.ldb"),
+		test_dlz_bind9_binddns_dir(tctx, "dns/sam.ldb"),
 		NULL
 	};
 	tctx_static = tctx;
@@ -70,19 +85,29 @@ static bool test_dlz_bind9_create(struct torture_context *tctx)
 	return true;
 }
 
+static bool calls_zone_hook = false;
+
 static isc_result_t dlz_bind9_writeable_zone_hook(dns_view_t *view,
 					   const char *zone_name)
 {
 	struct torture_context *tctx = talloc_get_type((void *)view, struct torture_context);
-	struct ldb_context *samdb = samdb_connect_url(tctx, NULL, tctx->lp_ctx,
-						      system_session(tctx->lp_ctx),
-						      0, lpcfg_private_path(tctx, tctx->lp_ctx, "dns/sam.ldb"));
+	struct ldb_context *samdb = NULL;
+	char *errstring = NULL;
+	int ret = samdb_connect_url(
+			tctx,
+			NULL,
+			tctx->lp_ctx,
+			system_session(tctx->lp_ctx),
+			0,
+			test_dlz_bind9_binddns_dir(tctx, "dns/sam.ldb"),
+			NULL,
+			&samdb,
+			&errstring);
 	struct ldb_message *msg;
-	int ret;
 	const char *attrs[] = {
 		NULL
 	};
-	if (!samdb) {
+	if (ret != LDB_SUCCESS) {
 		torture_fail(tctx, "Failed to connect to samdb");
 		return ISC_R_FAILURE;
 	}
@@ -96,6 +121,8 @@ static isc_result_t dlz_bind9_writeable_zone_hook(dns_view_t *view,
 	}
 	talloc_free(msg);
 
+	calls_zone_hook = true;
+
 	return ISC_R_SUCCESS;
 }
 
@@ -105,7 +132,7 @@ static bool test_dlz_bind9_configure(struct torture_context *tctx)
 	const char *argv[] = {
 		"samba_dlz",
 		"-H",
-		lpcfg_private_path(tctx, tctx->lp_ctx, "dns/sam.ldb"),
+		test_dlz_bind9_binddns_dir(tctx, "dns/sam.ldb"),
 		NULL
 	};
 	tctx_static = tctx;
@@ -115,11 +142,82 @@ static bool test_dlz_bind9_configure(struct torture_context *tctx)
 				 ISC_R_SUCCESS,
 				 "Failed to create samba_dlz");
 
+	calls_zone_hook = false;
 	torture_assert_int_equal(tctx, dlz_configure((void*)tctx, dbdata),
 						     ISC_R_SUCCESS,
 				 "Failed to configure samba_dlz");
 
 	dlz_destroy(dbdata);
+
+	torture_assert_int_equal(tctx, calls_zone_hook, 1, "Hasn't called zone hook");
+
+	return true;
+}
+
+static bool test_dlz_bind9_multiple_configure(struct torture_context *tctx)
+{
+	int i;
+	for(i = 0; i < NUM_DLZS_TO_CONFIGURE; i++){
+		test_dlz_bind9_configure(tctx);
+	}
+	return true;
+}
+
+static bool configure_multiple_dlzs(struct torture_context *tctx,
+				    void **dbdata, int count)
+{
+	int i, res;
+	const char *argv[] = {
+		"samba_dlz",
+		"-H",
+		test_dlz_bind9_binddns_dir(tctx, "dns/sam.ldb"),
+		NULL
+	};
+
+	tctx_static = tctx;
+	for(i = 0; i < count; i++){
+		res = dlz_create("samba_dlz", 3, argv, &(dbdata[i]),
+				 "log", dlz_bind9_log_wrapper,
+				 "writeable_zone",
+				 dlz_bind9_writeable_zone_hook, NULL);
+		torture_assert_int_equal(tctx, res, ISC_R_SUCCESS,
+					 "Failed to create samba_dlz");
+
+		res = dlz_configure((void*)tctx, dbdata[i]);
+		torture_assert_int_equal(tctx, res, ISC_R_SUCCESS,
+					 "Failed to configure samba_dlz");
+	}
+
+	return true;
+}
+
+static bool test_dlz_bind9_destroy_oldest_first(struct torture_context *tctx)
+{
+	void *dbdata[NUM_DLZS_TO_CONFIGURE];
+	int i;
+
+	configure_multiple_dlzs(tctx, dbdata, NUM_DLZS_TO_CONFIGURE);
+
+	/* Reload faults are reported to happen on the first destroy */
+	dlz_destroy(dbdata[0]);
+
+	for(i = 1; i < NUM_DLZS_TO_CONFIGURE; i++){
+		dlz_destroy(dbdata[i]);
+	}
+
+	return true;
+}
+
+static bool test_dlz_bind9_destroy_newest_first(struct torture_context *tctx)
+{
+	void *dbdata[NUM_DLZS_TO_CONFIGURE];
+	int i;
+
+	configure_multiple_dlzs(tctx, dbdata, NUM_DLZS_TO_CONFIGURE);
+
+	for(i = NUM_DLZS_TO_CONFIGURE - 1; i >= 0; i--) {
+		dlz_destroy(dbdata[i]);
+	}
 
 	return true;
 }
@@ -140,7 +238,7 @@ static bool test_dlz_bind9_gensec(struct torture_context *tctx, const char *mech
 	const char *argv[] = {
 		"samba_dlz",
 		"-H",
-		lpcfg_private_path(tctx, tctx->lp_ctx, "dns/sam.ldb"),
+		test_dlz_bind9_binddns_dir(tctx, "dns/sam.ldb"),
 		NULL
 	};
 	tctx_static = tctx;
@@ -171,7 +269,8 @@ static bool test_dlz_bind9_gensec(struct torture_context *tctx, const char *mech
 	status = gensec_set_target_service(gensec_client_context, "dns");
 	torture_assert_ntstatus_ok(tctx, status, "gensec_set_target_service failed");
 
-	status = gensec_set_credentials(gensec_client_context, cmdline_credentials);
+	status = gensec_set_credentials(gensec_client_context,
+			popt_get_cmdline_credentials());
 	torture_assert_ntstatus_ok(tctx, status, "gensec_set_credentials (client) failed");
 
 	status = gensec_start_mech_by_sasl_name(gensec_client_context, mech);
@@ -185,14 +284,16 @@ static bool test_dlz_bind9_gensec(struct torture_context *tctx, const char *mech
 		torture_assert_ntstatus_ok(tctx, status, "gensec_update (client) failed");
 	}
 
-	torture_assert_int_equal(tctx, dlz_ssumatch(cli_credentials_get_username(cmdline_credentials),
-						    lpcfg_dnsdomain(tctx->lp_ctx),
-						    "127.0.0.1", "type", "key",
-						    client_to_server.length,
-						    client_to_server.data,
-						    dbdata),
-				 ISC_TRUE,
-				 "Failed to check key for update rights samba_dlz");
+	torture_assert_int_equal(tctx, dlz_ssumatch(
+					cli_credentials_get_username(
+						popt_get_cmdline_credentials()),
+					lpcfg_dnsdomain(tctx->lp_ctx),
+					"127.0.0.1", "type", "key",
+					client_to_server.length,
+					client_to_server.data,
+					dbdata),
+					ISC_TRUE,
+			 "Failed to check key for update rights samba_dlz");
 
 	dlz_destroy(dbdata);
 
@@ -317,7 +418,7 @@ static bool test_dlz_bind9_lookup(struct torture_context *tctx)
 	const char *argv[] = {
 		"samba_dlz",
 		"-H",
-		lpcfg_private_path(tctx, tctx->lp_ctx, "dns/sam.ldb"),
+		test_dlz_bind9_binddns_dir(tctx, "dns/sam.ldb"),
 		NULL
 	};
 	struct test_expected_rr *expected1 = NULL;
@@ -442,7 +543,7 @@ static bool test_dlz_bind9_zonedump(struct torture_context *tctx)
 	const char *argv[] = {
 		"samba_dlz",
 		"-H",
-		lpcfg_private_path(tctx, tctx->lp_ctx, "dns/sam.ldb"),
+		test_dlz_bind9_binddns_dir(tctx, "dns/sam.ldb"),
 		NULL
 	};
 	struct test_expected_rr *expected1 = NULL;
@@ -554,7 +655,7 @@ static bool test_dlz_bind9_update01(struct torture_context *tctx)
 	const char *argv[] = {
 		"samba_dlz",
 		"-H",
-		lpcfg_private_path(tctx, tctx->lp_ctx, "dns/sam.ldb"),
+		test_dlz_bind9_binddns_dir(tctx, "dns/sam.ldb"),
 		NULL
 	};
 	struct test_expected_rr *expected1 = NULL;
@@ -650,7 +751,8 @@ static bool test_dlz_bind9_update01(struct torture_context *tctx)
 	status = gensec_set_target_service(gensec_client_context, "dns");
 	torture_assert_ntstatus_ok(tctx, status, "gensec_set_target_service failed");
 
-	status = gensec_set_credentials(gensec_client_context, cmdline_credentials);
+	status = gensec_set_credentials(gensec_client_context,
+			popt_get_cmdline_credentials());
 	torture_assert_ntstatus_ok(tctx, status, "gensec_set_credentials (client) failed");
 
 	status = gensec_start_mech_by_sasl_name(gensec_client_context, "GSS-SPNEGO");
@@ -664,16 +766,18 @@ static bool test_dlz_bind9_update01(struct torture_context *tctx)
 		torture_assert_ntstatus_ok(tctx, status, "gensec_update (client) failed");
 	}
 
-	torture_assert_int_equal(tctx, dlz_ssumatch(cli_credentials_get_username(cmdline_credentials),
-						    name,
-						    "127.0.0.1",
-						    expected1->records[0].type,
-						    "key",
-						    client_to_server.length,
-						    client_to_server.data,
-						    dbdata),
-				 ISC_TRUE,
-				 "Failed to check key for update rights samba_dlz");
+	torture_assert_int_equal(tctx, dlz_ssumatch(
+				cli_credentials_get_username(
+					popt_get_cmdline_credentials()),
+				name,
+				"127.0.0.1",
+				expected1->records[0].type,
+				"key",
+				client_to_server.length,
+				client_to_server.data,
+				dbdata),
+				ISC_TRUE,
+			 "Failed to check key for update rights samba_dlz");
 
 	/*
 	 * We test the following:
@@ -1066,6 +1170,13 @@ static struct torture_suite *dlz_bind9_suite(TALLOC_CTX *ctx)
 	torture_suite_add_simple_test(suite, "version", test_dlz_bind9_version);
 	torture_suite_add_simple_test(suite, "create", test_dlz_bind9_create);
 	torture_suite_add_simple_test(suite, "configure", test_dlz_bind9_configure);
+	torture_suite_add_simple_test(suite, "destroyoldestfirst",
+				      test_dlz_bind9_destroy_oldest_first);
+	torture_suite_add_simple_test(suite, "destroynewestfirst",
+				      test_dlz_bind9_destroy_newest_first);
+	torture_suite_add_simple_test(suite, "multipleconfigure",
+				      test_dlz_bind9_multiple_configure);
+
 	torture_suite_add_simple_test(suite, "gssapi", test_dlz_bind9_gssapi);
 	torture_suite_add_simple_test(suite, "spnego", test_dlz_bind9_spnego);
 	torture_suite_add_simple_test(suite, "lookup", test_dlz_bind9_lookup);
@@ -1077,16 +1188,15 @@ static struct torture_suite *dlz_bind9_suite(TALLOC_CTX *ctx)
 /**
  * DNS torture module initialization
  */
-NTSTATUS torture_bind_dns_init(void);
-NTSTATUS torture_bind_dns_init(void)
+NTSTATUS torture_bind_dns_init(TALLOC_CTX *);
+NTSTATUS torture_bind_dns_init(TALLOC_CTX *ctx)
 {
 	struct torture_suite *suite;
-	TALLOC_CTX *mem_ctx = talloc_autofree_context();
 
 	/* register DNS related test cases */
-	suite = dlz_bind9_suite(mem_ctx);
+	suite = dlz_bind9_suite(ctx);
 	if (!suite) return NT_STATUS_NO_MEMORY;
-	torture_register_suite(suite);
+	torture_register_suite(ctx, suite);
 
 	return NT_STATUS_OK;
 }

@@ -95,7 +95,7 @@ static const char *rdwr_string(enum rdwr_mode m)
 	CHECK_STATUS(status, NT_STATUS_OK); \
 	t1 = t & ~1; \
 	t2 = nt_time_to_unix(finfo.all_info.out.field) & ~1; \
-	if (abs(t1-t2) > 2) { \
+	if (labs(t1-t2) > 2) { \
 		torture_result(tctx, TORTURE_FAIL, \
 		       "(%s) wrong time for field %s  %s - %s\n", \
 		       __location__, #field, \
@@ -112,7 +112,7 @@ static const char *rdwr_string(enum rdwr_mode m)
 	status = smb_raw_pathinfo(cli->tree, tctx, &finfo); \
 	CHECK_STATUS(status, NT_STATUS_OK); \
 	t2 = finfo.all_info.out.field; \
-	if (abs(t-t2) > 20000) { \
+	if (llabs((int64_t)(t-t2)) > 20000) { \
 		torture_result(tctx, TORTURE_FAIL, \
 		       "(%s) wrong time for field %s  %s - %s\n", \
 		       __location__, #field, \
@@ -1006,7 +1006,8 @@ static bool test_nttrans_create(struct torture_context *tctx, struct smbcli_stat
 
 	/* Check some create options (these all should be ignored) */
 	for (i=0; i < 32; i++) {
-		uint32_t create_option = (1 << i) & NTCREATEX_OPTIONS_MUST_IGNORE_MASK;
+		uint32_t create_option =
+			((uint32_t)1 << i) & NTCREATEX_OPTIONS_MUST_IGNORE_MASK;
 		if (create_option == 0) {
 			continue;
 		}
@@ -1045,7 +1046,7 @@ static bool test_nttrans_create(struct torture_context *tctx, struct smbcli_stat
 	not_a_directory_mask = 0;
 	unexpected_mask = 0;
 	for (i=0; i < 32; i++) {
-		uint32_t create_option = 1<<i;
+		uint32_t create_option = (uint32_t)1<<i;
 		if (create_option & NTCREATEX_OPTIONS_DELETE_ON_CLOSE) {
 			continue;
 		}
@@ -1469,6 +1470,8 @@ static bool test_openx_over_dir(struct torture_context *tctx, struct smbcli_stat
 	int fnum = -1;
 	bool ret = true;
 
+	ZERO_STRUCT(io);
+
 	torture_assert(tctx, torture_setup_dir(cli, BASEDIR), "Failed to setup up test directory: " BASEDIR);
 
 	/* Create the Directory */
@@ -1699,6 +1702,8 @@ static bool test_chained_ntcreatex_readx(struct torture_context *tctx, struct sm
 	bool ret = true;
 	const char buf[] = "test";
 	char buf2[4];
+
+	ZERO_STRUCT(io);
 
 	torture_assert(tctx, torture_setup_dir(cli, BASEDIR), "Failed to setup up test directory: " BASEDIR);
 

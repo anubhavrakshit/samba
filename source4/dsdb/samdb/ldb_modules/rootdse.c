@@ -217,7 +217,7 @@ static int dsdb_module_we_are_master(struct ldb_module *module, struct ldb_dn *d
 		talloc_free(tmp_ctx);
 		return ret;
 	}
-	
+
 	talloc_free(tmp_ctx);
 	return LDB_SUCCESS;
 }
@@ -468,7 +468,9 @@ static int rootdse_add_dynamic(struct rootdse_context *ac, struct ldb_message *m
 	if (do_attribute_explicit(attrs, "tokenGroups")) {
 		/* Obtain the user's session_info */
 		struct auth_session_info *session_info
-			= (struct auth_session_info *)ldb_get_opaque(ldb, "sessionInfo");
+			= (struct auth_session_info *)ldb_get_opaque(
+				ldb,
+				DSDB_SESSION_INFO);
 		if (session_info && session_info->security_token) {
 			/* The list of groups this user is in */
 			for (i = 0; i < session_info->security_token->num_sids; i++) {
@@ -513,7 +515,21 @@ static int rootdse_add_dynamic(struct rootdse_context *ac, struct ldb_message *m
 					    DSDB_SEARCH_SHOW_EXTENDED_DN,
 					    ac->req);
 		if (ret != LDB_SUCCESS) {
-			return ldb_operr(ldb);
+			DBG_WARNING("Failed to convert GUID into full DN in rootDSE for %s: %s: %s\n",
+				    guid_attrs[i],
+				    ldb_dn_get_extended_linearized(ac, attr_dn, 1),
+				    ldb_errstring(ldb));
+			/*
+			 * Provide a meaninful error string but not
+			 * confidential DB contents possibly in the
+			 * original string
+			 */
+			ldb_asprintf_errstring(ldb,
+					       "Failed to find full DN for %s: %s",
+					       guid_attrs[i],
+					       ldb_dn_get_extended_linearized(ac, attr_dn, 1));
+			/* Overstamp the error code, it would confuse the caller */
+			return LDB_ERR_OPERATIONS_ERROR;
 		}
 
 		el = ldb_msg_find_element(msg, guid_attrs[i]);
@@ -701,11 +717,20 @@ static int rootdse_filter_controls(struct ldb_module *module, struct ldb_request
 			continue;
 		}
 
-		/* If the control is DIRSYNC control then we keep the critical
-		 * flag as the dirsync module will need to act upon it
+		/*
+		 * If the control is DIRSYNC, SORT or VLV then we keep the
+		 * critical flag as the modules will need to act upon it.
+		 *
+		 * These modules have to unset the critical flag after the
+		 * request has been seen by the correct module.
 		 */
-		if (is_registered && strcmp(req->controls[i]->oid,
-					LDB_CONTROL_DIRSYNC_OID)!= 0) {
+		if (is_registered &&
+		    strcmp(req->controls[i]->oid,
+			   LDB_CONTROL_DIRSYNC_OID) != 0 &&
+		    strcmp(req->controls[i]->oid,
+			   LDB_CONTROL_VLV_REQ_OID) != 0 &&
+		    strcmp(req->controls[i]->oid,
+			   LDB_CONTROL_SERVER_SORT_OID) != 0) {
 			req->controls[i]->critical = 0;
 		}
 	}
@@ -725,15 +750,17 @@ static int rootdse_filter_operations(struct ldb_module *module, struct ldb_reque
 		return LDB_SUCCESS;
 	}
 
-	session_info = (struct auth_session_info *)ldb_get_opaque(ldb_module_get_ctx(module), "sessionInfo");
+	session_info = (struct auth_session_info *)ldb_get_opaque(
+		ldb_module_get_ctx(module),
+		DSDB_SESSION_INFO);
 	if (session_info) {
 		is_anonymous = security_token_is_anonymous(session_info->security_token);
 	}
-	
+
 	if (is_anonymous == false || (priv && priv->block_anonymous == false)) {
 		return LDB_SUCCESS;
 	}
-	
+
 	if (req->operation == LDB_SEARCH) {
 		if (req->op.search.scope == LDB_SCOPE_BASE && ldb_dn_is_null(req->op.search.base)) {
 			return LDB_SUCCESS;
@@ -831,7 +858,7 @@ static int rootdse_search(struct ldb_module *module, struct ldb_request *req)
 
 	if (do_attribute_explicit(req->op.search.attrs, "netlogon")) {
 		ret = rootdse_handle_netlogon(ac);
-		/* We have to return an empty result, so dont forward `ret' */
+		/* We have to return an empty result, so don't forward `ret' */
 		if (ret != LDB_SUCCESS) {
 			return ldb_module_done(ac->req, NULL, NULL, LDB_SUCCESS);
 		}
@@ -854,10 +881,50 @@ static int rootdse_search(struct ldb_module *module, struct ldb_request *req)
 	return ldb_next_request(module, down_req);
 }
 
+static struct rootdse_private_data *rootdse_get_private_data(struct ldb_module *module)
+{
+	void *priv = ldb_module_get_private(module);
+	struct rootdse_private_data *data = NULL;
+	struct ldb_context *ldb
+		= ldb_module_get_ctx(module);
+
+	if (priv != NULL) {
+		data = talloc_get_type_abort(priv,
+					     struct rootdse_private_data);
+	}
+
+	if (data != NULL) {
+		return data;
+	}
+
+	data = talloc_zero(module, struct rootdse_private_data);
+	if (data == NULL) {
+		return NULL;
+	}
+
+	data->num_controls = 0;
+	data->controls = NULL;
+	data->num_partitions = 0;
+	data->partitions = NULL;
+	data->block_anonymous = true;
+
+	ldb_module_set_private(module, data);
+
+	ldb_set_default_dns(ldb);
+
+	return data;
+}
+
+
 static int rootdse_register_control(struct ldb_module *module, struct ldb_request *req)
 {
-	struct rootdse_private_data *priv = talloc_get_type(ldb_module_get_private(module), struct rootdse_private_data);
+	struct rootdse_private_data *priv =
+		rootdse_get_private_data(module);
 	char **list;
+
+	if (priv == NULL) {
+		return ldb_module_oom(module);
+	}
 
 	list = talloc_realloc(priv, priv->controls, char *, priv->num_controls + 1);
 	if (!list) {
@@ -877,8 +944,13 @@ static int rootdse_register_control(struct ldb_module *module, struct ldb_reques
 
 static int rootdse_register_partition(struct ldb_module *module, struct ldb_request *req)
 {
-	struct rootdse_private_data *priv = talloc_get_type(ldb_module_get_private(module), struct rootdse_private_data);
+	struct rootdse_private_data *priv =
+		rootdse_get_private_data(module);
 	struct ldb_dn **list;
+
+	if (priv == NULL) {
+		return ldb_module_oom(module);
+	}
 
 	list = talloc_realloc(priv, priv->partitions, struct ldb_dn *, priv->num_partitions + 1);
 	if (!list) {
@@ -915,29 +987,20 @@ static int rootdse_request(struct ldb_module *module, struct ldb_request *req)
 static int rootdse_init(struct ldb_module *module)
 {
 	int ret;
-	struct ldb_context *ldb;
 	struct ldb_result *res;
-	struct rootdse_private_data *data;
 	const char *attrs[] = { "msDS-Behavior-Version", NULL };
 	const char *ds_attrs[] = { "dsServiceName", NULL };
 	TALLOC_CTX *mem_ctx;
 
-	ldb = ldb_module_get_ctx(module);
+	struct ldb_context *ldb
+		= ldb_module_get_ctx(module);
 
-	data = talloc_zero(module, struct rootdse_private_data);
+	struct rootdse_private_data *data
+		= rootdse_get_private_data(module);
+
 	if (data == NULL) {
-		return ldb_oom(ldb);
+		return ldb_module_oom(module);
 	}
-
-	data->num_controls = 0;
-	data->controls = NULL;
-	data->num_partitions = 0;
-	data->partitions = NULL;
-	data->block_anonymous = true;
-
-	ldb_module_set_private(module, data);
-
-	ldb_set_default_dns(ldb);
 
 	ret = ldb_next_init(module);
 
@@ -1228,7 +1291,9 @@ static int rootdse_enableoptionalfeature(struct ldb_module *module, struct ldb_r
 	struct ldb_dn *op_feature_scope_dn;
 	struct ldb_message *op_feature_msg;
 	struct auth_session_info *session_info =
-				(struct auth_session_info *)ldb_get_opaque(ldb, "sessionInfo");
+		(struct auth_session_info *)ldb_get_opaque(
+			ldb,
+			DSDB_SESSION_INFO);
 	TALLOC_CTX *tmp_ctx = talloc_new(ldb);
 	int ret;
 	const char *guid_string;
@@ -1297,12 +1362,28 @@ static int rootdse_schemaupdatenow(struct ldb_module *module, struct ldb_request
 		return ldb_next_request(module, req);
 	}
 
-	ret = ldb_extended(ldb, DSDB_EXTENDED_SCHEMA_UPDATE_NOW_OID, schema_dn, &ext_res);
+	/*
+	 * schemaUpdateNow has been requested. Allow this to refresh the schema
+	 * even if we're currently in the middle of a transaction
+	 */
+	ret = ldb_set_opaque(ldb, "dsdb_schema_refresh_expected", (void *)1);
 	if (ret != LDB_SUCCESS) {
 		return ldb_operr(ldb);
 	}
 
+	ret = ldb_extended(ldb, DSDB_EXTENDED_SCHEMA_UPDATE_NOW_OID, schema_dn, &ext_res);
+	if (ret != LDB_SUCCESS) {
+		ldb_set_opaque(ldb, "dsdb_schema_refresh_expected", (void *)0);
+		return ldb_operr(ldb);
+	}
+
 	talloc_free(ext_res);
+
+	ret = ldb_set_opaque(ldb, "dsdb_schema_refresh_expected", (void *)0);
+	if (ret != LDB_SUCCESS) {
+		return ldb_operr(ldb);
+	}
+
 	return ldb_module_done(req, NULL, NULL, ret);
 }
 
@@ -1488,7 +1569,9 @@ static int rootdse_become_master(struct ldb_module *module,
 	struct fsmo_transfer_state *fsmo;
 	struct tevent_req *treq;
 
-	session_info = (struct auth_session_info *)ldb_get_opaque(ldb_module_get_ctx(module), "sessionInfo");
+	session_info = (struct auth_session_info *)ldb_get_opaque(
+		ldb_module_get_ctx(module),
+		DSDB_SESSION_INFO);
 	level = security_session_user_level(session_info, NULL);
 	if (level < SECURITY_ADMINISTRATOR) {
 		return ldb_error(ldb, LDB_ERR_INSUFFICIENT_ACCESS_RIGHTS, "Denied rootDSE modify for non-administrator");
@@ -1506,10 +1589,16 @@ static int rootdse_become_master(struct ldb_module *module,
 
 	/*
 	 * We always delete the transaction, not commit it, because
-	 * this gives the least supprise to this supprising action (as
+	 * this gives the least surprise to this surprising action (as
 	 * we will never record anything done to this point
 	 */
 	rootdse_del_trans(module);
+
+	/*
+	 * We must use the global event loop to run this IRPC in
+	 * single process mode
+	 */
+	ldb_handle_use_global_event_context(req->handle);
 
 	msg = imessaging_client_init(tmp_ctx, lp_ctx,
 				    ldb_get_event_context(ldb));

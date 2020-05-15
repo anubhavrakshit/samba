@@ -1,4 +1,3 @@
-#!/usr/bin/python
 #
 #   Python integration for tevent
 #
@@ -26,4 +25,4 @@ from _tevent import (
     backend_list,
     Context,
     Signal,
-    )
+)

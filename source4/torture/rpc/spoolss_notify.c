@@ -26,6 +26,7 @@
 #include "librpc/gen_ndr/ndr_spoolss.h"
 #include "torture/rpc/torture_rpc.h"
 #include "rpc_server/dcerpc_server.h"
+#include "rpc_server/dcerpc_server_proto.h"
 #include "rpc_server/service_rpc.h"
 #include "smbd/process_model.h"
 #include "smb_server/smb_server.h"
@@ -33,9 +34,14 @@
 #include "ntvfs/ntvfs.h"
 #include "param/param.h"
 
-static NTSTATUS spoolss__op_bind(struct dcesrv_call_state *dce_call,
-				 const struct dcesrv_interface *iface,
-				 uint32_t if_version)
+struct dcesrv_context_callbacks srv_cb = {
+	.log.successful_authz = log_successful_dcesrv_authz_event,
+	.auth.gensec_prepare = dcesrv_gensec_prepare,
+	.assoc_group.find = dcesrv_assoc_group_find,
+};
+
+static NTSTATUS spoolss__op_bind(struct dcesrv_connection_context *context,
+				 const struct dcesrv_interface *iface)
 {
 	return NT_STATUS_OK;
 }
@@ -62,9 +68,6 @@ static NTSTATUS spoolss__op_ndr_pull(struct dcesrv_call_state *dce_call, TALLOC_
         /* unravel the NDR for the packet */
 	ndr_err = ndr_table_spoolss.calls[opnum].ndr_pull(pull, NDR_IN, *r);
 	if (!NDR_ERR_CODE_IS_SUCCESS(ndr_err)) {
-		dcerpc_log_packet(dce_call->conn->packet_log_dir,
-						  &ndr_table_spoolss, opnum, NDR_IN,
-				  &dce_call->pkt.u.request.stub_and_verifier);
 		dce_call->fault_code = DCERPC_FAULT_NDR;
 		return NT_STATUS_NET_WRITE_FAULT;
 	}
@@ -72,13 +75,27 @@ static NTSTATUS spoolss__op_ndr_pull(struct dcesrv_call_state *dce_call, TALLOC_
 	return NT_STATUS_OK;
 }
 
-/* Note that received_packets are allocated in talloc_autofree_context(),
+/* Note that received_packets are allocated on the NULL context
  * because no other context appears to stay around long enough. */
 static struct received_packet {
 	uint16_t opnum;
 	void *r;
 	struct received_packet *prev, *next;
 } *received_packets = NULL;
+
+static void free_received_packets(void)
+{
+	struct received_packet *rp;
+	struct received_packet *rp_next;
+
+	for (rp = received_packets; rp; rp = rp_next) {
+		rp_next = rp->next;
+		DLIST_REMOVE(received_packets, rp);
+		talloc_unlink(rp, rp->r);
+		talloc_free(rp);
+	}
+	received_packets = NULL;
+}
 
 static WERROR _spoolss_ReplyOpenPrinter(struct dcesrv_call_state *dce_call,
 					TALLOC_CTX *mem_ctx,
@@ -136,11 +153,11 @@ static NTSTATUS spoolss__op_dispatch(struct dcesrv_call_state *dce_call, TALLOC_
 	uint16_t opnum = dce_call->pkt.u.request.opnum;
 	struct received_packet *rp;
 
-	rp = talloc_zero(talloc_autofree_context(), struct received_packet);
+	rp = talloc_zero(NULL, struct received_packet);
 	rp->opnum = opnum;
 	rp->r = talloc_reference(rp, r);
 
-	DLIST_ADD_END(received_packets, rp, struct received_packet *);
+	DLIST_ADD_END(received_packets, rp);
 
 	switch (opnum) {
 	case 58: {
@@ -165,9 +182,6 @@ static NTSTATUS spoolss__op_dispatch(struct dcesrv_call_state *dce_call, TALLOC_
 	}
 
 	if (dce_call->fault_code != 0) {
-		dcerpc_log_packet(dce_call->conn->packet_log_dir,
-						  &ndr_table_spoolss, opnum, NDR_IN,
-				  &dce_call->pkt.u.request.stub_and_verifier);
 		return NT_STATUS_NET_WRITE_FAULT;
 	}
 	return NT_STATUS_OK;
@@ -234,13 +248,23 @@ static NTSTATUS spoolss__op_init_server(struct dcesrv_context *dce_ctx, const st
 		NTSTATUS ret;
 		const char *name = ndr_table_spoolss.endpoints->names[i];
 
-		ret = dcesrv_interface_register(dce_ctx, name, &notify_test_spoolss_interface, NULL);
+		ret = dcesrv_interface_register(dce_ctx,
+						name,
+						NULL,
+						&notify_test_spoolss_interface,
+						NULL);
 		if (!NT_STATUS_IS_OK(ret)) {
 			DEBUG(1,("spoolss_op_init_server: failed to register endpoint '%s'\n",name));
 			return ret;
 		}
 	}
 
+	return NT_STATUS_OK;
+}
+
+static NTSTATUS spoolss__op_shutdown_server(struct dcesrv_context *dce_ctx,
+				const struct dcesrv_endpoint_server *ep_server)
+{
 	return NT_STATUS_OK;
 }
 
@@ -391,12 +415,12 @@ static bool test_SetPrinter(struct torture_context *tctx,
 	info2.drivername	= info.info2.drivername;
 	info2.comment		= talloc_asprintf(tctx, "torture_comment %d\n", (int)time(NULL));
 	info2.location		= info.info2.location;
-	info2.devmode_ptr	= NULL;
+	info2.devmode_ptr	= 0;
 	info2.sepfile		= info.info2.sepfile;
 	info2.printprocessor	= info.info2.printprocessor;
 	info2.datatype		= info.info2.datatype;
 	info2.parameters	= info.info2.parameters;
-	info2.secdesc_ptr	= NULL;
+	info2.secdesc_ptr	= 0;
 	info2.attributes	= info.info2.attributes;
 	info2.priority		= info.info2.priority;
 	info2.defaultpriority	= info.info2.defaultpriority;
@@ -440,8 +464,11 @@ static bool test_start_dcerpc_server(struct torture_context *tctx,
 	/* fill in our name */
 	ep_server.name = "spoolss";
 
+	ep_server.initialized = false;
+
 	/* fill in all the operations */
 	ep_server.init_server = spoolss__op_init_server;
+	ep_server.shutdown_server = spoolss__op_shutdown_server;
 
 	ep_server.interface_by_uuid = spoolss__op_interface_by_uuid;
 	ep_server.interface_by_name = spoolss__op_interface_by_name;
@@ -460,16 +487,24 @@ static bool test_start_dcerpc_server(struct torture_context *tctx,
 	torture_assert_ntstatus_ok(tctx, status,
 				   "unable to initialize process models");
 
-	status = smbsrv_add_socket(tctx, event_ctx, tctx->lp_ctx, process_model_startup("single"), address);
+	status = smbsrv_add_socket(tctx, event_ctx, tctx->lp_ctx,
+				   process_model_startup("single"),
+				   address, NULL);
 	torture_assert_ntstatus_ok(tctx, status, "starting smb server");
 
-	status = dcesrv_init_context(tctx, tctx->lp_ctx, endpoints, &dce_ctx);
+	status = dcesrv_init_context(tctx, tctx->lp_ctx, &srv_cb, &dce_ctx);
 	torture_assert_ntstatus_ok(tctx, status,
 				   "unable to initialize DCE/RPC server");
 
+	status = dcesrv_init_ep_servers(dce_ctx, endpoints);
+	torture_assert_ntstatus_ok(tctx,
+				   status,
+				   "unable to initialize DCE/RPC ep servers");
+
 	for (e=dce_ctx->endpoint_list;e;e=e->next) {
 		status = dcesrv_add_ep(dce_ctx, tctx->lp_ctx,
-				       e, tctx->ev, process_model_startup("single"));
+				       e, tctx->ev,
+				       process_model_startup("single"), NULL);
 		torture_assert_ntstatus_ok(tctx, status,
 				"unable listen on dcerpc endpoint server");
 	}
@@ -483,7 +518,8 @@ static bool test_start_dcerpc_server(struct torture_context *tctx,
 static struct received_packet *last_packet(struct received_packet *p)
 {
 	struct received_packet *tmp;
-	for (tmp = p; tmp->next; tmp = tmp->next) ;;
+	for (tmp = p; tmp->next; tmp = tmp->next) {
+	}
 	return tmp;
 }
 
@@ -502,7 +538,7 @@ static bool test_RFFPCNEx(struct torture_context *tctx,
 	const char *printername = NULL;
 	struct spoolss_NotifyInfo *info = NULL;
 
-	received_packets = NULL;
+	free_received_packets();
 
 	/* Start DCE/RPC server */
 	torture_assert(tctx, test_start_dcerpc_server(tctx, tctx->ev, &dce_ctx, &address), "");
@@ -541,6 +577,7 @@ static bool test_RFFPCNEx(struct torture_context *tctx,
 #endif
 	/* Shut down DCE/RPC server */
 	talloc_free(dce_ctx);
+	free_received_packets();
 
 	return true;
 }

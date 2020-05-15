@@ -32,7 +32,11 @@ void task_server_terminate(struct task_server *task, const char *reason, bool fa
 {
 	struct tevent_context *event_ctx = task->event_ctx;
 	const struct model_ops *model_ops = task->model_ops;
-	DEBUG(0,("task_server_terminate: [%s]\n", reason));
+	if (fatal) {
+		DBG_ERR("task_server_terminate: [%s]\n", reason);
+	} else {
+		DBG_NOTICE("task_server_terminate: [%s]\n", reason);
+	}
 
 	if (fatal && task->msg_ctx != NULL) {
 		struct dcerpc_binding_handle *irpc_handle;
@@ -50,15 +54,15 @@ void task_server_terminate(struct task_server *task, const char *reason, bool fa
 
 	imessaging_cleanup(task->msg_ctx);
 
-	model_ops->terminate(event_ctx, task->lp_ctx, reason);
-	
+	model_ops->terminate_task(
+	    event_ctx, task->lp_ctx, reason, fatal, task->process_context);
 	/* don't free this above, it might contain the 'reason' being printed */
 	talloc_free(task);
 }
 
 /* used for the callback from the process model code */
 struct task_state {
-	void (*task_init)(struct task_server *);
+	const struct service_details *service_details;
 	const struct model_ops *model_ops;
 };
 
@@ -67,51 +71,62 @@ struct task_state {
   called by the process model code when the new task starts up. This then calls
   the server specific startup code
 */
-static void task_server_callback(struct tevent_context *event_ctx, 
+static struct task_server *task_server_callback(struct tevent_context *event_ctx,
 				 struct loadparm_context *lp_ctx,
-				 struct server_id server_id, void *private_data)
+				 struct server_id server_id,
+				 void *private_data,
+				 void *context)
 {
-	struct task_state *state = talloc_get_type(private_data, struct task_state);
 	struct task_server *task;
+	NTSTATUS status = NT_STATUS_OK;
 
+	struct task_state *state = talloc_get_type(private_data, struct task_state);
 	task = talloc(event_ctx, struct task_server);
-	if (task == NULL) return;
+	if (task == NULL) return NULL;
 
 	task->event_ctx = event_ctx;
 	task->model_ops = state->model_ops;
 	task->server_id = server_id;
 	task->lp_ctx = lp_ctx;
+	task->process_context = context;
 
 	task->msg_ctx = imessaging_init(task,
 					task->lp_ctx,
 					task->server_id,
-					task->event_ctx, false);
+					task->event_ctx);
 	if (!task->msg_ctx) {
 		task_server_terminate(task, "imessaging_init() failed", true);
-		return;
+		return NULL;
 	}
 
-	state->task_init(task);
+	status = state->service_details->task_init(task);
+	if (!NT_STATUS_IS_OK(status)) {
+		return NULL;
+	}
+	return task;
 }
 
 /*
   startup a task based server
 */
-NTSTATUS task_server_startup(struct tevent_context *event_ctx, 
+NTSTATUS task_server_startup(struct tevent_context *event_ctx,
 			     struct loadparm_context *lp_ctx,
-			     const char *service_name, 
-			     const struct model_ops *model_ops, 
-			     void (*task_init)(struct task_server *))
+			     const char *service_name,
+			     const struct model_ops *model_ops,
+			     const struct service_details *service_details,
+			     int from_parent_fd)
 {
 	struct task_state *state;
 
 	state = talloc(event_ctx, struct task_state);
 	NT_STATUS_HAVE_NO_MEMORY(state);
 
-	state->task_init = task_init;
+	state->service_details = service_details;
 	state->model_ops = model_ops;
-	
-	model_ops->new_task(event_ctx, lp_ctx, service_name, task_server_callback, state);
+
+	state->model_ops->new_task(event_ctx, lp_ctx, service_name,
+			           task_server_callback, state, service_details,
+				   from_parent_fd);
 
 	return NT_STATUS_OK;
 }

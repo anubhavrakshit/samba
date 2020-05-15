@@ -146,6 +146,23 @@ WERROR winreg_get_printer_secdesc(TALLOC_CTX *mem_ctx,
 				  struct spoolss_security_descriptor **psecdesc);
 
 /**
+ * @brief Get the security descriptor for a printserver.
+ *
+ * @param[in]  mem_ctx  The talloc memory context to use.
+ *
+ * @param[in]  b The dcerpc binding handle
+ *
+ * @param[out] psecdesc   A pointer to store the security descriptor.
+ *
+ * @return              On success WERR_OK, a corresponding DOS error is
+ *                      something went wrong.
+ */
+
+WERROR winreg_get_printserver_secdesc(TALLOC_CTX *mem_ctx,
+				      struct dcerpc_binding_handle *winreg_handle,
+				      struct spoolss_security_descriptor **psecdesc);
+
+/**
  * @brief Set the security descriptor for a printer.
  *
  * @param[in]  mem_ctx  The talloc memory context to use.
@@ -163,6 +180,23 @@ WERROR winreg_set_printer_secdesc(TALLOC_CTX *mem_ctx,
 				  struct dcerpc_binding_handle *b,
 				  const char *sharename,
 				  const struct spoolss_security_descriptor *secdesc);
+
+/**
+ * @brief Set the security descriptor for a printserver.
+ *
+ * @param[in]  mem_ctx  The talloc memory context to use.
+ *
+ * @param[in]  b The dcerpc binding handle
+ *
+ * @param[in]  secdesc  The security descriptor to save.
+ *
+ * @return              On success WERR_OK, a corresponding DOS error is
+ *                      something went wrong.
+ */
+WERROR winreg_set_printserver_secdesc(TALLOC_CTX *mem_ctx,
+				      struct dcerpc_binding_handle *b,
+				      const struct spoolss_security_descriptor *secdesc);
+
 
 /**
  * @internal
@@ -421,7 +455,7 @@ WERROR winreg_printer_enumforms1(TALLOC_CTX *mem_ctx,
  * @param[in]  form_name The name of the form to delete.
  *
  * @return              WERR_OK on success.
- *                      WERR_INVALID_PARAM if the form is a builtin form.
+ *                      WERR_INVALID_PARAMETER if the form is a builtin form.
  *                      WERR_INVALID_FORM_NAME if the form or key doesn't exist.
  *                      A corresponding DOS error is something went wrong.
  */
@@ -444,7 +478,7 @@ WERROR winreg_printer_deleteform1(TALLOC_CTX *mem_ctx,
  * @param[in]  form     The FormInfo structure to save.
  *
  * @return              WERR_OK on success.
- *                      WERR_INVALID_PARAM if the form is a builtin form.
+ *                      WERR_INVALID_PARAMETER if the form is a builtin form.
  *                      A corresponding DOS error is something went wrong.
  */
 WERROR winreg_printer_setform1(TALLOC_CTX *mem_ctx,
@@ -565,5 +599,119 @@ WERROR winreg_get_driver_list(TALLOC_CTX *mem_ctx,
 			      uint32_t version,
 			      uint32_t *num_drivers,
 			      const char ***drivers);
+/**
+ * @brief This function gets a core printer driver
+ *
+ * @param[in]  mem_ctx	       A talloc memory context.
+ *
+ * @param[in]  b The dcerpc binding handle
+ *
+ * @param[in]  architecture    The architecture type.
+ *
+ * @param[in]  core_driver_guid The core driver guid.
+ *
+ * @param[out] core_printer_driver The returned core printer driver definiton
+ *
+ * @return              On success WERR_OK, a corresponding DOS error is
+ *                      something went wrong.
+ */
+
+WERROR winreg_get_core_driver(TALLOC_CTX *mem_ctx,
+			      struct dcerpc_binding_handle *winreg_handle,
+			      const char *architecture,
+			      const struct GUID *core_driver_guid,
+			      struct spoolss_CorePrinterDriver **_core_printer_driver);
+
+/**
+ * @brief This function adds a core printer driver
+ *
+ * @param[in]  mem_ctx	       A talloc memory context.
+ *
+ * @param[in]  b The dcerpc binding handle
+ *
+ * @param[in]  architecture    The architecture type.
+ *
+ * @param[in]  core_driver_driver The core driver.
+ *
+ * @return              On success WERR_OK, a corresponding DOS error is
+ *                      something went wrong.
+ */
+
+WERROR winreg_add_core_driver(TALLOC_CTX *mem_ctx,
+			      struct dcerpc_binding_handle *winreg_handle,
+			      const char *architecture,
+			      const struct spoolss_CorePrinterDriver *r);
+
+/**
+ * @brief This function adds a driver package
+ *
+ * @param[in]  mem_ctx	       A talloc memory context.
+ *
+ * @param[in]  b The dcerpc binding handle
+ *
+ * @param[in]  package_id    The package ID.
+ *
+ * @param[in]  architecture    The architecture type.
+ *
+ * @param[in]  driver_store_path The local DriverStorePath
+ *
+ * @param[in]  cab_path The local CabFile path
+ *
+ * @return              On success WERR_OK, a corresponding DOS error is
+ *                      something went wrong.
+ */
+
+WERROR winreg_add_driver_package(TALLOC_CTX *mem_ctx,
+				 struct dcerpc_binding_handle *winreg_handle,
+				 const char *package_id,
+				 const char *architecture,
+				 const char *driver_store_path,
+				 const char *cab_path);
+
+/**
+ * @brief This function gets a driver package
+ *
+ * @param[in]  mem_ctx	       A talloc memory context.
+ *
+ * @param[in]  b The dcerpc binding handle
+ *
+ * @param[in]  package_id    The package ID.
+ *
+ * @param[in]  architecture    The architecture type.
+ *
+ * @param[in]  driver_store_path The pointer to a local DriverStorePath
+ *
+ * @param[in]  cab_path The pointer to a local CabFile path
+ *
+ * @return              On success WERR_OK, a corresponding DOS error is
+ *                      something went wrong.
+ */
+
+WERROR winreg_get_driver_package(TALLOC_CTX *mem_ctx,
+				 struct dcerpc_binding_handle *winreg_handle,
+				 const char *package_id,
+				 const char *architecture,
+				 const char **driver_store_path,
+				 const char **cab_path);
+
+/**
+ * @brief This function deletes a driver package
+ *
+ * @param[in]  mem_ctx	       A talloc memory context.
+ *
+ * @param[in]  b The dcerpc binding handle
+ *
+ * @param[in]  package_id    The package ID.
+ *
+ * @param[in]  architecture    The architecture type.
+ *
+ * @return              On success WERR_OK, a corresponding DOS error is
+ *                      something went wrong.
+ */
+
+WERROR winreg_del_driver_package(TALLOC_CTX *mem_ctx,
+				 struct dcerpc_binding_handle *winreg_handle,
+				 const char *package_id,
+				 const char *architecture);
 
 #endif /* _RPC_CLIENT_CLI_WINREG_SPOOLSS_H_ */

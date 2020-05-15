@@ -44,18 +44,7 @@ from samba.kcc.graph import Vertex
 
 from samba.kcc.debug import DEBUG, DEBUG_FN, logger
 from samba.kcc import debug
-
-
-def sort_replica_by_dsa_guid(rep1, rep2):
-    """Helper to sort NCReplicas by their DSA guids
-
-    The guids need to be sorted in their NDR form.
-
-    :param rep1: An NC replica
-    :param rep2: Another replica
-    :return: -1, 0, or 1, indicating sort order.
-    """
-    return cmp(ndr_pack(rep1.rep_dsa_guid), ndr_pack(rep2.rep_dsa_guid))
+from samba.compat import cmp_fn
 
 
 def sort_dsa_by_gc_and_guid(dsa1, dsa2):
@@ -72,7 +61,7 @@ def sort_dsa_by_gc_and_guid(dsa1, dsa2):
         return -1
     if not dsa1.is_gc() and dsa2.is_gc():
         return +1
-    return cmp(ndr_pack(dsa1.dsa_guid), ndr_pack(dsa2.dsa_guid))
+    return cmp_fn(ndr_pack(dsa1.dsa_guid), ndr_pack(dsa2.dsa_guid))
 
 
 def is_smtp_replication_available():
@@ -94,10 +83,10 @@ class KCC(object):
     Service can then utilize to replicate naming contexts
 
     :param unix_now: The putative current time in seconds since 1970.
-    :param read_only: Don't write to the database.
+    :param readonly: Don't write to the database.
     :param verify: Check topological invariants for the generated graphs
     :param debug: Write verbosely to stderr.
-    "param dot_file_dir: write diagnostic Graphviz files in this directory
+    :param dot_file_dir: write diagnostic Graphviz files in this directory
     """
     def __init__(self, unix_now, readonly=False, verify=False, debug=False,
                  dot_file_dir=None):
@@ -152,7 +141,8 @@ class KCC(object):
                                     self.samdb.get_config_basedn(),
                                     scope=ldb.SCOPE_SUBTREE,
                                     expression="(objectClass=interSiteTransport)")
-        except ldb.LdbError, (enum, estr):
+        except ldb.LdbError as e2:
+            (enum, estr) = e2.args
             raise KCCError("Unable to find inter-site transports - (%s)" %
                            estr)
 
@@ -165,11 +155,12 @@ class KCC(object):
             if transport.name == 'IP':
                 self.ip_transport = transport
             elif transport.name == 'SMTP':
-                logger.info("Samba KCC is ignoring the obsolete SMTP transport.")
+                logger.debug("Samba KCC is ignoring the obsolete "
+                             "SMTP transport.")
 
             else:
-                logger.warning("Samba KCC does not support the transport called %r."
-                               % (transport.name,))
+                logger.warning("Samba KCC does not support the transport "
+                               "called %r." % (transport.name,))
 
         if self.ip_transport is None:
             raise KCCError("there doesn't seem to be an IP transport")
@@ -185,7 +176,8 @@ class KCC(object):
                                     self.samdb.get_config_basedn(),
                                     scope=ldb.SCOPE_SUBTREE,
                                     expression="(objectClass=siteLink)")
-        except ldb.LdbError, (enum, estr):
+        except ldb.LdbError as e3:
+            (enum, estr) = e3.args
             raise KCCError("Unable to find inter-site siteLinks - (%s)" % estr)
 
         for msg in res:
@@ -248,7 +240,8 @@ class KCC(object):
                                     self.samdb.get_config_basedn(),
                                     scope=ldb.SCOPE_SUBTREE,
                                     expression="(objectClass=site)")
-        except ldb.LdbError, (enum, estr):
+        except ldb.LdbError as e4:
+            (enum, estr) = e4.args
             raise KCCError("Unable to find sites - (%s)" % estr)
 
         for msg in res:
@@ -261,14 +254,16 @@ class KCC(object):
         :return: None
         :raise: KCCError if DSA can't be found
         """
-        dn = ldb.Dn(self.samdb, "<GUID=%s>" % self.samdb.get_ntds_GUID())
+        dn_query = "<GUID=%s>" % self.samdb.get_ntds_GUID()
+        dn = ldb.Dn(self.samdb, dn_query)
         try:
             res = self.samdb.search(base=dn, scope=ldb.SCOPE_BASE,
                                     attrs=["objectGUID"])
-        except ldb.LdbError, (enum, estr):
-            logger.warning("Search for %s failed: %s.  This typically happens"
-                           " in --importldif mode due to lack of module"
-                           " support.", dn, estr)
+        except ldb.LdbError as e5:
+            (enum, estr) = e5.args
+            DEBUG_FN("Search for dn '%s' [from %s] failed: %s. "
+                     "This typically happens in --importldif mode due "
+                     "to lack of module support." % (dn, dn_query, estr))
             try:
                 # We work around the failure above by looking at the
                 # dsServiceName that was put in the fake rootdse by
@@ -280,11 +275,12 @@ class KCC(object):
                                                      scope=ldb.SCOPE_BASE,
                                                      attrs=["dsServiceName"])
                 dn = ldb.Dn(self.samdb,
-                            service_name_res[0]["dsServiceName"][0])
+                            service_name_res[0]["dsServiceName"][0].decode('utf8'))
 
                 res = self.samdb.search(base=dn, scope=ldb.SCOPE_BASE,
                                         attrs=["objectGUID"])
-            except ldb.LdbError, (enum, estr):
+            except ldb.LdbError as e:
+                (enum, estr) = e.args
                 raise KCCError("Unable to find my nTDSDSA - (%s)" % estr)
 
         if len(res) != 1:
@@ -305,7 +301,7 @@ class KCC(object):
                                     " it must be RODC.\n"
                                     "Let's add it, because my_dsa is special!"
                                     "\n(likewise for self.dsa_by_guid)" %
-                                    self.my_dsas_dnstr)
+                                    self.my_dsa_dnstr)
 
             self.dsa_by_dnstr[self.my_dsa_dnstr] = self.my_dsa
             self.dsa_by_guid[str(self.my_dsa.dsa_guid)] = self.my_dsa
@@ -324,7 +320,8 @@ class KCC(object):
                                     self.samdb.get_config_basedn(),
                                     scope=ldb.SCOPE_SUBTREE,
                                     expression="(objectClass=crossRef)")
-        except ldb.LdbError, (enum, estr):
+        except ldb.LdbError as e6:
+            (enum, estr) = e6.args
             raise KCCError("Unable to find partitions - (%s)" % estr)
 
         for msg in res:
@@ -432,6 +429,165 @@ class KCC(object):
         # that became active during this run.
         pass
 
+    def _ensure_connections_are_loaded(self, connections):
+        """Load or fake-load NTDSConnections lacking GUIDs
+
+        New connections don't have GUIDs and created times which are
+        needed for sorting. If we're in read-only mode, we make fake
+        GUIDs, otherwise we ask SamDB to do it for us.
+
+        :param connections: an iterable of NTDSConnection objects.
+        :return: None
+        """
+        for cn_conn in connections:
+            if cn_conn.guid is None:
+                if self.readonly:
+                    cn_conn.guid = misc.GUID(str(uuid.uuid4()))
+                    cn_conn.whenCreated = self.nt_now
+                else:
+                    cn_conn.load_connection(self.samdb)
+
+    def _mark_broken_ntdsconn(self):
+        """Find NTDS Connections that lack a remote
+
+        I'm not sure how they appear. Let's be rid of them by marking
+        them with the to_be_deleted attribute.
+
+        :return: None
+        """
+        for cn_conn in self.my_dsa.connect_table.values():
+            s_dnstr = cn_conn.get_from_dnstr()
+            if s_dnstr is None:
+                DEBUG_FN("%s has phantom connection %s" % (self.my_dsa,
+                                                           cn_conn))
+                cn_conn.to_be_deleted = True
+
+    def _mark_unneeded_local_ntdsconn(self):
+        """Find unneeded intrasite NTDS Connections for removal
+
+        Based on MS-ADTS 6.2.2.4 Removing Unnecessary Connections.
+        Every DC removes its own unnecessary intrasite connections.
+        This function tags them with the to_be_deleted attribute.
+
+        :return: None
+        """
+        # XXX should an RODC be regarded as same site? It isn't part
+        # of the intrasite ring.
+
+        if self.my_site.is_cleanup_ntdsconn_disabled():
+            DEBUG_FN("not doing ntdsconn cleanup for site %s, "
+                     "because it is disabled" % self.my_site)
+            return
+
+        mydsa = self.my_dsa
+
+        try:
+            self._ensure_connections_are_loaded(mydsa.connect_table.values())
+        except KCCError:
+            # RODC never actually added any connections to begin with
+            if mydsa.is_ro():
+                return
+
+        local_connections = []
+
+        for cn_conn in mydsa.connect_table.values():
+            s_dnstr = cn_conn.get_from_dnstr()
+            if s_dnstr in self.my_site.dsa_table:
+                removable = not (cn_conn.is_generated() or
+                                 cn_conn.is_rodc_topology())
+                packed_guid = ndr_pack(cn_conn.guid)
+                local_connections.append((cn_conn, s_dnstr,
+                                          packed_guid, removable))
+
+        # Avoid "ValueError: r cannot be bigger than the iterable" in
+        # for a, b in itertools.permutations(local_connections, 2):
+        if (len(local_connections) < 2):
+            return
+
+        for a, b in itertools.permutations(local_connections, 2):
+            cn_conn, s_dnstr, packed_guid, removable = a
+            cn_conn2, s_dnstr2, packed_guid2, removable2 = b
+            if (removable and
+                s_dnstr == s_dnstr2 and
+                cn_conn.whenCreated < cn_conn2.whenCreated or
+                (cn_conn.whenCreated == cn_conn2.whenCreated and
+                 packed_guid < packed_guid2)):
+                cn_conn.to_be_deleted = True
+
+    def _mark_unneeded_intersite_ntdsconn(self):
+        """find unneeded intersite NTDS Connections for removal
+
+        Based on MS-ADTS 6.2.2.4 Removing Unnecessary Connections. The
+        intersite topology generator removes links for all DCs in its
+        site. Here we just tag them with the to_be_deleted attribute.
+
+        :return: None
+        """
+        # TODO Figure out how best to handle the RODC case
+        # The RODC is ISTG, but shouldn't act on anyone's behalf.
+        if self.my_dsa.is_ro():
+            return
+
+        # Find the intersite connections
+        local_dsas = self.my_site.dsa_table
+        connections_and_dsas = []
+        for dsa in local_dsas.values():
+            for cn in dsa.connect_table.values():
+                if cn.to_be_deleted:
+                    continue
+                s_dnstr = cn.get_from_dnstr()
+                if s_dnstr is None:
+                    continue
+                if s_dnstr not in local_dsas:
+                    from_dsa = self.get_dsa(s_dnstr)
+                    # Samba ONLY: ISTG removes connections to dead DCs
+                    if from_dsa is None or '\\0ADEL' in s_dnstr:
+                        logger.info("DSA appears deleted, removing connection %s"
+                                    % s_dnstr)
+                        cn.to_be_deleted = True
+                        continue
+                    connections_and_dsas.append((cn, dsa, from_dsa))
+
+        self._ensure_connections_are_loaded(x[0] for x in connections_and_dsas)
+        for cn, to_dsa, from_dsa in connections_and_dsas:
+            if not cn.is_generated() or cn.is_rodc_topology():
+                continue
+
+            # If the connection is in the kept_connections list, we
+            # only remove it if an endpoint seems down.
+            if (cn in self.kept_connections and
+                not (self.is_bridgehead_failed(to_dsa, True) or
+                     self.is_bridgehead_failed(from_dsa, True))):
+                continue
+
+            # this one is broken and might be superseded by another.
+            # But which other? Let's just say another link to the same
+            # site can supersede.
+            from_dnstr = from_dsa.dsa_dnstr
+            for site in self.site_table.values():
+                if from_dnstr in site.rw_dsa_table:
+                    for cn2, to_dsa2, from_dsa2 in connections_and_dsas:
+                        if (cn is not cn2 and
+                            from_dsa2 in site.rw_dsa_table):
+                            cn.to_be_deleted = True
+
+    def _commit_changes(self, dsa):
+        if dsa.is_ro() or self.readonly:
+            for connect in dsa.connect_table.values():
+                if connect.to_be_deleted:
+                    logger.info("TO BE DELETED:\n%s" % connect)
+                if connect.to_be_added:
+                    logger.info("TO BE ADDED:\n%s" % connect)
+                if connect.to_be_modified:
+                    logger.info("TO BE MODIFIED:\n%s" % connect)
+
+            # Peform deletion from our tables but perform
+            # no database modification
+            dsa.commit_connections(self.samdb, ro=True)
+        else:
+            # Commit any modified connections
+            dsa.commit_connections(self.samdb)
+
     def remove_unneeded_ntdsconn(self, all_connected):
         """Remove unneeded NTDS Connections once topology is calculated
 
@@ -440,147 +596,15 @@ class KCC(object):
         :param all_connected: indicates whether all sites are connected
         :return: None
         """
-        mydsa = self.my_dsa
+        self._mark_broken_ntdsconn()
+        self._mark_unneeded_local_ntdsconn()
+        # if we are not the istg, we're done!
+        # if we are the istg, but all_connected is False, we also do nothing.
+        if self.my_dsa.is_istg() and all_connected:
+            self._mark_unneeded_intersite_ntdsconn()
 
-        # New connections won't have GUIDs which are needed for
-        # sorting. Add them.
-        for cn_conn in mydsa.connect_table.values():
-            if cn_conn.guid is None:
-                if self.readonly:
-                    cn_conn.guid = misc.GUID(str(uuid.uuid4()))
-                    cn_conn.whenCreated = self.nt_now
-                else:
-                    cn_conn.load_connection(self.samdb)
-
-        for cn_conn in mydsa.connect_table.values():
-
-            s_dnstr = cn_conn.get_from_dnstr()
-            if s_dnstr is None:
-                cn_conn.to_be_deleted = True
-                continue
-
-            #XXX should an RODC be regarded as same site
-            same_site = s_dnstr in self.my_site.dsa_table
-
-            # Given an nTDSConnection object cn, if the DC with the
-            # nTDSDSA object dc that is the parent object of cn and
-            # the DC with the nTDSDA object referenced by cn!fromServer
-            # are in the same site, the KCC on dc deletes cn if all of
-            # the following are true:
-            #
-            # Bit NTDSCONN_OPT_IS_GENERATED is clear in cn!options.
-            #
-            # No site settings object s exists for the local DC's site, or
-            # bit NTDSSETTINGS_OPT_IS_TOPL_CLEANUP_DISABLED is clear in
-            # s!options.
-            #
-            # Another nTDSConnection object cn2 exists such that cn and
-            # cn2 have the same parent object, cn!fromServer = cn2!fromServer,
-            # and either
-            #
-            #     cn!whenCreated < cn2!whenCreated
-            #
-            #     cn!whenCreated = cn2!whenCreated and
-            #     cn!objectGUID < cn2!objectGUID
-            #
-            # Bit NTDSCONN_OPT_RODC_TOPOLOGY is clear in cn!options
-            if same_site:
-                if not cn_conn.is_generated():
-                    continue
-
-                if self.my_site.is_cleanup_ntdsconn_disabled():
-                    continue
-
-                # Loop thru connections looking for a duplicate that
-                # fulfills the previous criteria
-                lesser = False
-                packed_guid = ndr_pack(cn_conn.guid)
-                for cn2_conn in mydsa.connect_table.values():
-                    if cn2_conn is cn_conn:
-                        continue
-
-                    s2_dnstr = cn2_conn.get_from_dnstr()
-
-                    # If the NTDS Connections has a different
-                    # fromServer field then no match
-                    if s2_dnstr != s_dnstr:
-                        continue
-
-                    lesser = (cn_conn.whenCreated < cn2_conn.whenCreated or
-                              (cn_conn.whenCreated == cn2_conn.whenCreated and
-                               packed_guid < ndr_pack(cn2_conn.guid)))
-
-                    if lesser:
-                        break
-
-                if lesser and not cn_conn.is_rodc_topology():
-                    cn_conn.to_be_deleted = True
-
-            # Given an nTDSConnection object cn, if the DC with the nTDSDSA
-            # object dc that is the parent object of cn and the DC with
-            # the nTDSDSA object referenced by cn!fromServer are in
-            # different sites, a KCC acting as an ISTG in dc's site
-            # deletes cn if all of the following are true:
-            #
-            #     Bit NTDSCONN_OPT_IS_GENERATED is clear in cn!options.
-            #
-            #     cn!fromServer references an nTDSDSA object for a DC
-            #     in a site other than the local DC's site.
-            #
-            #     The keepConnections sequence returned by
-            #     CreateIntersiteConnections() does not contain
-            #     cn!objectGUID, or cn is "superseded by" (see below)
-            #     another nTDSConnection cn2 and keepConnections
-            #     contains cn2!objectGUID.
-            #
-            #     The return value of CreateIntersiteConnections()
-            #     was true.
-            #
-            #     Bit NTDSCONN_OPT_RODC_TOPOLOGY is clear in
-            #     cn!options
-            #
-            else:  # different site
-
-                if not mydsa.is_istg():
-                    continue
-
-                if not cn_conn.is_generated():
-                    continue
-
-                # TODO
-                # We are directly using this connection in intersite or
-                # we are using a connection which can supersede this one.
-                #
-                # MS-ADTS 6.2.2.4 - Removing Unnecessary Connections does not
-                # appear to be correct.
-                #
-                # 1. cn!fromServer and cn!parent appear inconsistent with
-                #    no cn2
-                # 2. The repsFrom do not imply each other
-                #
-                if cn_conn in self.kept_connections:  # and not_superceded:
-                    continue
-
-                # This is the result of create_intersite_connections
-                if not all_connected:
-                    continue
-
-                if not cn_conn.is_rodc_topology():
-                    cn_conn.to_be_deleted = True
-
-        if mydsa.is_ro() or self.readonly:
-            for connect in mydsa.connect_table.values():
-                if connect.to_be_deleted:
-                    DEBUG_FN("TO BE DELETED:\n%s" % connect)
-                if connect.to_be_added:
-                    DEBUG_FN("TO BE ADDED:\n%s" % connect)
-
-            # Peform deletion from our tables but perform
-            # no database modification
-            mydsa.commit_connections(self.samdb, ro=True)
-        else:
-            # Commit any modified connections
-            mydsa.commit_connections(self.samdb)
+        for dsa in self.my_site.dsa_table.values():
+            self._commit_changes(dsa)
 
     def modify_repsFrom(self, n_rep, t_repsFrom, s_rep, s_dsa, cn_conn):
         """Update an repsFrom object if required.
@@ -613,6 +637,12 @@ class KCC(object):
         times = convert_schedule_to_repltimes(cn_conn.schedule)
         if times != t_repsFrom.schedule:
             t_repsFrom.schedule = times
+
+        # Bit DRS_ADD_REF is set in replicaFlags unconditionally
+        # Samba ONLY:
+        if ((t_repsFrom.replica_flags &
+             drsuapi.DRSUAPI_DRS_ADD_REF) == 0x0):
+            t_repsFrom.replica_flags |= drsuapi.DRSUAPI_DRS_ADD_REF
 
         # Bit DRS_PER_SYNC is set in replicaFlags if and only
         # if nTDSConnection schedule has a value v that specifies
@@ -797,14 +827,12 @@ class KCC(object):
         :param cn_conn: NTDS Connection
         :return: source DSA or None
         """
-        #XXX different conditions for "implies" than MS-ADTS 6.2.2
+        # XXX different conditions for "implies" than MS-ADTS 6.2.2
+        # preamble.
 
-        # NTDS Connection must satisfy all the following criteria
-        # to imply a repsFrom tuple is needed:
-        #
-        #    cn!enabledConnection = true.
-        #    cn!options does not contain NTDSCONN_OPT_RODC_TOPOLOGY.
-        #    cn!fromServer references an nTDSDSA object.
+        # It boils down to: we want an enabled, non-FRS connections to
+        # a valid remote DSA with a non-RO replica corresponding to
+        # n_rep.
 
         if not cn_conn.is_enabled() or cn_conn.is_rodc_topology():
             return None
@@ -816,39 +844,11 @@ class KCC(object):
         if s_dsa is None:
             return None
 
-        # To imply a repsFrom tuple is needed, each of these
-        # must be True:
-        #
-        #     An NC replica of the NC "is present" on the DC to
-        #     which the nTDSDSA object referenced by cn!fromServer
-        #     corresponds.
-        #
-        #     An NC replica of the NC "should be present" on
-        #     the local DC
         s_rep = s_dsa.get_current_replica(n_rep.nc_dnstr)
 
-        if s_rep is None or not s_rep.is_present():
-            return None
-
-        # To imply a repsFrom tuple is needed, each of these
-        # must be True:
-        #
-        #     The NC replica on the DC referenced by cn!fromServer is
-        #     a writable replica or the NC replica that "should be
-        #     present" on the local DC is a partial replica.
-        #
-        #     The NC is not a domain NC, the NC replica that
-        #     "should be present" on the local DC is a partial
-        #     replica, cn!transportType has no value, or
-        #     cn!transportType has an RDN of CN=IP.
-        #
-        implied = (not s_rep.is_ro() or n_rep.is_partial()) and \
-                  (not n_rep.is_domain() or
-                   n_rep.is_partial() or
-                   cn_conn.transport_dnstr is None or
-                   cn_conn.transport_dnstr.find("CN=IP") == 0)
-
-        if implied:
+        if (s_rep is not None and
+            s_rep.is_present() and
+            (not s_rep.is_ro() or n_rep.is_partial())):
             return s_dsa
         return None
 
@@ -864,10 +864,12 @@ class KCC(object):
         :param current_dsa: optional DSA on whose behalf we are acting.
         :return: None
         """
-        count = 0
-
+        ro = False
         if current_dsa is None:
             current_dsa = self.my_dsa
+
+        if current_dsa.is_ro():
+            ro = True
 
         if current_dsa.is_translate_ntdsconn_disabled():
             DEBUG_FN("skipping translate_ntdsconn() "
@@ -897,17 +899,34 @@ class KCC(object):
         # If we have the replica and its not needed
         # then we add it to the "to be deleted" list.
         for dnstr in current_rep_table:
-            if dnstr not in needed_rep_table:
-                delete_reps.add(dnstr)
+            # If we're on the RODC, hardcode the update flags
+            if ro:
+                c_rep = current_rep_table[dnstr]
+                c_rep.load_repsFrom(self.samdb)
+                for t_repsFrom in c_rep.rep_repsFrom:
+                    replica_flags = (drsuapi.DRSUAPI_DRS_INIT_SYNC |
+                                     drsuapi.DRSUAPI_DRS_PER_SYNC |
+                                     drsuapi.DRSUAPI_DRS_ADD_REF |
+                                     drsuapi.DRSUAPI_DRS_SPECIAL_SECRET_PROCESSING |
+                                     drsuapi.DRSUAPI_DRS_NONGC_RO_REP)
+                    if t_repsFrom.replica_flags != replica_flags:
+                        t_repsFrom.replica_flags = replica_flags
+                c_rep.commit_repsFrom(self.samdb, ro=self.readonly)
+            else:
+                if dnstr not in needed_rep_table:
+                    delete_reps.add(dnstr)
 
         DEBUG_FN('current %d needed %d delete %d' % (len(current_rep_table),
                  len(needed_rep_table), len(delete_reps)))
 
         if delete_reps:
+            # TODO Must delete repsFrom/repsTo for these replicas
             DEBUG('deleting these reps: %s' % delete_reps)
             for dnstr in delete_reps:
                 del current_rep_table[dnstr]
 
+        # HANDLE REPS-FROM
+        #
         # Now perform the scan of replicas we'll need
         # and compare any current repsFrom against the
         # connections
@@ -918,7 +937,7 @@ class KCC(object):
             n_rep.load_repsFrom(self.samdb)
             n_rep.load_fsmo_roles(self.samdb)
 
-            # Loop thru the existing repsFrom tupples (if any)
+            # Loop thru the existing repsFrom tuples (if any)
             # XXX This is a list and could contain duplicates
             #     (multiple load_repsFrom calls)
             for t_repsFrom in n_rep.rep_repsFrom:
@@ -977,7 +996,7 @@ class KCC(object):
                 if s_dsa is None:
                     continue
 
-                # Loop thru the existing repsFrom tupples (if any) and
+                # Loop thru the existing repsFrom tuples (if any) and
                 # if we already have a tuple for this connection then
                 # no need to proceed to add.  It will have been changed
                 # to have the correct attributes above
@@ -1004,7 +1023,7 @@ class KCC(object):
                 if t_repsFrom.is_modified():
                     n_rep.rep_repsFrom.append(t_repsFrom)
 
-            if self.readonly:
+            if self.readonly or ro:
                 # Display any to be deleted or modified repsFrom
                 text = n_rep.dumpstr_to_be_deleted()
                 if text:
@@ -1019,6 +1038,74 @@ class KCC(object):
             else:
                 # Commit any modified repsFrom to the NC replica
                 n_rep.commit_repsFrom(self.samdb)
+
+        # HANDLE REPS-TO:
+        #
+        # Now perform the scan of replicas we'll need
+        # and compare any current repsTo against the
+        # connections
+
+        # RODC should never push to anybody (should we check this?)
+        if ro:
+            return
+
+        for n_rep in needed_rep_table.values():
+
+            # load any repsTo and fsmo roles as we'll
+            # need them during connection translation
+            n_rep.load_repsTo(self.samdb)
+
+            # Loop thru the existing repsTo tuples (if any)
+            # XXX This is a list and could contain duplicates
+            #     (multiple load_repsTo calls)
+            for t_repsTo in n_rep.rep_repsTo:
+
+                # for each tuple t in n!repsTo, let s be the nTDSDSA
+                # object such that s!objectGUID = t.uuidDsa
+                guidstr = str(t_repsTo.source_dsa_obj_guid)
+                s_dsa = self.get_dsa_by_guidstr(guidstr)
+
+                # Source dsa is gone from config (strange)
+                # so cleanup stale repsTo for unlisted DSA
+                if s_dsa is None:
+                    logger.warning("repsTo source DSA guid (%s) not found" %
+                                   guidstr)
+                    t_repsTo.to_be_deleted = True
+                    continue
+
+                # Find the connection that this repsTo would use. If
+                # there isn't a good one (i.e. non-RODC_TOPOLOGY,
+                # meaning non-FRS), we delete the repsTo.
+                s_dnstr = s_dsa.dsa_dnstr
+                if '\\0ADEL' in s_dnstr:
+                    logger.warning("repsTo source DSA guid (%s) appears deleted" %
+                                   guidstr)
+                    t_repsTo.to_be_deleted = True
+                    continue
+
+                connections = s_dsa.get_connection_by_from_dnstr(self.my_dsa_dnstr)
+                if len(connections) > 0:
+                    # Then this repsTo is tentatively valid
+                    continue
+                else:
+                    # There is no plausible connection for this repsTo
+                    t_repsTo.to_be_deleted = True
+
+            if self.readonly:
+                # Display any to be deleted or modified repsTo
+                for rt in n_rep.rep_repsTo:
+                    if rt.to_be_deleted:
+                        logger.info("REMOVING REPS-TO: %s" % rt)
+
+                # Peform deletion from our tables but perform
+                # no database modification
+                n_rep.commit_repsTo(self.samdb, ro=True)
+            else:
+                # Commit any modified repsTo to the NC replica
+                n_rep.commit_repsTo(self.samdb)
+
+        # TODO Remove any duplicate repsTo values. This should never happen in
+        # any normal situations.
 
     def merge_failed_links(self, ping=None):
         """Merge of kCCFailedLinks and kCCFailedLinks from bridgeheads.
@@ -1106,14 +1193,14 @@ class KCC(object):
 
         bhs = self.get_all_bridgeheads(site, part, transport,
                                        partial_ok, detect_failed)
-        if len(bhs) == 0:
-            debug.DEBUG_MAGENTA("get_bridgehead:\n\tsitedn=%s\n\tbhdn=None" %
+        if not bhs:
+            debug.DEBUG_MAGENTA("get_bridgehead FAILED:\nsitedn = %s" %
                                 site.site_dnstr)
             return None
-        else:
-            debug.DEBUG_GREEN("get_bridgehead:\n\tsitedn=%s\n\tbhdn=%s" %
-                              (site.site_dnstr, bhs[0].dsa_dnstr))
-            return bhs[0]
+
+        debug.DEBUG_GREEN("get_bridgehead:\n\tsitedn = %s\n\tbhdn = %s" %
+                          (site.site_dnstr, bhs[0].dsa_dnstr))
+        return bhs[0]
 
     def get_all_bridgeheads(self, site, part, transport,
                             partial_ok, detect_failed):
@@ -1141,7 +1228,6 @@ class KCC(object):
                            "non-IP transport! %r"
                            % (transport.name,))
 
-        DEBUG_FN("get_all_bridgeheads")
         DEBUG_FN(site.rw_dsa_table)
         for dsa in site.rw_dsa_table.values():
 
@@ -1189,7 +1275,7 @@ class KCC(object):
                 DEBUG("bridgehead is failed")
                 continue
 
-            DEBUG_FN("get_all_bridgeheads: dsadn=%s" % dsa.dsa_dnstr)
+            DEBUG_FN("found a bridgehead: %s" % dsa.dsa_dnstr)
             bhs.append(dsa)
 
         # IF bit NTDSSETTINGS_OPT_IS_RAND_BH_SELECTION_DISABLED is set in
@@ -1413,7 +1499,7 @@ class KCC(object):
                             cn.set_modified(True)
 
                     # Display any modified connection
-                    if self.readonly:
+                    if self.readonly or ldsa.is_ro():
                         if cn.to_be_modified:
                             logger.info("TO BE MODIFIED:\n%s" % cn)
 
@@ -1490,15 +1576,18 @@ class KCC(object):
             # cn!options = opt, cn!transportType is a reference to t,
             # cn!fromServer is a reference to rbh, and cn!schedule = sch
             DEBUG_FN("new connection, KCC dsa: %s" % self.my_dsa.dsa_dnstr)
-            cn = lbh.new_connection(opt, 0, transport,
+            system_flags = (dsdb.SYSTEM_FLAG_CONFIG_ALLOW_RENAME |
+                            dsdb.SYSTEM_FLAG_CONFIG_ALLOW_MOVE)
+
+            cn = lbh.new_connection(opt, system_flags, transport,
                                     rbh.dsa_dnstr, link_sched)
 
             # Display any added connection
-            if self.readonly:
+            if self.readonly or lbh.is_ro():
                 if cn.to_be_added:
                     logger.info("TO BE ADDED:\n%s" % cn)
 
-                    lbh.commit_connections(self.samdb, ro=True)
+                lbh.commit_connections(self.samdb, ro=True)
             else:
                 lbh.commit_connections(self.samdb)
 
@@ -1525,7 +1614,7 @@ class KCC(object):
         # here, but using vertex seems to make more sense. That is,
         # the docs want this:
         #
-        #bh = self.get_bridgehead(vertex.site, vertex.part, transport,
+        # bh = self.get_bridgehead(local_vertex.site, vertex.part, transport,
         #                         local_vertex.is_black(), detect_failed)
         #
         # TODO WHY?????
@@ -1596,7 +1685,7 @@ class KCC(object):
 
         for v in graph.vertices:
             v.color_vertex()
-            if self.add_transports(v, my_vertex, graph, False):
+            if self.add_transports(v, my_vertex, graph, detect_failed):
                 found_failed = True
 
         # No NC replicas for this NC in the site of the local DC,
@@ -1794,7 +1883,9 @@ class KCC(object):
         DEBUG_FN("intersite(): exit all_connected=%d" % all_connected)
         return all_connected
 
-    def update_rodc_connection(self):
+    # This function currently does no actions. The reason being that we cannot
+    # perform modifies in this way on the RODC.
+    def update_rodc_connection(self, ro=True):
         """Updates the RODC NTFRS connection object.
 
         If the local DSA is not an RODC, this does nothing.
@@ -1828,7 +1919,7 @@ class KCC(object):
                 con.schedule = cn2.schedule
                 con.to_be_modified = True
 
-            self.my_dsa.commit_connections(self.samdb, ro=self.readonly)
+            self.my_dsa.commit_connections(self.samdb, ro=ro)
 
     def intrasite_max_node_edges(self, node_count):
         """Find the maximum number of edges directed to an intrasite node
@@ -1922,14 +2013,13 @@ class KCC(object):
 
         if not needed:
             debug.DEBUG_RED("%s lacks 'should be present' status, "
-                            "aborting construct_intersite_graph!" %
+                            "aborting construct_intrasite_graph!" %
                             nc_x.nc_dnstr)
             return
 
         # Create a NCReplica that matches what the local replica
         # should say.  We'll use this below in our r_list
-        l_of_x = NCReplica(dc_local.dsa_dnstr, dc_local.dsa_guid,
-                           nc_x.nc_dnstr)
+        l_of_x = NCReplica(dc_local, nc_x.nc_dnstr)
 
         l_of_x.identify_by_basedn(self.samdb)
 
@@ -1971,7 +2061,7 @@ class KCC(object):
         for dc_s in self.my_site.dsa_table.values():
             # If this partition (nc_x) doesn't appear as a
             # replica (f_of_x) on (dc_s) then continue
-            if not nc_x.nc_dnstr in dc_s.current_rep_table:
+            if nc_x.nc_dnstr not in dc_s.current_rep_table:
                 continue
 
             # Pull out the NCReplica (f) of (x) with the dn
@@ -2053,7 +2143,7 @@ class KCC(object):
                 # If this partition NC (x) doesn't appear as a
                 # replica (p) of NC (x) on the dsa DC (s) then
                 # continue
-                if not nc_x.nc_dnstr in dc_s.current_rep_table:
+                if nc_x.nc_dnstr not in dc_s.current_rep_table:
                     continue
 
                 # Pull out the NCReplica with the dn that
@@ -2096,7 +2186,7 @@ class KCC(object):
         # on the local DC
         r_list.append(l_of_x)
 
-        r_list.sort(sort_replica_by_dsa_guid)
+        r_list.sort(key=lambda rep: ndr_pack(rep.rep_dsa_guid))
         r_len = len(r_list)
 
         max_node_edges = self.intrasite_max_node_edges(r_len)
@@ -2109,27 +2199,27 @@ class KCC(object):
 
         # For each r(i) from (0 <= i < |R|-1)
         i = 0
-        while i < (r_len-1):
+        while i < (r_len - 1):
             # Add an edge from r(i) to r(i+1) if r(i) is a full
             # replica or r(i+1) is a partial replica
-            if not r_list[i].is_partial() or r_list[i+1].is_partial():
-                graph_list[i+1].add_edge_from(r_list[i].rep_dsa_dnstr)
+            if not r_list[i].is_partial() or r_list[i +1].is_partial():
+                graph_list[i + 1].add_edge_from(r_list[i].rep_dsa_dnstr)
 
             # Add an edge from r(i+1) to r(i) if r(i+1) is a full
             # replica or ri is a partial replica.
-            if not r_list[i+1].is_partial() or r_list[i].is_partial():
-                graph_list[i].add_edge_from(r_list[i+1].rep_dsa_dnstr)
+            if not r_list[i + 1].is_partial() or r_list[i].is_partial():
+                graph_list[i].add_edge_from(r_list[i + 1].rep_dsa_dnstr)
             i = i + 1
 
         # Add an edge from r|R|-1 to r0 if r|R|-1 is a full replica
         # or r0 is a partial replica.
-        if not r_list[r_len-1].is_partial() or r_list[0].is_partial():
-            graph_list[0].add_edge_from(r_list[r_len-1].rep_dsa_dnstr)
+        if not r_list[r_len - 1].is_partial() or r_list[0].is_partial():
+            graph_list[0].add_edge_from(r_list[r_len - 1].rep_dsa_dnstr)
 
         # Add an edge from r0 to r|R|-1 if r0 is a full replica or
         # r|R|-1 is a partial replica.
-        if not r_list[0].is_partial() or r_list[r_len-1].is_partial():
-            graph_list[r_len-1].add_edge_from(r_list[0].rep_dsa_dnstr)
+        if not r_list[0].is_partial() or r_list[r_len -1].is_partial():
+            graph_list[r_len - 1].add_edge_from(r_list[0].rep_dsa_dnstr)
 
         DEBUG("r_list is length %s" % len(r_list))
         DEBUG('\n'.join(str((x.rep_dsa_guid, x.rep_dsa_dnstr))
@@ -2159,7 +2249,6 @@ class KCC(object):
                                   if not self.get_dsa(x).is_ro())
             rw_dot_edges = [(a, b) for a, b in dot_edges if
                             a in rw_dot_vertices and b in rw_dot_vertices]
-            print rw_dot_edges, rw_dot_vertices
             rw_verify_properties = ('connected',
                                     'directed_double_ring_or_small')
             verify_and_dot('intrasite_rw_pre_ntdscon', rw_dot_edges,
@@ -2214,9 +2303,9 @@ class KCC(object):
 
                 while candidates and not tnode.has_sufficient_edges():
                     other = random.choice(candidates)
-                    DEBUG("trying to add candidate %s" % other.dsa_dstr)
-                    if not tnode.add_edge_from(other):
-                        debug.DEBUG_RED("could not add %s" % other.dsa_dstr)
+                    DEBUG("trying to add candidate %s" % other.dsa_dnstr)
+                    if not tnode.add_edge_from(other.dsa_dnstr):
+                        debug.DEBUG_RED("could not add %s" % other.dsa_dnstr)
                     candidates.remove(other)
             else:
                 DEBUG_FN("not adding links to %s: nodes %s, links is %s/%s" %
@@ -2230,7 +2319,7 @@ class KCC(object):
             # points to us that satisfies the KCC criteria
 
             if tnode.dsa_dnstr == dc_local.dsa_dnstr:
-                tnode.add_connections_from_edges(dc_local)
+                tnode.add_connections_from_edges(dc_local, self.ip_transport)
 
         if self.verify or do_dot_files:
             dot_edges = []
@@ -2255,7 +2344,6 @@ class KCC(object):
                                   if not self.get_dsa(x).is_ro())
             rw_dot_edges = [(a, b) for a, b in dot_edges if
                             a in rw_dot_vertices and b in rw_dot_vertices]
-            print rw_dot_edges, rw_dot_vertices
             rw_verify_properties = ('connected',
                                     'directed_double_ring_or_small')
             verify_and_dot('intrasite_rw_post_ntdscon', rw_dot_edges,
@@ -2346,20 +2434,7 @@ class KCC(object):
                 self.construct_intrasite_graph(mysite, mydsa, part, True,
                                                False)  # don't detect stale
 
-        if self.readonly:
-            # Display any to be added or modified repsFrom
-            for connect in mydsa.connect_table.values():
-                if connect.to_be_deleted:
-                    logger.info("TO BE DELETED:\n%s" % connect)
-                if connect.to_be_modified:
-                    logger.info("TO BE MODIFIED:\n%s" % connect)
-                if connect.to_be_added:
-                    debug.DEBUG_GREEN("TO BE ADDED:\n%s" % connect)
-
-            mydsa.commit_connections(self.samdb, ro=True)
-        else:
-            # Commit any newly created connections to the samdb
-            mydsa.commit_connections(self.samdb)
+        self._commit_changes(mydsa)
 
     def list_dsas(self):
         """Compile a comprehensive list of DSA DNs
@@ -2385,16 +2460,27 @@ class KCC(object):
                          for dsa in site.dsa_table.values()])
         return dsas
 
-    def load_samdb(self, dburl, lp, creds):
+    def load_samdb(self, dburl, lp, creds, force=False):
         """Load the database using an url, loadparm, and credentials
+
+        If force is False, the samdb won't be reloaded if it already
+        exists.
 
         :param dburl: a database url.
         :param lp: a loadparm object.
         :param creds: a Credentials object.
+        :param force: a boolean indicating whether to overwrite.
+
         """
-        self.samdb = SamDB(url=dburl,
-                           session_info=system_session(),
-                           credentials=creds, lp=lp)
+        if force or self.samdb is None:
+            try:
+                self.samdb = SamDB(url=dburl,
+                                   session_info=system_session(),
+                                   credentials=creds, lp=lp)
+            except ldb.LdbError as e1:
+                (num, msg) = e1.args
+                raise KCCError("Unable to open sam database %s : %s" %
+                               (dburl, msg))
 
     def plot_all_connections(self, basename, verify_properties=()):
         """Helper function to plot and verify NTDSConnections
@@ -2448,15 +2534,9 @@ class KCC(object):
                determine link availability (boolean, default False)
         :return: 1 on error, 0 otherwise
         """
-        # We may already have a samdb setup if we are
-        # currently importing an ldif for a test run
         if self.samdb is None:
-            try:
-                self.load_samdb(dburl, lp, creds)
-            except ldb.LdbError, (num, msg):
-                logger.error("Unable to open sam database %s : %s" %
-                             (dburl, msg))
-                return 1
+            DEBUG_FN("samdb is None; let's load it from %s" % (dburl,))
+            self.load_samdb(dburl, lp, creds, force=False)
 
         if forced_local_dsa:
             self.samdb.set_ntds_settings_dn("CN=NTDS Settings,%s" %
@@ -2509,21 +2589,29 @@ class KCC(object):
                                dot_file_dir=self.dot_file_dir)
 
                 dot_edges = []
+                dot_colours = []
                 for link in self.sitelink_table.values():
+                    from hashlib import md5
+                    tmp_str = link.dnstr.encode('utf8')
+                    colour = '#' + md5(tmp_str).hexdigest()[:6]
                     for a, b in itertools.combinations(link.site_list, 2):
-                        dot_edges.append((str(a), str(b)))
+                        dot_edges.append((a[1], b[1]))
+                        dot_colours.append(colour)
                 properties = ('connected',)
                 verify_and_dot('dsa_sitelink_initial', dot_edges,
                                directed=False,
                                label=self.my_dsa_dnstr, properties=properties,
                                debug=DEBUG, verify=self.verify,
-                               dot_file_dir=self.dot_file_dir)
+                               dot_file_dir=self.dot_file_dir,
+                               edge_colors=dot_colours)
 
             if forget_local_links:
                 for dsa in self.my_site.dsa_table.values():
                     dsa.connect_table = dict((k, v) for k, v in
                                              dsa.connect_table.items()
-                                             if v.is_rodc_topology())
+                                             if v.is_rodc_topology() or
+                                             (v.from_dnstr not in
+                                              self.my_site.dsa_table))
                 self.plot_all_connections('dsa_forgotten_local')
 
             if forget_intersite_links:
@@ -2615,7 +2703,7 @@ class KCC(object):
 
         return 0
 
-    def import_ldif(self, dburl, lp, creds, ldif_file, forced_local_dsa=None):
+    def import_ldif(self, dburl, lp, ldif_file, forced_local_dsa=None):
         """Import relevant objects and attributes from an LDIF file.
 
         The point of this function is to allow a programmer/debugger to
@@ -2628,7 +2716,6 @@ class KCC(object):
 
         :param dburl: path to the temporary abbreviated db to create
         :param lp: a loadparm object.
-        :param cred: a Credentials object.
         :param ldif_file: path to the ldif file to import
         :param forced_local_dsa: perform KCC from this DSA's point of view
         :return: zero on success, 1 on error
@@ -2636,7 +2723,7 @@ class KCC(object):
         try:
             self.samdb = ldif_import_export.ldif_to_samdb(dburl, lp, ldif_file,
                                                           forced_local_dsa)
-        except ldif_import_export.LdifError, e:
+        except ldif_import_export.LdifError as e:
             logger.critical(e)
             return 1
         return 0
@@ -2661,7 +2748,7 @@ class KCC(object):
         try:
             ldif_import_export.samdb_to_ldif_file(self.samdb, dburl, lp, creds,
                                                   ldif_file)
-        except ldif_import_export.LdifError, e:
+        except ldif_import_export.LdifError as e:
             logger.critical(e)
             return 1
         return 0

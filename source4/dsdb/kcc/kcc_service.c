@@ -34,6 +34,7 @@
 #include "librpc/gen_ndr/ndr_drsuapi.h"
 #include "librpc/gen_ndr/ndr_drsblobs.h"
 #include "param/param.h"
+#include "libds/common/roles.h"
 
 /*
   establish system creds
@@ -42,7 +43,7 @@ static WERROR kccsrv_init_creds(struct kccsrv_service *service)
 {
 	service->system_session_info = system_session(service->task->lp_ctx);
 	if (!service->system_session_info) {
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	return WERR_OK;
@@ -55,13 +56,19 @@ static WERROR kccsrv_connect_samdb(struct kccsrv_service *service, struct loadpa
 {
 	const struct GUID *ntds_guid;
 
-	service->samdb = samdb_connect(service, service->task->event_ctx, lp_ctx, service->system_session_info, 0);
+	service->samdb = samdb_connect(service,
+				       service->task->event_ctx,
+				       lp_ctx,
+				       service->system_session_info,
+				       NULL,
+				       0);
 	if (!service->samdb) {
 		return WERR_DS_UNAVAILABLE;
 	}
 
 	ntds_guid = samdb_ntds_objectGUID(service->samdb);
 	if (!ntds_guid) {
+		DBG_ERR("Failed to determine own NTDS objectGUID\n");
 		return WERR_DS_UNAVAILABLE;
 	}
 
@@ -109,18 +116,17 @@ static WERROR kccsrv_load_partitions(struct kccsrv_service *s)
 	for (i=0; i < el->num_values; i++) {
 		const char *v = (const char *)el->values[i].data;
 		struct ldb_dn *pdn;
-		struct kccsrv_partition *p;
+		struct dsdb_ldb_dn_list_node *p;
 
 		pdn = ldb_dn_new(s, s->samdb, v);
 		if (!ldb_dn_validate(pdn)) {
 			return WERR_FOOBAR;
 		}
 
-		p = talloc_zero(s, struct kccsrv_partition);
+		p = talloc_zero(s, struct dsdb_ldb_dn_list_node);
 		W_ERROR_HAVE_NO_MEMORY(p);
 
 		p->dn = talloc_steal(p, pdn);
-		p->service = s;
 
 		DLIST_ADD(s->partitions, p);
 
@@ -261,7 +267,7 @@ static NTSTATUS kccsrv_replica_get_info(struct irpc_message *msg, struct drsuapi
 /*
   startup the kcc service task
 */
-static void kccsrv_task_init(struct task_server *task)
+static NTSTATUS kccsrv_task_init(struct task_server *task)
 {
 	WERROR status;
 	struct kccsrv_service *service;
@@ -270,10 +276,10 @@ static void kccsrv_task_init(struct task_server *task)
 	switch (lpcfg_server_role(task->lp_ctx)) {
 	case ROLE_STANDALONE:
 		task_server_terminate(task, "kccsrv: no KCC required in standalone configuration", false);
-		return;
+		return NT_STATUS_INVALID_DOMAIN_ROLE;
 	case ROLE_DOMAIN_MEMBER:
 		task_server_terminate(task, "kccsrv: no KCC required in domain member configuration", false);
-		return;
+		return NT_STATUS_INVALID_DOMAIN_ROLE;
 	case ROLE_ACTIVE_DIRECTORY_DC:
 		/* Yes, we want a KCC */
 		break;
@@ -284,7 +290,7 @@ static void kccsrv_task_init(struct task_server *task)
 	service = talloc_zero(task, struct kccsrv_service);
 	if (!service) {
 		task_server_terminate(task, "kccsrv_task_init: out of memory", true);
-		return;
+		return NT_STATUS_NO_MEMORY;
 	}
 	service->task		= task;
 	service->startup_time	= timeval_current();
@@ -296,7 +302,7 @@ static void kccsrv_task_init(struct task_server *task)
 				      talloc_asprintf(task,
 						      "kccsrv: Failed to obtain server credentials: %s\n",
 						      win_errstr(status)), true);
-		return;
+		return werror_to_ntstatus(status);
 	}
 
 	status = kccsrv_connect_samdb(service, task->lp_ctx);
@@ -304,7 +310,7 @@ static void kccsrv_task_init(struct task_server *task)
 		task_server_terminate(task, talloc_asprintf(task,
 				      "kccsrv: Failed to connect to local samdb: %s\n",
 							    win_errstr(status)), true);
-		return;
+		return werror_to_ntstatus(status);
 	}
 
 	status = kccsrv_load_partitions(service);
@@ -312,7 +318,7 @@ static void kccsrv_task_init(struct task_server *task)
 		task_server_terminate(task, talloc_asprintf(task,
 				      "kccsrv: Failed to load partitions: %s\n",
 							    win_errstr(status)), true);
-		return;
+		return werror_to_ntstatus(status);
 	}
 
 	periodic_startup_interval =
@@ -326,26 +332,33 @@ static void kccsrv_task_init(struct task_server *task)
 	 * topology generation code.
 	 */
 	service->samba_kcc_code = lpcfg_parm_bool(task->lp_ctx, NULL,
-						"kccsrv", "samba_kcc", false);
+						"kccsrv", "samba_kcc", true);
 
 	status = kccsrv_periodic_schedule(service, periodic_startup_interval);
 	if (!W_ERROR_IS_OK(status)) {
 		task_server_terminate(task, talloc_asprintf(task,
 				      "kccsrv: Failed to periodic schedule: %s\n",
 							    win_errstr(status)), true);
-		return;
+		return werror_to_ntstatus(status);
 	}
 
 	irpc_add_name(task->msg_ctx, "kccsrv");
 
 	IRPC_REGISTER(task->msg_ctx, drsuapi, DRSUAPI_DSEXECUTEKCC, kccsrv_execute_kcc, service);
 	IRPC_REGISTER(task->msg_ctx, drsuapi, DRSUAPI_DSREPLICAGETINFO, kccsrv_replica_get_info, service);
+	return NT_STATUS_OK;
 }
 
 /*
   register ourselves as a available server
 */
-NTSTATUS server_service_kcc_init(void)
+NTSTATUS server_service_kcc_init(TALLOC_CTX *ctx)
 {
-	return register_server_service("kcc", kccsrv_task_init);
+	static const struct service_details details = {
+		.inhibit_fork_on_accept = true,
+		.inhibit_pre_fork = true,
+		.task_init = kccsrv_task_init,
+		.post_fork = NULL
+	};
+	return register_server_service(ctx, "kcc", &details);
 }

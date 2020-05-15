@@ -1,4 +1,4 @@
-/* 
+/*
    ldb database library
 
    Copyright (C) Andrew Tridgell  2004
@@ -8,7 +8,7 @@
      ** NOTE! The following LGPL license applies to the ldb
      ** library. This does NOT imply that all of Samba is released
      ** under the LGPL
-   
+
    This library is free software; you can redistribute it and/or
    modify it under the terms of the GNU Lesser General Public
    License as published by the Free Software Foundation; either
@@ -56,7 +56,7 @@
   major restrictions as compared to normal LDAP:
 
      - each record must have a unique key field
-     - the key must be representable as a NULL terminated C string and may not 
+     - the key must be representable as a NULL terminated C string and may not
        contain a comma or braces
 
   major restrictions as compared to tdb:
@@ -75,7 +75,7 @@
    blobs of arbitrary size.
 
    \note the data is null (0x00) terminated, but the length does not
-   include the terminator. 
+   include the terminator.
 */
 struct ldb_val {
 	uint8_t *data; /*!< result data */
@@ -104,19 +104,20 @@ struct ldb_dn;
 /**
  There are a number of flags that are used with ldap_modify() in
  ldb_message_element.flags fields. The LDB_FLAG_MOD_ADD,
- LDB_FLAG_MOD_DELETE and LDB_FLAG_MOD_REPLACE flags are used in
- ldap_modify() calls to specify whether attributes are being added,
- deleted or modified respectively.
+ LDB_FLAG_MOD_DELETE and LDB_FLAG_MOD_REPLACE are better thought of as
+ an enumeration, not flags, and are used in ldap_modify() calls to
+ specify whether attributes are being added, deleted or modified
+ respectively.
 */
 #define LDB_FLAG_MOD_MASK  0x3
 
 /**
-  use this to extract the mod type from the operation
+  use this to extract the mod type (enum) from the operation
  */
 #define LDB_FLAG_MOD_TYPE(flags) ((flags) & LDB_FLAG_MOD_MASK)
 
 /**
-   Flag value used in ldap_modify() to indicate that attributes are
+   Value used in ldap_modify() to indicate that attributes are
    being added.
 
    \sa LDB_FLAG_MOD_MASK
@@ -124,7 +125,7 @@ struct ldb_dn;
 #define LDB_FLAG_MOD_ADD     1
 
 /**
-   Flag value used in ldap_modify() to indicate that attributes are
+   Value used in ldap_modify() to indicate that attributes are
    being replaced.
 
    \sa LDB_FLAG_MOD_MASK
@@ -132,12 +133,21 @@ struct ldb_dn;
 #define LDB_FLAG_MOD_REPLACE 2
 
 /**
-   Flag value used in ldap_modify() to indicate that attributes are
+   Value used in ldap_modify() to indicate that attributes are
    being deleted.
 
    \sa LDB_FLAG_MOD_MASK
 */
 #define LDB_FLAG_MOD_DELETE  3
+
+/**
+   Flag value used in ldb_ldif_write_trace() to enforce binary encoded
+   attribute values per attribute.
+
+   This is a genuine flag, being outside LDB_FLAG_MOD_MASK and also
+   outside LDB_FLAG_INTERNAL_MASK
+*/
+#define LDB_FLAG_FORCE_NO_BASE64_LDIF 4
 
 /**
     flag bits on an element usable only by the internal implementation
@@ -171,7 +181,7 @@ struct ldb_message_element {
 
 /**
   a ldb_message represents all or part of a record. It can contain an arbitrary
-  number of elements. 
+  number of elements.
 */
 struct ldb_message {
 	struct ldb_dn *dn;
@@ -198,8 +208,8 @@ struct ldb_ldif {
 	struct ldb_message *msg;  /*!< The changes */
 };
 
-enum ldb_scope {LDB_SCOPE_DEFAULT=-1, 
-		LDB_SCOPE_BASE=0, 
+enum ldb_scope {LDB_SCOPE_DEFAULT=-1,
+		LDB_SCOPE_BASE=0,
 		LDB_SCOPE_ONELEVEL=1,
 		LDB_SCOPE_SUBTREE=2};
 
@@ -207,8 +217,11 @@ struct ldb_context;
 struct tevent_context;
 
 /* debugging uses one of the following levels */
-enum ldb_debug_level {LDB_DEBUG_FATAL, LDB_DEBUG_ERROR, 
+enum ldb_debug_level {LDB_DEBUG_FATAL, LDB_DEBUG_ERROR,
 		      LDB_DEBUG_WARNING, LDB_DEBUG_TRACE};
+
+/* alias for something that's not a fatal error but we really want to log */
+#define LDB_DEBUG_ALWAYS_LOG  LDB_DEBUG_FATAL
 
 /**
   the user can optionally supply a debug function. The function
@@ -216,7 +229,7 @@ enum ldb_debug_level {LDB_DEBUG_FATAL, LDB_DEBUG_ERROR,
   of a severity level
 */
 struct ldb_debug_ops {
-	void (*debug)(void *context, enum ldb_debug_level level, 
+	void (*debug)(void *context, enum ldb_debug_level level,
 		      const char *fmt, va_list ap) PRINTF_ATTRIBUTE(3,0);
 	void *context;
 };
@@ -262,7 +275,7 @@ struct ldb_utf8_fns {
 
 /**
    Flag to tell ldif handlers not to force encoding of binary
-   structures in base64   
+   structures in base64
 */
 #define LDB_FLG_SHOW_BINARY 16
 
@@ -270,6 +283,15 @@ struct ldb_utf8_fns {
    Flags to enable ldb tracing
 */
 #define LDB_FLG_ENABLE_TRACING 32
+
+/**
+   Flags to tell LDB not to create a new database file:
+
+   Without this flag ldb_tdb (for example) will create a blank file
+   during an invocation of ldb_connect(), even when the caller only
+   wanted read operations, for example in ldbsearch.
+*/
+#define LDB_FLG_DONT_CREATE_DB 64
 
 /*
    structures for ldb_parse_tree handling code
@@ -367,7 +389,10 @@ typedef int (*ldb_attr_operator_t)(struct ldb_context *, enum ldb_parse_op opera
   ldif_read_fn		-> convert from ldif to binary format
   ldif_write_fn		-> convert from binary to ldif format
   canonicalise_fn	-> canonicalise a value, for use by indexing and dn construction
+  index_form_fn		-> get lexicographically sorted format for index
   comparison_fn		-> compare two values
+  operator_fn		-> override function for optimizing out unnecessary
+				calls to canonicalise_fn and comparison_fn
 */
 
 struct ldb_schema_syntax {
@@ -375,6 +400,7 @@ struct ldb_schema_syntax {
 	ldb_attr_handler_t ldif_read_fn;
 	ldb_attr_handler_t ldif_write_fn;
 	ldb_attr_handler_t canonicalise_fn;
+	ldb_attr_handler_t index_format_fn;
 	ldb_attr_comparison_t comparison_fn;
 	ldb_attr_operator_t operator_fn;
 };
@@ -401,15 +427,15 @@ const struct ldb_dn_extended_syntax *ldb_dn_extended_syntax_by_name(struct ldb_c
 /**
    The attribute is not returned by default
 */
-#define LDB_ATTR_FLAG_HIDDEN       (1<<0) 
+#define LDB_ATTR_FLAG_HIDDEN       (1<<0)
 
 /* the attribute handler name should be freed when released */
-#define LDB_ATTR_FLAG_ALLOCATED    (1<<1) 
+#define LDB_ATTR_FLAG_ALLOCATED    (1<<1)
 
 /**
    The attribute is supplied by the application and should not be removed
 */
-#define LDB_ATTR_FLAG_FIXED        (1<<2) 
+#define LDB_ATTR_FLAG_FIXED        (1<<2)
 
 /*
   when this is set, attempts to create two records which have the same
@@ -422,12 +448,27 @@ const struct ldb_dn_extended_syntax *ldb_dn_extended_syntax_by_name(struct ldb_c
  */
 #define LDB_ATTR_FLAG_SINGLE_VALUE (1<<4)
 
+/*
+ * The values should always be base64 encoded
+ */
+#define LDB_ATTR_FLAG_FORCE_BASE64_LDIF        (1<<5)
+
+/*
+ * The attribute was loaded from a DB, rather than via the C API
+ */
+#define LDB_ATTR_FLAG_FROM_DB      (1<<6)
+
+/*
+ * The attribute is indexed
+ */
+#define LDB_ATTR_FLAG_INDEXED      (1<<7)
+
 /**
   LDAP attribute syntax for a DN
 
   This is the well-known LDAP attribute syntax for a DN.
 
-  See <a href="http://www.ietf.org/rfc/rfc2252.txt">RFC 2252</a>, Section 4.3.2 
+  See <a href="http://www.ietf.org/rfc/rfc2252.txt">RFC 2252</a>, Section 4.3.2
 */
 #define LDB_SYNTAX_DN                   "1.3.6.1.4.1.1466.115.121.1.12"
 
@@ -436,7 +477,7 @@ const struct ldb_dn_extended_syntax *ldb_dn_extended_syntax_by_name(struct ldb_c
 
   This is the well-known LDAP attribute syntax for a Directory String.
 
-  \sa <a href="http://www.ietf.org/rfc/rfc2252.txt">RFC 2252</a>, Section 4.3.2 
+  \sa <a href="http://www.ietf.org/rfc/rfc2252.txt">RFC 2252</a>, Section 4.3.2
 */
 #define LDB_SYNTAX_DIRECTORY_STRING     "1.3.6.1.4.1.1466.115.121.1.15"
 
@@ -445,16 +486,22 @@ const struct ldb_dn_extended_syntax *ldb_dn_extended_syntax_by_name(struct ldb_c
 
   This is the well-known LDAP attribute syntax for an integer.
 
-  See <a href="http://www.ietf.org/rfc/rfc2252.txt">RFC 2252</a>, Section 4.3.2 
+  See <a href="http://www.ietf.org/rfc/rfc2252.txt">RFC 2252</a>, Section 4.3.2
 */
 #define LDB_SYNTAX_INTEGER              "1.3.6.1.4.1.1466.115.121.1.27"
+
+/**
+  Custom attribute syntax for an integer whose index is lexicographically
+  ordered by attribute value in the database.
+*/
+#define LDB_SYNTAX_ORDERED_INTEGER      "LDB_SYNTAX_ORDERED_INTEGER"
 
 /**
   LDAP attribute syntax for a boolean
 
   This is the well-known LDAP attribute syntax for a boolean.
 
-  See <a href="http://www.ietf.org/rfc/rfc2252.txt">RFC 2252</a>, Section 4.3.2 
+  See <a href="http://www.ietf.org/rfc/rfc2252.txt">RFC 2252</a>, Section 4.3.2
 */
 #define LDB_SYNTAX_BOOLEAN              "1.3.6.1.4.1.1466.115.121.1.7"
 
@@ -463,7 +510,7 @@ const struct ldb_dn_extended_syntax *ldb_dn_extended_syntax_by_name(struct ldb_c
 
   This is the well-known LDAP attribute syntax for an octet string.
 
-  See <a href="http://www.ietf.org/rfc/rfc2252.txt">RFC 2252</a>, Section 4.3.2 
+  See <a href="http://www.ietf.org/rfc/rfc2252.txt">RFC 2252</a>, Section 4.3.2
 */
 #define LDB_SYNTAX_OCTET_STRING         "1.3.6.1.4.1.1466.115.121.1.40"
 
@@ -472,7 +519,7 @@ const struct ldb_dn_extended_syntax *ldb_dn_extended_syntax_by_name(struct ldb_c
 
   This is the well-known LDAP attribute syntax for a UTC time.
 
-  See <a href="http://www.ietf.org/rfc/rfc2252.txt">RFC 2252</a>, Section 4.3.2 
+  See <a href="http://www.ietf.org/rfc/rfc2252.txt">RFC 2252</a>, Section 4.3.2
 */
 #define LDB_SYNTAX_UTC_TIME             "1.3.6.1.4.1.1466.115.121.1.53"
 #define LDB_SYNTAX_GENERALIZED_TIME     "1.3.6.1.4.1.1466.115.121.1.24"
@@ -487,11 +534,18 @@ typedef int (*ldb_qsort_cmp_fn_t) (void *v1, void *v2, void *opaque);
 /**
   OID for getting and manipulating attributes from the ldb
   without interception in the operational module.
-  It can be used to access attribute that used to be stored in the sam 
+  It can be used to access attribute that used to be stored in the sam
   and that are now calculated.
 */
 #define LDB_CONTROL_BYPASS_OPERATIONAL_OID "1.3.6.1.4.1.7165.4.3.13"
 #define LDB_CONTROL_BYPASS_OPERATIONAL_NAME "bypassoperational"
+
+/**
+  OID for recalculate RDN (rdn attribute and 'name') control. This control forces
+  the rdn_name module to the recalculate the rdn and name attributes as if the
+  object was just created.
+*/
+#define LDB_CONTROL_RECALCULATE_RDN_OID "1.3.6.1.4.1.7165.4.3.30"
 
 /**
   OID for recalculate SD control. This control force the
@@ -529,7 +583,7 @@ typedef int (*ldb_qsort_cmp_fn_t) (void *v1, void *v2, void *opaque);
    OID for the paged results control. This control is included in the
    searchRequest and searchResultDone messages as part of the controls
    field of the LDAPMessage, as defined in Section 4.1.12 of
-   LDAP v3. 
+   LDAP v3.
 
    \sa <a href="http://www.ietf.org/rfc/rfc2696.txt">RFC 2696</a>.
 */
@@ -645,13 +699,15 @@ typedef int (*ldb_qsort_cmp_fn_t) (void *v1, void *v2, void *opaque);
 #define LDB_CONTROL_ASQ_NAME	"asq"
 
 /**
-   OID for LDAP Directory Sync extension. 
+   OID for LDAP Directory Sync extension.
 
    This control is included in SearchRequest or SearchResponse
    messages as part of the controls field of the LDAPMessage.
 */
 #define LDB_CONTROL_DIRSYNC_OID		"1.2.840.113556.1.4.841"
 #define LDB_CONTROL_DIRSYNC_NAME	"dirsync"
+#define LDB_CONTROL_DIRSYNC_EX_OID	"1.2.840.113556.1.4.2090"
+#define LDB_CONTROL_DIRSYNC_EX_NAME	"dirsync_ex"
 
 
 /**
@@ -681,8 +737,8 @@ typedef int (*ldb_qsort_cmp_fn_t) (void *v1, void *v2, void *opaque);
 #define LDB_CONTROL_PERMISSIVE_MODIFY_OID	"1.2.840.113556.1.4.1413"
 #define LDB_CONTROL_PERMISSIVE_MODIFY_NAME	"permissive_modify"
 
-/** 
-    OID to allow the server to be more 'fast and loose' with the data being added.  
+/**
+    OID to allow the server to be more 'fast and loose' with the data being added.
 
     \sa <a href="http://msdn.microsoft.com/en-us/library/aa366982(v=VS.85).aspx">Microsoft documentation of this OID</a>
 */
@@ -842,7 +898,7 @@ struct ldb_vlv_req_control {
 		} gtOrEq;
 	} match;
 	int ctxid_len;
-	char *contextId;
+	uint8_t *contextId;
 };
 
 struct ldb_vlv_resp_control {
@@ -850,7 +906,7 @@ struct ldb_vlv_resp_control {
 	int contentCount;
 	int vlv_result;
 	int ctxid_len;
-	char *contextId;
+	uint8_t *contextId;
 };
 
 struct ldb_verify_name_control {
@@ -1028,6 +1084,10 @@ int ldb_global_init(void);
   \param mem_ctx pointer to a talloc memory context. Pass NULL if there is
   no suitable context available.
 
+  \note The LDB modules will be loaded from directory specified by the environment
+  variable LDB_MODULES_PATH. If the variable is not specified, the compiled-in default
+  is used.
+
   \return pointer to ldb_context that should be free'd (using talloc_free())
   at the end of the program.
 */
@@ -1095,7 +1155,7 @@ struct ldb_dn *ldb_get_schema_basedn(struct ldb_context *ldb);
 struct ldb_dn *ldb_get_default_basedn(struct ldb_context *ldb);
 
 /**
-  The default async search callback function 
+  The default async search callback function
 
   \param req the request we are callback of
   \param ares a single reply from the async core
@@ -1173,7 +1233,7 @@ int ldb_build_search_req_ex(struct ldb_request **ret_req,
   \param ret_req the request structure is returned here (talloced on mem_ctx)
   \param ldb the context associated with the database (from ldb_init())
   \param mem_ctx a talloc memory context (used as parent of ret_req)
-  \param message contains the entry to be added 
+  \param message contains the entry to be added
   \param controls an array of controls
   \param context the callback function context
   \param the callback function to handle the async replies
@@ -1290,27 +1350,27 @@ int ldb_request_add_control(struct ldb_request *req, const char *oid, bool criti
 int ldb_request_replace_control(struct ldb_request *req, const char *oid, bool critical, void *data);
 
 /**
-   check if a control with the specified "oid" exist and return it 
+   check if a control with the specified "oid" exist and return it
   \param req the request struct where to add the control
   \param oid the object identifier of the control as string
 
-  \return the control, NULL if not found 
+  \return the control, NULL if not found
 */
 struct ldb_control *ldb_request_get_control(struct ldb_request *req, const char *oid);
 
 /**
-   check if a control with the specified "oid" exist and return it 
+   check if a control with the specified "oid" exist and return it
   \param rep the reply struct where to add the control
   \param oid the object identifier of the control as string
 
-  \return the control, NULL if not found 
+  \return the control, NULL if not found
 */
 struct ldb_control *ldb_reply_get_control(struct ldb_reply *rep, const char *oid);
 
 /**
   Search the database
 
-  This function searches the database, and returns 
+  This function searches the database, and returns
   records that match an LDAP-like search expression
 
   \param ldb the context associated with the database (from ldb_init())
@@ -1335,7 +1395,7 @@ int ldb_search(struct ldb_context *ldb, TALLOC_CTX *mem_ctx,
 
   This function adds a record to the database. This function will fail
   if a record with the specified class and key already exists in the
-  database. 
+  database.
 
   \param ldb the context associated with the database (from
   ldb_init())
@@ -1344,7 +1404,7 @@ int ldb_search(struct ldb_context *ldb, TALLOC_CTX *mem_ctx,
   \return result code (LDB_SUCCESS if the record was added, otherwise
   a failure code)
 */
-int ldb_add(struct ldb_context *ldb, 
+int ldb_add(struct ldb_context *ldb,
 	    const struct ldb_message *message);
 
 /**
@@ -1359,7 +1419,7 @@ int ldb_add(struct ldb_context *ldb,
   \return result code (LDB_SUCCESS if the record was modified as
   requested, otherwise a failure code)
 */
-int ldb_modify(struct ldb_context *ldb, 
+int ldb_modify(struct ldb_context *ldb,
 	       const struct ldb_message *message);
 
 /**
@@ -1370,7 +1430,7 @@ int ldb_modify(struct ldb_context *ldb,
   \param ldb the context associated with the database (from
   ldb_init())
   \param olddn the DN for the record to be renamed.
-  \param newdn the new DN 
+  \param newdn the new DN
 
   \return result code (LDB_SUCCESS if the record was renamed as
   requested, otherwise a failure code)
@@ -1392,7 +1452,7 @@ int ldb_rename(struct ldb_context *ldb, struct ldb_dn *olddn, struct ldb_dn *new
 int ldb_delete(struct ldb_context *ldb, struct ldb_dn *dn);
 
 /**
-  The default async extended operation callback function 
+  The default async extended operation callback function
 
   \param req the request we are callback of
   \param ares a single reply from the async core
@@ -1419,7 +1479,7 @@ int ldb_extended_default_callback(struct ldb_request *req, struct ldb_reply *are
   \param mem_ctx a talloc memory context (used as parent of ret_req)
   \param oid the OID of the extended operation.
   \param data a void pointer a the extended operation specific parameters,
-  it needs to be NULL or a valid talloc pointer! talloc_get_type() will be used on it  
+  it needs to be NULL or a valid talloc pointer! talloc_get_type() will be used on it
   \param controls an array of controls
   \param context the callback function context
   \param the callback function to handle the async replies
@@ -1443,13 +1503,13 @@ int ldb_build_extended_req(struct ldb_request **ret_req,
   \param ldb the context associated with the database (from ldb_init())
   \param oid the OID of the extended operation.
   \param data a void pointer a the extended operation specific parameters,
-  it needs to be NULL or a valid talloc pointer! talloc_get_type() will be used on it  
+  it needs to be NULL or a valid talloc pointer! talloc_get_type() will be used on it
   \param res the result of the extended operation
 
   \return result code (LDB_SUCCESS if the extended operation returned fine,
   otherwise a failure code)
 */
-int ldb_extended(struct ldb_context *ldb, 
+int ldb_extended(struct ldb_context *ldb,
 		 const char *oid,
 		 void *data,/* NULL or a valid talloc pointer! talloc_get_type() will be used on it */
 		 struct ldb_result **res);
@@ -1492,7 +1552,7 @@ int ldb_transaction_cancel_noerr(struct ldb_context *ldb);
 const char *ldb_errstring(struct ldb_context *ldb);
 
 /**
-  return a string explaining what a ldb error constant meancs
+  return a string explaining what a ldb error constant means
 */
 const char *ldb_strerror(int ldb_err);
 
@@ -1507,7 +1567,7 @@ void ldb_set_utf8_default(struct ldb_context *ldb);
 
    \param ldb the ldb context
    \param mem_ctx the memory context to allocate the result string
-   memory from. 
+   memory from.
    \param s the string that is to be folded
    \return a copy of the string, converted to upper case
 
@@ -1537,7 +1597,7 @@ int ldb_valid_attr_name(const char *s);
    \param ldb the ldb context (from ldb_init())
    \param fprintf_fn a function pointer for the write function. This must take
    a private data pointer, followed by a format string, and then a variable argument
-   list. 
+   list.
    \param private_data pointer that will be provided back to the write
    function. This is useful for maintaining state or context.
    \param ldif the message to write out
@@ -1551,7 +1611,7 @@ int ldb_valid_attr_name(const char *s);
    \sa ldb_ldif_read for the reader equivalent to this function.
 */
 int ldb_ldif_write(struct ldb_context *ldb,
-		   int (*fprintf_fn)(void *, const char *, ...) PRINTF_ATTRIBUTE(2,3), 
+		   int (*fprintf_fn)(void *, const char *, ...) PRINTF_ATTRIBUTE(2,3),
 		   void *private_data,
 		   const struct ldb_ldif *ldif);
 
@@ -1572,7 +1632,7 @@ void ldb_ldif_read_free(struct ldb_context *ldb, struct ldb_ldif *msg);
    Read an LDIF message
 
    This function creates an LDIF message using a caller supplied read
-   function. 
+   function.
 
    \param ldb the ldb context (from ldb_init())
    \param fgetc_fn a function pointer for the read function. This must
@@ -1595,7 +1655,7 @@ void ldb_ldif_read_free(struct ldb_context *ldb, struct ldb_ldif *msg);
 
    \sa ldb_ldif_write for the writer equivalent to this function.
 */
-struct ldb_ldif *ldb_ldif_read(struct ldb_context *ldb, 
+struct ldb_ldif *ldb_ldif_read(struct ldb_context *ldb,
 			       int (*fgetc_fn)(void *), void *private_data);
 
 /**
@@ -1683,26 +1743,56 @@ int ldb_ldif_write_file(struct ldb_context *ldb, FILE *f, const struct ldb_ldif 
 
    \sa ldb_ldif_read_string for the reader equivalent to this function.
 */
-char * ldb_ldif_write_string(struct ldb_context *ldb, TALLOC_CTX *mem_ctx, 
+char * ldb_ldif_write_string(struct ldb_context *ldb, TALLOC_CTX *mem_ctx,
 			  const struct ldb_ldif *msg);
 
 
-/*
-   Produce a string form of an ldb message
+/**
+   Write an LDB message to a string
 
-   convenient function to turn a ldb_message into a string. Useful for
-   debugging
- */
-char *ldb_ldif_message_string(struct ldb_context *ldb, TALLOC_CTX *mem_ctx, 
+   \param ldb the ldb context (from ldb_init())
+   \param mem_ctx the talloc context on which to attach the string)
+   \param changetype LDB_CHANGETYPE_ADD or LDB_CHANGETYPE_MODIFY
+   \param msg the message to write out
+
+   \return the string containing the LDIF, or NULL on error
+
+   \sa ldb_ldif_message_redacted_string for a safer version of this 
+       function
+*/
+char *ldb_ldif_message_string(struct ldb_context *ldb, TALLOC_CTX *mem_ctx,
 			      enum ldb_changetype changetype,
 			      const struct ldb_message *msg);
+
+/**
+   Write an LDB message to a string
+
+   \param ldb the ldb context (from ldb_init())
+   \param mem_ctx the talloc context on which to attach the string)
+   \param changetype LDB_CHANGETYPE_ADD or LDB_CHANGETYPE_MODIFY
+   \param msg the message to write out
+
+   \return the string containing the LDIF, or NULL on error, but
+           with secret attributes redacted
+
+   \note The secret attributes are specified in a 
+         'const char * const *' within the LDB_SECRET_ATTRIBUTE_LIST
+         opaque set on the ldb
+
+   \sa ldb_ldif_message_string for an exact representiation of the
+       message as LDIF
+*/
+char *ldb_ldif_message_redacted_string(struct ldb_context *ldb,
+				       TALLOC_CTX *mem_ctx,
+				       enum ldb_changetype changetype,
+				       const struct ldb_message *msg);
 
 
 /**
    Base64 encode a buffer
 
    \param mem_ctx the memory context that the result is allocated
-   from. 
+   from.
    \param buf pointer to the array that is to be encoded
    \param len the number of elements in the array to be encoded
 
@@ -1730,15 +1820,15 @@ int ldb_base64_decode(char *s);
 
 /**
   Get the linear form of a DN (without any extended components)
-  
+
   \param dn The DN to linearize
 */
 
 const char *ldb_dn_get_linearized(struct ldb_dn *dn);
 
 /**
-  Allocate a copy of the linear form of a DN (without any extended components) onto the supplied memory context 
-  
+  Allocate a copy of the linear form of a DN (without any extended components) onto the supplied memory context
+
   \param dn The DN to linearize
   \param mem_ctx TALLOC context to return result on
 */
@@ -1747,7 +1837,7 @@ char *ldb_dn_alloc_linearized(TALLOC_CTX *mem_ctx, struct ldb_dn *dn);
 
 /**
   Get the linear form of a DN (with any extended components)
-  
+
   \param mem_ctx TALLOC context to return result on
   \param dn The DN to linearize
   \param mode Style of extended DN to return (0 is HEX representation of binary form, 1 is a string form)
@@ -1759,21 +1849,21 @@ void ldb_dn_extended_filter(struct ldb_dn *dn, const char * const *accept_list);
 void ldb_dn_remove_extended_components(struct ldb_dn *dn);
 bool ldb_dn_has_extended(struct ldb_dn *dn);
 
-int ldb_dn_extended_add_syntax(struct ldb_context *ldb, 
+int ldb_dn_extended_add_syntax(struct ldb_context *ldb,
 			       unsigned flags,
 			       const struct ldb_dn_extended_syntax *syntax);
 
-/** 
+/**
   Allocate a new DN from a string
 
   \param mem_ctx TALLOC context to return resulting ldb_dn structure on
-  \param dn The new DN 
+  \param dn The new DN
 
   \note The DN will not be parsed at this time.  Use ldb_dn_validate to tell if the DN is syntacticly correct
 */
 
 struct ldb_dn *ldb_dn_new(TALLOC_CTX *mem_ctx, struct ldb_context *ldb, const char *dn);
-/** 
+/**
   Allocate a new DN from a printf style format string and arguments
 
   \param mem_ctx TALLOC context to return resulting ldb_dn structure on
@@ -1783,11 +1873,11 @@ struct ldb_dn *ldb_dn_new(TALLOC_CTX *mem_ctx, struct ldb_context *ldb, const ch
 */
 
 struct ldb_dn *ldb_dn_new_fmt(TALLOC_CTX *mem_ctx, struct ldb_context *ldb, const char *new_fmt, ...) PRINTF_ATTRIBUTE(3,4);
-/** 
+/**
   Allocate a new DN from a struct ldb_val (useful to avoid buffer overrun)
 
   \param mem_ctx TALLOC context to return resulting ldb_dn structure on
-  \param dn The new DN 
+  \param dn The new DN
 
   \note The DN will not be parsed at this time.  Use ldb_dn_validate to tell if the DN is syntacticly correct
 */
@@ -1795,7 +1885,7 @@ struct ldb_dn *ldb_dn_new_fmt(TALLOC_CTX *mem_ctx, struct ldb_context *ldb, cons
 struct ldb_dn *ldb_dn_from_ldb_val(TALLOC_CTX *mem_ctx, struct ldb_context *ldb, const struct ldb_val *strdn);
 
 /**
-  Determine if this DN is syntactically valid 
+  Determine if this DN is syntactically valid
 
   \param dn The DN to validate
 */
@@ -1815,6 +1905,9 @@ bool ldb_dn_add_child(struct ldb_dn *dn, struct ldb_dn *child);
 bool ldb_dn_add_child_fmt(struct ldb_dn *dn, const char *child_fmt, ...) PRINTF_ATTRIBUTE(2,3);
 bool ldb_dn_remove_base_components(struct ldb_dn *dn, unsigned int num);
 bool ldb_dn_remove_child_components(struct ldb_dn *dn, unsigned int num);
+bool ldb_dn_add_child_val(struct ldb_dn *dn,
+			  const char *rdn,
+			  struct ldb_val value);
 
 struct ldb_dn *ldb_dn_copy(TALLOC_CTX *mem_ctx, struct ldb_dn *dn);
 struct ldb_dn *ldb_dn_get_parent(TALLOC_CTX *mem_ctx, struct ldb_dn *dn);
@@ -1902,31 +1995,31 @@ int ldb_msg_add_empty(struct ldb_message *msg,
 /**
    add a element to a ldb_message
 */
-int ldb_msg_add(struct ldb_message *msg, 
-		const struct ldb_message_element *el, 
+int ldb_msg_add(struct ldb_message *msg,
+		const struct ldb_message_element *el,
 		int flags);
-int ldb_msg_add_value(struct ldb_message *msg, 
+int ldb_msg_add_value(struct ldb_message *msg,
 		const char *attr_name,
 		const struct ldb_val *val,
 		struct ldb_message_element **return_el);
-int ldb_msg_add_steal_value(struct ldb_message *msg, 
+int ldb_msg_add_steal_value(struct ldb_message *msg,
 		      const char *attr_name,
 		      struct ldb_val *val);
-int ldb_msg_add_steal_string(struct ldb_message *msg, 
+int ldb_msg_add_steal_string(struct ldb_message *msg,
 			     const char *attr_name, char *str);
-int ldb_msg_add_string(struct ldb_message *msg, 
+int ldb_msg_add_string(struct ldb_message *msg,
 		       const char *attr_name, const char *str);
 int ldb_msg_add_linearized_dn(struct ldb_message *msg, const char *attr_name,
 			      struct ldb_dn *dn);
-int ldb_msg_add_fmt(struct ldb_message *msg, 
+int ldb_msg_add_fmt(struct ldb_message *msg,
 		    const char *attr_name, const char *fmt, ...) PRINTF_ATTRIBUTE(3,4);
 
 /**
    compare two message elements - return 0 on match
 */
-int ldb_msg_element_compare(struct ldb_message_element *el1, 
+int ldb_msg_element_compare(struct ldb_message_element *el1,
 			    struct ldb_message_element *el2);
-int ldb_msg_element_compare_name(struct ldb_message_element *el1, 
+int ldb_msg_element_compare_name(struct ldb_message_element *el1,
 				 struct ldb_message_element *el2);
 
 /**
@@ -1937,25 +2030,25 @@ int ldb_msg_element_compare_name(struct ldb_message_element *el1,
    single valued.
 */
 const struct ldb_val *ldb_msg_find_ldb_val(const struct ldb_message *msg, const char *attr_name);
-int ldb_msg_find_attr_as_int(const struct ldb_message *msg, 
+int ldb_msg_find_attr_as_int(const struct ldb_message *msg,
 			     const char *attr_name,
 			     int default_value);
-unsigned int ldb_msg_find_attr_as_uint(const struct ldb_message *msg, 
+unsigned int ldb_msg_find_attr_as_uint(const struct ldb_message *msg,
 				       const char *attr_name,
 				       unsigned int default_value);
-int64_t ldb_msg_find_attr_as_int64(const struct ldb_message *msg, 
+int64_t ldb_msg_find_attr_as_int64(const struct ldb_message *msg,
 				   const char *attr_name,
 				   int64_t default_value);
-uint64_t ldb_msg_find_attr_as_uint64(const struct ldb_message *msg, 
+uint64_t ldb_msg_find_attr_as_uint64(const struct ldb_message *msg,
 				     const char *attr_name,
 				     uint64_t default_value);
-double ldb_msg_find_attr_as_double(const struct ldb_message *msg, 
+double ldb_msg_find_attr_as_double(const struct ldb_message *msg,
 				   const char *attr_name,
 				   double default_value);
-int ldb_msg_find_attr_as_bool(const struct ldb_message *msg, 
+int ldb_msg_find_attr_as_bool(const struct ldb_message *msg,
 			      const char *attr_name,
 			      int default_value);
-const char *ldb_msg_find_attr_as_string(const struct ldb_message *msg, 
+const char *ldb_msg_find_attr_as_string(const struct ldb_message *msg,
 					const char *attr_name,
 					const char *default_value);
 
@@ -1966,9 +2059,9 @@ struct ldb_dn *ldb_msg_find_attr_as_dn(struct ldb_context *ldb,
 
 void ldb_msg_sort_elements(struct ldb_message *msg);
 
-struct ldb_message *ldb_msg_copy_shallow(TALLOC_CTX *mem_ctx, 
+struct ldb_message *ldb_msg_copy_shallow(TALLOC_CTX *mem_ctx,
 					 const struct ldb_message *msg);
-struct ldb_message *ldb_msg_copy(TALLOC_CTX *mem_ctx, 
+struct ldb_message *ldb_msg_copy(TALLOC_CTX *mem_ctx,
 				 const struct ldb_message *msg);
 
 /*
@@ -1980,7 +2073,7 @@ struct ldb_message *ldb_msg_copy(TALLOC_CTX *mem_ctx,
  * to steal the returned object into a TALLOC_CTX
  * with short lifetime.
  */
-struct ldb_message *ldb_msg_canonicalize(struct ldb_context *ldb, 
+struct ldb_message *ldb_msg_canonicalize(struct ldb_context *ldb,
 					 const struct ldb_message *msg) _DEPRECATED_;
 
 int ldb_msg_normalize(struct ldb_context *ldb,
@@ -1998,7 +2091,7 @@ int ldb_msg_normalize(struct ldb_context *ldb,
  * to steal the returned object into a TALLOC_CTX
  * with short lifetime.
  */
-struct ldb_message *ldb_msg_diff(struct ldb_context *ldb, 
+struct ldb_message *ldb_msg_diff(struct ldb_context *ldb,
 				 struct ldb_message *msg1,
 				 struct ldb_message *msg2) _DEPRECATED_;
 
@@ -2055,7 +2148,7 @@ int ldb_msg_sanity_check(struct ldb_context *ldb,
 /**
    Duplicate an ldb_val structure
 
-   This function copies an ldb value structure. 
+   This function copies an ldb value structure.
 
    \param mem_ctx the memory context that the duplicated value will be
    allocated from
@@ -2069,7 +2162,7 @@ struct ldb_val ldb_val_dup(TALLOC_CTX *mem_ctx, const struct ldb_val *v);
   this allows the user to set a debug function for error reporting
 */
 int ldb_set_debug(struct ldb_context *ldb,
-		  void (*debug)(void *context, enum ldb_debug_level level, 
+		  void (*debug)(void *context, enum ldb_debug_level level,
 				const char *fmt, va_list ap) PRINTF_ATTRIBUTE(3,0),
 		  void *context);
 
@@ -2099,8 +2192,8 @@ void ldb_msg_remove_attr(struct ldb_message *msg, const char *attr);
 void ldb_msg_remove_element(struct ldb_message *msg, struct ldb_message_element *el);
 
 
-void ldb_parse_tree_attr_replace(struct ldb_parse_tree *tree, 
-				 const char *attr, 
+void ldb_parse_tree_attr_replace(struct ldb_parse_tree *tree,
+				 const char *attr,
 				 const char *replace);
 
 /*
@@ -2115,7 +2208,7 @@ struct ldb_parse_tree *ldb_parse_tree_copy_shallow(TALLOC_CTX *mem_ctx,
 
    This function converts a time_t structure to an LDAP formatted
    GeneralizedTime string.
-		
+
    \param mem_ctx the memory context to allocate the return string in
    \param t the time structure to convert
 
@@ -2147,7 +2240,7 @@ int ldb_val_to_time(const struct ldb_val *v, time_t *t);
 
    This function converts a time_t structure to an LDAP formatted
    UTCTime string.
-		
+
    \param mem_ctx the memory context to allocate the return string in
    \param t the time structure to convert
 
@@ -2203,16 +2296,16 @@ do { \
 
 /**
    Convert a control into its string representation.
-   
+
    \param mem_ctx TALLOC context to return result on, and to allocate error_string on
    \param control A struct ldb_control to convert
 
-   \return string representation of the control 
+   \return string representation of the control
 */
 char* ldb_control_to_string(TALLOC_CTX *mem_ctx, const struct ldb_control *control);
 /**
-   Convert a string representing a control into a ldb_control structure 
-   
+   Convert a string representing a control into a ldb_control structure
+
    \param ldb LDB context
    \param mem_ctx TALLOC context to return result on, and to allocate error_string on
    \param control_strings A string-formatted control
@@ -2221,8 +2314,8 @@ char* ldb_control_to_string(TALLOC_CTX *mem_ctx, const struct ldb_control *contr
 */
 struct ldb_control *ldb_parse_control_from_string(struct ldb_context *ldb, TALLOC_CTX *mem_ctx, const char *control_strings);
 /**
-   Convert an array of string represention of a control into an array of ldb_control structures 
-   
+   Convert an array of string represention of a control into an array of ldb_control structures
+
    \param ldb LDB context
    \param mem_ctx TALLOC context to return result on, and to allocate error_string on
    \param control_strings Array of string-formatted controls
@@ -2232,7 +2325,7 @@ struct ldb_control *ldb_parse_control_from_string(struct ldb_context *ldb, TALLO
 struct ldb_control **ldb_parse_control_strings(struct ldb_context *ldb, TALLOC_CTX *mem_ctx, const char **control_strings);
 
 /**
-   return the ldb flags 
+   return the ldb flags
 */
 unsigned int ldb_get_flags(struct ldb_context *ldb);
 

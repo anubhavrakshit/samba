@@ -33,6 +33,7 @@
 #include "torture/drs/proto.h"
 #include "lib/tsocket/tsocket.h"
 #include "libcli/resolve/resolve.h"
+#include "lib/util/util_paths.h"
 
 struct DsSyncBindInfo {
 	struct dcerpc_pipe *drs_pipe;
@@ -85,12 +86,35 @@ struct DsIntIdTestCtx {
 		"objectClass: top\n" \
 		"objectClass: attributeSchema\n" \
 		"cn: msds-intid-%1$d\n" \
-		"attributeID: 1.2.840.%1$d.1.5.9940\n" \
+		"attributeID: 1.3.6.1.4.1.7165.4.6.1.%1$d.1.5.9940\n" \
 		"attributeSyntax: 2.5.5.10\n" \
 		"omSyntax: 4\n" \
 		"instanceType: 4\n" \
 		"isSingleValued: TRUE\n" \
 		"systemOnly: FALSE\n" \
+		"\n" \
+		"# schemaUpdateNow\n" \
+		"DN:\n" \
+		"changeType: modify\n" \
+		"add: schemaUpdateNow\n" \
+		"schemaUpdateNow: 1\n" \
+		"-\n" \
+		"\n" \
+		"###########################################################\n" \
+		"# Update schema (with linked attribute)\n" \
+		"###########################################################\n" \
+		"dn: CN=msds-intid-link-%1$d,CN=Schema,CN=Configuration,%2$s\n" \
+		"changetype: add\n" \
+		"objectClass: top\n" \
+		"objectClass: attributeSchema\n" \
+		"cn: msds-intid-link-%1$d\n" \
+		"attributeID: 1.3.6.1.4.1.7165.4.6.1.%1$d.1.5.9941\n" \
+		"attributeSyntax: 2.5.5.1\n" \
+		"omSyntax: 127\n" \
+		"instanceType: 4\n" \
+		"isSingleValued: TRUE\n" \
+		"systemOnly: FALSE\n" \
+		"linkID: 1.2.840.113556.1.2.50\n" \
 		"\n" \
 		"# schemaUpdateNow\n" \
 		"DN:\n" \
@@ -106,6 +130,7 @@ struct DsIntIdTestCtx {
 		"changetype: modify\n" \
 		"add: mayContain\n" \
 		"mayContain: msdsIntid%1$d\n" \
+		"mayContain: msdsIntidLink%1$d\n" \
 		"-\n" \
 		"\n" \
 		"# schemaUpdateNow\n" \
@@ -126,6 +151,7 @@ struct DsIntIdTestCtx {
 		"displayName: dsIntId_usr_%1$d\n" \
 		"sAMAccountName: dsIntId_usr_%1$d\n" \
 		"msdsIntid%1$d: msDS-IntId-%1$d attribute value\n" \
+		"msdsIntidLink%1$d: %2$s\n" \
 		"\n"
 
 
@@ -160,7 +186,7 @@ static struct DsIntIdTestCtx *_dsintid_create_context(struct torture_context *tc
 	}
 
 	/* populate test suite context */
-	ctx->creds = cmdline_credentials;
+	ctx->creds = popt_get_cmdline_credentials();
 	ctx->dsa_bind.server_binding = server_binding;
 
 	ctx->ldap_url = talloc_asprintf(ctx, "ldap://%s",
@@ -467,7 +493,15 @@ static bool _test_GetNCChanges(struct torture_context *tctx,
 			for (cur = ctr6.first_object; cur->next_object; cur = cur->next_object) {}
 			cur->next_object = ctr6_chunk->first_object;
 
-			/* TODO: store the chunk of linked_attributes if needed */
+			if (ctr6_chunk->linked_attributes_count != 0) {
+				uint32_t i;
+				ctr6.linked_attributes = talloc_realloc(mem_ctx, ctr6.linked_attributes,
+								       struct drsuapi_DsReplicaLinkedAttribute,
+								       ctr6.linked_attributes_count + ctr6_chunk->linked_attributes_count);
+				for (i = 0; i < ctr6_chunk->linked_attributes_count; i++) {
+					ctr6.linked_attributes[ctr6.linked_attributes_count++] = ctr6_chunk->linked_attributes[i];
+				}
+			}
 		}
 
 		/* prepare for next request */
@@ -566,13 +600,13 @@ static bool test_dsintid_schema(struct torture_context *tctx, struct DsIntIdTest
 			       la->attid == dsdb_attr->attributeID_id,
 			       _make_error_message(ctx, la->attid,
 						   dsdb_attr,
-						   la->identifier))
+						   la->identifier));
 		if (dsdb_attr->msDS_IntId) {
 			torture_assert(tctx,
 				       la->attid != dsdb_attr->msDS_IntId,
 				       _make_error_message(ctx, la->attid,
 							   dsdb_attr,
-							   la->identifier))
+							   la->identifier));
 		}
 	}
 

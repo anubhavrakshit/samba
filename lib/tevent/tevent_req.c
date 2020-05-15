@@ -31,19 +31,24 @@ char *tevent_req_default_print(struct tevent_req *req, TALLOC_CTX *mem_ctx)
 {
 	return talloc_asprintf(mem_ctx,
 			       "tevent_req[%p/%s]: state[%d] error[%lld (0x%llX)] "
-			       " state[%s (%p)] timer[%p]",
+			       " state[%s (%p)] timer[%p] finish[%s]",
 			       req, req->internal.create_location,
 			       req->internal.state,
 			       (unsigned long long)req->internal.error,
 			       (unsigned long long)req->internal.error,
-			       talloc_get_name(req->data),
+			       req->internal.private_type,
 			       req->data,
-			       req->internal.timer
+			       req->internal.timer,
+			       req->internal.finish_location
 			       );
 }
 
 char *tevent_req_print(TALLOC_CTX *mem_ctx, struct tevent_req *req)
 {
+	if (req == NULL) {
+		return talloc_strdup(mem_ctx, "tevent_req[NULL]");
+	}
+
 	if (!req->private_print) {
 		return tevent_req_default_print(req, mem_ctx);
 	}
@@ -60,8 +65,16 @@ struct tevent_req *_tevent_req_create(TALLOC_CTX *mem_ctx,
 				    const char *location)
 {
 	struct tevent_req *req;
+	struct tevent_req *parent;
 	void **ppdata = (void **)pdata;
 	void *data;
+	size_t payload;
+
+	payload = sizeof(struct tevent_immediate) + data_size;
+	if (payload < sizeof(struct tevent_immediate)) {
+		/* overflow */
+		return NULL;
+	}
 
 	req = talloc_pooled_object(
 		mem_ctx, struct tevent_req, 2,
@@ -69,26 +82,42 @@ struct tevent_req *_tevent_req_create(TALLOC_CTX *mem_ctx,
 	if (req == NULL) {
 		return NULL;
 	}
-	ZERO_STRUCTP(req);
-	req->internal.private_type	= type;
-	req->internal.create_location	= location;
-	req->internal.state		= TEVENT_REQ_IN_PROGRESS;
-	req->internal.trigger		= tevent_create_immediate(req);
-	if (!req->internal.trigger) {
-		talloc_free(req);
-		return NULL;
-	}
+
+	*req = (struct tevent_req) {
+		.internal = {
+			.private_type		= type,
+			.create_location	= location,
+			.state			= TEVENT_REQ_IN_PROGRESS,
+			.trigger		= tevent_create_immediate(req),
+		},
+	};
 
 	data = talloc_zero_size(req, data_size);
-	if (data == NULL) {
-		talloc_free(req);
-		return NULL;
-	}
+
+	/*
+	 * No need to check for req->internal.trigger!=NULL or
+	 * data!=NULL, this can't fail: talloc_pooled_object has
+	 * already allocated sufficient memory.
+	 */
+
 	talloc_set_name_const(data, type);
 
 	req->data = data;
 
 	talloc_set_destructor(req, tevent_req_destructor);
+
+	parent = talloc_get_type(talloc_parent(mem_ctx), struct tevent_req);
+	if ((parent != NULL) && (parent->internal.profile != NULL)) {
+		bool ok = tevent_req_set_profile(req);
+
+		if (!ok) {
+			TALLOC_FREE(req);
+			return NULL;
+		}
+		req->internal.profile->parent = parent->internal.profile;
+		DLIST_ADD_END(parent->internal.profile->subprofiles,
+			      req->internal.profile);
+	}
 
 	*ppdata = data;
 	return req;
@@ -135,6 +164,7 @@ static void tevent_req_finish(struct tevent_req *req,
 			      enum tevent_req_state state,
 			      const char *location)
 {
+	struct tevent_req_profile *p;
 	/*
 	 * make sure we do not timeout after
 	 * the request was already finished
@@ -145,6 +175,20 @@ static void tevent_req_finish(struct tevent_req *req,
 	req->internal.finish_location = location;
 
 	tevent_req_cleanup(req);
+
+	p = req->internal.profile;
+
+	if (p != NULL) {
+		p->stop_location = location;
+		p->stop_time = tevent_timeval_current();
+		p->state = state;
+		p->user_error = req->internal.error;
+
+		if (p->parent != NULL) {
+			talloc_steal(p->parent, p);
+			req->internal.profile = NULL;
+		}
+	}
 
 	_tevent_req_notify_callback(req, location);
 }
@@ -305,6 +349,11 @@ bool tevent_req_set_endtime(struct tevent_req *req,
 	return true;
 }
 
+void tevent_req_reset_endtime(struct tevent_req *req)
+{
+	TALLOC_FREE(req->internal.timer);
+}
+
 void tevent_req_set_callback(struct tevent_req *req, tevent_req_fn fn, void *pvt)
 {
 	req->async.fn = fn;
@@ -344,4 +393,178 @@ void tevent_req_set_cleanup_fn(struct tevent_req *req, tevent_req_cleanup_fn fn)
 {
 	req->private_cleanup.state = req->internal.state;
 	req->private_cleanup.fn = fn;
+}
+
+static int tevent_req_profile_destructor(struct tevent_req_profile *p);
+
+bool tevent_req_set_profile(struct tevent_req *req)
+{
+	struct tevent_req_profile *p;
+
+	if (req->internal.profile != NULL) {
+		tevent_req_error(req, EINVAL);
+		return false;
+	}
+
+	p = tevent_req_profile_create(req);
+
+	if (tevent_req_nomem(p, req)) {
+		return false;
+	}
+
+	p->req_name = talloc_get_name(req->data);
+	p->start_location = req->internal.create_location;
+	p->start_time = tevent_timeval_current();
+
+	req->internal.profile = p;
+
+	return true;
+}
+
+static int tevent_req_profile_destructor(struct tevent_req_profile *p)
+{
+	if (p->parent != NULL) {
+		DLIST_REMOVE(p->parent->subprofiles, p);
+		p->parent = NULL;
+	}
+
+	while (p->subprofiles != NULL) {
+		p->subprofiles->parent = NULL;
+		DLIST_REMOVE(p->subprofiles, p->subprofiles);
+	}
+
+	return 0;
+}
+
+struct tevent_req_profile *tevent_req_move_profile(struct tevent_req *req,
+						   TALLOC_CTX *mem_ctx)
+{
+	return talloc_move(mem_ctx, &req->internal.profile);
+}
+
+const struct tevent_req_profile *tevent_req_get_profile(
+	struct tevent_req *req)
+{
+	return req->internal.profile;
+}
+
+void tevent_req_profile_get_name(const struct tevent_req_profile *profile,
+				 const char **req_name)
+{
+	if (req_name != NULL) {
+		*req_name = profile->req_name;
+	}
+}
+
+void tevent_req_profile_get_start(const struct tevent_req_profile *profile,
+				  const char **start_location,
+				  struct timeval *start_time)
+{
+	if (start_location != NULL) {
+		*start_location = profile->start_location;
+	}
+	if (start_time != NULL) {
+		*start_time = profile->start_time;
+	}
+}
+
+void tevent_req_profile_get_stop(const struct tevent_req_profile *profile,
+				 const char **stop_location,
+				 struct timeval *stop_time)
+{
+	if (stop_location != NULL) {
+		*stop_location = profile->stop_location;
+	}
+	if (stop_time != NULL) {
+		*stop_time = profile->stop_time;
+	}
+}
+
+void tevent_req_profile_get_status(const struct tevent_req_profile *profile,
+				   pid_t *pid,
+				   enum tevent_req_state *state,
+				   uint64_t *user_error)
+{
+	if (pid != NULL) {
+		*pid = profile->pid;
+	}
+	if (state != NULL) {
+		*state = profile->state;
+	}
+	if (user_error != NULL) {
+		*user_error = profile->user_error;
+	}
+}
+
+const struct tevent_req_profile *tevent_req_profile_get_subprofiles(
+	const struct tevent_req_profile *profile)
+{
+	return profile->subprofiles;
+}
+
+const struct tevent_req_profile *tevent_req_profile_next(
+	const struct tevent_req_profile *profile)
+{
+	return profile->next;
+}
+
+struct tevent_req_profile *tevent_req_profile_create(TALLOC_CTX *mem_ctx)
+{
+	struct tevent_req_profile *result;
+
+	result = talloc_zero(mem_ctx, struct tevent_req_profile);
+	if (result == NULL) {
+		return NULL;
+	}
+	talloc_set_destructor(result, tevent_req_profile_destructor);
+
+	return result;
+}
+
+bool tevent_req_profile_set_name(struct tevent_req_profile *profile,
+				 const char *req_name)
+{
+	profile->req_name = talloc_strdup(profile, req_name);
+	return (profile->req_name != NULL);
+}
+
+bool tevent_req_profile_set_start(struct tevent_req_profile *profile,
+				  const char *start_location,
+				  struct timeval start_time)
+{
+	profile->start_time = start_time;
+
+	profile->start_location = talloc_strdup(profile, start_location);
+	return (profile->start_location != NULL);
+}
+
+bool tevent_req_profile_set_stop(struct tevent_req_profile *profile,
+				 const char *stop_location,
+				 struct timeval stop_time)
+{
+	profile->stop_time = stop_time;
+
+	profile->stop_location = talloc_strdup(profile, stop_location);
+	return (profile->stop_location != NULL);
+}
+
+void tevent_req_profile_set_status(struct tevent_req_profile *profile,
+				   pid_t pid,
+				   enum tevent_req_state state,
+				   uint64_t user_error)
+{
+	profile->pid = pid;
+	profile->state = state;
+	profile->user_error = user_error;
+}
+
+void tevent_req_profile_append_sub(struct tevent_req_profile *parent_profile,
+				   struct tevent_req_profile **sub_profile)
+{
+	struct tevent_req_profile *sub;
+
+	sub = talloc_move(parent_profile, sub_profile);
+
+	sub->parent = parent_profile;
+	DLIST_ADD_END(parent_profile->subprofiles, sub);
 }

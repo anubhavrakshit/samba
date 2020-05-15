@@ -26,12 +26,15 @@
 #include "dbwrap/dbwrap_private.h"
 
 struct db_context;
+struct ctdbd_connection;
 
 struct db_context *db_open_ctdb(TALLOC_CTX *mem_ctx,
+				struct messaging_context *msg_ctx,
 				const char *name,
 				int hash_size, int tdb_flags,
 				int open_flags, mode_t mode,
 				enum dbwrap_lock_order lock_order,
 				uint64_t dbwrap_flags);
+int ctdb_async_ctx_reinit(TALLOC_CTX *mem_ctx, struct tevent_context *ev);
 
 #endif /* __DBWRAP_CTDB_H__ */

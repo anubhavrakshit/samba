@@ -253,8 +253,8 @@ static NTSTATUS ipc_open(struct ntvfs_module_context *ntvfs,
 	struct tevent_req *subreq;
 	const char *fname;
 	const char *directory;
-	const struct tsocket_address *client_addr;
-	const struct tsocket_address *server_addr;
+	const struct tsocket_address *remote_client_addr;
+	const struct tsocket_address *local_server_addr;
 
 	switch (oi->generic.level) {
 	case RAW_OPEN_NTCREATEX:
@@ -321,16 +321,16 @@ static NTSTATUS ipc_open(struct ntvfs_module_context *ntvfs,
 
 	NT_STATUS_NOT_OK_RETURN(status);
 
-	client_addr = ntvfs_get_local_address(ipriv->ntvfs);
-	server_addr = ntvfs_get_remote_address(ipriv->ntvfs);
+	local_server_addr = ntvfs_get_local_address(ipriv->ntvfs);
+	remote_client_addr = ntvfs_get_remote_address(ipriv->ntvfs);
 
 	subreq = tstream_npa_connect_send(p,
 					  ipriv->ntvfs->ctx->event_ctx,
 					  directory,
 					  fname,
-					  client_addr,
+					  remote_client_addr,
 					  NULL,
-					  server_addr,
+					  local_server_addr,
 					  NULL,
 					  state->session_info_transport);
 	NT_STATUS_HAVE_NO_MEMORY(subreq);
@@ -1177,12 +1177,12 @@ static NTSTATUS ipc_ioctl_smb2(struct ntvfs_module_context *ntvfs,
 	state = talloc(req, struct ipc_ioctl_state);
 	NT_STATUS_HAVE_NO_MEMORY(state);
 
-	io->smb2.out._pad	= 0;
+	io->smb2.out.reserved	= 0;
 	io->smb2.out.function	= io->smb2.in.function;
-	io->smb2.out.unknown2	= 0;
-	io->smb2.out.unknown3	= 0;
+	io->smb2.out.flags	= 0;
+	io->smb2.out.reserved2	= 0;
 	io->smb2.out.in		= data_blob_null;
-	io->smb2.out.out = data_blob_talloc(req, NULL, io->smb2.in.max_response_size);
+	io->smb2.out.out = data_blob_talloc(req, NULL, io->smb2.in.max_output_response);
 	NT_STATUS_HAVE_NO_MEMORY(io->smb2.out.out.data);
 
 	state->ipriv = ipriv;
@@ -1297,7 +1297,7 @@ static NTSTATUS ipc_ioctl(struct ntvfs_module_context *ntvfs,
 /*
   initialialise the IPC backend, registering ourselves with the ntvfs subsystem
  */
-NTSTATUS ntvfs_ipc_init(void)
+NTSTATUS ntvfs_ipc_init(TALLOC_CTX *ctx)
 {
 	NTSTATUS ret;
 	struct ntvfs_ops ops;

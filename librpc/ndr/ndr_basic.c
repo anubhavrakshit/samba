@@ -19,18 +19,49 @@
    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-#include "includes.h"
+#include "replace.h"
 #include "system/network.h"
 #include "librpc/ndr/libndr.h"
 #include "lib/util/util_net.h"
+#include "lib/util/debug.h"
+#include "lib/util/util.h"
+#include "lib/util/bytearray.h"
 
-#define NDR_SVAL(ndr, ofs) (NDR_BE(ndr)?RSVAL(ndr->data,ofs):SVAL(ndr->data,ofs))
-#define NDR_IVAL(ndr, ofs) (NDR_BE(ndr)?RIVAL(ndr->data,ofs):IVAL(ndr->data,ofs))
-#define NDR_IVALS(ndr, ofs) (NDR_BE(ndr)?RIVALS(ndr->data,ofs):IVALS(ndr->data,ofs))
-#define NDR_SSVAL(ndr, ofs, v) do { if (NDR_BE(ndr))  { RSSVAL(ndr->data,ofs,v); } else SSVAL(ndr->data,ofs,v); } while (0)
-#define NDR_SIVAL(ndr, ofs, v) do { if (NDR_BE(ndr))  { RSIVAL(ndr->data,ofs,v); } else SIVAL(ndr->data,ofs,v); } while (0)
-#define NDR_SIVALS(ndr, ofs, v) do { if (NDR_BE(ndr))  { RSIVALS(ndr->data,ofs,v); } else SIVALS(ndr->data,ofs,v); } while (0)
+#define NDR_PULL_U16(ndr, ofs) \
+	(NDR_BE(ndr) ? PULL_BE_U16(ndr->data,ofs) : PULL_LE_U16(ndr->data,ofs))
 
+#define NDR_PULL_U32(ndr, ofs) \
+	(NDR_BE(ndr) ? PULL_BE_U32(ndr->data,ofs) : PULL_LE_U32(ndr->data,ofs))
+
+#define NDR_PULL_I32(ndr, ofs) \
+	(int32_t)(NDR_BE(ndr) ? PULL_BE_U32(ndr->data,ofs) : PULL_LE_U32(ndr->data,ofs))
+
+#define NDR_PUSH_U16(ndr, ofs, v) \
+	do { \
+		if (NDR_BE(ndr)) { \
+			PUSH_BE_U16(ndr->data, ofs, v); \
+		} else { \
+			PUSH_LE_U16(ndr->data, ofs, v); \
+		} \
+	} while (0)
+
+#define NDR_PUSH_U32(ndr, ofs, v) \
+	do { \
+		if (NDR_BE(ndr)) { \
+			PUSH_BE_U32(ndr->data, ofs, v); \
+		} else { \
+			PUSH_LE_U32(ndr->data, ofs, v); \
+		} \
+	} while (0)
+
+#define NDR_PUSH_I32(ndr, ofs, v) \
+	do { \
+		if (NDR_BE(ndr)) { \
+			PUSH_BE_U32(ndr->data, ofs, v); \
+		} else { \
+			PUSH_LE_U32(ndr->data, ofs, v); \
+		} \
+	} while (0)
 
 static void ndr_dump_data(struct ndr_print *ndr, const uint8_t *buf, int len);
 
@@ -42,7 +73,7 @@ static void ndr_dump_data(struct ndr_print *ndr, const uint8_t *buf, int len);
 _PUBLIC_ void ndr_check_padding(struct ndr_pull *ndr, size_t n)
 {
 	size_t ofs2 = (ndr->offset + (n-1)) & ~(n-1);
-	int i;
+	size_t i;
 	for (i=ndr->offset;i<ofs2;i++) {
 		if (ndr->data[i] != 0) {
 			break;
@@ -65,7 +96,7 @@ _PUBLIC_ enum ndr_err_code ndr_pull_int8(struct ndr_pull *ndr, int ndr_flags, in
 {
 	NDR_PULL_CHECK_FLAGS(ndr, ndr_flags);
 	NDR_PULL_NEED_BYTES(ndr, 1);
-	*v = (int8_t)CVAL(ndr->data, ndr->offset);
+	*v = (int8_t)PULL_BE_U8(ndr->data, ndr->offset);
 	ndr->offset += 1;
 	return NDR_ERR_SUCCESS;
 }
@@ -77,7 +108,7 @@ _PUBLIC_ enum ndr_err_code ndr_pull_uint8(struct ndr_pull *ndr, int ndr_flags, u
 {
 	NDR_PULL_CHECK_FLAGS(ndr, ndr_flags);
 	NDR_PULL_NEED_BYTES(ndr, 1);
-	*v = CVAL(ndr->data, ndr->offset);
+	*v = PULL_BE_U8(ndr->data, ndr->offset);
 	ndr->offset += 1;
 	return NDR_ERR_SUCCESS;
 }
@@ -90,7 +121,7 @@ _PUBLIC_ enum ndr_err_code ndr_pull_int16(struct ndr_pull *ndr, int ndr_flags, i
 	NDR_PULL_CHECK_FLAGS(ndr, ndr_flags);
 	NDR_PULL_ALIGN(ndr, 2);
 	NDR_PULL_NEED_BYTES(ndr, 2);
-	*v = (uint16_t)NDR_SVAL(ndr, ndr->offset);
+	*v = (uint16_t)NDR_PULL_U16(ndr, ndr->offset);
 	ndr->offset += 2;
 	return NDR_ERR_SUCCESS;
 }
@@ -103,7 +134,7 @@ _PUBLIC_ enum ndr_err_code ndr_pull_uint16(struct ndr_pull *ndr, int ndr_flags, 
 	NDR_PULL_CHECK_FLAGS(ndr, ndr_flags);
 	NDR_PULL_ALIGN(ndr, 2);
 	NDR_PULL_NEED_BYTES(ndr, 2);
-	*v = NDR_SVAL(ndr, ndr->offset);
+	*v = NDR_PULL_U16(ndr, ndr->offset);
 	ndr->offset += 2;
 	return NDR_ERR_SUCCESS;
 }
@@ -135,7 +166,7 @@ _PUBLIC_ enum ndr_err_code ndr_pull_int32(struct ndr_pull *ndr, int ndr_flags, i
 	NDR_PULL_CHECK_FLAGS(ndr, ndr_flags);
 	NDR_PULL_ALIGN(ndr, 4);
 	NDR_PULL_NEED_BYTES(ndr, 4);
-	*v = NDR_IVALS(ndr, ndr->offset);
+	*v = NDR_PULL_I32(ndr, ndr->offset);
 	ndr->offset += 4;
 	return NDR_ERR_SUCCESS;
 }
@@ -148,7 +179,7 @@ _PUBLIC_ enum ndr_err_code ndr_pull_uint32(struct ndr_pull *ndr, int ndr_flags, 
 	NDR_PULL_CHECK_FLAGS(ndr, ndr_flags);
 	NDR_PULL_ALIGN(ndr, 4);
 	NDR_PULL_NEED_BYTES(ndr, 4);
-	*v = NDR_IVAL(ndr, ndr->offset);
+	*v = NDR_PULL_U32(ndr, ndr->offset);
 	ndr->offset += 4;
 	return NDR_ERR_SUCCESS;
 }
@@ -158,13 +189,16 @@ _PUBLIC_ enum ndr_err_code ndr_pull_uint32(struct ndr_pull *ndr, int ndr_flags, 
 */
 _PUBLIC_ enum ndr_err_code ndr_pull_uint3264(struct ndr_pull *ndr, int ndr_flags, uint32_t *v)
 {
-	uint64_t v64;
+	uint64_t v64 = 0;
 	enum ndr_err_code err;
 	NDR_PULL_CHECK_FLAGS(ndr, ndr_flags);
 	if (likely(!(ndr->flags & LIBNDR_FLAG_NDR64))) {
 		return ndr_pull_uint32(ndr, ndr_flags, v);
 	}
 	err = ndr_pull_hyper(ndr, ndr_flags, &v64);
+	if (!NDR_ERR_CODE_IS_SUCCESS(err)) {
+		return err;
+	}
 	*v = (uint32_t)v64;
 	if (unlikely(v64 != *v)) {
 		DEBUG(0,(__location__ ": non-zero upper 32 bits 0x%016llx\n",
@@ -232,8 +266,8 @@ _PUBLIC_ enum ndr_err_code ndr_pull_udlong(struct ndr_pull *ndr, int ndr_flags, 
 	NDR_PULL_CHECK_FLAGS(ndr, ndr_flags);
 	NDR_PULL_ALIGN(ndr, 4);
 	NDR_PULL_NEED_BYTES(ndr, 8);
-	*v = NDR_IVAL(ndr, ndr->offset);
-	*v |= (uint64_t)(NDR_IVAL(ndr, ndr->offset+4)) << 32;
+	*v = NDR_PULL_U32(ndr, ndr->offset);
+	*v |= (uint64_t)(NDR_PULL_U32(ndr, ndr->offset+4)) << 32;
 	ndr->offset += 8;
 	return NDR_ERR_SUCCESS;
 }
@@ -246,8 +280,8 @@ _PUBLIC_ enum ndr_err_code ndr_pull_udlongr(struct ndr_pull *ndr, int ndr_flags,
 	NDR_PULL_CHECK_FLAGS(ndr, ndr_flags);
 	NDR_PULL_ALIGN(ndr, 4);
 	NDR_PULL_NEED_BYTES(ndr, 8);
-	*v = ((uint64_t)NDR_IVAL(ndr, ndr->offset)) << 32;
-	*v |= NDR_IVAL(ndr, ndr->offset+4);
+	*v = ((uint64_t)NDR_PULL_U32(ndr, ndr->offset)) << 32;
+	*v |= NDR_PULL_U32(ndr, ndr->offset+4);
 	ndr->offset += 8;
 	return NDR_ERR_SUCCESS;
 }
@@ -470,7 +504,7 @@ _PUBLIC_ enum ndr_err_code ndr_push_int8(struct ndr_push *ndr, int ndr_flags, in
 {
 	NDR_PUSH_CHECK_FLAGS(ndr, ndr_flags);
 	NDR_PUSH_NEED_BYTES(ndr, 1);
-	SCVAL(ndr->data, ndr->offset, (uint8_t)v);
+	PUSH_BE_U8(ndr->data, ndr->offset, (uint8_t)v);
 	ndr->offset += 1;
 	return NDR_ERR_SUCCESS;
 }
@@ -482,7 +516,7 @@ _PUBLIC_ enum ndr_err_code ndr_push_uint8(struct ndr_push *ndr, int ndr_flags, u
 {
 	NDR_PUSH_CHECK_FLAGS(ndr, ndr_flags);
 	NDR_PUSH_NEED_BYTES(ndr, 1);
-	SCVAL(ndr->data, ndr->offset, v);
+	PUSH_BE_U8(ndr->data, ndr->offset, v);
 	ndr->offset += 1;
 	return NDR_ERR_SUCCESS;
 }
@@ -495,7 +529,7 @@ _PUBLIC_ enum ndr_err_code ndr_push_int16(struct ndr_push *ndr, int ndr_flags, i
 	NDR_PUSH_CHECK_FLAGS(ndr, ndr_flags);
 	NDR_PUSH_ALIGN(ndr, 2);
 	NDR_PUSH_NEED_BYTES(ndr, 2);
-	NDR_SSVAL(ndr, ndr->offset, (uint16_t)v);
+	NDR_PUSH_U16(ndr, ndr->offset, (uint16_t)v);
 	ndr->offset += 2;
 	return NDR_ERR_SUCCESS;
 }
@@ -508,7 +542,7 @@ _PUBLIC_ enum ndr_err_code ndr_push_uint16(struct ndr_push *ndr, int ndr_flags, 
 	NDR_PUSH_CHECK_FLAGS(ndr, ndr_flags);
 	NDR_PUSH_ALIGN(ndr, 2);
 	NDR_PUSH_NEED_BYTES(ndr, 2);
-	NDR_SSVAL(ndr, ndr->offset, v);
+	NDR_PUSH_U16(ndr, ndr->offset, v);
 	ndr->offset += 2;
 	return NDR_ERR_SUCCESS;
 }
@@ -532,7 +566,7 @@ _PUBLIC_ enum ndr_err_code ndr_push_int32(struct ndr_push *ndr, int ndr_flags, i
 	NDR_PUSH_CHECK_FLAGS(ndr, ndr_flags);
 	NDR_PUSH_ALIGN(ndr, 4);
 	NDR_PUSH_NEED_BYTES(ndr, 4);
-	NDR_SIVALS(ndr, ndr->offset, v);
+	NDR_PUSH_I32(ndr, ndr->offset, v);
 	ndr->offset += 4;
 	return NDR_ERR_SUCCESS;
 }
@@ -545,7 +579,7 @@ _PUBLIC_ enum ndr_err_code ndr_push_uint32(struct ndr_push *ndr, int ndr_flags, 
 	NDR_PUSH_CHECK_FLAGS(ndr, ndr_flags);
 	NDR_PUSH_ALIGN(ndr, 4);
 	NDR_PUSH_NEED_BYTES(ndr, 4);
-	NDR_SIVAL(ndr, ndr->offset, v);
+	NDR_PUSH_U32(ndr, ndr->offset, v);
 	ndr->offset += 4;
 	return NDR_ERR_SUCCESS;
 }
@@ -569,8 +603,8 @@ _PUBLIC_ enum ndr_err_code ndr_push_udlong(struct ndr_push *ndr, int ndr_flags, 
 	NDR_PUSH_CHECK_FLAGS(ndr, ndr_flags);
 	NDR_PUSH_ALIGN(ndr, 4);
 	NDR_PUSH_NEED_BYTES(ndr, 8);
-	NDR_SIVAL(ndr, ndr->offset, (v & 0xFFFFFFFF));
-	NDR_SIVAL(ndr, ndr->offset+4, (v>>32));
+	NDR_PUSH_U32(ndr, ndr->offset, (v & 0xFFFFFFFF));
+	NDR_PUSH_U32(ndr, ndr->offset+4, (v>>32));
 	ndr->offset += 8;
 	return NDR_ERR_SUCCESS;
 }
@@ -583,8 +617,8 @@ _PUBLIC_ enum ndr_err_code ndr_push_udlongr(struct ndr_push *ndr, int ndr_flags,
 	NDR_PUSH_CHECK_FLAGS(ndr, ndr_flags);
 	NDR_PUSH_ALIGN(ndr, 4);
 	NDR_PUSH_NEED_BYTES(ndr, 8);
-	NDR_SIVAL(ndr, ndr->offset, (v>>32));
-	NDR_SIVAL(ndr, ndr->offset+4, (v & 0xFFFFFFFF));
+	NDR_PUSH_U32(ndr, ndr->offset, (v>>32));
+	NDR_PUSH_U32(ndr, ndr->offset+4, (v & 0xFFFFFFFF));
 	ndr->offset += 8;
 	return NDR_ERR_SUCCESS;
 }
@@ -717,6 +751,12 @@ _PUBLIC_ enum ndr_err_code ndr_pull_trailer_align(struct ndr_pull *ndr, size_t s
 */
 _PUBLIC_ enum ndr_err_code ndr_push_bytes(struct ndr_push *ndr, const uint8_t *data, uint32_t n)
 {
+	if (unlikely(n == 0)) {
+		return NDR_ERR_SUCCESS;
+	}
+	if (unlikely(data == NULL)) {
+		return NDR_ERR_INVALID_POINTER;
+	}
 	NDR_PUSH_NEED_BYTES(ndr, n);
 	memcpy(ndr->data + ndr->offset, data, n);
 	ndr->offset += n;
@@ -770,9 +810,13 @@ _PUBLIC_ enum ndr_err_code ndr_push_full_ptr(struct ndr_push *ndr, const void *p
 		/* Check if the pointer already exists and has an id */
 		ptr = ndr_token_peek(&ndr->full_ptr_list, p);
 		if (ptr == 0) {
+			enum ndr_err_code ret = NDR_ERR_SUCCESS;
 			ndr->ptr_count++;
 			ptr = ndr->ptr_count;
-			ndr_token_store(ndr, &ndr->full_ptr_list, p, ptr);
+			ret = ndr_token_store(ndr, &ndr->full_ptr_list, p, ptr);
+			if (ret != NDR_ERR_SUCCESS) {
+				return ret;
+			}
 		}
 	}
 	return ndr_push_uint3264(ndr, NDR_SCALARS, ptr);
@@ -883,7 +927,7 @@ _PUBLIC_ enum ndr_err_code ndr_push_uid_t(struct ndr_push *ndr, int ndr_flags, u
 */
 _PUBLIC_ enum ndr_err_code ndr_pull_uid_t(struct ndr_pull *ndr, int ndr_flags, uid_t *u)
 {
-	uint64_t uu;
+	uint64_t uu = 0;
 	NDR_CHECK(ndr_pull_hyper(ndr, ndr_flags, &uu));
 	*u = (uid_t)uu;
 	if (unlikely(uu != *u)) {
@@ -909,7 +953,7 @@ _PUBLIC_ enum ndr_err_code ndr_push_gid_t(struct ndr_push *ndr, int ndr_flags, g
 */
 _PUBLIC_ enum ndr_err_code ndr_pull_gid_t(struct ndr_pull *ndr, int ndr_flags, gid_t *g)
 {
-	uint64_t gg;
+	uint64_t gg = 0;
 	NDR_CHECK(ndr_pull_hyper(ndr, ndr_flags, &gg));
 	*g = (gid_t)gg;
 	if (unlikely(gg != *g)) {
@@ -1062,41 +1106,73 @@ _PUBLIC_ void ndr_print_bitmap_flag(struct ndr_print *ndr, size_t size, const ch
 
 _PUBLIC_ void ndr_print_int8(struct ndr_print *ndr, const char *name, int8_t v)
 {
+	if (NDR_HIDE_SECRET(ndr)) {
+		ndr->print(ndr, "%-25s: <REDACTED SECRET VALUE>", name);
+		return;
+	}
 	ndr->print(ndr, "%-25s: %d", name, v);
 }
 
 _PUBLIC_ void ndr_print_uint8(struct ndr_print *ndr, const char *name, uint8_t v)
 {
+	if (NDR_HIDE_SECRET(ndr)) {
+		ndr->print(ndr, "%-25s: <REDACTED SECRET VALUE>", name);
+		return;
+	}
 	ndr->print(ndr, "%-25s: 0x%02x (%u)", name, v, v);
 }
 
 _PUBLIC_ void ndr_print_int16(struct ndr_print *ndr, const char *name, int16_t v)
 {
+	if (NDR_HIDE_SECRET(ndr)) {
+		ndr->print(ndr, "%-25s: <REDACTED SECRET VALUE>", name);
+		return;
+	}
 	ndr->print(ndr, "%-25s: %d", name, v);
 }
 
 _PUBLIC_ void ndr_print_uint16(struct ndr_print *ndr, const char *name, uint16_t v)
 {
+	if (NDR_HIDE_SECRET(ndr)) {
+		ndr->print(ndr, "%-25s: <REDACTED SECRET VALUE>", name);
+		return;
+	}
 	ndr->print(ndr, "%-25s: 0x%04x (%u)", name, v, v);
 }
 
 _PUBLIC_ void ndr_print_int32(struct ndr_print *ndr, const char *name, int32_t v)
 {
+	if (NDR_HIDE_SECRET(ndr)) {
+		ndr->print(ndr, "%-25s: <REDACTED SECRET VALUE>", name);
+		return;
+	}
 	ndr->print(ndr, "%-25s: %d", name, v);
 }
 
 _PUBLIC_ void ndr_print_uint32(struct ndr_print *ndr, const char *name, uint32_t v)
 {
+	if (NDR_HIDE_SECRET(ndr)) {
+		ndr->print(ndr, "%-25s: <REDACTED SECRET VALUE>", name);
+		return;
+	}
 	ndr->print(ndr, "%-25s: 0x%08x (%u)", name, v, v);
 }
 
 _PUBLIC_ void ndr_print_int3264(struct ndr_print *ndr, const char *name, int32_t v)
 {
+	if (NDR_HIDE_SECRET(ndr)) {
+		ndr->print(ndr, "%-25s: <REDACTED SECRET VALUE>", name);
+		return;
+	}
 	ndr->print(ndr, "%-25s: %d", name, v);
 }
 
 _PUBLIC_ void ndr_print_uint3264(struct ndr_print *ndr, const char *name, uint32_t v)
 {
+	if (NDR_HIDE_SECRET(ndr)) {
+		ndr->print(ndr, "%-25s: <REDACTED SECRET VALUE>", name);
+		return;
+	}
 	ndr->print(ndr, "%-25s: 0x%08x (%u)", name, v, v);
 }
 
@@ -1112,6 +1188,10 @@ _PUBLIC_ void ndr_print_udlongr(struct ndr_print *ndr, const char *name, uint64_
 
 _PUBLIC_ void ndr_print_dlong(struct ndr_print *ndr, const char *name, int64_t v)
 {
+	if (NDR_HIDE_SECRET(ndr)) {
+		ndr->print(ndr, "%-25s: <REDACTED SECRET VALUE>", name);
+		return;
+	}
 	ndr->print(ndr, "%-25s: 0x%016llx (%lld)", name, (unsigned long long)v, (long long)v);
 }
 
@@ -1201,6 +1281,11 @@ _PUBLIC_ void ndr_print_array_uint8(struct ndr_print *ndr, const char *name,
 		return;
 	}
 
+	if (NDR_HIDE_SECRET(ndr)) {
+		ndr->print(ndr, "%s: ARRAY(%d): <REDACTED SECRET VALUES>", name, count);
+		return;
+	}
+
 	if (count <= _ONELINE_LIMIT && (ndr->flags & LIBNDR_PRINT_ARRAY_HEX)) {
 		char s[(_ONELINE_LIMIT + 1) * 2];
 		for (i=0;i<count;i++) {
@@ -1241,6 +1326,9 @@ static void ndr_print_dump_data_cb(const char *buf, void *private_data)
  */
 static void ndr_dump_data(struct ndr_print *ndr, const uint8_t *buf, int len)
 {
+	if (NDR_HIDE_SECRET(ndr)) {
+		return;
+	}
 	ndr->no_newline = true;
 	dump_data_cb(buf, len, true, ndr_print_dump_data_cb, ndr);
 	ndr->no_newline = false;
@@ -1398,8 +1486,8 @@ _PUBLIC_ enum ndr_err_code ndr_pull_timespec(struct ndr_pull *ndr,
 					     int ndr_flags,
 					     struct timespec *t)
 {
-	uint64_t secs;
-	uint32_t nsecs;
+	uint64_t secs = 0;
+	uint32_t nsecs = 0;
 	NDR_PULL_CHECK_FLAGS(ndr, ndr_flags);
 	NDR_CHECK(ndr_pull_hyper(ndr, ndr_flags, &secs));
 	NDR_CHECK(ndr_pull_uint32(ndr, ndr_flags, &nsecs));
@@ -1411,8 +1499,9 @@ _PUBLIC_ enum ndr_err_code ndr_pull_timespec(struct ndr_pull *ndr,
 _PUBLIC_ void ndr_print_timespec(struct ndr_print *ndr, const char *name,
 				 const struct timespec *t)
 {
-	ndr->print(ndr, "%-25s: %s.%ld", name, timestring(ndr, t->tv_sec),
-		   (long)t->tv_nsec);
+	char *str = timestring(ndr, t->tv_sec);
+	ndr->print(ndr, "%-25s: %s.%ld", name, str, t->tv_nsec);
+	TALLOC_FREE(str);
 }
 
 _PUBLIC_ enum ndr_err_code ndr_push_timeval(struct ndr_push *ndr,
@@ -1429,8 +1518,8 @@ _PUBLIC_ enum ndr_err_code ndr_pull_timeval(struct ndr_pull *ndr,
 					    int ndr_flags,
 					    struct timeval *t)
 {
-	uint64_t secs;
-	uint32_t usecs;
+	uint64_t secs = 0;
+	uint32_t usecs = 0;
 	NDR_PULL_CHECK_FLAGS(ndr, ndr_flags);
 	NDR_CHECK(ndr_pull_hyper(ndr, ndr_flags, &secs));
 	NDR_CHECK(ndr_pull_uint32(ndr, ndr_flags, &usecs));

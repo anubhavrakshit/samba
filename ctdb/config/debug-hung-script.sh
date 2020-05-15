@@ -4,11 +4,11 @@
 # for other operating systems.
 
 [ -n "$CTDB_BASE" ] || \
-    export CTDB_BASE=$(cd -P $(dirname "$0") ; echo "$PWD")
+    CTDB_BASE=$(d=$(dirname "$0") ; cd -P "$d" ; echo "$PWD")
 
-. "$CTDB_BASE/functions"
+. "${CTDB_BASE}/functions"
 
-loadconfig ctdb
+load_script_options
 
 # Testing hook
 if [ -n "$CTDB_DEBUG_HUNG_SCRIPT_LOGFILE" ] ; then
@@ -25,7 +25,7 @@ fi
     echo "===== Start of hung script debug for PID=\"$1\", event=\"$2\" ====="
 
     echo "pstree -p -a ${1}:"
-    out=$(pstree -p -a $1)
+    out=$(pstree -p -a "$1")
     echo "$out"
 
     # Check for processes matching a regular expression and print
@@ -36,9 +36,11 @@ fi
     default_pat='exportfs|rpcinfo'
     pat="${CTDB_DEBUG_HUNG_SCRIPT_STACKPAT:-${default_pat}}"
     echo "$out" |
-    sed -r -n "s@.*-(.*(${pat}).*),([0-9]*).*@\3 \1@p" |
+    sed -r -n "s@.*-(.*(${pat}).*),([0-9]*).*@\\3 \\1@p" |
     while read pid name ; do
 	trace=$(cat "/proc/${pid}/stack" 2>/dev/null)
+	# No! Checking the exit code afterwards is actually clearer...
+	# shellcheck disable=SC2181
 	if [ $? -eq 0 ] ; then
 	    echo "---- Stack trace of interesting process ${pid}[${name}] ----"
 	    echo "$trace"
@@ -47,7 +49,7 @@ fi
 
     if [ "$2" != "init" ] ; then
 	echo "---- ctdb scriptstatus ${2}: ----"
-	ctdb scriptstatus "$2"
+	$CTDB scriptstatus "$2"
     fi
 
     echo "===== End of hung script debug for PID=\"$1\", event=\"$2\" ====="
@@ -56,4 +58,4 @@ fi
 	mv "$tmp" "$CTDB_DEBUG_HUNG_SCRIPT_LOGFILE"
     fi
 
-) 9>"${CTDB_VARDIR}/debug-hung-script.lock"
+) 9>"${CTDB_SCRIPT_VARDIR}/debug-hung-script.lock"

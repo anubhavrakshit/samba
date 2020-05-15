@@ -26,6 +26,9 @@
 enum security_user_level security_session_user_level(struct auth_session_info *session_info,
 						     const struct dom_sid *domain_sid)
 {
+	bool authenticated = false;
+	bool guest = false;
+
 	if (!session_info) {
 		return SECURITY_ANONYMOUS;
 	}
@@ -35,6 +38,15 @@ enum security_user_level security_session_user_level(struct auth_session_info *s
 	}
 
 	if (security_token_is_anonymous(session_info->security_token)) {
+		return SECURITY_ANONYMOUS;
+	}
+
+	authenticated = security_token_has_nt_authenticated_users(session_info->security_token);
+	guest = security_token_has_builtin_guests(session_info->security_token);
+	if (!authenticated) {
+		if (guest) {
+			return SECURITY_GUEST;
+		}
 		return SECURITY_ANONYMOUS;
 	}
 
@@ -56,9 +68,5 @@ enum security_user_level security_session_user_level(struct auth_session_info *s
 		return SECURITY_DOMAIN_CONTROLLER;
 	}
 
-	if (security_token_has_nt_authenticated_users(session_info->security_token)) {
-		return SECURITY_USER;
-	}
-
-	return SECURITY_ANONYMOUS;
+	return SECURITY_USER;
 }

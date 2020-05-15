@@ -25,12 +25,14 @@
 #include "librpc/gen_ndr/ndr_netlogon.h"
 #include "librpc/gen_ndr/ndr_netlogon_c.h"
 #include "librpc/gen_ndr/ndr_samr_c.h"
-#include "../lib/crypto/crypto.h"
 #include "lib/cmdline/popt_common.h"
 #include "torture/rpc/torture_rpc.h"
 #include "auth/gensec/gensec.h"
 #include "libcli/auth/libcli_auth.h"
 #include "param/param.h"
+
+#include <gnutls/gnutls.h>
+#include <gnutls/crypto.h>
 
 #define TEST_MACHINE_NAME "samlogontest"
 #define TEST_USER_NAME "samlogontestuser"
@@ -96,8 +98,7 @@ static NTSTATUS check_samlogon(struct samlogon_state *samlogon_state,
 
 	ninfo.identity_info.domain_name.string = samlogon_state->account_domain;
 	ninfo.identity_info.parameter_control = parameter_control;
-	ninfo.identity_info.logon_id_low = 0;
-	ninfo.identity_info.logon_id_high = 0;
+	ninfo.identity_info.logon_id = 0;
 	ninfo.identity_info.account_name.string = samlogon_state->account_name;
 	ninfo.identity_info.workstation.string = TEST_MACHINE_NAME;
 
@@ -175,9 +176,15 @@ static NTSTATUS check_samlogon(struct samlogon_state *samlogon_state,
 
 		validation_level = r->in.validation_level;
 
-		netlogon_creds_decrypt_samlogon_validation(samlogon_state->creds,
-							   validation_level,
-							   r->out.validation);
+		status = netlogon_creds_decrypt_samlogon_validation(samlogon_state->creds,
+								    validation_level,
+								    r->out.validation);
+		if (!NT_STATUS_IS_OK(status)) {
+			if (error_string) {
+				*error_string = strdup(nt_errstr(status));
+			}
+			return status;
+		}
 
 		switch (validation_level) {
 		case 2:
@@ -209,9 +216,15 @@ static NTSTATUS check_samlogon(struct samlogon_state *samlogon_state,
 
 		validation_level = r_ex->in.validation_level;
 
-		netlogon_creds_decrypt_samlogon_validation(samlogon_state->creds,
-							   validation_level,
-							   r_ex->out.validation);
+		status = netlogon_creds_decrypt_samlogon_validation(samlogon_state->creds,
+								    validation_level,
+								    r_ex->out.validation);
+		if (!NT_STATUS_IS_OK(status)) {
+			if (error_string) {
+				*error_string = strdup(nt_errstr(status));
+			}
+			return status;
+		}
 
 		switch (validation_level) {
 		case 2:
@@ -251,9 +264,15 @@ static NTSTATUS check_samlogon(struct samlogon_state *samlogon_state,
 
 		validation_level = r_flags->in.validation_level;
 
-		netlogon_creds_decrypt_samlogon_validation(samlogon_state->creds,
-							   validation_level,
-							   r_flags->out.validation);
+		status = netlogon_creds_decrypt_samlogon_validation(samlogon_state->creds,
+								    validation_level,
+								    r_flags->out.validation);
+		if (!NT_STATUS_IS_OK(status)) {
+			if (error_string) {
+				*error_string = strdup(nt_errstr(status));
+			}
+			return status;
+		}
 
 		switch (validation_level) {
 		case 2:
@@ -346,8 +365,13 @@ static bool test_lm_ntlm_broken(struct samlogon_state *samlogon_state, enum ntlm
 	} else if (NT_STATUS_EQUAL(NT_STATUS_NOT_FOUND, nt_status) && strchr_m(samlogon_state->account_name, '@')) {
 		return ((break_which == BREAK_NT) || (break_which == BREAK_BOTH) || (break_which == NO_NT));
 	} else if (!NT_STATUS_EQUAL(samlogon_state->expected_error, nt_status)) {
+		int ret;
+
 		SAFE_FREE(*error_string);
-		asprintf(error_string, "Expected error: %s, got %s", nt_errstr(samlogon_state->expected_error), nt_errstr(nt_status));
+		ret = asprintf(error_string, "Expected error: %s, got %s", nt_errstr(samlogon_state->expected_error), nt_errstr(nt_status));
+		if (ret == -1) {
+			*error_string = NULL;
+		}
 		return false;
 	} else if (NT_STATUS_EQUAL(samlogon_state->expected_error, nt_status) && !NT_STATUS_IS_OK(nt_status)) {
 		return true;
@@ -467,8 +491,13 @@ static bool test_ntlm_in_lm(struct samlogon_state *samlogon_state, char **error_
 		}
 		return false;
 	} else if (!NT_STATUS_EQUAL(samlogon_state->expected_error, nt_status)) {
+		int ret;
+
 		SAFE_FREE(*error_string);
-		asprintf(error_string, "Expected error: %s, got %s", nt_errstr(samlogon_state->expected_error), nt_errstr(nt_status));
+		ret = asprintf(error_string, "Expected error: %s, got %s", nt_errstr(samlogon_state->expected_error), nt_errstr(nt_status));
+		if (ret == -1) {
+			*error_string = NULL;
+		}
 		return false;
 	} else if (NT_STATUS_EQUAL(samlogon_state->expected_error, nt_status) && !NT_STATUS_IS_OK(nt_status)) {
 		return true;
@@ -564,8 +593,13 @@ static bool test_ntlm_in_both(struct samlogon_state *samlogon_state, char **erro
 		}
 		return false;
 	} else if (!NT_STATUS_EQUAL(samlogon_state->expected_error, nt_status)) {
+		int ret;
+
 		SAFE_FREE(*error_string);
-		asprintf(error_string, "Expected error: %s, got %s", nt_errstr(samlogon_state->expected_error), nt_errstr(nt_status));
+		ret = asprintf(error_string, "Expected error: %s, got %s", nt_errstr(samlogon_state->expected_error), nt_errstr(nt_status));
+		if (ret == -1) {
+			*error_string = NULL;
+		}
 		return false;
 	} else if (NT_STATUS_EQUAL(samlogon_state->expected_error, nt_status) && !NT_STATUS_IS_OK(nt_status)) {
 		return true;
@@ -677,8 +711,13 @@ static bool test_lmv2_ntlmv2_broken(struct samlogon_state *samlogon_state,
 	} else if (NT_STATUS_EQUAL(NT_STATUS_NOT_FOUND, nt_status) && strchr_m(samlogon_state->account_name, '@')) {
 		return ((break_which == BREAK_NT) || (break_which == BREAK_BOTH) || (break_which == NO_NT));
 	} else if (!NT_STATUS_EQUAL(samlogon_state->expected_error, nt_status)) {
+		int ret;
+
 		SAFE_FREE(*error_string);
-		asprintf(error_string, "Expected error: %s, got %s", nt_errstr(samlogon_state->expected_error), nt_errstr(nt_status));
+		ret = asprintf(error_string, "Expected error: %s, got %s", nt_errstr(samlogon_state->expected_error), nt_errstr(nt_status));
+		if (ret == -1) {
+			*error_string = NULL;
+		}
 		return false;
 	} else if (NT_STATUS_EQUAL(samlogon_state->expected_error, nt_status) && !NT_STATUS_IS_OK(nt_status)) {
 		return true;
@@ -845,8 +884,13 @@ static bool test_lmv2_ntlm_broken(struct samlogon_state *samlogon_state,
 	} else if (NT_STATUS_EQUAL(NT_STATUS_NOT_FOUND, nt_status) && strchr_m(samlogon_state->account_name, '@')) {
 		return ((break_which == BREAK_NT) || (break_which == BREAK_BOTH));
 	} else if (!NT_STATUS_EQUAL(samlogon_state->expected_error, nt_status)) {
+		int ret;
+
 		SAFE_FREE(*error_string);
-		asprintf(error_string, "Expected error: %s, got %s", nt_errstr(samlogon_state->expected_error), nt_errstr(nt_status));
+		ret = asprintf(error_string, "Expected error: %s, got %s", nt_errstr(samlogon_state->expected_error), nt_errstr(nt_status));
+		if (ret == -1) {
+			*error_string = NULL;
+		}
 		return false;
 	} else if (NT_STATUS_EQUAL(samlogon_state->expected_error, nt_status) && !NT_STATUS_IS_OK(nt_status)) {
 		return true;
@@ -896,14 +940,11 @@ static bool test_lmv2_ntlm_broken(struct samlogon_state *samlogon_state,
 				pass = false;
 			}
 		} else {
-			static const uint8_t zeros[8];
-			if (memcmp(zeros, lm_session_key,
-				   sizeof(lm_session_key)) != 0) {
+			if (!all_zero(lm_session_key,
+				      sizeof(lm_session_key))) {
 				torture_comment(samlogon_state->tctx, "LM Session Key does not match expectations (zeros)!\n");
 				torture_comment(samlogon_state->tctx, "lm_session_key:\n");
 				dump_data(1, lm_session_key, 8);
-				torture_comment(samlogon_state->tctx, "expected:\n");
-				dump_data(1, zeros, 8);
 				pass = false;
 			}
 		}
@@ -1082,17 +1123,17 @@ static bool test_ntlm2(struct samlogon_state *samlogon_state, char **error_strin
 	uint8_t session_nonce_hash[16];
 	uint8_t client_chall[8];
 
-	MD5_CTX md5_session_nonce_ctx;
-	HMACMD5Context hmac_ctx;
+	gnutls_hmac_hd_t hmac_hnd;
+	gnutls_hash_hd_t hash_hnd;
 
 	ZERO_STRUCT(user_session_key);
 	ZERO_STRUCT(lm_key);
 	generate_random_buffer(client_chall, 8);
 
-	MD5Init(&md5_session_nonce_ctx);
-	MD5Update(&md5_session_nonce_ctx, samlogon_state->chall.data, 8);
-	MD5Update(&md5_session_nonce_ctx, client_chall, 8);
-	MD5Final(session_nonce_hash, &md5_session_nonce_ctx);
+	gnutls_hash_init(&hash_hnd, GNUTLS_DIG_MD5);
+	gnutls_hash(hash_hnd, samlogon_state->chall.data, 8);
+	gnutls_hash(hash_hnd, client_chall, 8);
+	gnutls_hash_deinit(hash_hnd, session_nonce_hash);
 
 	E_md4hash(samlogon_state->password, (uint8_t *)nt_hash);
 	lm_good = E_deshash(samlogon_state->password, (uint8_t *)lm_hash);
@@ -1104,10 +1145,13 @@ static bool test_ntlm2(struct samlogon_state *samlogon_state, char **error_strin
 	memcpy(lm_response.data, session_nonce_hash, 8);
 	memset(lm_response.data + 8, 0, 16);
 
-	hmac_md5_init_rfc2104(nt_key, 16, &hmac_ctx);
-	hmac_md5_update(samlogon_state->chall.data, 8, &hmac_ctx);
-	hmac_md5_update(client_chall, 8, &hmac_ctx);
-	hmac_md5_final(expected_user_session_key, &hmac_ctx);
+	gnutls_hmac_init(&hmac_hnd,
+			 GNUTLS_MAC_MD5,
+			 nt_key,
+			 16);
+	gnutls_hmac(hmac_hnd, samlogon_state->chall.data, 8);
+	gnutls_hmac(hmac_hnd, client_chall, 8);
+	gnutls_hmac_deinit(hmac_hnd, expected_user_session_key);
 
 	nt_status = check_samlogon(samlogon_state,
 				   BREAK_NONE,
@@ -1126,8 +1170,13 @@ static bool test_ntlm2(struct samlogon_state *samlogon_state, char **error_strin
 		}
 		return false;
 	} else if (!NT_STATUS_EQUAL(samlogon_state->expected_error, nt_status)) {
+		int ret;
+
 		SAFE_FREE(*error_string);
-		asprintf(error_string, "Expected error: %s, got %s", nt_errstr(samlogon_state->expected_error), nt_errstr(nt_status));
+		ret = asprintf(error_string, "Expected error: %s, got %s", nt_errstr(samlogon_state->expected_error), nt_errstr(nt_status));
+		if (ret == -1) {
+			*error_string = NULL;
+		}
 		return false;
 	} else if (NT_STATUS_EQUAL(samlogon_state->expected_error, nt_status) && !NT_STATUS_IS_OK(nt_status)) {
 		return true;
@@ -1146,14 +1195,10 @@ static bool test_ntlm2(struct samlogon_state *samlogon_state, char **error_strin
 			pass = false;
 		}
 	} else {
-		static const uint8_t zeros[8];
-		if (memcmp(zeros, lm_key,
-			   sizeof(lm_key)) != 0) {
+		if (!all_zero(lm_key, sizeof(lm_key))) {
 			torture_comment(samlogon_state->tctx, "LM Session Key does not match expectations (zeros)!\n");
 			torture_comment(samlogon_state->tctx, "lm_key:\n");
 			dump_data(1, lm_key, 8);
-			torture_comment(samlogon_state->tctx, "expected:\n");
-			dump_data(1, zeros, 8);
 			pass = false;
 		}
 	}
@@ -1180,8 +1225,7 @@ static bool test_plaintext(struct samlogon_state *samlogon_state, enum ntlm_brea
 	uint8_t user_session_key[16];
 	uint8_t lm_key[16];
 	uint8_t lm_hash[16];
-	static const uint8_t zeros[8];
-	DATA_BLOB chall = data_blob_talloc(samlogon_state->mem_ctx, zeros, sizeof(zeros));
+	DATA_BLOB chall = data_blob_talloc_zero(samlogon_state->mem_ctx, 8);
 	bool lm_good = E_deshash(samlogon_state->password, lm_hash);
 
 	ZERO_STRUCT(user_session_key);
@@ -1229,8 +1273,13 @@ static bool test_plaintext(struct samlogon_state *samlogon_state, enum ntlm_brea
 	} else if (NT_STATUS_EQUAL(NT_STATUS_NOT_FOUND, nt_status) && strchr_m(samlogon_state->account_name, '@')) {
 		return ((break_which == BREAK_NT) || (break_which == BREAK_BOTH) || (break_which == NO_NT));
 	} else if (!NT_STATUS_EQUAL(samlogon_state->expected_error, nt_status)) {
+		int ret;
+
 		SAFE_FREE(*error_string);
-		asprintf(error_string, "Expected error: %s, got %s", nt_errstr(samlogon_state->expected_error), nt_errstr(nt_status));
+		ret = asprintf(error_string, "Expected error: %s, got %s", nt_errstr(samlogon_state->expected_error), nt_errstr(nt_status));
+		if (ret == -1) {
+			*error_string = NULL;
+		}
 		return false;
 	} else if (NT_STATUS_EQUAL(samlogon_state->expected_error, nt_status) && !NT_STATUS_IS_OK(nt_status)) {
 		return true;
@@ -1330,7 +1379,7 @@ static const struct ntlm_tests {
 	{test_plaintext_nt_broken, "Plaintext NT broken", false},
 	{test_plaintext_nt_only, "Plaintext NT only", false},
 	{test_plaintext_lm_only, "Plaintext LM only", false},
-	{NULL, NULL}
+	{ .name = NULL, }
 };
 
 /*
@@ -1499,8 +1548,7 @@ bool test_InteractiveLogon(struct dcerpc_pipe *p, TALLOC_CTX *mem_ctx,
 
 	pinfo.identity_info.domain_name.string = account_domain;
 	pinfo.identity_info.parameter_control = parameter_control;
-	pinfo.identity_info.logon_id_low = 0;
-	pinfo.identity_info.logon_id_high = 0;
+	pinfo.identity_info.logon_id = 0;
 	pinfo.identity_info.account_name.string = account_name;
 	pinfo.identity_info.workstation.string = workstation_name;
 
@@ -1755,7 +1803,8 @@ bool torture_rpc_samlogon(struct torture_context *torture)
 	 * with INTERNAL_ERROR */
 
 	status = dcerpc_binding_set_flags(b,
-					  DCERPC_SCHANNEL | DCERPC_SIGN |
+					  DCERPC_SCHANNEL |
+					  DCERPC_SIGN | DCERPC_SEAL |
 					  DCERPC_SCHANNEL_128,
 					  DCERPC_AUTH_OPTIONS);
 	torture_assert_ntstatus_ok(torture, status, "set flags");
@@ -1788,47 +1837,63 @@ bool torture_rpc_samlogon(struct torture_context *torture)
 		} usercreds[] = {
 			{
 				.comment       = "domain\\user",
-				.domain        = cli_credentials_get_domain(cmdline_credentials),
-				.username      = cli_credentials_get_username(cmdline_credentials),
-				.password      = cli_credentials_get_password(cmdline_credentials),
+				.domain        = cli_credentials_get_domain(
+					popt_get_cmdline_credentials()),
+				.username      = cli_credentials_get_username(
+					popt_get_cmdline_credentials()),
+				.password      = cli_credentials_get_password(
+					popt_get_cmdline_credentials()),
 				.network_login = true,
 				.expected_interactive_error = NT_STATUS_OK,
-				.expected_network_error     = NT_STATUS_OK
+				.expected_network_error     = NT_STATUS_OK,
+				.parameter_control          = 0,
 			},
 			{
 				.comment       = "realm\\user",
-				.domain        = cli_credentials_get_realm(cmdline_credentials),
-				.username      = cli_credentials_get_username(cmdline_credentials),
-				.password      = cli_credentials_get_password(cmdline_credentials),
+				.domain        = cli_credentials_get_realm(
+					popt_get_cmdline_credentials()),
+				.username      = cli_credentials_get_username(
+					popt_get_cmdline_credentials()),
+				.password      = cli_credentials_get_password(
+					popt_get_cmdline_credentials()),
 				.network_login = true,
 				.expected_interactive_error = NT_STATUS_OK,
-				.expected_network_error     = NT_STATUS_OK
+				.expected_network_error     = NT_STATUS_OK,
+				.parameter_control          = 0,
 			},
 			{
 				.comment       = "user@domain",
 				.domain        = NULL,
 				.username      = talloc_asprintf(mem_ctx,
-						"%s@%s",
-						cli_credentials_get_username(cmdline_credentials),
-						cli_credentials_get_domain(cmdline_credentials)
+					"%s@%s",
+					cli_credentials_get_username(
+					popt_get_cmdline_credentials()),
+					cli_credentials_get_domain(
+					popt_get_cmdline_credentials())
 					),
-				.password      = cli_credentials_get_password(cmdline_credentials),
+				.password      = cli_credentials_get_password(
+					popt_get_cmdline_credentials()),
 				.network_login = false, /* works for some things, but not NTLMv2.  Odd */
 				.expected_interactive_error = NT_STATUS_OK,
-				.expected_network_error     = NT_STATUS_OK
+				.expected_network_error     = NT_STATUS_OK,
+				.parameter_control          = 0,
 			},
 			{
 				.comment       = "user@realm",
 				.domain        = NULL,
 				.username      = talloc_asprintf(mem_ctx,
-						"%s@%s",
-						cli_credentials_get_username(cmdline_credentials),
-						cli_credentials_get_realm(cmdline_credentials)
+					"%s@%s",
+					cli_credentials_get_username(
+						popt_get_cmdline_credentials()),
+					cli_credentials_get_realm(
+						popt_get_cmdline_credentials())
 					),
-				.password      = cli_credentials_get_password(cmdline_credentials),
+				.password      = cli_credentials_get_password(
+						popt_get_cmdline_credentials()),
 				.network_login = true,
 				.expected_interactive_error = NT_STATUS_OK,
-				.expected_network_error     = NT_STATUS_OK
+				.expected_network_error     = NT_STATUS_OK,
+				.parameter_control          = 0,
 			},
 			{
 				.comment      = "machine domain\\user",
@@ -1846,7 +1911,8 @@ bool torture_rpc_samlogon(struct torture_context *torture)
 				.password     = cli_credentials_get_password(machine_credentials),
 				.network_login = true,
 				.expected_interactive_error = NT_STATUS_NO_SUCH_USER,
-				.expected_network_error = NT_STATUS_NOLOGON_WORKSTATION_TRUST_ACCOUNT
+				.expected_network_error = NT_STATUS_NOLOGON_WORKSTATION_TRUST_ACCOUNT,
+				.parameter_control          = 0,
 			},
 			{
 				.comment       = "machine realm\\user",
@@ -1890,7 +1956,8 @@ bool torture_rpc_samlogon(struct torture_context *torture)
 				.password      = user_password,
 				.network_login = true,
 				.expected_interactive_error = NT_STATUS_OK,
-				.expected_network_error     = NT_STATUS_OK
+				.expected_network_error     = NT_STATUS_OK,
+				.parameter_control          = 0,
 			},
 			{
 				.comment       = "test user (long pw): user@realm",
@@ -1902,7 +1969,8 @@ bool torture_rpc_samlogon(struct torture_context *torture)
 				.password      = user_password,
 				.network_login = true,
 				.expected_interactive_error = NT_STATUS_OK,
-				.expected_network_error     = NT_STATUS_OK
+				.expected_network_error     = NT_STATUS_OK,
+				.parameter_control          = 0,
 			},
 			{
 				.comment       = "test user (long pw): user@domain",
@@ -1914,7 +1982,8 @@ bool torture_rpc_samlogon(struct torture_context *torture)
 				.password      = user_password,
 				.network_login = false, /* works for some things, but not NTLMv2.  Odd */
 				.expected_interactive_error = NT_STATUS_OK,
-				.expected_network_error     = NT_STATUS_OK
+				.expected_network_error     = NT_STATUS_OK,
+				.parameter_control          = 0,
 			},
 			/* Oddball, can we use the old password ? */
 			{
@@ -1934,7 +2003,8 @@ bool torture_rpc_samlogon(struct torture_context *torture)
 				.password      = user_password_wrong_wks,
 				.network_login = true,
 				.expected_interactive_error = NT_STATUS_INVALID_WORKSTATION,
-				.expected_network_error     = NT_STATUS_INVALID_WORKSTATION
+				.expected_network_error     = NT_STATUS_INVALID_WORKSTATION,
+				.parameter_control          = 0,
 			}
 		};
 

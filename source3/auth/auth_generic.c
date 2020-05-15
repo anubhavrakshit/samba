@@ -22,12 +22,15 @@
 */
 
 #include "includes.h"
+#include <tevent.h>
+#include "../lib/util/tevent_ntstatus.h"
 #include "auth.h"
 #include "../lib/tsocket/tsocket.h"
 #include "auth/gensec/gensec.h"
 #include "lib/param/param.h"
 #ifdef HAVE_KRB5
 #include "auth/kerberos/pac_utils.h"
+#include "nsswitch/libwbclient/wbclient.h"
 #endif
 #include "librpc/crypto/gse.h"
 #include "auth/credentials/credentials.h"
@@ -63,6 +66,51 @@ static NTSTATUS auth3_generate_session_info_pac(struct auth4_context *auth_ctx,
 
 	if (pac_blob) {
 #ifdef HAVE_KRB5
+		struct wbcAuthUserParams params = {};
+		struct wbcAuthUserInfo *info = NULL;
+		struct wbcAuthErrorInfo *err = NULL;
+		wbcErr wbc_err;
+
+		/*
+		 * Let winbind decode the PAC.
+		 * This will also store the user
+		 * data in the netsamlogon cache.
+		 *
+		 * We need to do this *before* we
+		 * call get_user_from_kerberos_info()
+		 * as that does a user lookup that
+		 * expects info in the netsamlogon cache.
+		 *
+		 * See BUG: https://bugzilla.samba.org/show_bug.cgi?id=11259
+		 */
+		params.level = WBC_AUTH_USER_LEVEL_PAC;
+		params.password.pac.data = pac_blob->data;
+		params.password.pac.length = pac_blob->length;
+
+		become_root();
+		wbc_err = wbcAuthenticateUserEx(&params, &info, &err);
+		unbecome_root();
+
+		/*
+		 * As this is merely a cache prime
+		 * WBC_ERR_WINBIND_NOT_AVAILABLE
+		 * is not a fatal error, treat it
+		 * as success.
+		 */
+
+		switch (wbc_err) {
+			case WBC_ERR_WINBIND_NOT_AVAILABLE:
+			case WBC_ERR_SUCCESS:
+				break;
+			case WBC_ERR_AUTH_ERROR:
+				status = NT_STATUS(err->nt_status);
+				wbcFreeMemory(err);
+				goto done;
+			default:
+				status = NT_STATUS_LOGON_FAILURE;
+				goto done;
+		}
+
 		status = kerberos_pac_logon_info(tmp_ctx, *pac_blob, NULL, NULL,
 						 NULL, NULL, 0, &logon_info);
 #else
@@ -95,13 +143,13 @@ static NTSTATUS auth3_generate_session_info_pac(struct auth4_context *auth_ctx,
 					     &ntuser, &ntdomain,
 					     &username, &pw);
 	if (!NT_STATUS_IS_OK(status)) {
-		DEBUG(1, ("Failed to map kerberos principal to system user "
-			  "(%s)\n", nt_errstr(status)));
+		DBG_NOTICE("Failed to map kerberos principal to system user "
+			  "(%s)\n", nt_errstr(status));
 		status = NT_STATUS_ACCESS_DENIED;
 		goto done;
 	}
 
-	/* save the PAC data if we have it */
+	/* Get the info3 from the PAC data if we have it */
 	if (logon_info) {
 		status = create_info3_from_pac_logon_info(tmp_ctx,
 					logon_info,
@@ -109,14 +157,7 @@ static NTSTATUS auth3_generate_session_info_pac(struct auth4_context *auth_ctx,
 		if (!NT_STATUS_IS_OK(status)) {
 			goto done;
 		}
-		netsamlogon_cache_store(ntuser, info3_copy);
 	}
-
-	/* setup the string used by %U */
-	sub_set_smb_name(username);
-
-	/* reload services so that the new %U is taken into account */
-	lp_load_with_shares(get_dyn_CONFIGFILE());
 
 	status = make_session_info_krb5(mem_ctx,
 					ntuser, ntdomain, username, pw,
@@ -128,6 +169,14 @@ static NTSTATUS auth3_generate_session_info_pac(struct auth4_context *auth_ctx,
 		status = NT_STATUS_ACCESS_DENIED;
 		goto done;
 	}
+
+	/* setup the string used by %U */
+	set_current_user_info((*session_info)->unix_info->sanitized_username,
+			      (*session_info)->unix_info->unix_name,
+			      (*session_info)->info->domain_name);
+
+	/* reload services so that the new %U is taken into account */
+	lp_load_with_shares(get_dyn_CONFIGFILE());
 
 	DEBUG(5, (__location__ "OK: user: %s domain: %s client: %s\n",
 		  ntuser, ntdomain, rhost));
@@ -150,7 +199,8 @@ static struct auth4_context *make_auth4_context_s3(TALLOC_CTX *mem_ctx, struct a
 	auth4_context->generate_session_info = auth3_generate_session_info;
 	auth4_context->get_ntlm_challenge = auth3_get_challenge;
 	auth4_context->set_ntlm_challenge = auth3_set_challenge;
-	auth4_context->check_ntlm_password = auth3_check_password;
+	auth4_context->check_ntlm_password_send = auth3_check_password_send;
+	auth4_context->check_ntlm_password_recv = auth3_check_password_recv;
 	auth4_context->private_data = talloc_steal(auth4_context, auth_context);
 	return auth4_context;
 }
@@ -163,7 +213,7 @@ NTSTATUS make_auth4_context(TALLOC_CTX *mem_ctx, struct auth4_context **auth4_co
 	TALLOC_CTX *tmp_ctx = talloc_new(mem_ctx);
 	NT_STATUS_HAVE_NO_MEMORY(tmp_ctx);
 
-	nt_status = make_auth_context_subsystem(tmp_ctx, &auth_context);
+	nt_status = make_auth3_context_for_ntlm(tmp_ctx, &auth_context);
 	if (!NT_STATUS_IS_OK(nt_status)) {
 		TALLOC_FREE(tmp_ctx);
 		return nt_status;
@@ -188,6 +238,8 @@ NTSTATUS make_auth4_context(TALLOC_CTX *mem_ctx, struct auth4_context **auth4_co
 
 NTSTATUS auth_generic_prepare(TALLOC_CTX *mem_ctx,
 			      const struct tsocket_address *remote_address,
+			      const struct tsocket_address *local_address,
+			      const char *service_description,
 			      struct gensec_security **gensec_security_out)
 {
 	struct gensec_security *gensec_security;
@@ -197,7 +249,7 @@ NTSTATUS auth_generic_prepare(TALLOC_CTX *mem_ctx,
 	TALLOC_CTX *tmp_ctx = talloc_new(mem_ctx);
 	NT_STATUS_HAVE_NO_MEMORY(tmp_ctx);
 
-	nt_status = make_auth_context_subsystem(tmp_ctx, &auth_context);
+	nt_status = make_auth3_context_for_ntlm(tmp_ctx, &auth_context);
 	if (!NT_STATUS_IS_OK(nt_status)) {
 		TALLOC_FREE(tmp_ctx);
 		return nt_status;
@@ -332,11 +384,31 @@ NTSTATUS auth_generic_prepare(TALLOC_CTX *mem_ctx,
 		return nt_status;
 	}
 
+	nt_status = gensec_set_local_address(gensec_security,
+					     local_address);
+	if (!NT_STATUS_IS_OK(nt_status)) {
+		TALLOC_FREE(tmp_ctx);
+		return nt_status;
+	}
+
+	nt_status = gensec_set_target_service_description(gensec_security,
+							  service_description);
+
+	if (!NT_STATUS_IS_OK(nt_status)) {
+		TALLOC_FREE(tmp_ctx);
+		return nt_status;
+	}
+
 	*gensec_security_out = talloc_steal(mem_ctx, gensec_security);
 	TALLOC_FREE(tmp_ctx);
 	return NT_STATUS_OK;
 }
 
+/*
+ * Check a username and password, and return the final session_info.
+ * We also log the authorization of the session here, just as
+ * gensec_session_info() does.
+ */
 NTSTATUS auth_check_password_session_info(struct auth4_context *auth_context,
 					  TALLOC_CTX *mem_ctx,
 					  struct auth_usersupplied_info *user_info,
@@ -344,21 +416,66 @@ NTSTATUS auth_check_password_session_info(struct auth4_context *auth_context,
 {
 	NTSTATUS nt_status;
 	void *server_info;
+	uint8_t authoritative = 0;
+	struct tevent_context *ev = NULL;
+	struct tevent_req *subreq = NULL;
+	bool ok;
 
-	nt_status = auth_context->check_ntlm_password(auth_context,
-						      talloc_tos(),
-						      user_info,
-						      &server_info, NULL, NULL);
-
-	if (NT_STATUS_IS_OK(nt_status)) {
-		nt_status = auth_context->generate_session_info(auth_context,
-								mem_ctx,
-								server_info,
-								user_info->client.account_name,
-								AUTH_SESSION_INFO_UNIX_TOKEN |
-								AUTH_SESSION_INFO_DEFAULT_GROUPS,
-								session_info);
-		TALLOC_FREE(server_info);
+	ev = samba_tevent_context_init(talloc_tos());
+	if (ev == NULL) {
+		return NT_STATUS_NO_MEMORY;
 	}
+
+	subreq = auth_context->check_ntlm_password_send(ev, ev,
+							auth_context,
+							user_info);
+	if (subreq == NULL) {
+		TALLOC_FREE(ev);
+		return NT_STATUS_NO_MEMORY;
+	}
+	ok = tevent_req_poll_ntstatus(subreq, ev, &nt_status);
+	if (!ok) {
+		TALLOC_FREE(ev);
+		return nt_status;
+	}
+	nt_status = auth_context->check_ntlm_password_recv(subreq,
+							   talloc_tos(),
+							   &authoritative,
+							   &server_info,
+							   NULL, NULL);
+	TALLOC_FREE(ev);
+	if (!NT_STATUS_IS_OK(nt_status)) {
+		return nt_status;
+	}
+
+	nt_status = auth_context->generate_session_info(auth_context,
+							mem_ctx,
+							server_info,
+							user_info->client.account_name,
+							AUTH_SESSION_INFO_UNIX_TOKEN |
+							AUTH_SESSION_INFO_DEFAULT_GROUPS |
+							AUTH_SESSION_INFO_NTLM,
+							session_info);
+	TALLOC_FREE(server_info);
+
+	if (!NT_STATUS_IS_OK(nt_status)) {
+		return nt_status;
+	}
+
+	/*
+	 * This is rather redundant (the authentication has just been
+	 * logged, with much the same details), but because we want to
+	 * log all authorizations consistently (be they NLTM, NTLMSSP
+	 * or krb5) we log this info again as an authorization.
+	 */
+	log_successful_authz_event(auth_context->msg_ctx,
+				   auth_context->lp_ctx,
+				   user_info->remote_host,
+				   user_info->local_host,
+				   user_info->service_description,
+				   user_info->auth_description,
+				   AUTHZ_TRANSPORT_PROTECTION_SMB,
+				   *session_info);
+
 	return nt_status;
 }

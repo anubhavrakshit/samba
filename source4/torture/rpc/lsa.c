@@ -35,7 +35,11 @@
 #include "source4/auth/kerberos/kerberos.h"
 #include "source4/auth/kerberos/kerberos_util.h"
 #include "lib/util/util_net.h"
-#include "../lib/crypto/crypto.h"
+#include "libcli/resolve/resolve.h"
+
+#include <gnutls/gnutls.h>
+#include <gnutls/crypto.h>
+
 #define TEST_MACHINENAME "lsatestmach"
 #define TRUSTPW "12345678"
 
@@ -153,7 +157,8 @@ static bool test_OpenPolicy_fail(struct dcerpc_binding_handle *b,
 bool test_lsa_OpenPolicy2_ex(struct dcerpc_binding_handle *b,
 			     struct torture_context *tctx,
 			     struct policy_handle **handle,
-			     NTSTATUS expected_status)
+			     NTSTATUS expected_status,
+			     NTSTATUS expected_status2)
 {
 	struct lsa_ObjectAttribute attr;
 	struct lsa_QosInfo qos;
@@ -183,9 +188,15 @@ bool test_lsa_OpenPolicy2_ex(struct dcerpc_binding_handle *b,
 	r.out.handle = *handle;
 
 	status = dcerpc_lsa_OpenPolicy2_r(b, tctx, &r);
-	torture_assert_ntstatus_equal(tctx, status, expected_status,
-				   "OpenPolicy2 failed");
-	if (!NT_STATUS_IS_OK(expected_status)) {
+
+	/* Allow two possible failure status codes */
+	if (!NT_STATUS_EQUAL(status, expected_status2)) {
+		torture_assert_ntstatus_equal(tctx, status,
+					      expected_status,
+					      "OpenPolicy2 failed");
+	}
+	if (!NT_STATUS_IS_OK(expected_status) ||
+	    !NT_STATUS_IS_OK(expected_status2)) {
 		return true;
 	}
 
@@ -201,7 +212,8 @@ bool test_lsa_OpenPolicy2(struct dcerpc_binding_handle *b,
 			  struct torture_context *tctx,
 			  struct policy_handle **handle)
 {
-	return test_lsa_OpenPolicy2_ex(b, tctx, handle, NT_STATUS_OK);
+	return test_lsa_OpenPolicy2_ex(b, tctx, handle,
+				       NT_STATUS_OK, NT_STATUS_OK);
 }
 
 static bool test_OpenPolicy2_fail(struct dcerpc_binding_handle *b,
@@ -269,6 +281,7 @@ static bool test_OpenPolicy2_fail(struct dcerpc_binding_handle *b,
 static bool test_LookupNames(struct dcerpc_binding_handle *b,
 			     struct torture_context *tctx,
 			     struct policy_handle *handle,
+			     enum lsa_LookupNamesLevel level,
 			     struct lsa_TransNameArray *tnames)
 {
 	struct lsa_LookupNames r;
@@ -301,7 +314,7 @@ static bool test_LookupNames(struct dcerpc_binding_handle *b,
 	r.in.handle = handle;
 	r.in.names = names;
 	r.in.sids = &sids;
-	r.in.level = 1;
+	r.in.level = level;
 	r.in.count = &count;
 	r.out.count = &count;
 	r.out.sids = &sids;
@@ -357,7 +370,8 @@ static bool test_LookupNames(struct dcerpc_binding_handle *b,
 
 static bool test_LookupNames_bogus(struct dcerpc_binding_handle *b,
 				   struct torture_context *tctx,
-				   struct policy_handle *handle)
+				   struct policy_handle *handle,
+				   enum lsa_LookupNamesLevel level)
 {
 	struct lsa_LookupNames r;
 	struct lsa_TransSidArray sids;
@@ -376,7 +390,7 @@ static bool test_LookupNames_bogus(struct dcerpc_binding_handle *b,
 	r.in.num_names = 1;
 	r.in.names = names;
 	r.in.sids = &sids;
-	r.in.level = 1;
+	r.in.level = level;
 	r.in.count = &count;
 	r.out.count = &count;
 	r.out.sids = &sids;
@@ -397,7 +411,8 @@ static bool test_LookupNames_bogus(struct dcerpc_binding_handle *b,
 
 static bool test_LookupNames_NULL(struct dcerpc_binding_handle *b,
 				  struct torture_context *tctx,
-				  struct policy_handle *handle)
+				  struct policy_handle *handle,
+				  enum lsa_LookupNamesLevel level)
 {
 	struct lsa_LookupNames r;
 	struct lsa_TransSidArray sids;
@@ -416,7 +431,7 @@ static bool test_LookupNames_NULL(struct dcerpc_binding_handle *b,
 	r.in.num_names = 1;
 	r.in.names = names;
 	r.in.sids = &sids;
-	r.in.level = 1;
+	r.in.level = level;
 	r.in.count = &count;
 	r.out.count = &count;
 	r.out.sids = &sids;
@@ -441,7 +456,8 @@ static bool test_LookupNames_NULL(struct dcerpc_binding_handle *b,
 
 static bool test_LookupNames_wellknown(struct dcerpc_binding_handle *b,
 				       struct torture_context *tctx,
-				       struct policy_handle *handle)
+				       struct policy_handle *handle,
+				       enum lsa_LookupNamesLevel level)
 {
 	struct lsa_TranslatedName name;
 	struct lsa_TransNameArray tnames;
@@ -453,45 +469,46 @@ static bool test_LookupNames_wellknown(struct dcerpc_binding_handle *b,
 	tnames.count = 1;
 	name.name.string = "NT AUTHORITY\\SYSTEM";
 	name.sid_type = SID_NAME_WKN_GRP;
-	ret &= test_LookupNames(b, tctx, handle, &tnames);
+	ret &= test_LookupNames(b, tctx, handle, level, &tnames);
 
 	name.name.string = "NT AUTHORITY\\ANONYMOUS LOGON";
 	name.sid_type = SID_NAME_WKN_GRP;
-	ret &= test_LookupNames(b, tctx, handle, &tnames);
+	ret &= test_LookupNames(b, tctx, handle, level, &tnames);
 
 	name.name.string = "NT AUTHORITY\\Authenticated Users";
 	name.sid_type = SID_NAME_WKN_GRP;
-	ret &= test_LookupNames(b, tctx, handle, &tnames);
+	ret &= test_LookupNames(b, tctx, handle, level, &tnames);
 
 #if 0
 	name.name.string = "NT AUTHORITY";
-	ret &= test_LookupNames(b, tctx, handle, &tnames);
+	ret &= test_LookupNames(b, tctx, handle, level, &tnames);
 
 	name.name.string = "NT AUTHORITY\\";
-	ret &= test_LookupNames(b, tctx, handle, &tnames);
+	ret &= test_LookupNames(b, tctx, handle, level, &tnames);
 #endif
 
 	name.name.string = "BUILTIN\\";
 	name.sid_type = SID_NAME_DOMAIN;
-	ret &= test_LookupNames(b, tctx, handle, &tnames);
+	ret &= test_LookupNames(b, tctx, handle, level, &tnames);
 
 	name.name.string = "BUILTIN\\Administrators";
 	name.sid_type = SID_NAME_ALIAS;
-	ret &= test_LookupNames(b, tctx, handle, &tnames);
+	ret &= test_LookupNames(b, tctx, handle, level, &tnames);
 
 	name.name.string = "SYSTEM";
 	name.sid_type = SID_NAME_WKN_GRP;
-	ret &= test_LookupNames(b, tctx, handle, &tnames);
+	ret &= test_LookupNames(b, tctx, handle, level, &tnames);
 
 	name.name.string = "Everyone";
 	name.sid_type = SID_NAME_WKN_GRP;
-	ret &= test_LookupNames(b, tctx, handle, &tnames);
+	ret &= test_LookupNames(b, tctx, handle, level, &tnames);
 	return ret;
 }
 
 static bool test_LookupNames2(struct dcerpc_binding_handle *b,
 			      struct torture_context *tctx,
 			      struct policy_handle *handle,
+			      enum lsa_LookupNamesLevel level,
 			      struct lsa_TransNameArray2 *tnames,
 			      bool check_result)
 {
@@ -524,7 +541,7 @@ static bool test_LookupNames2(struct dcerpc_binding_handle *b,
 	r.in.handle = handle;
 	r.in.names = names;
 	r.in.sids = &sids;
-	r.in.level = 1;
+	r.in.level = level;
 	r.in.count = &count;
 	r.in.lookup_options = 0;
 	r.in.client_revision = 0;
@@ -553,6 +570,7 @@ static bool test_LookupNames2(struct dcerpc_binding_handle *b,
 static bool test_LookupNames3(struct dcerpc_binding_handle *b,
 			      struct torture_context *tctx,
 			      struct policy_handle *handle,
+			      enum lsa_LookupNamesLevel level,
 			      struct lsa_TransNameArray2 *tnames,
 			      bool check_result)
 {
@@ -584,7 +602,7 @@ static bool test_LookupNames3(struct dcerpc_binding_handle *b,
 	r.in.handle = handle;
 	r.in.names = names;
 	r.in.sids = &sids;
-	r.in.level = 1;
+	r.in.level = level;
 	r.in.count = &count;
 	r.in.lookup_options = 0;
 	r.in.client_revision = 0;
@@ -612,6 +630,7 @@ static bool test_LookupNames3(struct dcerpc_binding_handle *b,
 
 static bool test_LookupNames4(struct dcerpc_binding_handle *b,
 			      struct torture_context *tctx,
+			      enum lsa_LookupNamesLevel level,
 			      struct lsa_TransNameArray2 *tnames,
 			      bool check_result)
 {
@@ -643,7 +662,7 @@ static bool test_LookupNames4(struct dcerpc_binding_handle *b,
 	r.in.num_names = tnames->count;
 	r.in.names = names;
 	r.in.sids = &sids;
-	r.in.level = 1;
+	r.in.level = level;
 	r.in.count = &count;
 	r.in.lookup_options = 0;
 	r.in.client_revision = 0;
@@ -681,7 +700,8 @@ static bool test_LookupNames4(struct dcerpc_binding_handle *b,
 }
 
 static bool test_LookupNames4_fail(struct dcerpc_binding_handle *b,
-				   struct torture_context *tctx)
+				   struct torture_context *tctx,
+				   enum lsa_LookupNamesLevel level)
 {
 	struct lsa_LookupNames4 r;
 	struct lsa_TransSidArray3 sids;
@@ -700,7 +720,7 @@ static bool test_LookupNames4_fail(struct dcerpc_binding_handle *b,
 	r.in.num_names = count;
 	r.in.names = names;
 	r.in.sids = &sids;
-	r.in.level = 1;
+	r.in.level = level;
 	r.in.count = &count;
 	r.in.lookup_options = 0;
 	r.in.client_revision = 0;
@@ -748,6 +768,7 @@ static bool test_LookupNames4_fail(struct dcerpc_binding_handle *b,
 static bool test_LookupSids(struct dcerpc_binding_handle *b,
 			    struct torture_context *tctx,
 			    struct policy_handle *handle,
+			    enum lsa_LookupNamesLevel level,
 			    struct lsa_SidArray *sids)
 {
 	struct lsa_LookupSids r;
@@ -763,7 +784,7 @@ static bool test_LookupSids(struct dcerpc_binding_handle *b,
 	r.in.handle = handle;
 	r.in.sids = sids;
 	r.in.names = &names;
-	r.in.level = 1;
+	r.in.level = level;
 	r.in.count = &count;
 	r.out.count = &count;
 	r.out.names = &names;
@@ -778,7 +799,7 @@ static bool test_LookupSids(struct dcerpc_binding_handle *b,
 
 	torture_comment(tctx, "\n");
 
-	if (!test_LookupNames(b, tctx, handle, &names)) {
+	if (!test_LookupNames(b, tctx, handle, level, &names)) {
 		return false;
 	}
 
@@ -789,6 +810,7 @@ static bool test_LookupSids(struct dcerpc_binding_handle *b,
 static bool test_LookupSids2(struct dcerpc_binding_handle *b,
 			    struct torture_context *tctx,
 			    struct policy_handle *handle,
+			    enum lsa_LookupNamesLevel level,
 			    struct lsa_SidArray *sids)
 {
 	struct lsa_LookupSids2 r;
@@ -804,7 +826,7 @@ static bool test_LookupSids2(struct dcerpc_binding_handle *b,
 	r.in.handle = handle;
 	r.in.sids = sids;
 	r.in.names = &names;
-	r.in.level = 1;
+	r.in.level = level;
 	r.in.count = &count;
 	r.in.lookup_options = 0;
 	r.in.client_revision = 0;
@@ -823,11 +845,11 @@ static bool test_LookupSids2(struct dcerpc_binding_handle *b,
 
 	torture_comment(tctx, "\n");
 
-	if (!test_LookupNames2(b, tctx, handle, &names, false)) {
+	if (!test_LookupNames2(b, tctx, handle, level, &names, false)) {
 		return false;
 	}
 
-	if (!test_LookupNames3(b, tctx, handle, &names, false)) {
+	if (!test_LookupNames3(b, tctx, handle, level, &names, false)) {
 		return false;
 	}
 
@@ -836,6 +858,7 @@ static bool test_LookupSids2(struct dcerpc_binding_handle *b,
 
 static bool test_LookupSids3(struct dcerpc_binding_handle *b,
 			    struct torture_context *tctx,
+			    enum lsa_LookupNamesLevel level,
 			    struct lsa_SidArray *sids)
 {
 	struct lsa_LookupSids3 r;
@@ -850,7 +873,7 @@ static bool test_LookupSids3(struct dcerpc_binding_handle *b,
 
 	r.in.sids = sids;
 	r.in.names = &names;
-	r.in.level = 1;
+	r.in.level = level;
 	r.in.count = &count;
 	r.in.lookup_options = 0;
 	r.in.client_revision = 0;
@@ -879,7 +902,7 @@ static bool test_LookupSids3(struct dcerpc_binding_handle *b,
 
 	torture_comment(tctx, "\n");
 
-	if (!test_LookupNames4(b, tctx, &names, true)) {
+	if (!test_LookupNames4(b, tctx, level, &names, true)) {
 		return false;
 	}
 
@@ -888,6 +911,7 @@ static bool test_LookupSids3(struct dcerpc_binding_handle *b,
 
 static bool test_LookupSids3_fail(struct dcerpc_binding_handle *b,
 				  struct torture_context *tctx,
+				  enum lsa_LookupNamesLevel level,
 				  struct lsa_SidArray *sids)
 {
 	struct lsa_LookupSids3 r;
@@ -903,7 +927,7 @@ static bool test_LookupSids3_fail(struct dcerpc_binding_handle *b,
 
 	r.in.sids = sids;
 	r.in.names = &names;
-	r.in.level = 1;
+	r.in.level = level;
 	r.in.count = &count;
 	r.in.lookup_options = 0;
 	r.in.client_revision = 0;
@@ -947,7 +971,8 @@ static bool test_LookupSids3_fail(struct dcerpc_binding_handle *b,
 
 bool test_many_LookupSids(struct dcerpc_pipe *p,
 			  struct torture_context *tctx,
-			  struct policy_handle *handle)
+			  struct policy_handle *handle,
+			  enum lsa_LookupNamesLevel level)
 {
 	uint32_t count;
 	struct lsa_SidArray sids;
@@ -978,7 +1003,7 @@ bool test_many_LookupSids(struct dcerpc_pipe *p,
 		r.in.handle = handle;
 		r.in.sids = &sids;
 		r.in.names = &names;
-		r.in.level = 1;
+		r.in.level = level;
 		r.in.count = &names.count;
 		r.out.count = &count;
 		r.out.names = &names;
@@ -994,16 +1019,16 @@ bool test_many_LookupSids(struct dcerpc_pipe *p,
 
 		torture_comment(tctx, "\n");
 
-		if (!test_LookupNames(b, tctx, handle, &names)) {
+		if (!test_LookupNames(b, tctx, handle, level, &names)) {
 			return false;
 		}
 	}
 
 	if (transport == NCACN_NP) {
-		if (!test_LookupSids3_fail(b, tctx, &sids)) {
+		if (!test_LookupSids3_fail(b, tctx, level, &sids)) {
 			return false;
 		}
-		if (!test_LookupNames4_fail(b, tctx)) {
+		if (!test_LookupNames4_fail(b, tctx, level)) {
 			return false;
 		}
 	} else if (transport == NCACN_IP_TCP) {
@@ -1019,10 +1044,10 @@ bool test_many_LookupSids(struct dcerpc_pipe *p,
 
 		if (auth_type == DCERPC_AUTH_TYPE_SCHANNEL &&
 		    auth_level >= DCERPC_AUTH_LEVEL_INTEGRITY) {
-			if (!test_LookupSids3(b, tctx, &sids)) {
+			if (!test_LookupSids3(b, tctx, level, &sids)) {
 				return false;
 			}
-			if (!test_LookupNames4(b, tctx, &names, true)) {
+			if (!test_LookupNames4(b, tctx, level, &names, true)) {
 				return false;
 			}
 		} else {
@@ -1030,10 +1055,10 @@ bool test_many_LookupSids(struct dcerpc_pipe *p,
 			 * If we don't have a secure channel these tests must
 			 * fail with ACCESS_DENIED.
 			 */
-			if (!test_LookupSids3_fail(b, tctx, &sids)) {
+			if (!test_LookupSids3_fail(b, tctx, level, &sids)) {
 				return false;
 			}
-			if (!test_LookupNames4_fail(b, tctx)) {
+			if (!test_LookupNames4_fail(b, tctx, level)) {
 				return false;
 			}
 		}
@@ -1065,7 +1090,8 @@ static void lookupsids_cb(struct tevent_req *subreq)
 
 static bool test_LookupSids_async(struct dcerpc_binding_handle *b,
 				  struct torture_context *tctx,
-				  struct policy_handle *handle)
+				  struct policy_handle *handle,
+				  enum lsa_LookupNamesLevel level)
 {
 	struct lsa_SidArray sids;
 	struct lsa_SidPtr sidptr;
@@ -1100,7 +1126,7 @@ static bool test_LookupSids_async(struct dcerpc_binding_handle *b,
 		r[i].in.handle = handle;
 		r[i].in.sids = &sids;
 		r[i].in.names = &names[i];
-		r[i].in.level = 1;
+		r[i].in.level = level;
 		r[i].in.count = &names[i].count;
 		r[i].out.count = &count[i];
 		r[i].out.names = &names[i];
@@ -1911,11 +1937,11 @@ static bool test_EnumAccounts(struct dcerpc_binding_handle *b,
 		torture_assert_ntstatus_ok(tctx, r.out.result,
 			"EnumAccounts failed");
 
-		if (!test_LookupSids(b, tctx, handle, &sids1)) {
+		if (!test_LookupSids(b, tctx, handle, LSA_LOOKUP_NAMES_ALL, &sids1)) {
 			return false;
 		}
 
-		if (!test_LookupSids2(b, tctx, handle, &sids1)) {
+		if (!test_LookupSids2(b, tctx, handle, LSA_LOOKUP_NAMES_ALL, &sids1)) {
 			return false;
 		}
 
@@ -2006,7 +2032,7 @@ static bool test_EnumAccountsWithUserRight(struct dcerpc_binding_handle *b,
 	torture_assert_ntstatus_ok(tctx, dcerpc_lsa_EnumAccountsWithUserRight_r(b, tctx, &r),
 		"EnumAccountsWithUserRight failed");
 
-	/* NT_STATUS_NO_MORE_ENTRIES means noone has this privilege */
+	/* NT_STATUS_NO_MORE_ENTRIES means no one has this privilege */
 	if (NT_STATUS_EQUAL(r.out.result, NT_STATUS_NO_MORE_ENTRIES)) {
 		return true;
 	}
@@ -2408,7 +2434,7 @@ static bool test_EnumTrustDom(struct dcerpc_binding_handle *b,
 
 		in_resume_handle = out_resume_handle;
 
-	} while ((NT_STATUS_EQUAL(r.out.result, STATUS_MORE_ENTRIES)));
+	} while (NT_STATUS_EQUAL(r.out.result, STATUS_MORE_ENTRIES));
 
 	return ret;
 }
@@ -2506,7 +2532,7 @@ static bool test_EnumTrustDomEx(struct dcerpc_binding_handle *b,
 
 		ret &= test_query_each_TrustDomEx(b, tctx, handle, &domains_ex);
 
-	} while ((NT_STATUS_EQUAL(r_ex.out.result, STATUS_MORE_ENTRIES)));
+	} while (NT_STATUS_EQUAL(r_ex.out.result, STATUS_MORE_ENTRIES));
 
 	return ret;
 }
@@ -2639,6 +2665,8 @@ static bool gen_authinfo_internal(TALLOC_CTX *mem_ctx,
 	DATA_BLOB auth_blob;
 	enum ndr_err_code ndr_err;
 	bool ok;
+	gnutls_cipher_hd_t cipher_hnd = NULL;
+	gnutls_datum_t _session_key;
 
 	authinfo_internal = talloc_zero(mem_ctx, struct lsa_TrustDomainInfoAuthInfoInternal);
 	if (authinfo_internal == NULL) {
@@ -2708,7 +2736,19 @@ static bool gen_authinfo_internal(TALLOC_CTX *mem_ctx,
 		return false;
 	}
 
-	arcfour_crypt_blob(auth_blob.data, auth_blob.length, &session_key);
+	_session_key = (gnutls_datum_t) {
+		.data = session_key.data,
+		.size = session_key.length,
+	};
+
+	gnutls_cipher_init(&cipher_hnd,
+			   GNUTLS_CIPHER_ARCFOUR_128,
+			   &_session_key,
+			   NULL);
+	gnutls_cipher_encrypt(cipher_hnd,
+			      auth_blob.data,
+			      auth_blob.length);
+	gnutls_cipher_deinit(cipher_hnd);
 
 	authinfo_internal->auth_blob.size = auth_blob.length;
 	authinfo_internal->auth_blob.data = auth_blob.data;
@@ -2976,8 +3016,8 @@ static krb5_error_code check_pw_with_krb5_send_and_recv_func(krb5_context contex
 
 	hi.proto = KRB5_KRBHST_TCP;
 
-	smb_krb5_free_error(ctx->smb_krb5_context->krb5_context,
-			    &ctx->error);
+	krb5_free_error_contents(ctx->smb_krb5_context->krb5_context,
+				 &ctx->error);
 	ctx->counts.io++;
 
 	k5ret = smb_krb5_send_and_recv_func_forced(context, ctx->server,
@@ -3157,8 +3197,8 @@ static int check_pw_with_krb5_ctx_destructor(struct check_pw_with_krb5_ctx *ctx)
 
 	free_EncTicketPart(&ctx->krbtgt_referral_enc_part);
 
-	smb_krb5_free_error(ctx->smb_krb5_context->krb5_context,
-			    &ctx->error);
+	krb5_free_error_contents(ctx->smb_krb5_context->krb5_context,
+				 &ctx->error);
 
 	talloc_unlink(ctx, ctx->smb_krb5_context);
 	ctx->smb_krb5_context = NULL;
@@ -3216,7 +3256,7 @@ static bool check_pw_with_krb5(struct torture_context *tctx,
 	k5ret = smb_krb5_init_context(ctx, tctx->lp_ctx, &ctx->smb_krb5_context);
 	torture_assert_int_equal(tctx, k5ret, 0, "smb_krb5_init_context failed");
 
-	ok = interpret_string_addr_internal(&ctx->server, host, AI_NUMERICHOST);
+	ok = interpret_string_addr_internal(&ctx->server, host, 0);
 	torture_assert(tctx, ok, "Failed to parse target server");
 	talloc_set_destructor(ctx, check_pw_with_krb5_ctx_destructor);
 
@@ -3346,7 +3386,8 @@ static bool check_pw_with_krb5(struct torture_context *tctx,
 	torture_assert(tctx, ctx->error.cname == NULL, assertion_message);
 	torture_assert_str_equal(tctx, ctx->error.realm, realm, assertion_message);
 
-	torture_comment(tctx, "password[%s] old_password[%s]\n",
+	torture_comment(tctx, "(%s:%s) password[%s] old_password[%s]\n",
+			__location__, __FUNCTION__,
 			password, old_password);
 	if (old_password != NULL) {
 		k5ret = krb5_get_init_creds_password(ctx->smb_krb5_context->krb5_context,
@@ -4127,6 +4168,8 @@ static bool check_dom_trust_pw(struct dcerpc_pipe *p,
 	char *workstation = NULL;
 	const char *binding = torture_setting_string(tctx, "binding", NULL);
 	const char *host = torture_setting_string(tctx, "host", NULL);
+	const char *ip;
+	struct nbt_name nbt_name;
 	struct dcerpc_binding *b2;
 	struct netlogon_creds_CredentialState *creds;
 	struct samr_CryptPassword samr_crypt_password;
@@ -4134,7 +4177,8 @@ static bool check_dom_trust_pw(struct dcerpc_pipe *p,
 	struct netr_Authenticator req_auth;
 	struct netr_Authenticator rep_auth;
 	struct netr_ServerPasswordSet2 s;
-	struct dcerpc_pipe *p2;
+	struct dcerpc_pipe *p1 = NULL;
+	struct dcerpc_pipe *p2 = NULL;
 	NTSTATUS status;
 	bool ok;
 	int rc;
@@ -4182,11 +4226,22 @@ static bool check_dom_trust_pw(struct dcerpc_pipe *p,
 	cli_credentials_set_workstation(incoming_creds, workstation, CRED_SPECIFIED);
 	cli_credentials_set_secure_channel_type(incoming_creds, secure_channel_type);
 
+	make_nbt_name_server(&nbt_name, host);
+
+	status = resolve_name_ex(lpcfg_resolve_context(tctx->lp_ctx),
+				 0, 0, &nbt_name, tctx, &ip, tctx->ev);
+	torture_assert_ntstatus_ok(tctx, status,
+			talloc_asprintf(tctx,"Failed to resolve %s: %s",
+					nbt_name.name, nt_errstr(status)));
+
 	rc = tsocket_address_inet_from_strings(tctx, "ip",
-					       host,
+					       ip,
 					       lpcfg_cldap_port(tctx->lp_ctx),
 					       &dest_addr);
-	torture_assert_int_equal(tctx, rc, 0, "tsocket_address_inet_from_strings");
+	torture_assert_int_equal(tctx, rc, 0,
+				 talloc_asprintf(tctx,
+						 "tsocket_address_inet_from_strings failed parsing %s:%d",
+						 host, lpcfg_cldap_port(tctx->lp_ctx)));
 
 	/* cldap_socket_init should now know about the dest. address */
 	status = cldap_socket_init(tctx, NULL, dest_addr, &cldap);
@@ -4223,18 +4278,25 @@ static bool check_dom_trust_pw(struct dcerpc_pipe *p,
 	status = dcerpc_parse_binding(tctx, binding, &b2);
 	torture_assert_ntstatus_ok(tctx, status, "Bad binding string");
 
-	status = dcerpc_pipe_connect_b(tctx, &p2, b2,
+	status = dcerpc_pipe_connect_b(tctx, &p1, b2,
 				       &ndr_table_netlogon,
 				       cli_credentials_init_anon(tctx),
 				       tctx->ev, tctx->lp_ctx);
 	torture_assert_ntstatus_ok(tctx, status, "dcerpc_pipe_connect_b");
 
-	ok = check_pw_with_ServerAuthenticate3(p2, tctx,
+	ok = check_pw_with_ServerAuthenticate3(p1, tctx,
 					       NETLOGON_NEG_AUTH2_ADS_FLAGS,
 					       server_name,
 					       incoming_creds, &creds);
 	torture_assert_int_equal(tctx, ok, expected_result,
 				 "check_pw_with_ServerAuthenticate3");
+	if (expected_result == true) {
+		ok = test_SetupCredentialsPipe(p1, tctx, incoming_creds, creds,
+					       DCERPC_SIGN | DCERPC_SEAL, &p2);
+		torture_assert_int_equal(tctx, ok, true,
+					 "test_SetupCredentialsPipe");
+	}
+	TALLOC_FREE(p1);
 
 	if (trusted->trust_type != LSA_TRUST_TYPE_DOWNLEVEL) {
 #ifdef SAMBA4_USES_HEIMDAL
@@ -4757,7 +4819,7 @@ static bool test_QueryInfoPolicyCalls(	bool version2,
 			|| i == LSA_POLICY_INFO_DNS_INT)) {
 			/* Let's look up some of these names */
 
-			struct lsa_TransNameArray tnames;
+			struct lsa_TransNameArray tnames, dnames;
 			tnames.count = 14;
 			tnames.names = talloc_zero_array(tctx, struct lsa_TranslatedName, tnames.count);
 			tnames.names[0].name.string = info->dns.name.string;
@@ -4788,8 +4850,14 @@ static bool test_QueryInfoPolicyCalls(	bool version2,
 			tnames.names[12].sid_type = SID_NAME_USER;
 			tnames.names[13].name.string = talloc_asprintf(tctx, TEST_MACHINENAME "$@%s", info->dns.dns_domain.string);
 			tnames.names[13].sid_type = SID_NAME_USER;
-			ret &= test_LookupNames(b, tctx, handle, &tnames);
+			ret &= test_LookupNames(b, tctx, handle, LSA_LOOKUP_NAMES_ALL, &tnames);
 
+			/* Try to use in-forest search for the test machine */
+			dnames.count = 1;
+			dnames.names = talloc_zero_array(tctx, struct lsa_TranslatedName, dnames.count);
+			dnames.names[0].name.string = talloc_asprintf(tctx, "%s\\"TEST_MACHINENAME "$", info->dns.name.string);
+			dnames.names[0].sid_type = SID_NAME_USER;
+			ret &= test_LookupNames(b, tctx, handle, LSA_LOOKUP_NAMES_UPLEVEL_TRUSTS_ONLY2, &dnames);
 		}
 	}
 
@@ -4814,7 +4882,6 @@ static bool test_GetUserName(struct dcerpc_binding_handle *b,
 			     struct torture_context *tctx)
 {
 	struct lsa_GetUserName r;
-	bool ret = true;
 	struct lsa_String *authority_name_p = NULL;
 	struct lsa_String *account_name_p = NULL;
 
@@ -4827,11 +4894,11 @@ static bool test_GetUserName(struct dcerpc_binding_handle *b,
 
 	torture_assert_ntstatus_ok(tctx, dcerpc_lsa_GetUserName_r(b, tctx, &r),
 		"GetUserName failed");
-
-	if (!NT_STATUS_IS_OK(r.out.result)) {
-		torture_comment(tctx, "GetUserName failed - %s\n", nt_errstr(r.out.result));
-		ret = false;
-	}
+	torture_assert_ntstatus_ok(tctx, r.out.result,
+		"GetUserName result failed");
+	torture_assert_not_null(tctx, r.out.account_name, "r.out.account_name");
+	torture_assert_not_null(tctx, *r.out.account_name, "*r.out.account_name");
+	torture_assert(tctx, r.out.authority_name == NULL, "r.out.authority_name");
 
 	account_name_p = NULL;
 	r.in.account_name	= &account_name_p;
@@ -4840,13 +4907,19 @@ static bool test_GetUserName(struct dcerpc_binding_handle *b,
 
 	torture_assert_ntstatus_ok(tctx, dcerpc_lsa_GetUserName_r(b, tctx, &r),
 		"GetUserName failed");
+	torture_assert_ntstatus_ok(tctx, r.out.result,
+		"GetUserName result failed");
+	torture_assert_not_null(tctx, r.out.account_name, "r.out.account_name");
+	torture_assert_not_null(tctx, *r.out.account_name, "*r.out.account_name");
+	torture_assert_not_null(tctx, r.out.authority_name, "r.out.authority_name");
+	torture_assert_not_null(tctx, *r.out.authority_name, "*r.out.authority_name");
 
-	if (!NT_STATUS_IS_OK(r.out.result)) {
-		torture_comment(tctx, "GetUserName failed - %s\n", nt_errstr(r.out.result));
-		ret = false;
-	}
+	torture_comment(tctx,
+			"Account Name: %s, Authority Name: %s\n",
+			(*r.out.account_name)->string,
+			(*r.out.authority_name)->string);
 
-	return ret;
+	return true;
 }
 
 static bool test_GetUserName_fail(struct dcerpc_binding_handle *b,
@@ -4938,9 +5011,8 @@ bool torture_rpc_lsa(struct torture_context *tctx)
 	enum dcerpc_transport_t transport;
 
 	status = torture_rpc_connection(tctx, &p, &ndr_table_lsarpc);
-	if (!NT_STATUS_IS_OK(status)) {
-		return false;
-	}
+	torture_assert_ntstatus_ok(tctx, status, "Error connecting to server");
+
 	b = p->binding_handle;
 	transport = dcerpc_binding_get_transport(p->binding);
 
@@ -4954,7 +5026,7 @@ bool torture_rpc_lsa(struct torture_context *tctx)
 			ret = false;
 		}
 
-		if (!test_many_LookupSids(p, tctx, handle)) {
+		if (!test_many_LookupSids(p, tctx, handle, LSA_LOOKUP_NAMES_ALL)) {
 			ret = false;
 		}
 
@@ -4975,7 +5047,7 @@ bool torture_rpc_lsa(struct torture_context *tctx)
 			ret = false;
 		}
 
-		if (!test_LookupSids_async(b, tctx, handle)) {
+		if (!test_LookupSids_async(b, tctx, handle, LSA_LOOKUP_NAMES_ALL)) {
 			ret = false;
 		}
 
@@ -4999,7 +5071,7 @@ bool torture_rpc_lsa(struct torture_context *tctx)
 			ret = false;
 		}
 
-		if (!test_many_LookupSids(p, tctx, handle)) {
+		if (!test_many_LookupSids(p, tctx, handle, LSA_LOOKUP_NAMES_ALL)) {
 			ret = false;
 		}
 
@@ -5010,7 +5082,7 @@ bool torture_rpc_lsa(struct torture_context *tctx)
 		torture_leave_domain(tctx, join);
 
 	} else {
-		if (!test_many_LookupSids(p, tctx, handle)) {
+		if (!test_many_LookupSids(p, tctx, handle, LSA_LOOKUP_NAMES_ALL)) {
 			ret = false;
 		}
 	}
@@ -5031,9 +5103,8 @@ bool torture_rpc_lsa_get_user(struct torture_context *tctx)
 	enum dcerpc_transport_t transport;
 
 	status = torture_rpc_connection(tctx, &p, &ndr_table_lsarpc);
-	if (!NT_STATUS_IS_OK(status)) {
-		return false;
-	}
+	torture_assert_ntstatus_ok(tctx, status, "Error connecting to server");
+
 	b = p->binding_handle;
 	transport = dcerpc_binding_get_transport(p->binding);
 
@@ -5085,7 +5156,7 @@ static bool testcase_LookupNames(struct torture_context *tctx,
 	tnames.names[0].name.string = "BUILTIN";
 	tnames.names[0].sid_type = SID_NAME_DOMAIN;
 
-	if (!test_LookupNames(b, tctx, handle, &tnames)) {
+	if (!test_LookupNames(b, tctx, handle, LSA_LOOKUP_NAMES_ALL, &tnames)) {
 		ret = false;
 	}
 
@@ -5095,23 +5166,23 @@ static bool testcase_LookupNames(struct torture_context *tctx,
 	tnames2.names[0].name.string = "BUILTIN";
 	tnames2.names[0].sid_type = SID_NAME_DOMAIN;
 
-	if (!test_LookupNames2(b, tctx, handle, &tnames2, true)) {
+	if (!test_LookupNames2(b, tctx, handle, LSA_LOOKUP_NAMES_ALL, &tnames2, true)) {
 		ret = false;
 	}
 
-	if (!test_LookupNames3(b, tctx, handle, &tnames2, true)) {
+	if (!test_LookupNames3(b, tctx, handle, LSA_LOOKUP_NAMES_ALL, &tnames2, true)) {
 		ret = false;
 	}
 
-	if (!test_LookupNames_wellknown(b, tctx, handle)) {
+	if (!test_LookupNames_wellknown(b, tctx, handle, LSA_LOOKUP_NAMES_ALL)) {
 		ret = false;
 	}
 
-	if (!test_LookupNames_NULL(b, tctx, handle)) {
+	if (!test_LookupNames_NULL(b, tctx, handle, LSA_LOOKUP_NAMES_ALL)) {
 		ret = false;
 	}
 
-	if (!test_LookupNames_bogus(b, tctx, handle)) {
+	if (!test_LookupNames_bogus(b, tctx, handle, LSA_LOOKUP_NAMES_ALL)) {
 		ret = false;
 	}
 

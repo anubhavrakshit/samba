@@ -285,10 +285,17 @@ my %ads_sdeffective = (
 );
 
 my %ads_trustattrs = (
-	"TRUST_ATTRIBUTE_NON_TRANSITIVE"	=> 1,
-	"TRUST_ATTRIBUTE_TREE_PARENT"		=> 2,
-	"TRUST_ATTRIBUTE_TREE_ROOT"		=> 3,
-	"TRUST_ATTRIBUTE_UPLEVEL_ONLY"		=> 4,
+	"TRUST_ATTRIBUTE_NON_TRANSITIVE"				=> 0x00000001,
+	"TRUST_ATTRIBUTE_UPLEVEL_ONLY"					=> 0x00000002,
+	"TRUST_ATTRIBUTE_QUARANTINED_DOMAIN"				=> 0x00000004,
+	"TRUST_ATTRIBUTE_FOREST_TRANSITIVE"				=> 0x00000008,
+	"TRUST_ATTRIBUTE_CROSS_ORGANIZATION"				=> 0x00000010,
+	"TRUST_ATTRIBUTE_WITHIN_FOREST"					=> 0x00000020,
+	"TRUST_ATTRIBUTE_TREAT_AS_EXTERNAL"				=> 0x00000040,
+	"TRUST_ATTRIBUTE_USES_RC4_ENCRYPTION"				=> 0x00000080,
+	"TRUST_ATTRIBUTE_CROSS_ORGANIZATION_NO_TGT_DELEGATION"		=> 0x00000200,
+	"TRUST_ATTRIBUTE_PIM_TRUST"					=> 0x00000400,
+	"TRUST_ATTRIBUTE_CROSS_ORGANIZATION_ENABLE_TGT_DELEGATION"	=> 0x00000800,
 );
 
 my %ads_trustdirection = (
@@ -1283,7 +1290,7 @@ sub dump_sdeffective {
 }
 
 sub dump_trustattr {
-	return dump_bitmask_equal(@_,%ads_trustattrs);
+	return dump_bitmask_and(@_,%ads_trustattrs);
 }
 
 sub dump_trusttype {
@@ -1723,14 +1730,14 @@ sub do_bind($$) {
 		$mesg = $async_ldap_hd->bind( 
 			sasl => $sasl_hd, 
 			callback => \&error_callback 
-		) || die "doesnt work"; 
+		) || die "doesn't work"; 
 	} else {
 		$sasl_mech = "";
 		$mesg = $async_ldap_hd->bind( 
 			$binddn, 
 			password => $password, 
 			callback => $opt_fastbind ? undef : \&error_callback
-		) || die "doesnt work";
+		) || die "doesn't work";
 	};
 	if ($mesg->code) { 
 		display_ldap_err($mesg) if (!$opt_fastbind);

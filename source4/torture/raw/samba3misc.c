@@ -440,22 +440,29 @@ bool torture_samba3_badpath(struct torture_context *torture)
 	bool ret = true;
 	TALLOC_CTX *mem_ctx;
 	bool nt_status_support;
+	bool client_ntlmv2_auth;
 
 	torture_assert(torture, mem_ctx = talloc_init("torture_samba3_badpath"), "talloc_init failed");
 
 	nt_status_support = lpcfg_nt_status_support(torture->lp_ctx);
+	client_ntlmv2_auth = lpcfg_client_ntlmv2_auth(torture->lp_ctx);
 
 	torture_assert_goto(torture, lpcfg_set_cmdline(torture->lp_ctx, "nt status support", "yes"), ret, fail, "Could not set 'nt status support = yes'\n");
+	torture_assert_goto(torture, lpcfg_set_cmdline(torture->lp_ctx, "client ntlmv2 auth", "yes"), ret, fail, "Could not set 'client ntlmv2 auth = yes'\n");
 
 	torture_assert_goto(torture, torture_open_connection(&cli_nt, torture, 0), ret, fail, "Could not open NTSTATUS connection\n");
 
 	torture_assert_goto(torture, lpcfg_set_cmdline(torture->lp_ctx, "nt status support", "no"), ret, fail, "Could not set 'nt status support = no'\n");
+	torture_assert_goto(torture, lpcfg_set_cmdline(torture->lp_ctx, "client ntlmv2 auth", "no"), ret, fail, "Could not set 'client ntlmv2 auth = no'\n");
 
 	torture_assert_goto(torture, torture_open_connection(&cli_dos, torture, 1), ret, fail, "Could not open DOS connection\n");
 
 	torture_assert_goto(torture, lpcfg_set_cmdline(torture->lp_ctx, "nt status support",
 						       nt_status_support ? "yes":"no"), 
 			    ret, fail, "Could not set 'nt status support' back to where it was\n");
+	torture_assert_goto(torture, lpcfg_set_cmdline(torture->lp_ctx, "client ntlmv2 auth",
+						       client_ntlmv2_auth ? "yes":"no"),
+			    ret, fail, "Could not set 'client ntlmv2 auth' back to where it was\n");
 
 	torture_assert(torture, torture_setup_dir(cli_nt, dirname), "creating test directory");
 
@@ -768,8 +775,8 @@ static void receive_lock_result(struct smbcli_request *req)
 }
 
 /*
- * Check that Samba3 correctly deals with conflicting posix byte range locks
- * on an underlying file
+ * Check that Samba3 correctly deals with conflicting local posix byte range
+ * locks on an underlying file via "normal" SMB1 (without unix extentions).
  *
  * Note: This test depends on "posix locking = yes".
  * Note: To run this test, use "--option=torture:localdir=<LOCALDIR>"
@@ -866,7 +873,7 @@ bool torture_samba3_posixtimedlock(struct torture_context *tctx, struct smbcli_s
 	status = smb_raw_lock(cli->tree, &io);
 
 	ret = true;
-	CHECK_STATUS(tctx, status, NT_STATUS_FILE_LOCK_CONFLICT);
+	CHECK_STATUS(tctx, status, NT_STATUS_LOCK_NOT_GRANTED);
 
 	if (!ret) {
 		goto done;
@@ -976,6 +983,80 @@ bool torture_samba3_rootdirfid(struct torture_context *tctx, struct smbcli_state
 
 	ret = true;
  done:
+	return ret;
+}
+
+bool torture_samba3_rootdirfid2(struct torture_context *tctx, struct smbcli_state *cli)
+{
+	int fnum;
+	uint16_t dnum;
+	union smb_open io;
+	const char *dirname1 = "dir1";
+	const char *dirname2 = "dir1/dir2";
+	const char *path = "dir1/dir2/testfile";
+	const char *relname = "dir2/testfile";
+	bool ret = false;
+
+	smbcli_deltree(cli->tree, dirname1);
+
+	torture_assert(tctx, torture_setup_dir(cli, dirname1), "creating test directory");
+	torture_assert(tctx, torture_setup_dir(cli, dirname2), "creating test directory");
+
+	fnum = smbcli_open(cli->tree, path, O_RDWR | O_CREAT, DENY_NONE);
+	if (fnum == -1) {
+		torture_result(tctx, TORTURE_FAIL,
+			"Could not create file: %s",
+			 smbcli_errstr(cli->tree));
+		goto done;
+	}
+	smbcli_close(cli->tree, fnum);
+
+	ZERO_STRUCT(io);
+	io.generic.level = RAW_OPEN_NTCREATEX;
+	io.ntcreatex.in.flags = NTCREATEX_FLAGS_EXTENDED;
+	io.ntcreatex.in.root_fid.fnum = 0;
+	io.ntcreatex.in.security_flags = 0;
+	io.ntcreatex.in.access_mask =
+		SEC_STD_SYNCHRONIZE | SEC_FILE_EXECUTE;
+	io.ntcreatex.in.alloc_size = 0;
+	io.ntcreatex.in.file_attr = FILE_ATTRIBUTE_DIRECTORY;
+	io.ntcreatex.in.share_access =
+		NTCREATEX_SHARE_ACCESS_READ
+		| NTCREATEX_SHARE_ACCESS_READ;
+	io.ntcreatex.in.open_disposition = NTCREATEX_DISP_OPEN;
+	io.ntcreatex.in.create_options = 0;
+	io.ntcreatex.in.impersonation = NTCREATEX_IMPERSONATION_ANONYMOUS;
+	io.ntcreatex.in.fname = dirname1;
+	torture_assert_ntstatus_equal_goto(tctx, smb_raw_open(cli->tree, tctx, &io),
+					   NT_STATUS_OK,
+					   ret, done, "smb_open on the directory failed: %s\n");
+
+	dnum = io.ntcreatex.out.file.fnum;
+
+	io.ntcreatex.in.flags =
+		NTCREATEX_FLAGS_REQUEST_OPLOCK
+		| NTCREATEX_FLAGS_REQUEST_BATCH_OPLOCK;
+	io.ntcreatex.in.root_fid.fnum = dnum;
+	io.ntcreatex.in.security_flags = 0;
+	io.ntcreatex.in.open_disposition = NTCREATEX_DISP_OPEN;
+	io.ntcreatex.in.access_mask = SEC_RIGHTS_FILE_ALL;
+	io.ntcreatex.in.alloc_size = 0;
+	io.ntcreatex.in.file_attr = FILE_ATTRIBUTE_NORMAL;
+	io.ntcreatex.in.share_access = NTCREATEX_SHARE_ACCESS_NONE;
+	io.ntcreatex.in.create_options = 0;
+	io.ntcreatex.in.impersonation = NTCREATEX_IMPERSONATION_ANONYMOUS;
+	io.ntcreatex.in.fname = relname;
+
+	torture_assert_ntstatus_equal_goto(tctx, smb_raw_open(cli->tree, tctx, &io),
+					   NT_STATUS_OK,
+					   ret, done, "smb_open on the file failed");
+
+	smbcli_close(cli->tree, io.ntcreatex.out.file.fnum);
+	smbcli_close(cli->tree, dnum);
+
+	ret = true;
+done:
+	smbcli_deltree(cli->tree, dirname1);
 	return ret;
 }
 

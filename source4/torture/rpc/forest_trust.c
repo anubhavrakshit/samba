@@ -30,7 +30,9 @@
 #include "libcli/auth/libcli_auth.h"
 #include "torture/rpc/torture_rpc.h"
 #include "param/param.h"
-#include "../lib/crypto/crypto.h"
+
+#include <gnutls/gnutls.h>
+#include <gnutls/crypto.h>
 
 #define TEST_DOM "torturedom"
 #define TEST_DOM_DNS "torturedom.samba.example.com"
@@ -223,7 +225,7 @@ static bool get_and_set_info(struct dcerpc_pipe *p,
 		/* {LSA_TRUSTED_DOMAIN_INFO_INFO_EX2_INTERNAL, NT_STATUS_INVALID_PARAMETER, NT_STATUS_INVALID_INFO_CLASS}, */
 		{LSA_TRUSTED_DOMAIN_INFO_FULL_INFO_2_INTERNAL, NT_STATUS_OK, NT_STATUS_INVALID_PARAMETER},
 		{LSA_TRUSTED_DOMAIN_SUPPORTED_ENCRYPTION_TYPES, NT_STATUS_OK, NT_STATUS_OK},
-		{-1, NT_STATUS_OK}
+		{ .info_level = -1, },
 	};
 
 	torture_comment(tctx, "\nGetting/Setting dom info\n");
@@ -405,6 +407,7 @@ static bool delete_trusted_domain_by_sid(struct dcerpc_pipe *p,
 	return true;
 }
 
+/*
 static const uint8_t my_blob[] = {
 0xa3,0x0b,0x32,0x45,0x8b,0x84,0x3b,0x01,0x68,0xe8,0x2b,0xbb,0x00,0x13,0x69,0x1f,
 0x10,0x35,0x72,0xa9,0x4f,0x77,0xb7,0xeb,0x59,0x08,0x07,0xc3,0xe8,0x17,0x00,0xc5,
@@ -445,7 +448,7 @@ static const uint8_t my_blob[] = {
 0x14,0x00,0x00,0x00,0x31,0x00,0x32,0x00,0x33,0x00,0x34,0x00,0x35,0x00,0x36,0x00,
 0x37,0x00,0x38,0x00,0x39,0x00,0x30,0x00,0x30,0x00,0x00,0x00,0x30,0x00,0x00,0x00
 };
-
+*/
 static bool get_trust_domain_passwords_auth_blob(TALLOC_CTX *mem_ctx,
 						 const char *password,
 						 DATA_BLOB *auth_blob)
@@ -516,7 +519,8 @@ static bool test_validate_trust(struct torture_context *tctx,
 	NTSTATUS status;
 	struct cli_credentials *credentials;
 	struct dcerpc_binding *b;
-	struct dcerpc_pipe *p;
+	struct dcerpc_pipe *p1 = NULL;
+	struct dcerpc_pipe *p = NULL;
 
 	struct netr_GetForestTrustInformation fr;
 	struct lsa_ForestTrustInformation *forest_trust_info;
@@ -547,7 +551,7 @@ static bool test_validate_trust(struct torture_context *tctx,
 					trusted_dom_name, CRED_SPECIFIED);
 	cli_credentials_set_secure_channel_type(credentials, SEC_CHAN_DOMAIN);
 
-	status = dcerpc_pipe_connect_b(tctx, &p, b,
+	status = dcerpc_pipe_connect_b(tctx, &p1, b,
 				       &ndr_table_netlogon, credentials,
 				       tctx->ev, tctx->lp_ctx);
 
@@ -559,9 +563,14 @@ static bool test_validate_trust(struct torture_context *tctx,
 		return false;
 	}
 
-	if (!test_SetupCredentials3(p, tctx, NETLOGON_NEG_AUTH2_ADS_FLAGS | NETLOGON_NEG_SUPPORTS_AES,
+	if (!test_SetupCredentials3(p1, tctx, NETLOGON_NEG_AUTH2_ADS_FLAGS | NETLOGON_NEG_SUPPORTS_AES,
 				    credentials, &creds)) {
 		torture_comment(tctx, "test_SetupCredentials3 failed.\n");
+		return false;
+	}
+	if (!test_SetupCredentialsPipe(p1, tctx, credentials, creds,
+				       DCERPC_SIGN | DCERPC_SEAL, &p)) {
+		torture_comment(tctx, "test_SetupCredentialsPipe failed.\n");
 		return false;
 	}
 
@@ -680,6 +689,8 @@ static bool test_setup_trust(struct torture_context *tctx,
 	DATA_BLOB session_key;
 	struct lsa_TrustDomainInfoAuthInfoInternal authinfo;
 	NTSTATUS status;
+	gnutls_cipher_hd_t cipher_hnd = NULL;
+	gnutls_datum_t _session_key;
 
 	if (!check_name(p, tctx, netbios_name)) {
 		return false;
@@ -702,8 +713,19 @@ static bool test_setup_trust(struct torture_context *tctx,
 	}
 	authinfo.auth_blob.size = auth_blob->length;
 
-	arcfour_crypt_blob(authinfo.auth_blob.data, authinfo.auth_blob.size,
-			   &session_key);
+	_session_key = (gnutls_datum_t) {
+		.data = session_key.data,
+		.size = session_key.length,
+	};
+
+	gnutls_cipher_init(&cipher_hnd,
+			   GNUTLS_CIPHER_ARCFOUR_128,
+			   &_session_key,
+			   NULL);
+	gnutls_cipher_encrypt(cipher_hnd,
+			      authinfo.auth_blob.data,
+			      authinfo.auth_blob.size);
+	gnutls_cipher_deinit(cipher_hnd);
 
 	if (!test_create_trust_and_set_info(p, tctx, netbios_name,
 					    dns_name, sid, &authinfo)) {

@@ -418,9 +418,10 @@ enum pdb_policy_type {
  * Changed to 23, new idmap control functions
  * Changed to 24, removed uid_to_sid and gid_to_sid, replaced with id_to_sid
  * Leave at 24, add optional get_trusteddom_creds()
+ * Change to 25, loadable modules now have a TALLOC_CTX * parameter in init.
  */
 
-#define PASSDB_INTERFACE_VERSION 24
+#define PASSDB_INTERFACE_VERSION 25
 
 struct pdb_methods 
 {
@@ -688,7 +689,6 @@ bool login_cache_delentry(const struct samu *sampass);
 
 /* The following definitions come from passdb/passdb.c  */
 
-const char *my_sam_name(void);
 struct samu *samu_new( TALLOC_CTX *ctx );
 NTSTATUS samu_set_unix(struct samu *user, const struct passwd *pwd);
 NTSTATUS samu_alloc_rid_unix(struct pdb_methods *methods,
@@ -811,6 +811,7 @@ bool pdb_set_nt_passwd(struct samu *sampass, const uint8_t pwd[NT_HASH_LEN], enu
 bool pdb_set_lanman_passwd(struct samu *sampass, const uint8_t pwd[LM_HASH_LEN], enum pdb_value_state flag);
 bool pdb_set_pw_history(struct samu *sampass, const uint8_t *pwd, uint32_t historyLen, enum pdb_value_state flag);
 bool pdb_set_plaintext_pw_only(struct samu *sampass, const char *password, enum pdb_value_state flag);
+bool pdb_update_history(struct samu *sampass, const uint8_t new_nt[NT_HASH_LEN]);
 bool pdb_set_bad_password_count(struct samu *sampass, uint16_t bad_password_count, enum pdb_value_state flag);
 bool pdb_set_logon_count(struct samu *sampass, uint16_t logon_count, enum pdb_value_state flag);
 bool pdb_set_country_code(struct samu *sampass, uint16_t country_code,
@@ -894,11 +895,6 @@ NTSTATUS pdb_lookup_rids(const struct dom_sid *domain_sid,
 			 uint32_t *rids,
 			 const char **names,
 			 enum lsa_SidType *attrs);
-NTSTATUS pdb_lookup_names(const struct dom_sid *domain_sid,
-			  int num_names,
-			  const char **names,
-			  uint32_t *rids,
-			  enum lsa_SidType *attrs);
 bool pdb_get_account_policy(enum pdb_policy_type type, uint32_t *value);
 bool pdb_set_account_policy(enum pdb_policy_type type, uint32_t value);
 bool pdb_get_seq_num(time_t *seq_num);
@@ -975,14 +971,10 @@ bool pdb_is_responsible_for_everything_else(void);
 NTSTATUS pdb_create_builtin(uint32_t rid);
 NTSTATUS create_builtin_users(const struct dom_sid *sid);
 NTSTATUS create_builtin_administrators(const struct dom_sid *sid);
+NTSTATUS create_builtin_guests(const struct dom_sid *dom_sid);
 
 #include "passdb/machine_sid.h"
 #include "passdb/lookup_sid.h"
-
-/* The following definitions come from passdb/pdb_unixid.c */
-void unixid_from_uid(struct unixid *id, uint32_t some_uid);
-void unixid_from_gid(struct unixid *id, uint32_t some_gid);
-void unixid_from_both(struct unixid *id, uint32_t some_id);
 
 /* The following definitions come from passdb/pdb_secrets.c
  * and should be used by PDB modules if they need to store

@@ -26,6 +26,7 @@
 
 #include "replace.h"
 #include "system/time.h"
+#define TEVENT_DEPRECATED 1
 #include "tevent.h"
 #include "tevent_internal.h"
 #include "tevent_util.h"
@@ -133,6 +134,12 @@ struct timeval tevent_timeval_current_ofs(uint32_t secs, uint32_t usecs)
 */
 static int tevent_common_timed_destructor(struct tevent_timer *te)
 {
+	if (te->destroyed) {
+		tevent_common_check_double_free(te, "tevent_timer double free");
+		goto done;
+	}
+	te->destroyed = true;
+
 	if (te->event_ctx == NULL) {
 		return 0;
 	}
@@ -146,47 +153,28 @@ static int tevent_common_timed_destructor(struct tevent_timer *te)
 	}
 	DLIST_REMOVE(te->event_ctx->timer_events, te);
 
+	te->event_ctx = NULL;
+done:
+	if (te->busy) {
+		return -1;
+	}
+	te->wrapper = NULL;
+
 	return 0;
 }
 
-static int tevent_common_timed_deny_destructor(struct tevent_timer *te)
+static void tevent_common_insert_timer(struct tevent_context *ev,
+				       struct tevent_timer *te,
+				       bool optimize_zero)
 {
-	return -1;
-}
+	struct tevent_timer *prev_te = NULL;
 
-/*
-  add a timed event
-  return NULL on failure (memory allocation error)
-*/
-static struct tevent_timer *tevent_common_add_timer_internal(
-					struct tevent_context *ev,
-					TALLOC_CTX *mem_ctx,
-					struct timeval next_event,
-					tevent_timer_handler_t handler,
-					void *private_data,
-					const char *handler_name,
-					const char *location,
-					bool optimize_zero)
-{
-	struct tevent_timer *te, *prev_te, *cur_te;
-
-	te = talloc(mem_ctx?mem_ctx:ev, struct tevent_timer);
-	if (te == NULL) return NULL;
-
-	te->event_ctx		= ev;
-	te->next_event		= next_event;
-	te->handler		= handler;
-	te->private_data	= private_data;
-	te->handler_name	= handler_name;
-	te->location		= location;
-	te->additional_data	= NULL;
-
-	if (ev->timer_events == NULL) {
-		ev->last_zero_timer = NULL;
+	if (te->destroyed) {
+		tevent_abort(ev, "tevent_timer use after free");
+		return;
 	}
 
 	/* keep the list ordered */
-	prev_te = NULL;
 	if (optimize_zero && tevent_timeval_is_zero(&te->next_event)) {
 		/*
 		 * Some callers use zero tevent_timer
@@ -199,6 +187,8 @@ static struct tevent_timer *tevent_common_add_timer_internal(
 		prev_te = ev->last_zero_timer;
 		ev->last_zero_timer = te;
 	} else {
+		struct tevent_timer *cur_te;
+
 		/*
 		 * we traverse the list from the tail
 		 * because it's much more likely that
@@ -227,6 +217,41 @@ static struct tevent_timer *tevent_common_add_timer_internal(
 	}
 
 	DLIST_ADD_AFTER(ev->timer_events, te, prev_te);
+}
+
+/*
+  add a timed event
+  return NULL on failure (memory allocation error)
+*/
+static struct tevent_timer *tevent_common_add_timer_internal(
+					struct tevent_context *ev,
+					TALLOC_CTX *mem_ctx,
+					struct timeval next_event,
+					tevent_timer_handler_t handler,
+					void *private_data,
+					const char *handler_name,
+					const char *location,
+					bool optimize_zero)
+{
+	struct tevent_timer *te;
+
+	te = talloc(mem_ctx?mem_ctx:ev, struct tevent_timer);
+	if (te == NULL) return NULL;
+
+	*te = (struct tevent_timer) {
+		.event_ctx	= ev,
+		.next_event	= next_event,
+		.handler	= handler,
+		.private_data	= private_data,
+		.handler_name	= handler_name,
+		.location	= location,
+	};
+
+	if (ev->timer_events == NULL) {
+		ev->last_zero_timer = NULL;
+	}
+
+	tevent_common_insert_timer(ev, te, optimize_zero);
 
 	talloc_set_destructor(te, tevent_common_timed_destructor);
 
@@ -274,6 +299,104 @@ struct tevent_timer *tevent_common_add_timer_v2(struct tevent_context *ev,
 						true);
 }
 
+void tevent_update_timer(struct tevent_timer *te, struct timeval next_event)
+{
+	struct tevent_context *ev = te->event_ctx;
+
+	if (ev->last_zero_timer == te) {
+		te->event_ctx->last_zero_timer = DLIST_PREV(te);
+	}
+	DLIST_REMOVE(ev->timer_events, te);
+
+	te->next_event = next_event;
+
+	/*
+	 * Not doing the zero_timer optimization. This is for new code
+	 * that should know about immediates.
+	 */
+	tevent_common_insert_timer(ev, te, false);
+}
+
+int tevent_common_invoke_timer_handler(struct tevent_timer *te,
+				       struct timeval current_time,
+				       bool *removed)
+{
+	struct tevent_context *handler_ev = te->event_ctx;
+
+	if (removed != NULL) {
+		*removed = false;
+	}
+
+	if (te->event_ctx == NULL) {
+		return 0;
+	}
+
+	/*
+	 * We need to remove the timer from the list before calling the
+	 * handler because in a semi-async inner event loop called from the
+	 * handler we don't want to come across this event again -- vl
+	 */
+	if (te->event_ctx->last_zero_timer == te) {
+		te->event_ctx->last_zero_timer = DLIST_PREV(te);
+	}
+	DLIST_REMOVE(te->event_ctx->timer_events, te);
+
+	tevent_debug(te->event_ctx, TEVENT_DEBUG_TRACE,
+		     "Running timer event %p \"%s\"\n",
+		     te, te->handler_name);
+
+	/*
+	 * If the timed event was registered for a zero current_time,
+	 * then we pass a zero timeval here too! To avoid the
+	 * overhead of gettimeofday() calls.
+	 *
+	 * otherwise we pass the current time
+	 */
+	te->busy = true;
+	if (te->wrapper != NULL) {
+		handler_ev = te->wrapper->wrap_ev;
+
+		tevent_wrapper_push_use_internal(handler_ev, te->wrapper);
+		te->wrapper->ops->before_timer_handler(
+					te->wrapper->wrap_ev,
+					te->wrapper->private_state,
+					te->wrapper->main_ev,
+					te,
+					te->next_event,
+					current_time,
+					te->handler_name,
+					te->location);
+	}
+	te->handler(handler_ev, te, current_time, te->private_data);
+	if (te->wrapper != NULL) {
+		te->wrapper->ops->after_timer_handler(
+					te->wrapper->wrap_ev,
+					te->wrapper->private_state,
+					te->wrapper->main_ev,
+					te,
+					te->next_event,
+					current_time,
+					te->handler_name,
+					te->location);
+		tevent_wrapper_pop_use_internal(handler_ev, te->wrapper);
+	}
+	te->busy = false;
+
+	tevent_debug(te->event_ctx, TEVENT_DEBUG_TRACE,
+		     "Ending timer event %p \"%s\"\n",
+		     te, te->handler_name);
+
+	te->wrapper = NULL;
+	te->event_ctx = NULL;
+	talloc_set_destructor(te, NULL);
+	TALLOC_FREE(te);
+
+	if (removed != NULL) {
+		*removed = true;
+	}
+
+	return 0;
+}
 /*
   do a single event loop using the events defined in ev
 
@@ -284,6 +407,7 @@ struct timeval tevent_common_loop_timer_delay(struct tevent_context *ev)
 {
 	struct timeval current_time = tevent_timeval_zero();
 	struct tevent_timer *te = ev->timer_events;
+	int ret;
 
 	if (!te) {
 		/* have a default tick time of 30 seconds. This guarantees
@@ -315,40 +439,10 @@ struct timeval tevent_common_loop_timer_delay(struct tevent_context *ev)
 	/*
 	 * ok, we have a timed event that we'll process ...
 	 */
-
-	/* deny the handler to free the event */
-	talloc_set_destructor(te, tevent_common_timed_deny_destructor);
-
-	/* We need to remove the timer from the list before calling the
-	 * handler because in a semi-async inner event loop called from the
-	 * handler we don't want to come across this event again -- vl */
-	if (ev->last_zero_timer == te) {
-		ev->last_zero_timer = DLIST_PREV(te);
+	ret = tevent_common_invoke_timer_handler(te, current_time, NULL);
+	if (ret != 0) {
+		tevent_abort(ev, "tevent_common_invoke_timer_handler() failed");
 	}
-	DLIST_REMOVE(ev->timer_events, te);
-
-	tevent_debug(te->event_ctx, TEVENT_DEBUG_TRACE,
-		     "Running timer event %p \"%s\"\n",
-		     te, te->handler_name);
-
-	/*
-	 * If the timed event was registered for a zero current_time,
-	 * then we pass a zero timeval here too! To avoid the
-	 * overhead of gettimeofday() calls.
-	 *
-	 * otherwise we pass the current time
-	 */
-	te->handler(ev, te, current_time, te->private_data);
-
-	/* The destructor isn't necessary anymore, we've already removed the
-	 * event from the list. */
-	talloc_set_destructor(te, NULL);
-
-	tevent_debug(te->event_ctx, TEVENT_DEBUG_TRACE,
-		     "Ending timer event %p \"%s\"\n",
-		     te, te->handler_name);
-
-	talloc_free(te);
 
 	return tevent_timeval_zero();
 }

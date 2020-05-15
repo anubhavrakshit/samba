@@ -45,58 +45,8 @@
 struct extended_dn_out_private {
 	bool dereference;
 	bool normalise;
-	struct dsdb_openldap_dereference_control *dereference_control;
 	const char **attrs;
 };
-
-/* Do the lazy init of the derererence control */
-
-static int extended_dn_out_dereference_setup_control(struct ldb_context *ldb, struct extended_dn_out_private *p)
-{
-	const struct dsdb_schema *schema;
-	struct dsdb_openldap_dereference_control *dereference_control;
-	struct dsdb_attribute *cur;
-
-	unsigned int i = 0;
-	if (p->dereference_control) {
-		return LDB_SUCCESS;
-	}
-
-	schema = dsdb_get_schema(ldb, p);
-	if (!schema) {
-		/* No schema on this DB (yet) */
-		return LDB_SUCCESS;
-	}
-
-	p->dereference_control = dereference_control
-		= talloc_zero(p, struct dsdb_openldap_dereference_control);
-
-	if (!p->dereference_control) {
-		return ldb_oom(ldb);
-	}
-
-	for (cur = schema->attributes; cur; cur = cur->next) {
-		if (cur->dn_format != DSDB_NORMAL_DN) {
-			continue;
-		}
-		dereference_control->dereference
-			= talloc_realloc(p, dereference_control->dereference,
-					 struct dsdb_openldap_dereference *, i + 2);
-		if (!dereference_control->dereference) {
-			return ldb_oom(ldb);
-		}
-		dereference_control->dereference[i] = talloc(dereference_control->dereference,
-					 struct dsdb_openldap_dereference);
-		if (!dereference_control->dereference[i]) {
-			return ldb_oom(ldb);
-		}
-		dereference_control->dereference[i]->source_attribute = cur->lDAPDisplayName;
-		dereference_control->dereference[i]->dereference_attribute = p->attrs;
-		i++;
-		dereference_control->dereference[i] = NULL;
-	}
-	return LDB_SUCCESS;
-}
 
 static char **copy_attrs(void *mem_ctx, const char * const * attrs)
 {
@@ -183,131 +133,6 @@ static int inject_extended_dn_out(struct ldb_reply *ares,
 	return LDB_SUCCESS;
 }
 
-static int handle_dereference_openldap(struct ldb_dn *dn,
-			      struct dsdb_openldap_dereference_result **dereference_attrs, 
-			      const char *attr, const DATA_BLOB *val)
-{
-	const struct ldb_val *entryUUIDblob, *sid_blob;
-	struct ldb_message fake_msg; /* easier to use routines that expect an ldb_message */
-	unsigned int j;
-	
-	fake_msg.num_elements = 0;
-			
-	/* Look for this attribute in the returned control */
-	for (j = 0; dereference_attrs && dereference_attrs[j]; j++) {
-		struct ldb_val source_dn = data_blob_string_const(dereference_attrs[j]->dereferenced_dn);
-		if (ldb_attr_cmp(dereference_attrs[j]->source_attribute, attr) == 0
-		    && data_blob_cmp(&source_dn, val) == 0) {
-			fake_msg.num_elements = dereference_attrs[j]->num_attributes;
-			fake_msg.elements = dereference_attrs[j]->attributes;
-			break;
-		}
-	}
-	if (!fake_msg.num_elements) {
-		return LDB_SUCCESS;
-	}
-	/* Look for an OpenLDAP entryUUID */
-	
-	entryUUIDblob = ldb_msg_find_ldb_val(&fake_msg, "entryUUID");
-	if (entryUUIDblob) {
-		NTSTATUS status;
-		struct ldb_val guid_blob;
-		struct GUID guid;
-		
-		status = GUID_from_data_blob(entryUUIDblob, &guid);
-		
-		if (!NT_STATUS_IS_OK(status)) {
-			return LDB_ERR_INVALID_DN_SYNTAX;
-		}
-		status = GUID_to_ndr_blob(&guid, dn, &guid_blob);
-		if (!NT_STATUS_IS_OK(status)) {
-			return LDB_ERR_INVALID_DN_SYNTAX;
-		}
-		
-		ldb_dn_set_extended_component(dn, "GUID", &guid_blob);
-	}
-	
-	sid_blob = ldb_msg_find_ldb_val(&fake_msg, "objectSid");
-	
-	/* Look for the objectSid */
-	if (sid_blob) {
-		ldb_dn_set_extended_component(dn, "SID", sid_blob);
-	}
-	return LDB_SUCCESS;
-}
-
-static int handle_dereference_fds(struct ldb_dn *dn,
-			      struct dsdb_openldap_dereference_result **dereference_attrs, 
-			      const char *attr, const DATA_BLOB *val)
-{
-	const struct ldb_val *nsUniqueIdBlob, *sidBlob;
-	struct ldb_message fake_msg; /* easier to use routines that expect an ldb_message */
-	unsigned int j;
-	
-	fake_msg.num_elements = 0;
-			
-	/* Look for this attribute in the returned control */
-	for (j = 0; dereference_attrs && dereference_attrs[j]; j++) {
-		struct ldb_val source_dn = data_blob_string_const(dereference_attrs[j]->dereferenced_dn);
-		if (ldb_attr_cmp(dereference_attrs[j]->source_attribute, attr) == 0
-		    && data_blob_cmp(&source_dn, val) == 0) {
-			fake_msg.num_elements = dereference_attrs[j]->num_attributes;
-			fake_msg.elements = dereference_attrs[j]->attributes;
-			break;
-		}
-	}
-	if (!fake_msg.num_elements) {
-		return LDB_SUCCESS;
-	}
-
-	/* Look for the nsUniqueId */
-	
-	nsUniqueIdBlob = ldb_msg_find_ldb_val(&fake_msg, "nsUniqueId");
-	if (nsUniqueIdBlob) {
-		NTSTATUS status;
-		struct ldb_val guid_blob;
-		struct GUID guid;
-		
-        	status = NS_GUID_from_string((char *)nsUniqueIdBlob->data, &guid);
-		
-		if (!NT_STATUS_IS_OK(status)) {
-			return LDB_ERR_INVALID_DN_SYNTAX;
-		}
-		status = GUID_to_ndr_blob(&guid, dn, &guid_blob);
-		if (!NT_STATUS_IS_OK(status)) {
-			return LDB_ERR_INVALID_DN_SYNTAX;
-		}
-		
-		ldb_dn_set_extended_component(dn, "GUID", &guid_blob);
-	}
-	
-	/* Look for the objectSid */
-
-	sidBlob = ldb_msg_find_ldb_val(&fake_msg, "sambaSID");
-	if (sidBlob) {
-		enum ndr_err_code ndr_err;
-
-		struct ldb_val sid_blob;
-        	struct dom_sid *sid;
-
-        	sid = dom_sid_parse_length(NULL, sidBlob);
-
-        	if (sid == NULL) {
-			return LDB_ERR_INVALID_DN_SYNTAX;
-        	}
-
-        	ndr_err = ndr_push_struct_blob(&sid_blob, NULL, sid,
-						(ndr_push_flags_fn_t)ndr_push_dom_sid);
-        	talloc_free(sid);
-        	if (!NDR_ERR_CODE_IS_SUCCESS(ndr_err)) {
-			return LDB_ERR_INVALID_DN_SYNTAX;
-        	}
-
-		ldb_dn_set_extended_component(dn, "SID", &sid_blob);
-	}
-	return LDB_SUCCESS;
-}
-
 /* search */
 struct extended_search_context {
 	struct ldb_module *module;
@@ -325,7 +150,8 @@ struct extended_search_context {
    renames of the target
 */
 static int fix_one_way_link(struct extended_search_context *ac, struct ldb_dn *dn,
-			    bool is_deleted_objects, bool *remove_value)
+			    bool is_deleted_objects, bool *remove_value,
+			    uint32_t linkID)
 {
 	struct GUID guid;
 	NTSTATUS status;
@@ -348,9 +174,9 @@ static int fix_one_way_link(struct extended_search_context *ac, struct ldb_dn *d
 
 	search_flags = DSDB_FLAG_NEXT_MODULE | DSDB_SEARCH_SEARCH_ALL_PARTITIONS | DSDB_SEARCH_ONE_ONLY;
 
-	if (ldb_request_get_control(ac->req, LDB_CONTROL_SHOW_DEACTIVATED_LINK_OID) ||
-	    is_deleted_objects) {
-		search_flags |= DSDB_SEARCH_SHOW_DELETED;
+	if (linkID == 0) {
+		/* You must ALWAYS show one-way links regardless of the state of the target */
+		search_flags |= (DSDB_SEARCH_SHOW_DELETED | DSDB_SEARCH_SHOW_RECYCLED);
 	}
 
 	ret = dsdb_module_search(ac->module, tmp_ctx, &res, NULL, LDB_SCOPE_SUBTREE, attrs,
@@ -388,20 +214,15 @@ static int fix_one_way_link(struct extended_search_context *ac, struct ldb_dn *d
 /*
   this is called to post-process the results from the search
  */
-static int extended_callback(struct ldb_request *req, struct ldb_reply *ares,
-		int (*handle_dereference)(struct ldb_dn *dn,
-				struct dsdb_openldap_dereference_result **dereference_attrs, 
-				const char *attr, const DATA_BLOB *val))
+static int extended_callback(struct ldb_request *req, struct ldb_reply *ares)
 {
 	struct extended_search_context *ac;
-	struct ldb_control *control;
-	struct dsdb_openldap_dereference_result_control *dereference_control = NULL;
 	int ret;
-	unsigned int i, j;
+	unsigned int i, j, k;
 	struct ldb_message *msg;
 	struct extended_dn_out_private *p;
 	struct ldb_context *ldb;
-	bool have_reveal_control=false, checked_reveal_control=false;
+	bool have_reveal_control=false;
 
 	ac = talloc_get_type(req->context, struct extended_search_context);
 	p = talloc_get_type(ldb_module_get_private(ac->module), struct extended_dn_out_private);
@@ -464,14 +285,17 @@ static int extended_callback(struct ldb_request *req, struct ldb_reply *ares,
 		}
 	}
 
-	if (p && p->dereference) {
-		control = ldb_reply_get_control(ares, DSDB_OPENLDAP_DEREFERENCE_CONTROL);
-	
-		if (control && control->data) {
-			dereference_control = talloc_get_type(control->data, struct dsdb_openldap_dereference_result_control);
-		}
-	}
+	have_reveal_control =
+		dsdb_request_has_control(req, LDB_CONTROL_REVEAL_INTERNALS);
 
+	/* 
+	 * Shortcut for repl_meta_data.  We asked for the data
+	 * 'as-is', so stop processing here!
+	 */
+	if (have_reveal_control && p->normalise == false && ac->inject == true) {
+		return ldb_module_send_entry(ac->req, msg, ares->controls);
+	}
+	
 	/* Walk the returned elements (but only if we have a schema to
 	 * interpret the list with) */
 	for (i = 0; ac->schema && i < msg->num_elements; i++) {
@@ -483,7 +307,7 @@ static int extended_callback(struct ldb_request *req, struct ldb_reply *ares,
 			continue;
 		}
 
-		if (p->normalise) {
+		if (p && p->normalise) {
 			/* If we are also in 'normalise' mode, then
 			 * fix the attribute names to be in the
 			 * correct case */
@@ -511,18 +335,12 @@ static int extended_callback(struct ldb_request *req, struct ldb_reply *ares,
 			make_extended_dn = (strcmp(attribute->syntax->ldap_oid, DSDB_SYNTAX_OR_NAME) != 0);
 		}
 
-		for (j = 0; j < msg->elements[i].num_values; j++) {
+		for (k = 0, j = 0; j < msg->elements[i].num_values; j++) {
 			const char *dn_str;
 			struct ldb_dn *dn;
 			struct dsdb_dn *dsdb_dn = NULL;
-			struct ldb_val *plain_dn = &msg->elements[i].values[j];		
+			struct ldb_val *plain_dn = &msg->elements[i].values[j];
 			bool is_deleted_objects = false;
-
-			if (!checked_reveal_control) {
-				have_reveal_control =
-					ldb_request_get_control(req, LDB_CONTROL_REVEAL_INTERNALS) != NULL;
-				checked_reveal_control = true;
-			}
 
 			/* this is a fast method for detecting deleted
 			   linked attributes, working on the unparsed
@@ -530,20 +348,16 @@ static int extended_callback(struct ldb_request *req, struct ldb_reply *ares,
 			if (dsdb_dn_is_deleted_val(plain_dn) && !have_reveal_control) {
 				/* it's a deleted linked attribute,
 				  and we don't have the reveal control */
-				memmove(&msg->elements[i].values[j],
-					&msg->elements[i].values[j+1],
-					(msg->elements[i].num_values-(j+1))*sizeof(struct ldb_val));
-				msg->elements[i].num_values--;
-				j--;
+				/* we won't keep this one, so not incrementing k */
 				continue;
 			}
 
 
-			dsdb_dn = dsdb_dn_parse(msg, ldb, plain_dn, attribute->syntax->ldap_oid);
+			dsdb_dn = dsdb_dn_parse_trusted(msg, ldb, plain_dn, attribute->syntax->ldap_oid);
 
-			if (!dsdb_dn || !ldb_dn_validate(dsdb_dn->dn)) {
-				ldb_asprintf_errstring(ldb, 
-						       "could not parse %.*s in %s on %s as a %s DN", 
+			if (!dsdb_dn) {
+				ldb_asprintf_errstring(ldb,
+						       "could not parse %.*s in %s on %s as a %s DN",
 						       (int)plain_dn->length, plain_dn->data,
 						       msg->elements[i].name, ldb_dn_get_linearized(msg->dn),
 						       attribute->syntax->ldap_oid);
@@ -563,13 +377,6 @@ static int extended_callback(struct ldb_request *req, struct ldb_reply *ares,
 				talloc_free(hex_string);
 			}
 
-			/* don't let users see the internal extended
-			   GUID components */
-			if (!have_reveal_control) {
-				const char *accept[] = { "GUID", "SID", NULL };
-				ldb_dn_extended_filter(dn, accept);
-			}
-
 			if (p->normalise) {
 				ret = dsdb_fix_dn_rdncase(ldb, dn);
 				if (ret != LDB_SUCCESS) {
@@ -577,25 +384,8 @@ static int extended_callback(struct ldb_request *req, struct ldb_reply *ares,
 					return ldb_module_done(ac->req, NULL, NULL, ret);
 				}
 			}
-			
-			/* If we are running in dereference mode (such
-			 * as against OpenLDAP) then the DN in the msg
-			 * above does not contain the extended values,
-			 * and we need to look in the dereference
-			 * result */
 
 			/* Look for this value in the attribute */
-
-			if (dereference_control) {
-				ret = handle_dereference(dn, 
-							 dereference_control->attributes,
-							 msg->elements[i].name,
-							 &msg->elements[i].values[j]);
-				if (ret != LDB_SUCCESS) {
-					talloc_free(dsdb_dn);
-					return ldb_module_done(ac->req, NULL, NULL, ret);
-				}
-			}
 
 			/* note that we don't fixup objectCategory as
 			   it should not be possible to move
@@ -603,7 +393,8 @@ static int extended_callback(struct ldb_request *req, struct ldb_reply *ares,
 			if (attribute->one_way_link &&
 			    strcasecmp(attribute->lDAPDisplayName, "objectCategory") != 0) {
 				bool remove_value;
-				ret = fix_one_way_link(ac, dn, is_deleted_objects, &remove_value);
+				ret = fix_one_way_link(ac, dn, is_deleted_objects, &remove_value,
+						       attribute->linkID);
 				if (ret != LDB_SUCCESS) {
 					talloc_free(dsdb_dn);
 					return ldb_module_done(ac->req, NULL, NULL, ret);
@@ -613,39 +404,51 @@ static int extended_callback(struct ldb_request *req, struct ldb_reply *ares,
 					/* we show these with REVEAL
 					   to allow dbcheck to find and
 					   cleanup these orphaned links */
-					memmove(&msg->elements[i].values[j],
-						&msg->elements[i].values[j+1],
-						(msg->elements[i].num_values-(j+1))*sizeof(struct ldb_val));
-					msg->elements[i].num_values--;
-					j--;
+					/* we won't keep this one, so not incrementing k */
 					continue;
 				}
 			}
 			
 			if (make_extended_dn) {
+				if (!ldb_dn_validate(dsdb_dn->dn)) {
+					ldb_asprintf_errstring(ldb, 
+							       "could not parse %.*s in %s on %s as a %s DN", 
+							       (int)plain_dn->length, plain_dn->data,
+							       msg->elements[i].name, ldb_dn_get_linearized(msg->dn),
+							       attribute->syntax->ldap_oid);
+					talloc_free(dsdb_dn);
+					return ldb_module_done(ac->req, NULL, NULL, LDB_ERR_INVALID_DN_SYNTAX);
+				}
+				/* don't let users see the internal extended
+				   GUID components */
+				if (!have_reveal_control) {
+					const char *accept[] = { "GUID", "SID", NULL };
+					ldb_dn_extended_filter(dn, accept);
+				}
 				dn_str = dsdb_dn_get_extended_linearized(msg->elements[i].values,
 									 dsdb_dn, ac->extended_type);
 			} else {
-				dn_str = dsdb_dn_get_linearized(msg->elements[i].values, 
+				dn_str = dsdb_dn_get_linearized(msg->elements[i].values,
 								dsdb_dn);
 			}
-			
+
 			if (!dn_str) {
 				ldb_oom(ldb);
 				talloc_free(dsdb_dn);
 				return ldb_module_done(ac->req, NULL, NULL, LDB_ERR_OPERATIONS_ERROR);
 			}
-			msg->elements[i].values[j] = data_blob_string_const(dn_str);
+			msg->elements[i].values[k] = data_blob_string_const(dn_str);
 			talloc_free(dsdb_dn);
+			k++;
 		}
-		if (msg->elements[i].num_values == 0) {
+
+		if (k == 0) {
 			/* we've deleted all of the values from this
 			 * element - remove the element */
-			memmove(&msg->elements[i],
-				&msg->elements[i+1],
-				(msg->num_elements-(i+1))*sizeof(struct ldb_message_element));
-			msg->num_elements--;
+			ldb_msg_remove_element(msg, &msg->elements[i]);
 			i--;
+		} else {
+			msg->elements[i].num_values = k;
 		}
 	}
 	return ldb_module_send_entry(ac->req, msg, ares->controls);
@@ -653,17 +456,7 @@ static int extended_callback(struct ldb_request *req, struct ldb_reply *ares,
 
 static int extended_callback_ldb(struct ldb_request *req, struct ldb_reply *ares)
 {
-	return extended_callback(req, ares, NULL);
-}
-
-static int extended_callback_openldap(struct ldb_request *req, struct ldb_reply *ares)
-{
-	return extended_callback(req, ares, handle_dereference_openldap);
-}
-
-static int extended_callback_fds(struct ldb_request *req, struct ldb_reply *ares)
-{
-	return extended_callback(req, ares, handle_dereference_fds);
+	return extended_callback(req, ares);
 }
 
 static int extended_dn_out_search(struct ldb_module *module, struct ldb_request *req,
@@ -725,7 +518,7 @@ static int extended_dn_out_search(struct ldb_module *module, struct ldb_request 
 	 * the extended DN, or we are 'store DN+GUID+SID'
 	 * (!dereference) mode.  (This is the normal mode for LDB on
 	 * tdb). */
-	if (control || (storage_format_control && p && !p->dereference)) {
+	if (control || (storage_format_control && p)) {
 		ac->inject = true;
 		if (extended_ctrl) {
 			ac->extended_type = extended_ctrl->type;
@@ -733,7 +526,7 @@ static int extended_dn_out_search(struct ldb_module *module, struct ldb_request 
 			ac->extended_type = 0;
 		}
 
-		/* check if attrs only is specified, in that case check wether we need to modify them */
+		/* check if attrs only is specified, in that case check whether we need to modify them */
 		if (req->op.search.attrs && !is_attr_in_list(req->op.search.attrs, "*")) {
 			if (! is_attr_in_list(req->op.search.attrs, "objectGUID")) {
 				ac->remove_guid = true;
@@ -783,34 +576,6 @@ static int extended_dn_out_search(struct ldb_module *module, struct ldb_request 
 		storage_format_control->critical = 0;
 	}
 
-	/* Add in dereference control, if we were asked to, we are
-	 * using the 'dereference' mode (such as with an OpenLDAP
-	 * backend) and have the control prepared */
-	if (control && p && p->dereference) {
-		ret = extended_dn_out_dereference_setup_control(ldb, p);
-		if (ret != LDB_SUCCESS) {
-			return ret;
-		}
-
-		/* We should always have this, but before the schema
-		 * is with us, things get tricky */
-		if (p->dereference_control) {
-
-			/* This control must *not* be critical,
-			 * because if this particular request did not
-			 * return any dereferencable attributes in the
-			 * end, then OpenLDAP will reply with
-			 * unavailableCriticalExtension, rather than
-			 * just an empty return control */
-			ret = ldb_request_add_control(down_req,
-						      DSDB_OPENLDAP_DEREFERENCE_CONTROL,
-						      false, p->dereference_control);
-			if (ret != LDB_SUCCESS) {
-				return ret;
-			}
-		}
-	}
-
 	/* perform the search */
 	return ldb_next_request(module, down_req);
 }
@@ -818,16 +583,6 @@ static int extended_dn_out_search(struct ldb_module *module, struct ldb_request 
 static int extended_dn_out_ldb_search(struct ldb_module *module, struct ldb_request *req)
 {
 	return extended_dn_out_search(module, req, extended_callback_ldb);
-}
-
-static int extended_dn_out_openldap_search(struct ldb_module *module, struct ldb_request *req)
-{
-	return extended_dn_out_search(module, req, extended_callback_openldap);
-}
-
-static int extended_dn_out_fds_search(struct ldb_module *module, struct ldb_request *req)
-{
-	return extended_dn_out_search(module, req, extended_callback_fds);
 }
 
 static int extended_dn_out_ldb_init(struct ldb_module *module)
@@ -869,87 +624,10 @@ static int extended_dn_out_ldb_init(struct ldb_module *module)
 	return ldb_next_init(module);
 }
 
-static int extended_dn_out_dereference_init(struct ldb_module *module, const char *attrs[])
-{
-	int ret;
-	struct extended_dn_out_private *p = talloc_zero(module, struct extended_dn_out_private);
-	struct dsdb_extended_dn_store_format *dn_format;
-
-	ldb_module_set_private(module, p);
-
-	if (!p) {
-		return ldb_module_oom(module);
-	}
-
-	dn_format = talloc(p, struct dsdb_extended_dn_store_format);
-	if (!dn_format) {
-		talloc_free(p);
-		return ldb_module_oom(module);
-	}
-
-	dn_format->store_extended_dn_in_ldb = false;
-
-	ret = ldb_set_opaque(ldb_module_get_ctx(module), DSDB_EXTENDED_DN_STORE_FORMAT_OPAQUE_NAME, dn_format);
-	if (ret != LDB_SUCCESS) {
-		talloc_free(p);
-		return ret;
-	}
-
-	p->dereference = true;
-
-	p->attrs = attrs;
-	/* At the moment, servers that need dereference also need the
-	 * DN and attribute names to be normalised */
-	p->normalise = true;
-
-	ret = ldb_mod_register_control(module, LDB_CONTROL_EXTENDED_DN_OID);
-	if (ret != LDB_SUCCESS) {
-		ldb_debug(ldb_module_get_ctx(module), LDB_DEBUG_ERROR,
-			  "extended_dn_out: Unable to register control with rootdse!\n");
-		return ldb_operr(ldb_module_get_ctx(module));
-	}
-
-	return ldb_next_init(module);
-}
-
-static int extended_dn_out_openldap_init(struct ldb_module *module)
-{
-	static const char *attrs[] = {
-		"entryUUID",
-		"objectSid",
-		NULL
-	};
-
-	return extended_dn_out_dereference_init(module, attrs);
-}
-
-static int extended_dn_out_fds_init(struct ldb_module *module)
-{
-	static const char *attrs[] = {
-		"nsUniqueId",
-		"sambaSID",
-		NULL
-	};
-
-	return extended_dn_out_dereference_init(module, attrs);
-}
-
 static const struct ldb_module_ops ldb_extended_dn_out_ldb_module_ops = {
 	.name		   = "extended_dn_out_ldb",
 	.search            = extended_dn_out_ldb_search,
 	.init_context	   = extended_dn_out_ldb_init,
-};
-
-static const struct ldb_module_ops ldb_extended_dn_out_openldap_module_ops = {
-	.name		   = "extended_dn_out_openldap",
-	.search            = extended_dn_out_openldap_search,
-	.init_context	   = extended_dn_out_openldap_init,
-};
-
-static const struct ldb_module_ops ldb_extended_dn_out_fds_module_ops = {
-	.name		   = "extended_dn_out_fds",
-	.search            = extended_dn_out_fds_search,
-	.init_context	   = extended_dn_out_fds_init,
 };
 
 /*
@@ -960,14 +638,6 @@ _PUBLIC_ int ldb_extended_dn_out_module_init(const char *version)
 	int ret;
 	LDB_MODULE_CHECK_VERSION(version);
 	ret = ldb_register_module(&ldb_extended_dn_out_ldb_module_ops);
-	if (ret != LDB_SUCCESS) {
-		return ret;
-	}
-	ret = ldb_register_module(&ldb_extended_dn_out_openldap_module_ops);
-	if (ret != LDB_SUCCESS) {
-		return ret;
-	}
-	ret = ldb_register_module(&ldb_extended_dn_out_fds_module_ops);
 	if (ret != LDB_SUCCESS) {
 		return ret;
 	}

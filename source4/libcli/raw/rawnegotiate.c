@@ -28,62 +28,16 @@
 #include "../libcli/smb/smbXcli_base.h"
 #include "../lib/util/tevent_ntstatus.h"
 
-struct smb_raw_negotiate_state {
-	struct smbcli_transport *transport;
-};
-
-static void smb_raw_negotiate_done(struct tevent_req *subreq);
-
-struct tevent_req *smb_raw_negotiate_send(TALLOC_CTX *mem_ctx,
-					  struct tevent_context *ev,
-					  struct smbcli_transport *transport,
-					  int maxprotocol)
+NTSTATUS smb_raw_negotiate_fill_transport(struct smbcli_transport *transport)
 {
-	struct tevent_req *req;
-	struct smb_raw_negotiate_state *state;
-	struct tevent_req *subreq;
-	uint32_t timeout_msec = transport->options.request_timeout * 1000;
-
-	req = tevent_req_create(mem_ctx, &state,
-				struct smb_raw_negotiate_state);;
-	if (req == NULL) {
-		return NULL;
-	}
-	state->transport = transport;
-
-	subreq = smbXcli_negprot_send(state, ev,
-				      transport->conn,
-				      timeout_msec,
-				      PROTOCOL_CORE,
-				      maxprotocol);
-	if (tevent_req_nomem(subreq, req)) {
-		return tevent_req_post(req, ev);
-	}
-	tevent_req_set_callback(subreq, smb_raw_negotiate_done, req);
-
-	return req;
-}
-
-static void smb_raw_negotiate_done(struct tevent_req *subreq)
-{
-	struct tevent_req *req =
-		tevent_req_callback_data(subreq,
-		struct tevent_req);
-	struct smb_raw_negotiate_state *state =
-		tevent_req_data(req,
-		struct smb_raw_negotiate_state);
-	struct smbcli_negotiate *n = &state->transport->negotiate;
-	struct smbXcli_conn *c = state->transport->conn;
-	NTSTATUS status;
+	struct smbcli_negotiate *n = &transport->negotiate;
+	struct smbXcli_conn *c = transport->conn;
 	NTTIME ntt;
 
-	status = smbXcli_negprot_recv(subreq);
-	TALLOC_FREE(subreq);
-	if (tevent_req_nterror(req, status)) {
-		return;
-	}
-
 	n->protocol = smbXcli_conn_protocol(c);
+	if (n->protocol > PROTOCOL_NT1) {
+		return NT_STATUS_REVISION_MISMATCH;
+	}
 
 	n->sec_mode = smb1cli_conn_server_security_mode(c);
 	n->max_mux  = smbXcli_conn_max_requests(c);
@@ -112,6 +66,76 @@ static void smb_raw_negotiate_done(struct tevent_req *subreq)
 	n->readbraw_supported = smb1cli_conn_server_writebraw(c);
 	n->lockread_supported = smb1cli_conn_server_lockread(c);
 
+	return NT_STATUS_OK;
+}
+
+struct smb_raw_negotiate_state {
+	struct smbcli_transport *transport;
+};
+
+static void smb_raw_negotiate_done(struct tevent_req *subreq);
+
+struct tevent_req *smb_raw_negotiate_send(TALLOC_CTX *mem_ctx,
+					  struct tevent_context *ev,
+					  struct smbcli_transport *transport,
+					  int minprotocol,
+					  int maxprotocol)
+{
+	struct tevent_req *req;
+	struct smb_raw_negotiate_state *state;
+	struct tevent_req *subreq;
+	uint32_t timeout_msec = transport->options.request_timeout * 1000;
+
+	req = tevent_req_create(mem_ctx, &state,
+				struct smb_raw_negotiate_state);;
+	if (req == NULL) {
+		return NULL;
+	}
+	state->transport = transport;
+
+	if (maxprotocol > PROTOCOL_NT1) {
+		maxprotocol = PROTOCOL_NT1;
+	}
+
+	if (minprotocol > maxprotocol) {
+		minprotocol = maxprotocol;
+	}
+
+	subreq = smbXcli_negprot_send(state, ev,
+				      transport->conn,
+				      timeout_msec,
+				      minprotocol,
+				      maxprotocol,
+				      transport->options.max_credits);
+	if (tevent_req_nomem(subreq, req)) {
+		return tevent_req_post(req, ev);
+	}
+	tevent_req_set_callback(subreq, smb_raw_negotiate_done, req);
+
+	return req;
+}
+
+static void smb_raw_negotiate_done(struct tevent_req *subreq)
+{
+	struct tevent_req *req =
+		tevent_req_callback_data(subreq,
+		struct tevent_req);
+	struct smb_raw_negotiate_state *state =
+		tevent_req_data(req,
+		struct smb_raw_negotiate_state);
+	NTSTATUS status;
+
+	status = smbXcli_negprot_recv(subreq);
+	TALLOC_FREE(subreq);
+	if (tevent_req_nterror(req, status)) {
+		return;
+	}
+
+	status = smb_raw_negotiate_fill_transport(state->transport);
+	if (tevent_req_nterror(req, status)) {
+		return;
+	}
+
 	tevent_req_done(req);
 }
 
@@ -127,18 +151,21 @@ NTSTATUS smb_raw_negotiate_recv(struct tevent_req *req)
 /*
  Send a negprot command (sync interface)
 */
-NTSTATUS smb_raw_negotiate(struct smbcli_transport *transport, bool unicode, int maxprotocol)
+NTSTATUS smb_raw_negotiate(struct smbcli_transport *transport, bool unicode,
+			   int minprotocol, int maxprotocol)
 {
-	NTSTATUS status = NT_STATUS_INTERNAL_ERROR;
+	NTSTATUS status;
 	struct tevent_req *subreq = NULL;
 	bool ok;
 
 	subreq = smb_raw_negotiate_send(transport,
 					transport->ev,
 					transport,
+					minprotocol,
 					maxprotocol);
 	if (subreq == NULL) {
-		return NT_STATUS_NO_MEMORY;
+		status = NT_STATUS_NO_MEMORY;
+		goto failed;
 	}
 
 	ok = tevent_req_poll(subreq, transport->ev);

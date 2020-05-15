@@ -26,26 +26,17 @@
 #include "smbd/smbd.h"
 #include "smbd/globals.h"
 #include "ntdomain.h"
-#include "../librpc/gen_ndr/srv_dfs.h"
-#include "../librpc/gen_ndr/srv_dssetup.h"
-#include "../librpc/gen_ndr/srv_echo.h"
-#include "../librpc/gen_ndr/srv_eventlog.h"
-#include "../librpc/gen_ndr/srv_initshutdown.h"
-#include "../librpc/gen_ndr/srv_lsa.h"
-#include "../librpc/gen_ndr/srv_netlogon.h"
-#include "../librpc/gen_ndr/srv_ntsvcs.h"
-#include "../librpc/gen_ndr/srv_samr.h"
-#include "../librpc/gen_ndr/srv_spoolss.h"
-#include "../librpc/gen_ndr/srv_srvsvc.h"
-#include "../librpc/gen_ndr/srv_svcctl.h"
-#include "../librpc/gen_ndr/srv_winreg.h"
-#include "../librpc/gen_ndr/srv_wkssvc.h"
+#include "librpc/rpc/dcesrv_core.h"
 #include "printing/notify.h"
 #include "printing.h"
 #include "serverid.h"
 #include "messages.h"
+#include "passdb.h"
 #include "../lib/util/pidfile.h"
 #include "smbprofile.h"
+#include "libcli/auth/netlogon_creds_cli.h"
+#include "lib/gencache.h"
+#include "rpc_server/rpc_config.h"
 
 static struct files_struct *log_writeable_file_fn(
 	struct files_struct *fsp, void *private_data)
@@ -53,7 +44,7 @@ static struct files_struct *log_writeable_file_fn(
 	bool *found = (bool *)private_data;
 	char *path;
 
-	if (!fsp->can_write) {
+	if (!fsp->fsp_flags.can_write) {
 		return NULL;
 	}
 	if (!(*found)) {
@@ -89,13 +80,10 @@ static void exit_server_common(enum server_exit_reason how,
 	struct smbXsrv_client *client = global_smbXsrv_client;
 	struct smbXsrv_connection *xconn = NULL;
 	struct smbd_server_connection *sconn = NULL;
-	struct messaging_context *msg_ctx = server_messaging_context();
+	struct messaging_context *msg_ctx = global_messaging_context();
 
 	if (client != NULL) {
 		sconn = client->sconn;
-		/*
-		 * Here we typically have just one connection
-		 */
 		xconn = client->connections;
 	}
 
@@ -105,7 +93,11 @@ static void exit_server_common(enum server_exit_reason how,
 
 	change_to_root_user();
 
-	if (xconn != NULL) {
+
+	/*
+	 * Here we typically have just one connection
+	 */
+	for (; xconn != NULL; xconn = xconn->next) {
 		/*
 		 * This is typically the disconnect for the only
 		 * (or with multi-channel last) connection of the client
@@ -120,8 +112,7 @@ static void exit_server_common(enum server_exit_reason how,
 				break;
 			}
 		}
-
-		TALLOC_FREE(xconn->smb1.negprot.auth_context);
+		DO_PROFILE_INC(disconnect);
 	}
 
 	change_to_root_user();
@@ -135,33 +126,43 @@ static void exit_server_common(enum server_exit_reason how,
 
 	change_to_root_user();
 
-	if (xconn != NULL) {
+	if (client != NULL) {
 		NTSTATUS status;
 
 		/*
 		 * Note: this is a no-op for smb2 as
 		 * conn->tcon_table is empty
 		 */
-		status = smb1srv_tcon_disconnect_all(xconn);
+		status = smb1srv_tcon_disconnect_all(client);
 		if (!NT_STATUS_IS_OK(status)) {
 			DEBUG(0,("Server exit (%s)\n",
 				(reason ? reason : "normal exit")));
 			DEBUG(0, ("exit_server_common: "
 				  "smb1srv_tcon_disconnect_all() failed (%s) - "
 				  "triggering cleanup\n", nt_errstr(status)));
-			how = SERVER_EXIT_ABNORMAL;
-			reason = "smb1srv_tcon_disconnect_all failed";
 		}
 
-		status = smbXsrv_session_logoff_all(xconn);
+		status = smbXsrv_session_logoff_all(client);
 		if (!NT_STATUS_IS_OK(status)) {
 			DEBUG(0,("Server exit (%s)\n",
 				(reason ? reason : "normal exit")));
 			DEBUG(0, ("exit_server_common: "
 				  "smbXsrv_session_logoff_all() failed (%s) - "
 				  "triggering cleanup\n", nt_errstr(status)));
-			how = SERVER_EXIT_ABNORMAL;
-			reason = "smbXsrv_session_logoff_all failed";
+		}
+	}
+
+	change_to_root_user();
+
+	if (client != NULL) {
+		struct smbXsrv_connection *xconn_next = NULL;
+
+		for (xconn = client->connections;
+		     xconn != NULL;
+		     xconn = xconn_next) {
+			xconn_next = xconn->next;
+			DLIST_REMOVE(client->connections, xconn);
+			TALLOC_FREE(xconn);
 		}
 	}
 
@@ -169,20 +170,6 @@ static void exit_server_common(enum server_exit_reason how,
 
 	/* 3 second timeout. */
 	print_notify_send_messages(msg_ctx, 3);
-
-	/* delete our entry in the serverid database. */
-	if (am_parent) {
-		/*
-		 * For children the parent takes care of cleaning up
-		 */
-		serverid_deregister(messaging_server_id(msg_ctx));
-	}
-
-#ifdef WITH_DFS
-	if (dcelogin_atmost_once) {
-		dfs_unlogin();
-	}
-#endif
 
 #ifdef USE_DMAPI
 	/* Destroy Samba DMAPI session only if we are master smbd process */
@@ -193,25 +180,10 @@ static void exit_server_common(enum server_exit_reason how,
 	}
 #endif
 
-	if (am_parent) {
-		rpc_wkssvc_shutdown();
-		rpc_dssetup_shutdown();
-#ifdef DEVELOPER
-		rpc_rpcecho_shutdown();
-#endif
-		rpc_netdfs_shutdown();
-		rpc_initshutdown_shutdown();
-		rpc_eventlog_shutdown();
-		rpc_ntsvcs_shutdown();
-		rpc_svcctl_shutdown();
-		rpc_spoolss_shutdown();
+	if (am_parent && sconn != NULL) {
+		dcesrv_shutdown_registered_ep_servers(sconn->dce_ctx);
 
-		rpc_srvsvc_shutdown();
-		rpc_winreg_shutdown();
-
-		rpc_netlogon_shutdown();
-		rpc_samr_shutdown();
-		rpc_lsarpc_shutdown();
+		global_dcesrv_context_free();
 	}
 
 	/*
@@ -219,23 +191,16 @@ static void exit_server_common(enum server_exit_reason how,
 	 * because smbd_msg_ctx is not a talloc child of smbd_server_conn.
 	 */
 	if (client != NULL) {
-		struct smbXsrv_connection *next;
-
-		for (; xconn != NULL; xconn = next) {
-			next = xconn->next;
-			DLIST_REMOVE(client->connections, xconn);
-			talloc_free(xconn);
-			DO_PROFILE_INC(disconnect);
-		}
 		TALLOC_FREE(client->sconn);
 	}
 	sconn = NULL;
 	xconn = NULL;
 	client = NULL;
+	netlogon_creds_cli_close_global_db();
 	TALLOC_FREE(global_smbXsrv_client);
 	smbprofile_dump();
-	server_messaging_context_free();
-	server_event_context_free();
+	global_messaging_context_free();
+	global_event_context_free();
 	TALLOC_FREE(smbd_memcache_ctx);
 
 	locking_end();
@@ -253,7 +218,6 @@ static void exit_server_common(enum server_exit_reason how,
 		if (am_parent) {
 			pidfile_unlink(lp_pid_directory(), "smbd");
 		}
-		gencache_stabilize();
 	}
 
 	exit(0);
@@ -275,8 +239,11 @@ void smbd_exit_server_cleanly(const char *const explanation)
  */
 NTSTATUS smbd_reinit_after_fork(struct messaging_context *msg_ctx,
 				struct tevent_context *ev_ctx,
-				bool parent_longlived)
+				bool parent_longlived, const char *comment)
 {
+	NTSTATUS ret;
 	am_parent = NULL;
-	return reinit_after_fork(msg_ctx, ev_ctx, parent_longlived);
+	ret = reinit_after_fork(msg_ctx, ev_ctx, parent_longlived, comment);
+	initialize_password_db(true, ev_ctx);
+	return ret;
 }

@@ -84,7 +84,7 @@
  *		supportedLDAPVersion:	3
  *					2
  *		supportedLDAPPolicies:	...
- *		highestCommitedUSN:	...
+ *		highestCommittedUSN:	...
  *		supportedSASLMechanisms:GSSAPI
  *					GSS-SPNEGO
  *					EXTERNAL
@@ -2673,7 +2673,7 @@ static WERROR becomeDC_drsuapi_pull_partition_recv(struct libnet_BecomeDC_state 
 						   struct libnet_BecomeDC_Partition *partition,
 						   struct drsuapi_DsGetNCChanges *r)
 {
-	uint32_t req_level = 0;
+	uint32_t req_level = r->in.level;
 	struct drsuapi_DsGetNCChangesRequest5 *req5 = NULL;
 	struct drsuapi_DsGetNCChangesRequest8 *req8 = NULL;
 	struct drsuapi_DsGetNCChangesRequest10 *req10 = NULL;
@@ -2684,7 +2684,7 @@ static WERROR becomeDC_drsuapi_pull_partition_recv(struct libnet_BecomeDC_state 
 	struct GUID *source_dsa_invocation_id = NULL;
 	struct drsuapi_DsReplicaHighWaterMark *new_highwatermark = NULL;
 	bool more_data = false;
-	NTSTATUS nt_status;
+	WERROR werr;
 
 	if (!W_ERROR_IS_OK(r->out.result)) {
 		return r->out.result;
@@ -2783,9 +2783,9 @@ static WERROR becomeDC_drsuapi_pull_partition_recv(struct libnet_BecomeDC_state 
 	 */
 	s->_sc.gensec_skey	= &drsuapi_p->gensec_skey;
 
-	nt_status = partition->store_chunk(s->callbacks.private_data, &s->_sc);
-	if (!NT_STATUS_IS_OK(nt_status)) {
-		return ntstatus_to_werror(nt_status);
+	werr = partition->store_chunk(s->callbacks.private_data, &s->_sc);
+	if (!W_ERROR_IS_OK(werr)) {
+		return werr;
 	}
 
 	return WERR_OK;
@@ -2806,7 +2806,8 @@ static void becomeDC_drsuapi3_pull_schema_send(struct libnet_BecomeDC_state *s)
 					| DRSUAPI_DRS_PER_SYNC
 					| DRSUAPI_DRS_FULL_SYNC_IN_PROGRESS
 					| DRSUAPI_DRS_NEVER_SYNCED
-					| DRSUAPI_DRS_USE_COMPRESSION;
+					| DRSUAPI_DRS_USE_COMPRESSION
+					| DRSUAPI_DRS_GET_ANC;
 	if (s->rodc_join) {
 	    s->schema_part.replica_flags &= ~DRSUAPI_DRS_WRIT_REP;
 	}
@@ -2866,7 +2867,8 @@ static void becomeDC_drsuapi3_pull_config_send(struct libnet_BecomeDC_state *s)
 					| DRSUAPI_DRS_PER_SYNC
 					| DRSUAPI_DRS_FULL_SYNC_IN_PROGRESS
 					| DRSUAPI_DRS_NEVER_SYNCED
-					| DRSUAPI_DRS_USE_COMPRESSION;
+					| DRSUAPI_DRS_USE_COMPRESSION
+					| DRSUAPI_DRS_GET_ANC;
 	if (s->rodc_join) {
 	    s->schema_part.replica_flags &= ~DRSUAPI_DRS_WRIT_REP;
 	}
@@ -2924,9 +2926,10 @@ static void becomeDC_drsuapi3_pull_domain_send(struct libnet_BecomeDC_state *s)
 					| DRSUAPI_DRS_PER_SYNC
 					| DRSUAPI_DRS_FULL_SYNC_IN_PROGRESS
 					| DRSUAPI_DRS_NEVER_SYNCED
-					| DRSUAPI_DRS_USE_COMPRESSION;
+					| DRSUAPI_DRS_USE_COMPRESSION
+					| DRSUAPI_DRS_GET_ANC;
 	if (s->critical_only) {
-		s->domain_part.replica_flags |= DRSUAPI_DRS_CRITICAL_ONLY | DRSUAPI_DRS_GET_ANC;
+		s->domain_part.replica_flags |= DRSUAPI_DRS_CRITICAL_ONLY;
 	}
 	if (s->rodc_join) {
 	    s->schema_part.replica_flags &= ~DRSUAPI_DRS_WRIT_REP;

@@ -25,6 +25,66 @@
 #include "../libcli/smb/smbXcli_base.h"
 
 /****************************************************************************
+ Check if a returned directory name is safe.
+****************************************************************************/
+
+static NTSTATUS is_bad_name(bool windows_names, const char *name)
+{
+	const char *bad_name_p = NULL;
+
+	bad_name_p = strchr(name, '/');
+	if (bad_name_p != NULL) {
+		/*
+		 * Windows and POSIX names can't have '/'.
+		 * Server is attacking us.
+		 */
+		return NT_STATUS_INVALID_NETWORK_RESPONSE;
+	}
+	if (windows_names) {
+		bad_name_p = strchr(name, '\\');
+		if (bad_name_p != NULL) {
+			/*
+			 * Windows names can't have '\\'.
+			 * Server is attacking us.
+			 */
+			return NT_STATUS_INVALID_NETWORK_RESPONSE;
+		}
+	}
+	return NT_STATUS_OK;
+}
+
+/****************************************************************************
+ Check if a returned directory name is safe. Disconnect if server is
+ sending bad names.
+****************************************************************************/
+
+NTSTATUS is_bad_finfo_name(const struct cli_state *cli,
+			const struct file_info *finfo)
+{
+	NTSTATUS status = NT_STATUS_OK;
+	bool windows_names = true;
+
+	if (cli->requested_posix_capabilities & CIFS_UNIX_POSIX_PATHNAMES_CAP) {
+		windows_names = false;
+	}
+	if (finfo->name != NULL) {
+		status = is_bad_name(windows_names, finfo->name);
+		if (!NT_STATUS_IS_OK(status)) {
+			DBG_ERR("bad finfo->name\n");
+			return status;
+		}
+	}
+	if (finfo->short_name != NULL) {
+		status = is_bad_name(windows_names, finfo->short_name);
+		if (!NT_STATUS_IS_OK(status)) {
+			DBG_ERR("bad finfo->short_name\n");
+			return status;
+		}
+	}
+	return NT_STATUS_OK;
+}
+
+/****************************************************************************
  Calculate a safe next_entry_offset.
 ****************************************************************************/
 
@@ -77,6 +137,14 @@ static size_t interpret_long_filename(TALLOC_CTX *ctx,
 			if (pdata_end - base < 27) {
 				return pdata_end - base;
 			}
+			/*
+			 * What we're returning here as ctime_ts is
+			 * actually the server create time.
+			 */
+			finfo->btime_ts = convert_time_t_to_timespec(
+				make_unix_date2(p+4,
+					smb1cli_conn_server_time_zone(
+						cli->conn)));
 			finfo->ctime_ts = convert_time_t_to_timespec(
 				make_unix_date2(p+4, smb1cli_conn_server_time_zone(cli->conn)));
 			finfo->atime_ts = convert_time_t_to_timespec(
@@ -128,6 +196,14 @@ static size_t interpret_long_filename(TALLOC_CTX *ctx,
 			if (pdata_end - base < 31) {
 				return pdata_end - base;
 			}
+			/*
+			 * What we're returning here as ctime_ts is
+			 * actually the server create time.
+			 */
+			finfo->btime_ts = convert_time_t_to_timespec(
+				make_unix_date2(p+4,
+					smb1cli_conn_server_time_zone(
+						cli->conn)));
 			finfo->ctime_ts = convert_time_t_to_timespec(
 				make_unix_date2(p+4, smb1cli_conn_server_time_zone(cli->conn)));
 			finfo->atime_ts = convert_time_t_to_timespec(
@@ -186,7 +262,7 @@ static size_t interpret_long_filename(TALLOC_CTX *ctx,
 			namelen = IVAL(p,0);
 			p += 4;
 			p += 4; /* EA size */
-			slen = SVAL(p, 0);
+			slen = CVAL(p, 0);
 			if (slen > 24) {
 				/* Bad short name length. */
 				return pdata_end - base;
@@ -250,6 +326,9 @@ static bool interpret_short_filename(TALLOC_CTX *ctx,
 
 	finfo->mode = CVAL(p,21);
 
+	/* We don't get birth time. */
+	finfo->btime_ts.tv_sec = 0;
+	finfo->btime_ts.tv_nsec = 0;
 	/* this date is converted to GMT by make_unix_date */
 	finfo->ctime_ts.tv_sec = make_unix_date(p+22, smb1cli_conn_server_time_zone(cli->conn));
 	finfo->ctime_ts.tv_nsec = 0;
@@ -334,8 +413,8 @@ static struct tevent_req *cli_list_old_send(TALLOC_CTX *mem_ctx,
 		return tevent_req_post(req, ev);
 	}
 
-	subreq = cli_smb_send(state, state->ev, state->cli, SMBsearch,
-			      0, 2, state->vwv, talloc_get_size(bytes), bytes);
+	subreq = cli_smb_send(state, state->ev, state->cli, SMBsearch, 0, 0,
+			2, state->vwv, talloc_get_size(bytes), bytes);
 	if (tevent_req_nomem(subreq, req)) {
 		return tevent_req_post(req, ev);
 	}
@@ -437,7 +516,7 @@ static void cli_list_old_done(struct tevent_req *subreq)
 	if (tevent_req_nomem(bytes, req)) {
 		return;
 	}
-	subreq = cli_smb_send(state, state->ev, state->cli, cmd, 0,
+	subreq = cli_smb_send(state, state->ev, state->cli, cmd, 0, 0,
 			      2, state->vwv, talloc_get_size(bytes), bytes);
 	if (tevent_req_nomem(subreq, req)) {
 		return;
@@ -473,6 +552,16 @@ static NTSTATUS cli_list_old_recv(struct tevent_req *req, TALLOC_CTX *mem_ctx,
 			TALLOC_FREE(finfo);
 			return NT_STATUS_NO_MEMORY;
 		}
+		if (finfo->name == NULL) {
+			TALLOC_FREE(finfo);
+			return NT_STATUS_INVALID_NETWORK_RESPONSE;
+		}
+		status = is_bad_finfo_name(state->cli, finfo);
+		if (!NT_STATUS_IS_OK(status)) {
+			smbXcli_conn_disconnect(state->cli->conn, status);
+			TALLOC_FREE(finfo);
+			return status;
+		}
 	}
 	*pfinfo = finfo;
 	return NT_STATUS_OK;
@@ -487,7 +576,7 @@ NTSTATUS cli_list_old(struct cli_state *cli, const char *mask,
 	struct tevent_context *ev;
 	struct tevent_req *req;
 	NTSTATUS status = NT_STATUS_NO_MEMORY;
-	struct file_info *finfo;
+	struct file_info *finfo = NULL;
 	size_t i, num_finfo;
 
 	if (smbXcli_conn_has_async_calls(cli->conn)) {
@@ -557,6 +646,7 @@ static struct tevent_req *cli_list_trans_send(TALLOC_CTX *mem_ctx,
 	struct tevent_req *req, *subreq;
 	struct cli_list_trans_state *state;
 	size_t param_len;
+	uint16_t additional_flags2 = 0;
 
 	req = tevent_req_create(mem_ctx, &state,
 				struct cli_list_trans_state);
@@ -598,9 +688,14 @@ static struct tevent_req *cli_list_trans_send(TALLOC_CTX *mem_ctx,
 	if (tevent_req_nomem(state->param, req)) {
 		return tevent_req_post(req, ev);
 	}
+
+	if (clistr_is_previous_version_path(state->mask, NULL, NULL, NULL)) {
+		additional_flags2 = FLAGS2_REPARSE_PATH;
+	}
+
 	param_len = talloc_get_size(state->param);
 
-	subreq = cli_trans_send(state, state->ev, state->cli,
+	subreq = cli_trans_send(state, state->ev, state->cli, additional_flags2,
 				SMBtrans2, NULL, -1, 0, 0,
 				state->setup, 1, 0,
 				state->param, param_len, 10,
@@ -636,6 +731,7 @@ static void cli_list_trans_done(struct tevent_req *subreq)
 	DATA_BLOB last_name_raw;
 	struct file_info *finfo = NULL;
 	size_t param_len;
+	uint16_t additional_flags2 = 0;
 
 	min_param = (state->first ? 6 : 4);
 
@@ -698,9 +794,18 @@ static void cli_list_trans_done(struct tevent_req *subreq)
 		if (finfo->name == NULL) {
 			DEBUG(1, ("cli_list: Error: unable to parse name from "
 				  "info level %d\n", state->info_level));
-			ff_eos = true;
-			break;
+			tevent_req_nterror(req,
+				NT_STATUS_INVALID_NETWORK_RESPONSE);
+			return;
 		}
+
+		status = is_bad_finfo_name(state->cli, finfo);
+		if (!NT_STATUS_IS_OK(status)) {
+			smbXcli_conn_disconnect(state->cli->conn, status);
+			tevent_req_nterror(req, status);
+			return;
+		}
+
 		if (!state->first && (state->mask[0] != '\0') &&
 		    strcsequal(finfo->name, state->mask)) {
 			DEBUG(1, ("Error: Looping in FIND_NEXT as name %s has "
@@ -785,7 +890,11 @@ static void cli_list_trans_done(struct tevent_req *subreq)
 	}
 	param_len = talloc_get_size(state->param);
 
-	subreq = cli_trans_send(state, state->ev, state->cli,
+	if (clistr_is_previous_version_path(state->mask, NULL, NULL, NULL)) {
+		additional_flags2 = FLAGS2_REPARSE_PATH;
+	}
+
+	subreq = cli_trans_send(state, state->ev, state->cli, additional_flags2,
 				SMBtrans2, NULL, -1, 0, 0,
 				state->setup, 1, 0,
 				state->param, param_len, 10,
@@ -937,7 +1046,7 @@ NTSTATUS cli_list(struct cli_state *cli, const char *mask, uint16_t attribute,
 	struct tevent_req *req;
 	NTSTATUS status = NT_STATUS_NO_MEMORY;
 	struct file_info *finfo;
-	size_t i, num_finfo;
+	size_t i, num_finfo = 0;
 	uint16_t info_level;
 
 	if (smbXcli_conn_protocol(cli->conn) >= PROTOCOL_SMB2_02) {

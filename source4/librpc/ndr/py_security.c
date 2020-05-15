@@ -18,6 +18,7 @@
    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 #include <Python.h>
+#include "py3compat.h"
 #include "libcli/security/security.h"
 
 static void PyType_AddMethods(PyTypeObject *type, PyMethodDef *methods)
@@ -35,6 +36,7 @@ static void PyType_AddMethods(PyTypeObject *type, PyMethodDef *methods)
 			descr = PyDescr_NewMethod(type, &methods[i]);
 		PyDict_SetItemString(dict, methods[i].ml_name, 
 				     descr);
+		Py_CLEAR(descr);
 	}
 }
 
@@ -65,6 +67,32 @@ static PyObject *py_dom_sid_split(PyObject *py_self, PyObject *args)
 	return Py_BuildValue("(OI)", py_domain_sid, rid);
 }
 
+#if PY_MAJOR_VERSION >= 3
+static PyObject *py_dom_sid_richcmp(PyObject *py_self, PyObject *py_other, int op)
+{
+	struct dom_sid *self = pytalloc_get_ptr(py_self), *other;
+	int val;
+
+	other = pytalloc_get_ptr(py_other);
+	if (other == NULL) {
+		Py_INCREF(Py_NotImplemented);
+		return Py_NotImplemented;
+	}
+
+	val =  dom_sid_compare(self, other);
+
+	switch (op) {
+			case Py_EQ: if (val == 0) Py_RETURN_TRUE; else Py_RETURN_FALSE;
+			case Py_NE: if (val != 0) Py_RETURN_TRUE; else Py_RETURN_FALSE;
+			case Py_LT: if (val <  0) Py_RETURN_TRUE; else Py_RETURN_FALSE;
+			case Py_GT: if (val >  0) Py_RETURN_TRUE; else Py_RETURN_FALSE;
+			case Py_LE: if (val <= 0) Py_RETURN_TRUE; else Py_RETURN_FALSE;
+			case Py_GE: if (val >= 0) Py_RETURN_TRUE; else Py_RETURN_FALSE;
+	}
+	Py_INCREF(Py_NotImplemented);
+	return Py_NotImplemented;
+}
+#else
 static int py_dom_sid_cmp(PyObject *py_self, PyObject *py_other)
 {
 	struct dom_sid *self = pytalloc_get_ptr(py_self), *other;
@@ -82,22 +110,22 @@ static int py_dom_sid_cmp(PyObject *py_self, PyObject *py_other)
 	}
 	return 0;
 }
+#endif
 
 static PyObject *py_dom_sid_str(PyObject *py_self)
 {
 	struct dom_sid *self = pytalloc_get_ptr(py_self);
-	char *str = dom_sid_string(NULL, self);
-	PyObject *ret = PyString_FromString(str);
-	talloc_free(str);
+	struct dom_sid_buf buf;
+	PyObject *ret = PyUnicode_FromString(dom_sid_str_buf(self, &buf));
 	return ret;
 }
 
 static PyObject *py_dom_sid_repr(PyObject *py_self)
 {
 	struct dom_sid *self = pytalloc_get_ptr(py_self);
-	char *str = dom_sid_string(NULL, self);
-	PyObject *ret = PyString_FromFormat("dom_sid('%s')", str);
-	talloc_free(str);
+	struct dom_sid_buf buf;
+	PyObject *ret = PyUnicode_FromFormat(
+		"dom_sid('%s')", dom_sid_str_buf(self, &buf));
 	return ret;
 }
 
@@ -122,7 +150,7 @@ static PyMethodDef py_dom_sid_extra_methods[] = {
 	{ "split", (PyCFunction)py_dom_sid_split, METH_NOARGS,
 		"S.split() -> (domain_sid, rid)\n"
 		"Split a domain sid" },
-	{ NULL }
+	{0}
 };
 
 
@@ -131,7 +159,11 @@ static void py_dom_sid_patch(PyTypeObject *type)
 	type->tp_init = py_dom_sid_init;
 	type->tp_str = py_dom_sid_str;
 	type->tp_repr = py_dom_sid_repr;
+#if PY_MAJOR_VERSION >= 3
+	type->tp_richcompare = py_dom_sid_richcmp;
+#else
 	type->tp_compare = py_dom_sid_cmp;
+#endif
 	PyType_AddMethods(type, py_dom_sid_extra_methods);
 }
 
@@ -217,6 +249,13 @@ static PyObject *py_descriptor_from_sddl(PyObject *self, PyObject *args)
 	if (!PyArg_ParseTuple(args, "sO!", &sddl, &dom_sid_Type, &py_sid))
 		return NULL;
 
+	if (!PyObject_TypeCheck(py_sid, &dom_sid_Type)) {
+		PyErr_SetString(PyExc_TypeError,
+				"expected security.dom_sid "
+				"for second argument to .from_sddl");
+		return NULL;
+	}
+
 	sid = pytalloc_get_ptr(py_sid);
 
 	secdesc = sddl_decode(NULL, sddl, sid);
@@ -246,7 +285,7 @@ static PyObject *py_descriptor_as_sddl(PyObject *self, PyObject *args)
 
 	text = sddl_encode(NULL, desc, sid);
 
-	ret = PyString_FromString(text);
+	ret = PyUnicode_FromString(text);
 
 	talloc_free(text);
 
@@ -267,7 +306,7 @@ static PyMethodDef py_descriptor_extra_methods[] = {
 		NULL },
 	{ "as_sddl", (PyCFunction)py_descriptor_as_sddl, METH_VARARGS,
 		NULL },
-	{ NULL }
+	{0}
 };
 
 static void py_descriptor_patch(PyTypeObject *type)
@@ -304,28 +343,32 @@ static PyObject *py_token_has_sid(PyObject *self, PyObject *args)
 	return PyBool_FromLong(security_token_has_sid(token, sid));
 }
 
-static PyObject *py_token_is_anonymous(PyObject *self)
+static PyObject *py_token_is_anonymous(PyObject *self,
+	PyObject *Py_UNUSED(ignored))
 {
 	struct security_token *token = pytalloc_get_ptr(self);
 	
 	return PyBool_FromLong(security_token_is_anonymous(token));
 }
 
-static PyObject *py_token_is_system(PyObject *self)
+static PyObject *py_token_is_system(PyObject *self,
+	PyObject *Py_UNUSED(ignored))
 {
 	struct security_token *token = pytalloc_get_ptr(self);
 	
 	return PyBool_FromLong(security_token_is_system(token));
 }
 
-static PyObject *py_token_has_builtin_administrators(PyObject *self)
+static PyObject *py_token_has_builtin_administrators(PyObject *self,
+	PyObject *Py_UNUSED(ignored))
 {
 	struct security_token *token = pytalloc_get_ptr(self);
 	
 	return PyBool_FromLong(security_token_has_builtin_administrators(token));
 }
 
-static PyObject *py_token_has_nt_authenticated_users(PyObject *self)
+static PyObject *py_token_has_nt_authenticated_users(PyObject *self,
+	PyObject *Py_UNUSED(ignored))
 {
 	struct security_token *token = pytalloc_get_ptr(self);
 	
@@ -379,7 +422,7 @@ static PyMethodDef py_token_extra_methods[] = {
 		NULL },
 	{ "set_privilege", (PyCFunction)py_token_set_privilege, METH_VARARGS,
 		NULL },
-	{ NULL }
+	{0}
 };
 
 #define PY_TOKEN_PATCH py_token_patch
@@ -392,10 +435,18 @@ static void py_token_patch(PyTypeObject *type)
 static PyObject *py_privilege_name(PyObject *self, PyObject *args)
 {
 	int priv;
-	if (!PyArg_ParseTuple(args, "i", &priv))
+	const char *name = NULL;
+	if (!PyArg_ParseTuple(args, "i", &priv)) {
 		return NULL;
+	}
+	name = sec_privilege_name(priv);
+	if (name == NULL) {
+		PyErr_Format(PyExc_ValueError,
+			     "Invalid privilege LUID: %d", priv);
+		return NULL;
+	}
 
-	return PyString_FromString(sec_privilege_name(priv));
+	return PyUnicode_FromString(name);
 }
 
 static PyObject *py_privilege_id(PyObject *self, PyObject *args)
@@ -405,10 +456,11 @@ static PyObject *py_privilege_id(PyObject *self, PyObject *args)
 	if (!PyArg_ParseTuple(args, "s", &name))
 		return NULL;
 
-	return PyInt_FromLong(sec_privilege_id(name));
+	return PyLong_FromLong(sec_privilege_id(name));
 }
 
-static PyObject *py_random_sid(PyObject *self)
+static PyObject *py_random_sid(PyObject *self,
+	PyObject *Py_UNUSED(ignored))
 {
 	struct dom_sid *sid;
 	PyObject *ret;
@@ -427,7 +479,7 @@ static PyMethodDef py_mod_security_extra_methods[] = {
 	{ "random_sid", (PyCFunction)py_random_sid, METH_NOARGS, NULL },
 	{ "privilege_id", (PyCFunction)py_privilege_id, METH_VARARGS, NULL },
 	{ "privilege_name", (PyCFunction)py_privilege_name, METH_VARARGS, NULL },
-	{ NULL }
+	{0}
 };
 
 static void py_mod_security_patch(PyObject *m)

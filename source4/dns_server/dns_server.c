@@ -47,11 +47,12 @@
 #include "auth/credentials/credentials.h"
 #include "librpc/gen_ndr/ndr_irpc.h"
 #include "lib/messaging/irpc.h"
+#include "libds/common/roles.h"
 
 #undef DBGC_CLASS
 #define DBGC_CLASS DBGC_DNS
 
-NTSTATUS server_service_dns_init(void);
+NTSTATUS server_service_dns_init(TALLOC_CTX *);
 
 /* hold information about one dns socket */
 struct dns_socket {
@@ -116,13 +117,15 @@ static void dns_process_done(struct tevent_req *subreq);
 static struct tevent_req *dns_process_send(TALLOC_CTX *mem_ctx,
 					   struct tevent_context *ev,
 					   struct dns_server *dns,
+					   const struct tsocket_address *remote_address,
+					   const struct tsocket_address *local_address,
 					   DATA_BLOB *in)
 {
 	struct tevent_req *req, *subreq;
 	struct dns_process_state *state;
 	enum ndr_err_code ndr_err;
 	WERROR ret;
-	const char *forwarder = lpcfg_dns_forwarder(dns->task->lp_ctx);
+	const char **forwarder = lpcfg_dns_forwarder(dns->task->lp_ctx);
 	req = tevent_req_create(mem_ctx, &state, struct dns_process_state);
 	if (req == NULL) {
 		return NULL;
@@ -133,7 +136,7 @@ static struct tevent_req *dns_process_send(TALLOC_CTX *mem_ctx,
 	state->dns = dns;
 
 	if (in->length < 12) {
-		tevent_req_werror(req, WERR_INVALID_PARAM);
+		tevent_req_werror(req, WERR_INVALID_PARAMETER);
 		return tevent_req_post(req, ev);
 	}
 	dump_data_dbgc(DBGC_DNS, 8, in->data, in->length);
@@ -151,34 +154,37 @@ static struct tevent_req *dns_process_send(TALLOC_CTX *mem_ctx,
 		NDR_PRINT_DEBUGC(DBGC_DNS, dns_name_packet, &state->in_packet);
 	}
 
-	ret = dns_verify_tsig(dns, state, &state->state, &state->in_packet, in);
-	if (!W_ERROR_IS_OK(ret)) {
-		DEBUG(1, ("Failed to verify TSIG!\n"));
-		state->dns_err = werr_to_dns_err(ret);
-		tevent_req_done(req);
-		return tevent_req_post(req, ev);
-	}
-
 	if (state->in_packet.operation & DNS_FLAG_REPLY) {
 		DEBUG(1, ("Won't reply to replies.\n"));
-		tevent_req_werror(req, WERR_INVALID_PARAM);
+		tevent_req_werror(req, WERR_INVALID_PARAMETER);
 		return tevent_req_post(req, ev);
 	}
 
 	state->state.flags = state->in_packet.operation;
 	state->state.flags |= DNS_FLAG_REPLY;
 
-	
-	if (forwarder && *forwarder) {
+	state->state.local_address = local_address;
+	state->state.remote_address = remote_address;
+
+	if (forwarder && *forwarder && **forwarder) {
 		state->state.flags |= DNS_FLAG_RECURSION_AVAIL;
 	}
 
 	state->out_packet = state->in_packet;
 
+	ret = dns_verify_tsig(dns, state, &state->state,
+			      &state->out_packet, in);
+	if (!W_ERROR_IS_OK(ret)) {
+		state->dns_err = werr_to_dns_err(ret);
+		tevent_req_done(req);
+		return tevent_req_post(req, ev);
+	}
+
 	switch (state->in_packet.operation & DNS_OPCODE) {
 	case DNS_OPCODE_QUERY:
 		subreq = dns_server_process_query_send(
-			state, ev, dns, &state->state, &state->in_packet);
+			state, ev, dns,
+			&state->state, &state->in_packet);
 		if (tevent_req_nomem(subreq, req)) {
 			return tevent_req_post(req, ev);
 		}
@@ -235,7 +241,9 @@ static WERROR dns_process_recv(struct tevent_req *req, TALLOC_CTX *mem_ctx,
 		return ret;
 	}
 	if ((state->dns_err != DNS_RCODE_OK) &&
-	    (state->dns_err != DNS_RCODE_NXDOMAIN)) {
+	    (state->dns_err != DNS_RCODE_NXDOMAIN) &&
+	    (state->dns_err != DNS_RCODE_NOTAUTH))
+	{
 		goto drop;
 	}
 	if (state->dns_err != DNS_RCODE_OK) {
@@ -270,7 +278,7 @@ static WERROR dns_process_recv(struct tevent_req *req, TALLOC_CTX *mem_ctx,
 drop:
 	*out = data_blob_talloc(mem_ctx, state->in->data, state->in->length);
 	if (out->data == NULL) {
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 	out->data[2] |= 0x80; /* Toggle DNS_FLAG_REPLY */
 	out->data[3] |= state->dns_err;
@@ -331,6 +339,8 @@ static void dns_tcp_call_loop(struct tevent_req *subreq)
 	call->in.length -= 2;
 
 	subreq = dns_process_send(call, dns->task->event_ctx, dns,
+				  dns_conn->conn->remote_address,
+				  dns_conn->conn->local_address,
 				  &call->in);
 	if (subreq == NULL) {
 		dns_tcp_terminate_connection(
@@ -532,6 +542,8 @@ static void dns_udp_call_loop(struct tevent_req *subreq)
 		 tsocket_address_string(call->src, call)));
 
 	subreq = dns_process_send(call, dns->task->event_ctx, dns,
+				  call->src,
+				  sock->dns_socket->local_address,
 				  &call->in);
 	if (subreq == NULL) {
 		TALLOC_FREE(call);
@@ -630,7 +642,8 @@ static NTSTATUS dns_add_socket(struct dns_server *dns,
 				     &dns_tcp_stream_ops,
 				     "ip", address, &port,
 				     lpcfg_socket_options(dns->task->lp_ctx),
-				     dns_socket);
+				     dns_socket,
+				     dns->task->process_context);
 	if (!NT_STATUS_IS_OK(status)) {
 		DEBUG(0,("Failed to bind to %s:%u TCP - %s\n",
 			 address, port, nt_errstr(status)));
@@ -671,22 +684,13 @@ static NTSTATUS dns_add_socket(struct dns_server *dns,
   setup our listening sockets on the configured network interfaces
 */
 static NTSTATUS dns_startup_interfaces(struct dns_server *dns,
-				       struct interface *ifaces)
+				       struct interface *ifaces,
+				       const struct model_ops *model_ops)
 {
-	const struct model_ops *model_ops;
-	int num_interfaces;
+	size_t num_interfaces;
 	TALLOC_CTX *tmp_ctx = talloc_new(dns);
 	NTSTATUS status;
 	int i;
-
-	/* within the dns task we want to be a single process, so
-	   ask for the single process model ops and pass these to the
-	   stream_setup_socket() call. */
-	model_ops = process_model_startup("single");
-	if (!model_ops) {
-		DEBUG(0,("Can't find 'single' process model_ops\n"));
-		return NT_STATUS_INTERNAL_ERROR;
-	}
 
 	if (ifaces != NULL) {
 		num_interfaces = iface_list_count(ifaces);
@@ -700,7 +704,7 @@ static NTSTATUS dns_startup_interfaces(struct dns_server *dns,
 			NT_STATUS_NOT_OK_RETURN(status);
 		}
 	} else {
-		int num_binds = 0;
+		size_t num_binds = 0;
 		char **wcard;
 		wcard = iface_list_wildcard(tmp_ctx);
 		if (wcard == NULL) {
@@ -723,27 +727,6 @@ static NTSTATUS dns_startup_interfaces(struct dns_server *dns,
 	talloc_free(tmp_ctx);
 
 	return NT_STATUS_OK;
-}
-
-static int dns_server_sort_zones(struct ldb_message **m1, struct ldb_message **m2)
-{
-	const char *n1, *n2;
-	size_t l1, l2;
-
-	n1 = ldb_msg_find_attr_as_string(*m1, "name", NULL);
-	n2 = ldb_msg_find_attr_as_string(*m2, "name", NULL);
-
-	l1 = strlen(n1);
-	l2 = strlen(n2);
-
-	/* If the string lengths are not equal just sort by length */
-	if (l1 != l2) {
-		/* If m1 is the larger zone name, return it first */
-		return l2 - l1;
-	}
-
-	/*TODO: We need to compare DNs here, we want the DomainDNSZones first */
-	return 0;
 }
 
 static struct dns_server_tkey_store *tkey_store_init(TALLOC_CTX *mem_ctx,
@@ -769,51 +752,14 @@ static struct dns_server_tkey_store *tkey_store_init(TALLOC_CTX *mem_ctx,
 
 static NTSTATUS dns_server_reload_zones(struct dns_server *dns)
 {
-	int ret;
-	static const char * const attrs[] = { "name", NULL};
-	struct ldb_result *res;
-	int i;
+	NTSTATUS status;
 	struct dns_server_zone *new_list = NULL;
 	struct dns_server_zone *old_list = NULL;
 	struct dns_server_zone *old_zone;
-
-	// TODO: this search does not work against windows
-	ret = dsdb_search(dns->samdb, dns, &res, NULL, LDB_SCOPE_SUBTREE,
-			  attrs, DSDB_SEARCH_SEARCH_ALL_PARTITIONS, "(objectClass=dnsZone)");
-	if (ret != LDB_SUCCESS) {
-		return NT_STATUS_INTERNAL_DB_CORRUPTION;
+	status = dns_common_zones(dns->samdb, dns, NULL, &new_list);
+	if (!NT_STATUS_IS_OK(status)) {
+		return status;
 	}
-
-	TYPESAFE_QSORT(res->msgs, res->count, dns_server_sort_zones);
-
-	for (i=0; i < res->count; i++) {
-		struct dns_server_zone *z;
-
-		z = talloc_zero(dns, struct dns_server_zone);
-		if (z == NULL) {
-			return NT_STATUS_NO_MEMORY;
-		}
-
-		z->name = ldb_msg_find_attr_as_string(res->msgs[i], "name", NULL);
-		z->dn = talloc_move(z, &res->msgs[i]->dn);
-		/*
-		 * Ignore the RootDNSServers zone and zones that we don't support yet
-		 * RootDNSServers should never be returned (Windows DNS server don't)
-		 * ..TrustAnchors should never be returned as is, (Windows returns
-		 * TrustAnchors) and for the moment we don't support DNSSEC so we'd better
-		 * not return this zone.
-		 */
-		if ((strcmp(z->name, "RootDNSServers") == 0) ||
-		    (strcmp(z->name, "..TrustAnchors") == 0))
-		{
-			DEBUG(10, ("Ignoring zone %s\n", z->name));
-			talloc_free(z);
-			continue;
-		}
-		DLIST_ADD_END(new_list, z, NULL);
-	}
-
-	old_list = dns->zones;
 	dns->zones = new_list;
 	while ((old_zone = DLIST_TAIL(old_list)) != NULL) {
 		DLIST_REMOVE(old_list, old_zone);
@@ -844,7 +790,7 @@ static NTSTATUS dns_reload_zones(struct irpc_message *msg,
 	return NT_STATUS_OK;
 }
 
-static void dns_task_init(struct task_server *task)
+static NTSTATUS dns_task_init(struct task_server *task)
 {
 	struct dns_server *dns;
 	NTSTATUS status;
@@ -858,10 +804,10 @@ static void dns_task_init(struct task_server *task)
 	switch (lpcfg_server_role(task->lp_ctx)) {
 	case ROLE_STANDALONE:
 		task_server_terminate(task, "dns: no DNS required in standalone configuration", false);
-		return;
+		return NT_STATUS_INVALID_DOMAIN_ROLE;
 	case ROLE_DOMAIN_MEMBER:
 		task_server_terminate(task, "dns: no DNS required in member server configuration", false);
-		return;
+		return NT_STATUS_INVALID_DOMAIN_ROLE;
 	case ROLE_ACTIVE_DIRECTORY_DC:
 		/* Yes, we want a DNS */
 		break;
@@ -872,7 +818,7 @@ static void dns_task_init(struct task_server *task)
 
 		if (iface_list_count(ifaces) == 0) {
 			task_server_terminate(task, "dns: no network interfaces configured", false);
-			return;
+			return NT_STATUS_UNSUCCESSFUL;
 		}
 	}
 
@@ -881,24 +827,26 @@ static void dns_task_init(struct task_server *task)
 	dns = talloc_zero(task, struct dns_server);
 	if (dns == NULL) {
 		task_server_terminate(task, "dns: out of memory", true);
-		return;
+		return NT_STATUS_NO_MEMORY;
 	}
 
 	dns->task = task;
-	/*FIXME: Make this a configurable option */
-	dns->max_payload = 4096;
 
 	dns->server_credentials = cli_credentials_init(dns);
 	if (!dns->server_credentials) {
 		task_server_terminate(task, "Failed to init server credentials\n", true);
-		return;
+		return NT_STATUS_UNSUCCESSFUL;
 	}
 
-	dns->samdb = samdb_connect(dns, dns->task->event_ctx, dns->task->lp_ctx,
-			      system_session(dns->task->lp_ctx), 0);
+	dns->samdb = samdb_connect(dns,
+				   dns->task->event_ctx,
+				   dns->task->lp_ctx,
+				   system_session(dns->task->lp_ctx),
+				   NULL,
+				   0);
 	if (!dns->samdb) {
 		task_server_terminate(task, "dns: samdb_connect failed", true);
-		return;
+		return NT_STATUS_UNSUCCESSFUL;
 	}
 
 	cli_credentials_set_conf(dns->server_credentials, task->lp_ctx);
@@ -917,7 +865,7 @@ static void dns_task_init(struct task_server *task)
 		TALLOC_FREE(dns_acc);
 		if (!dns_spn) {
 			task_server_terminate(task, "dns: talloc_asprintf failed", true);
-			return;
+			return NT_STATUS_UNSUCCESSFUL;
 		}
 		status = cli_credentials_set_stored_principal(dns->server_credentials, task->lp_ctx, dns_spn);
 		if (!NT_STATUS_IS_OK(status)) {
@@ -926,7 +874,7 @@ static void dns_task_init(struct task_server *task)
 							      "despite finding it in the samdb! %s\n",
 							      nt_errstr(status)),
 					      true);
-			return;
+			return status;
 		}
 	} else {
 		TALLOC_FREE(dns_spn);
@@ -936,44 +884,51 @@ static void dns_task_init(struct task_server *task)
 					      talloc_asprintf(task, "Failed to obtain server credentials, perhaps a standalone server?: %s\n",
 							      nt_errstr(status)),
 					      true);
-			return;
+			return status;
 		}
 	}
 
 	dns->tkeys = tkey_store_init(dns, TKEY_BUFFER_SIZE);
 	if (!dns->tkeys) {
 		task_server_terminate(task, "Failed to allocate tkey storage\n", true);
-		return;
+		return NT_STATUS_NO_MEMORY;
 	}
 
 	status = dns_server_reload_zones(dns);
 	if (!NT_STATUS_IS_OK(status)) {
 		task_server_terminate(task, "dns: failed to load DNS zones", true);
-		return;
+		return status;
 	}
 
-	status = dns_startup_interfaces(dns, ifaces);
+	status = dns_startup_interfaces(dns, ifaces, task->model_ops);
 	if (!NT_STATUS_IS_OK(status)) {
 		task_server_terminate(task, "dns failed to setup interfaces", true);
-		return;
+		return status;
 	}
 
 	/* Setup the IRPC interface and register handlers */
 	status = irpc_add_name(task->msg_ctx, "dnssrv");
 	if (!NT_STATUS_IS_OK(status)) {
 		task_server_terminate(task, "dns: failed to register IRPC name", true);
-		return;
+		return status;
 	}
 
 	status = IRPC_REGISTER(task->msg_ctx, irpc, DNSSRV_RELOAD_DNS_ZONES,
 			       dns_reload_zones, dns);
 	if (!NT_STATUS_IS_OK(status)) {
 		task_server_terminate(task, "dns: failed to setup reload handler", true);
-		return;
+		return status;
 	}
+	return NT_STATUS_OK;
 }
 
-NTSTATUS server_service_dns_init(void)
+NTSTATUS server_service_dns_init(TALLOC_CTX *ctx)
 {
-	return register_server_service("dns", dns_task_init);
+	static const struct service_details details = {
+		.inhibit_fork_on_accept = true,
+		.inhibit_pre_fork = true,
+		.task_init = dns_task_init,
+		.post_fork = NULL
+	};
+	return register_server_service(ctx, "dns", &details);
 }

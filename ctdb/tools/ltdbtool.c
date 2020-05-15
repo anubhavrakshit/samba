@@ -18,23 +18,14 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <stdio.h>
-#include <stdbool.h>
-#include <stddef.h>
-#include <stdlib.h>
-#include <ctype.h> /* isprint */
-#include <string.h> /* strstr */
-#include <fcntl.h> /* mode_t */
-#include <sys/stat.h> /* S_IRUSR */
-#include <stdint.h> /* uint32_t */
-#include <netinet/in.h> /* struct sockaddr_in */
-#include <sys/socket.h> /* struct sockaddr */
-#include <sys/param.h>  /* MIN */
-#include <tdb.h>
-#include <unistd.h> /* getopt */
-#include <errno.h>
+#include "replace.h"
+#include "system/filesys.h"
+#include "system/network.h"
+#include "system/locale.h"
 
-#include "ctdb_protocol.h"
+#include <tdb.h>
+
+#include "protocol/protocol.h"
 
 enum {
 	MAX_HEADER_SIZE=24,
@@ -48,7 +39,9 @@ union  ltdb_header {
 };
 
 static const union ltdb_header DEFAULT_HDR = {
-	.hdr.dmaster = -1,
+	.hdr = {
+		.dmaster = -1,
+	}
 };
 
 static int help(const char* cmd)
@@ -103,7 +96,7 @@ static int usage(const char* cmd)
 static int
 ltdb_traverse(TDB_CONTEXT *tdb, int (*fn)(TDB_CONTEXT*, TDB_DATA, TDB_DATA,
 					  struct ctdb_ltdb_header*, void *),
-	      void *state, int hsize, bool skip_empty);
+	      void *state, size_t hsize, bool skip_empty);
 
 struct write_record_ctx {
 	TDB_CONTEXT* tdb;
@@ -132,7 +125,10 @@ static void dump_header_nop(struct dump_record_ctx* c,
 			    struct ctdb_ltdb_header* h)
 {}
 
-static int dump_db(const char* iname, FILE* ofile, int hsize, bool dump_header,
+static int dump_db(const char* iname,
+		   FILE* ofile,
+		   size_t hsize,
+		   bool dump_header,
 		   bool empty)
 {
 	int ret = -1;
@@ -276,7 +272,7 @@ struct ltdb_traverse_ctx {
 	void* state;
 	size_t hsize;
 	bool skip_empty;
-	unsigned nempty;
+	int nempty;
 };
 
 static int
@@ -311,14 +307,15 @@ ltdb_traverse_fn(TDB_CONTEXT* tdb, TDB_DATA key, TDB_DATA val,
 	return ctx->fn(tdb, key, val, &hdr.hdr, ctx->state);
 }
 
-int ltdb_traverse(TDB_CONTEXT *tdb,
-		  int (*fn)(TDB_CONTEXT *,TDB_DATA,TDB_DATA,struct ctdb_ltdb_header*,void *),
-		  void *state, int hsize, bool skip_empty)
+static int ltdb_traverse(TDB_CONTEXT *tdb,
+			 int (*fn)(TDB_CONTEXT*, TDB_DATA, TDB_DATA,
+				   struct ctdb_ltdb_header*, void *),
+			 void *state, size_t hsize, bool skip_empty)
 {
 	struct ltdb_traverse_ctx ctx = {
 		.fn = fn,
 		.state = state,
-		.hsize = hsize < 0 ? sizeof(struct ctdb_ltdb_header) : hsize,
+		.hsize = hsize,
 		.skip_empty = skip_empty,
 		.nempty = 0,
 	};
@@ -327,38 +324,39 @@ int ltdb_traverse(TDB_CONTEXT *tdb,
 	return (ret < 0) ? ret : (ret - ctx.nempty);
 }
 
-int write_record(TDB_CONTEXT* tdb, TDB_DATA key, TDB_DATA val,
-		 struct ctdb_ltdb_header* hdr,
-		 void* write_record_ctx)
+static int write_record(TDB_CONTEXT* tdb, TDB_DATA key, TDB_DATA val,
+			struct ctdb_ltdb_header* hdr,
+			void* write_record_ctx)
 {
 	struct write_record_ctx* ctx
 		= (struct write_record_ctx*)write_record_ctx;
+	int ret;
 
 	if (ctx->hsize == 0) {
-		if (tdb_store(ctx->tdb, key, val, ctx->tdb_store_flags) == -1) {
-			fprintf(stderr, "tdb_store: %s\n", tdb_errorstr(ctx->tdb));
-			return -1;
-		}
+		ret = tdb_store(ctx->tdb, key, val, ctx->tdb_store_flags);
 	} else {
-		TDB_DATA h = {
-			.dptr = (void*)hdr,
-			.dsize = ctx->hsize,
-		};
-		if(tdb_store(ctx->tdb, key, h, ctx->tdb_store_flags) == -1) {
-			fprintf(stderr, "tdb_store: %s\n", tdb_errorstr(ctx->tdb));
-			return -1;
-		}
-		if(tdb_append(ctx->tdb, key, val) == -1) {
-			fprintf(stderr, "tdb_append: %s\n", tdb_errorstr(ctx->tdb));
-			return -1;
-		}
+		TDB_DATA rec[2];
+
+		rec[0].dsize = ctx->hsize;
+		rec[0].dptr = (uint8_t *)hdr;
+
+		rec[1].dsize = val.dsize;
+		rec[1].dptr = val.dptr;
+
+		ret = tdb_storev(ctx->tdb, key, rec, 2, ctx->tdb_store_flags);
 	}
+
+	if (ret == -1) {
+		fprintf(stderr, "tdb_store: %s\n", tdb_errorstr(ctx->tdb));
+		return -1;
+	}
+
 	return 0;
 }
 
-int dump_record(TDB_CONTEXT* tdb, TDB_DATA key, TDB_DATA val,
-		struct ctdb_ltdb_header* hdr,
-		void* dump_record_ctx)
+static int dump_record(TDB_CONTEXT* tdb, TDB_DATA key, TDB_DATA val,
+		       struct ctdb_ltdb_header* hdr,
+		       void* dump_record_ctx)
 {
 	struct dump_record_ctx* ctx = (struct dump_record_ctx*)dump_record_ctx;
 
@@ -372,14 +370,16 @@ int dump_record(TDB_CONTEXT* tdb, TDB_DATA key, TDB_DATA val,
 	return 0;
 }
 
-void dump_header_full(struct dump_record_ctx* c, struct ctdb_ltdb_header* h)
+static void dump_header_full(struct dump_record_ctx* c,
+			     struct ctdb_ltdb_header* h)
 {
 	fprintf(c->file, "dmaster: %d\nrsn: %llu\nflags: 0x%X\n",
 		(int)h->dmaster,
 		(unsigned long long)h->rsn, h->flags);
 }
 
-void print_data_tdbdump(FILE* file, TDB_DATA data) {
+static void print_data_tdbdump(FILE* file, TDB_DATA data)
+{
 	unsigned char *ptr = data.dptr;
 	fputc('"', file);
 	while (data.dsize--) {

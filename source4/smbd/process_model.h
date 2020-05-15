@@ -51,21 +51,31 @@ struct model_ops {
 				  void (*)(struct tevent_context *, 
 					   struct loadparm_context *,
 					   struct socket_context *, 
-					   struct server_id , void *), 
-				  void *);
+					   struct server_id , void *, void *),
+				  void *, void *);
 
 	/* function to create a task */
 	void (*new_task)(struct tevent_context *, 
 			 struct loadparm_context *lp_ctx,
 			 const char *service_name,
-			 void (*)(struct tevent_context *, 
+			 struct task_server * (*)(struct tevent_context *,
 				  struct loadparm_context *, struct server_id, 
-				  void *),
-			 void *);
+				  void *, void *),
+			 void *,
+			 const struct service_details*,
+			 const int);
 
-	/* function to terminate a connection or task */
-	void (*terminate)(struct tevent_context *, struct loadparm_context *lp_ctx,
-			  const char *reason);
+	/* function to terminate a task */
+	void (*terminate_task)(struct tevent_context *,
+			       struct loadparm_context *lp_ctx,
+			       const char *reason,
+			       bool fatal,
+			       void *process_context);
+	/* function to terminate a connection */
+	void (*terminate_connection)(struct tevent_context *,
+				     struct loadparm_context *lp_ctx,
+				     const char *reason,
+				     void *process_context);
 
 	/* function to set a title for the connection or task */
 	void (*set_title)(struct tevent_context *, const char *title);

@@ -19,6 +19,7 @@
 
 #include "replace.h"
 #include "system/filesys.h"
+#include "lib/util/server_id.h"
 #include "lib/util/server_id_db.h"
 #include "lib/tdb_wrap/tdb_wrap.h"
 #include "lib/util/strv.h"
@@ -93,8 +94,7 @@ static int server_id_db_destructor(struct server_id_db *db)
 int server_id_db_add(struct server_id_db *db, const char *name)
 {
 	struct tdb_context *tdb = db->tdb->tdb;
-	struct server_id_buf buf;
-	TDB_DATA key, data;
+	TDB_DATA key;
 	char *n;
 	int ret;
 
@@ -110,10 +110,17 @@ int server_id_db_add(struct server_id_db *db, const char *name)
 
 	key = string_term_tdb_data(name);
 
-	server_id_str_buf(db->pid, &buf);
-	data = string_term_tdb_data(buf.buf);
+	{
+		size_t idlen = server_id_str_buf_unique(db->pid, NULL, 0);
+		char idbuf[idlen];
 
-	ret = tdb_append(tdb, key, data);
+		server_id_str_buf_unique(db->pid, idbuf, idlen);
+
+		ret = tdb_append(
+			tdb, key,
+			(TDB_DATA) { .dptr = (uint8_t *)idbuf, .dsize = idlen });
+	}
+
 	if (ret != 0) {
 		enum TDB_ERROR err = tdb_error(tdb);
 		strv_delete(&db->names, strv_find(db->names, name));
@@ -127,14 +134,16 @@ int server_id_db_prune_name(struct server_id_db *db, const char *name,
 			    struct server_id server)
 {
 	struct tdb_context *tdb = db->tdb->tdb;
-	struct server_id_buf buf;
+	size_t idbuf_len = server_id_str_buf_unique(server, NULL, 0);
+	char idbuf[idbuf_len];
 	TDB_DATA key;
 	uint8_t *data;
+	size_t datalen;
 	char *ids, *id;
 	int ret;
 
 	key = string_term_tdb_data(name);
-	server_id_str_buf(server, &buf);
+	server_id_str_buf_unique(server, idbuf, idbuf_len);
 
 	ret = tdb_chainlock(tdb, key);
 	if (ret == -1) {
@@ -148,9 +157,16 @@ int server_id_db_prune_name(struct server_id_db *db, const char *name,
 		return ret;
 	}
 
+	datalen = talloc_get_size(data);
+	if ((datalen == 0) || (data[datalen-1] != '\0')) {
+		tdb_chainunlock(tdb, key);
+		TALLOC_FREE(data);
+		return EINVAL;
+	}
+
 	ids = (char *)data;
 
-	id = strv_find(ids, buf.buf);
+	id = strv_find(ids, idbuf);
 	if (id == NULL) {
 		tdb_chainunlock(tdb, key);
 		TALLOC_FREE(data);
@@ -158,10 +174,20 @@ int server_id_db_prune_name(struct server_id_db *db, const char *name,
 	}
 
 	strv_delete(&ids, id);
-	ret = tdb_store(tdb, key, talloc_tdb_data(ids), TDB_MODIFY);
+
+	if (talloc_get_size(ids) == 0) {
+		ret = tdb_delete(tdb, key);
+	} else {
+		ret = tdb_store(tdb, key, talloc_tdb_data(ids), TDB_MODIFY);
+	}
 	TALLOC_FREE(data);
 
 	tdb_chainunlock(tdb, key);
+
+	if (ret == -1) {
+		enum TDB_ERROR err = tdb_error(tdb);
+		return map_unix_error_from_tdb(err);
+	}
 
 	return 0;
 }
@@ -192,6 +218,7 @@ int server_id_db_lookup(struct server_id_db *db, const char *name,
 	struct tdb_context *tdb = db->tdb->tdb;
 	TDB_DATA key;
 	uint8_t *data;
+	size_t datalen;
 	char *ids, *id;
 	unsigned num_servers;
 	struct server_id *servers;
@@ -202,6 +229,12 @@ int server_id_db_lookup(struct server_id_db *db, const char *name,
 	ret = tdb_fetch_talloc(tdb, key, mem_ctx, &data);
 	if (ret != 0) {
 		return ret;
+	}
+
+	datalen = talloc_get_size(data);
+	if ((datalen == 0) || (data[datalen-1] != '\0')) {
+		TALLOC_FREE(data);
+		return EINVAL;
 	}
 
 	ids = (char *)data;

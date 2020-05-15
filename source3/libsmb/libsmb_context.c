@@ -177,8 +177,8 @@ smbc_new_context(void)
         smbc_setOptionBrowseMaxLmbCount(context, 3);    /* # LMBs to query */
         smbc_setOptionUrlEncodeReaddirEntries(context, False);
         smbc_setOptionOneSharePerServer(context, False);
-	if (getenv("LIBSMBCLIENT_NO_CCACHE") == NULL) {
-		smbc_setOptionUseCCache(context, true);
+	if (getenv("LIBSMBCLIENT_NO_CCACHE") != NULL) {
+		smbc_setOptionUseCCache(context, false);
 	}
 
         smbc_setFunctionAuthData(context, SMBC_get_auth_data);
@@ -208,6 +208,8 @@ smbc_new_context(void)
         smbc_setFunctionOpendir(context, SMBC_opendir_ctx);
         smbc_setFunctionClosedir(context, SMBC_closedir_ctx);
         smbc_setFunctionReaddir(context, SMBC_readdir_ctx);
+        smbc_setFunctionReaddirPlus(context, SMBC_readdirplus_ctx);
+	smbc_setFunctionReaddirPlus2(context, SMBC_readdirplus2_ctx);
         smbc_setFunctionGetdents(context, SMBC_getdents_ctx);
         smbc_setFunctionMkdir(context, SMBC_mkdir_ctx);
         smbc_setFunctionRmdir(context, SMBC_rmdir_ctx);
@@ -256,8 +258,9 @@ smbc_free_context(SMBCCTX *context,
 
                 f = context->internal->files;
                 while (f) {
+			SMBCFILE *next = f->next;
                         smbc_getFunctionClose(context)(context, f);
-                        f = f->next;
+			f = next;
                 }
                 context->internal->files = NULL;
 
@@ -485,7 +488,7 @@ smbc_option_get(SMBCCTX *context,
 
                 for (s = context->internal->servers; s; s = s->next) {
                         num_servers++;
-                        if (!smb1cli_conn_encryption_on(s->cli->conn)) {
+                        if (!cli_state_is_encryption_on(s->cli)) {
                                 return (void *)false;
                         }
                 }
@@ -657,24 +660,16 @@ smbc_init_context(SMBCCTX *context)
         DEBUG(1, ("Using netbios name %s.\n", smbc_getNetbiosName(context)));
 
         if (!smbc_getWorkgroup(context)) {
-                char *workgroup;
+                const char *workgroup;
 
                 if (lp_workgroup()) {
-                        workgroup = SMB_STRDUP(lp_workgroup());
-                }
-                else {
+                        workgroup = lp_workgroup();
+                } else {
                         /* TODO: Think about a decent default workgroup */
-                        workgroup = SMB_STRDUP("samba");
-                }
-
-                if (!workgroup) {
-                        TALLOC_FREE(frame);
-                        errno = ENOMEM;
-                        return NULL;
+                        workgroup = "samba";
                 }
 
                 smbc_setWorkgroup(context, workgroup);
-		SAFE_FREE(workgroup);
 
 		if (!smbc_getWorkgroup(context)) {
                         TALLOC_FREE(frame);
@@ -708,7 +703,7 @@ smbc_init_context(SMBCCTX *context)
 }
 
 
-/* Return the verion of samba, and thus libsmbclient */
+/* Return the version of samba, and thus libsmbclient */
 const char *
 smbc_version(void)
 {

@@ -23,6 +23,7 @@
 #define __DEFAULT_LIBRPC_RPCCOMMON_H__
 
 #include "gen_ndr/dcerpc.h"
+#include "lib/util/attr.h"
 
 struct dcerpc_binding_handle;
 struct GUID;
@@ -35,6 +36,7 @@ struct epm_floor;
 struct epm_tower;
 struct tevent_context;
 struct tstream_context;
+struct gensec_security;
 
 enum dcerpc_transport_t {
 	NCA_UNKNOWN, NCACN_NP, NCACN_IP_TCP, NCACN_IP_UDP, NCACN_VNS_IPC, 
@@ -104,6 +106,10 @@ struct dcerpc_binding;
 /* this triggers the DCERPC_PFC_FLAG_SUPPORT_HEADER_SIGN flag in the bind request */
 #define DCERPC_PROPOSE_HEADER_SIGNING          (1<<25)
 
+#define DCERPC_PACKET			(1<<26)
+
+#define DCERPC_SMB1                    (1<<27)
+
 /* The following definitions come from ../librpc/rpc/dcerpc_error.c  */
 
 const char *dcerpc_errstr(TALLOC_CTX *mem_ctx, uint32_t fault_code);
@@ -162,10 +168,18 @@ enum dcerpc_transport_t dcerpc_transport_by_tower(const struct epm_tower *tower)
 void dcerpc_set_frag_length(DATA_BLOB *blob, uint16_t v);
 uint16_t dcerpc_get_frag_length(const DATA_BLOB *blob);
 void dcerpc_set_auth_length(DATA_BLOB *blob, uint16_t v);
+uint16_t dcerpc_get_auth_length(const DATA_BLOB *blob);
 uint8_t dcerpc_get_endian_flag(DATA_BLOB *blob);
+uint8_t dcerpc_get_auth_type(const DATA_BLOB *blob);
+uint8_t dcerpc_get_auth_level(const DATA_BLOB *blob);
+uint32_t dcerpc_get_auth_context_id(const DATA_BLOB *blob);
 const char *dcerpc_default_transport_endpoint(TALLOC_CTX *mem_ctx,
 					      enum dcerpc_transport_t transport,
 					      const struct ndr_interface_table *table);
+
+NTSTATUS dcerpc_pull_ncacn_packet(TALLOC_CTX *mem_ctx,
+				  const DATA_BLOB *blob,
+				  struct ncacn_packet *r);
 
 /**
 * @brief	Pull a dcerpc_auth structure, taking account of any auth
@@ -186,12 +200,35 @@ const char *dcerpc_default_transport_endpoint(TALLOC_CTX *mem_ctx,
 *
 * @return		- A NTSTATUS error code.
 */
-NTSTATUS dcerpc_pull_auth_trailer(struct ncacn_packet *pkt,
+NTSTATUS dcerpc_pull_auth_trailer(const struct ncacn_packet *pkt,
 				  TALLOC_CTX *mem_ctx,
-				  DATA_BLOB *pkt_trailer,
+				  const DATA_BLOB *pkt_trailer,
 				  struct dcerpc_auth *auth,
 				  uint32_t *auth_length,
 				  bool auth_data_only);
+NTSTATUS dcerpc_verify_ncacn_packet_header(const struct ncacn_packet *pkt,
+					   enum dcerpc_pkt_type ptype,
+					   size_t max_auth_info,
+					   uint8_t required_flags,
+					   uint8_t optional_flags);
+NTSTATUS dcerpc_ncacn_pull_pkt_auth(const struct dcerpc_auth *auth_state,
+				    struct gensec_security *gensec,
+				    TALLOC_CTX *mem_ctx,
+				    enum dcerpc_pkt_type ptype,
+				    uint8_t required_flags,
+				    uint8_t optional_flags,
+				    uint8_t payload_offset,
+				    DATA_BLOB *payload_and_verifier,
+				    DATA_BLOB *raw_packet,
+				    const struct ncacn_packet *pkt);
+NTSTATUS dcerpc_ncacn_push_pkt_auth(const struct dcerpc_auth *auth_state,
+				    struct gensec_security *gensec,
+				    TALLOC_CTX *mem_ctx,
+				    DATA_BLOB *raw_packet,
+				    size_t sig_size,
+				    uint8_t payload_offset,
+				    const DATA_BLOB *payload,
+				    const struct ncacn_packet *pkt);
 struct tevent_req *dcerpc_read_ncacn_packet_send(TALLOC_CTX *mem_ctx,
 						 struct tevent_context *ev,
 						 struct tstream_context *stream);
@@ -407,5 +444,39 @@ struct ndr_syntax_id dcerpc_construct_bind_time_features(uint64_t features);
 	(((stub_length) % DCERPC_AUTH_PAD_ALIGNMENT) > 0)?\
 	(DCERPC_AUTH_PAD_ALIGNMENT - (stub_length) % DCERPC_AUTH_PAD_ALIGNMENT):\
 	0)
+
+NTSTATUS dcerpc_generic_session_key(DATA_BLOB *session_key);
+
+NTSTATUS dcerpc_ncacn_push_auth(DATA_BLOB *blob,
+				TALLOC_CTX *mem_ctx,
+				struct ncacn_packet *pkt,
+				struct dcerpc_auth *auth_info);
+
+void dcerpc_log_packet(const char *packet_log_dir,
+		       const char *interface_name,
+		       uint32_t opnum, uint32_t flags,
+		       const DATA_BLOB *pkt,
+		       const char *why);
+
+#ifdef DEVELOPER
+void dcerpc_save_ndr_fuzz_seed(TALLOC_CTX *mem_ctx,
+			       DATA_BLOB raw_blob,
+			       const char *dump_dir,
+			       const char *iface_name,
+			       int flags,
+			       int opnum,
+			       bool ndr64);
+#else
+static inline void dcerpc_save_ndr_fuzz_seed(TALLOC_CTX *mem_ctx,
+					     DATA_BLOB raw_blob,
+					     const char *dump_dir,
+					     const char *iface_name,
+					     int flags,
+					     int opnum,
+					     bool ndr64)
+{
+	return;
+}
+#endif
 
 #endif /* __DEFAULT_LIBRPC_RPCCOMMON_H__ */

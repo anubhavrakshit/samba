@@ -33,14 +33,14 @@
 #include "param/share.h"
 #include "dsdb/samdb/samdb.h"
 #include "param/param.h"
-#include "file_server/file_server.h"
-
+#include "ntvfs/ntvfs.h"
+#include "lib/cmdline/popt_common.h"
 /*
   open the smb server sockets
 */
-static void smbsrv_task_init(struct task_server *task)
+static NTSTATUS smbsrv_task_init(struct task_server *task)
 {	
-	NTSTATUS status;
+	NTSTATUS status = NT_STATUS_UNSUCCESSFUL;
 
 	task_server_set_title(task, "task[smbsrv]");
 
@@ -59,7 +59,11 @@ static void smbsrv_task_init(struct task_server *task)
 		*/
 		for(i = 0; i < num_interfaces; i++) {
 			const char *address = iface_list_n_ip(ifaces, i);
-			status = smbsrv_add_socket(task, task->event_ctx, task->lp_ctx, task->model_ops, address);
+			status = smbsrv_add_socket(task, task->event_ctx,
+					           task->lp_ctx,
+						   task->model_ops,
+						   address,
+						   task->process_context);
 			if (!NT_STATUS_IS_OK(status)) goto failed;
 		}
 	} else {
@@ -68,24 +72,37 @@ static void smbsrv_task_init(struct task_server *task)
 		wcard = iface_list_wildcard(task);
 		if (wcard == NULL) {
 			DEBUG(0,("No wildcard addresses available\n"));
+			status = NT_STATUS_UNSUCCESSFUL;
 			goto failed;
 		}
 		for (i=0; wcard[i]; i++) {
-			status = smbsrv_add_socket(task, task->event_ctx, task->lp_ctx, task->model_ops, wcard[i]);
+			status = smbsrv_add_socket(task, task->event_ctx,
+						   task->lp_ctx,
+						   task->model_ops,
+						   wcard[i],
+						   task->process_context);
 			if (!NT_STATUS_IS_OK(status)) goto failed;
 		}
 		talloc_free(wcard);
 	}
 
 	irpc_add_name(task->msg_ctx, "smb_server");
-	return;
+	return NT_STATUS_OK;
 failed:
 	task_server_terminate(task, "Failed to startup smb server task", true);	
+	return status;
 }
 
 /* called at smbd startup - register ourselves as a server service */
-NTSTATUS server_service_smb_init(void)
+NTSTATUS server_service_smb_init(TALLOC_CTX *ctx)
 {
+	static const struct service_details details = {
+		.inhibit_fork_on_accept = true,
+		.inhibit_pre_fork = true,
+		.task_init = smbsrv_task_init,
+		.post_fork = NULL
+	};
+	ntvfs_init(cmdline_lp_ctx);
 	share_init();
-	return register_server_service("smb", smbsrv_task_init);
+	return register_server_service(ctx, "smb", &details);
 }

@@ -34,9 +34,8 @@
 #include "libcli/composite/composite.h"
 #include "param/param.h"
 #include "torture/basic/proto.h"
+#include "lib/cmdline/popt_common.h"
 
-extern struct cli_credentials *cmdline_credentials;
-	
 static bool wait_lock(struct smbcli_state *c, int fnum, uint32_t offset, uint32_t len)
 {
 	while (NT_STATUS_IS_ERR(smbcli_lock(c->tree, fnum, offset, len, -1, WRITE_LOCK))) {
@@ -70,13 +69,16 @@ static bool rw_torture(struct torture_context *tctx, struct smbcli_state *c)
 
 	for (i=0;i<torture_numops;i++) {
 		unsigned int n = (unsigned int)random()%10;
+		int ret;
+
 		if (i % 10 == 0) {
 			if (torture_setting_bool(tctx, "progress", true)) {
 				torture_comment(tctx, "%d\r", i);
 				fflush(stdout);
 			}
 		}
-		asprintf(&fname, "\\torture.%u", n);
+		ret = asprintf(&fname, "\\torture.%u", n);
+		torture_assert(tctx, ret != -1, "asprintf failed");
 
 		if (!wait_lock(c, fnum2, n*sizeof(int), sizeof(int))) {
 			return false;
@@ -234,7 +236,7 @@ bool torture_holdcon(struct torture_context *tctx)
 /*
   open a file N times on the server and just hold them open
   used for testing performance when there are N file handles
-  alopenn
+  open
  */
 bool torture_holdopen(struct torture_context *tctx,
 		      struct smbcli_state *cli)
@@ -284,7 +286,7 @@ bool torture_holdopen(struct torture_context *tctx,
 
 	while (1) {
 		struct smb_echo ec;
-
+		ZERO_STRUCT(ec);
 		status = smb_raw_echo(cli->transport, &ec);
 		torture_comment(tctx, ".");
 		fflush(stdout);
@@ -302,6 +304,7 @@ bool torture_maxfid_test(struct torture_context *tctx, struct smbcli_state *cli)
 	int fnums[0x11000], i;
 	int retries=4, maxfid;
 	bool correct = true;
+	int ret;
 
 	if (retries <= 0) {
 		torture_comment(tctx, "failed to connect\n");
@@ -323,7 +326,8 @@ bool torture_maxfid_test(struct torture_context *tctx, struct smbcli_state *cli)
 
 	for (i=0; i<0x11000; i++) {
 		if (i % 1000 == 0) {
-			asprintf(&fname, "\\maxfid\\fid%d", i/1000);
+			ret = asprintf(&fname, "\\maxfid\\fid%d", i/1000);
+			torture_assert(tctx, ret != -1, "asprintf failed");
 			if (NT_STATUS_IS_ERR(smbcli_mkdir(cli->tree, fname))) {
 				torture_comment(tctx, "Failed to mkdir %s, error=%s\n", 
 				       fname, smbcli_errstr(cli->tree));
@@ -331,7 +335,8 @@ bool torture_maxfid_test(struct torture_context *tctx, struct smbcli_state *cli)
 			}
 			free(fname);
 		}
-		asprintf(&fname, MAXFID_TEMPLATE, i/1000, i,(int)getpid());
+		ret = asprintf(&fname, MAXFID_TEMPLATE, i/1000, i,(int)getpid());
+		torture_assert(tctx, ret != -1, "asprintf failed");
 		if ((fnums[i] = smbcli_open(cli->tree, fname, 
 					O_RDWR|O_CREAT|O_TRUNC, DENY_NONE)) ==
 		    -1) {
@@ -352,7 +357,8 @@ bool torture_maxfid_test(struct torture_context *tctx, struct smbcli_state *cli)
 
 	torture_comment(tctx, "cleaning up\n");
 	for (i=0;i<maxfid;i++) {
-		asprintf(&fname, MAXFID_TEMPLATE, i/1000, i,(int)getpid());
+		ret = asprintf(&fname, MAXFID_TEMPLATE, i/1000, i,(int)getpid());
+		torture_assert(tctx, ret != -1, "asprintf failed");
 		if (NT_STATUS_IS_ERR(smbcli_close(cli->tree, fnums[i]))) {
 			torture_comment(tctx, "Close of fnum %d failed - %s\n", fnums[i], smbcli_errstr(cli->tree));
 		}
@@ -445,6 +451,19 @@ enum benchrw_stage {
 	FINISHED
 };
 
+struct bench_params {
+		struct unclist{
+			const char *host;
+			const char *share;
+		} **unc;
+		const char *workgroup;
+		int retry;
+		unsigned int writeblocks;
+		unsigned int blocksize;
+		unsigned int writeratio;
+		int num_parallel_requests;
+};
+
 struct benchrw_state {
 	struct torture_context *tctx;
 	char *dname;
@@ -459,18 +478,7 @@ struct benchrw_state {
 	int num_parallel_requests;
 	void *req_params;
 	enum benchrw_stage mode;
-	struct params{
-		struct unclist{
-			const char *host;
-			const char *share;
-		} **unc;
-		const char *workgroup;
-		int retry;
-		unsigned int writeblocks;
-		unsigned int blocksize;
-		unsigned int writeratio;
-		int num_parallel_requests;
-	} *lpcfg_params;
+	struct bench_params *lpcfg_params;
 };
 
 /* 
@@ -478,7 +486,7 @@ struct benchrw_state {
  	return number of unclist entries
 */
 static int init_benchrw_params(struct torture_context *tctx,
-			       struct params *lpar)
+			       struct bench_params *lpar)
 {
 	char **unc_list = NULL;
 	int num_unc_names = 0, conn_index=0, empty_lines=0;
@@ -750,7 +758,7 @@ static void benchrw_callback(struct smbcli_request *req)
 	struct benchrw_state *state = req->async.private_data;
 	struct torture_context *tctx = state->tctx;
 	
-	/*dont send new requests when torture_numops is reached*/
+	/*don't send new requests when torture_numops is reached*/
 	if ((state->mode == READ_WRITE_DATA)
 	    && (state->completed >= torture_numops)) {
 		state->mode=MAX_OPS_REACHED;
@@ -866,7 +874,7 @@ static struct composite_context *torture_connect_async(
 	smb->in.socket_options = lpcfg_socket_options(tctx->lp_ctx);
 	smb->in.called_name = strupper_talloc(mem_ctx, host);
 	smb->in.service_type=NULL;
-	smb->in.credentials=cmdline_credentials;
+	smb->in.credentials=popt_get_cmdline_credentials();
 	smb->in.fallback_to_anonymous=false;
 	smb->in.gensec_settings = lpcfg_gensec_settings(mem_ctx, tctx->lp_ctx);
 	smb->in.workgroup=workgroup;
@@ -886,7 +894,7 @@ bool run_benchrw(struct torture_context *tctx)
 	int i , num_unc_names;
 	struct tevent_context 	*ev	;	
 	struct composite_context *req1;
-	struct params lpparams;
+	struct bench_params lpparams;
 	union smb_mkdir parms;
 	int finished = 0;
 	bool success=true;
@@ -925,8 +933,8 @@ bool run_benchrw(struct torture_context *tctx)
 			switch (state[i]->mode){
 			/*open multiple connections with the same userid */
 			case START:
-				smb_con = talloc(
-					tctx,struct smb_composite_connect) ;
+				smb_con = talloc_zero(
+					tctx,struct smb_composite_connect);
 				state[i]->req_params=smb_con; 
 				state[i]->mode=OPEN_CONNECTION;
 				req1 = torture_connect_async(
@@ -960,7 +968,7 @@ bool run_benchrw(struct torture_context *tctx)
 				req->async.fn = benchrw_callback;
 				req->async.private_data=state[i];
 				break;
-			/* error occured , finish */
+			/* error occurred , finish */
 			case ERROR:
 				finished++;
 				success=false;
@@ -979,6 +987,8 @@ bool run_benchrw(struct torture_context *tctx)
 					break;
 				}
 				state[i]->mode=FINISHED;
+
+				FALL_THROUGH;
 			case FINISHED:
 				finished++;
 				break;

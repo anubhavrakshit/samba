@@ -86,9 +86,9 @@ static int commit_do(
 		("%s: flushing %lu dirty bytes\n",
 		 MODULE, (unsigned long)c->dbytes));
 
-#if HAVE_FDATASYNC
+#if defined(HAVE_FDATASYNC)
         result = fdatasync(fd);
-#elif HAVE_FSYNC
+#elif defined(HAVE_FSYNC)
         result = fsync(fd);
 #else
 	DEBUG(0, ("%s: WARNING: no commit support on this platform\n",
@@ -202,7 +202,7 @@ static int commit_open(
                                         MODULE, "eof mode", "none");
 
         if (dthresh > 0 || !strequal(eof_mode, "none")) {
-                c = (struct commit_info *)VFS_ADD_FSP_EXTENSION(
+                c = VFS_ADD_FSP_EXTENSION(
 			handle, fsp, struct commit_info, NULL);
                 /* Process main tunables */
                 if (c) {
@@ -230,31 +230,22 @@ static int commit_open(
         /* EOF commit modes require us to know the initial file size. */
         if (c && (c->on_eof != EOF_NONE)) {
                 SMB_STRUCT_STAT st;
-                if (SMB_VFS_FSTAT(fsp, &st) == -1) {
+		/*
+		 * Setting the fd of the FSP is a hack
+		 * but also practiced elsewhere -
+		 * needed for calling the VFS.
+		 */
+		fsp->fh->fd = fd;
+		if (SMB_VFS_FSTAT(fsp, &st) == -1) {
+			int saved_errno = errno;
+			SMB_VFS_CLOSE(fsp);
+			errno = saved_errno;
                         return -1;
                 }
 		c->eof = st.st_ex_size;
         }
 
         return fd;
-}
-
-static ssize_t commit_write(
-        vfs_handle_struct * handle,
-        files_struct *      fsp,
-        const void *        data,
-        size_t              count)
-{
-        ssize_t ret;
-        ret = SMB_VFS_NEXT_WRITE(handle, fsp, data, count);
-
-        if (ret > 0) {
-                if (commit(handle, fsp, fsp->fh->pos, ret) == -1) {
-                        return -1;
-                }
-        }
-
-        return ret;
 }
 
 static ssize_t commit_pwrite(
@@ -280,7 +271,7 @@ struct commit_pwrite_state {
 	struct vfs_handle_struct *handle;
 	struct files_struct *fsp;
 	ssize_t ret;
-	int err;
+	struct vfs_aio_state vfs_aio_state;
 };
 
 static void commit_pwrite_written(struct tevent_req *subreq);
@@ -319,7 +310,7 @@ static void commit_pwrite_written(struct tevent_req *subreq)
 		req, struct commit_pwrite_state);
 	int commit_ret;
 
-	state->ret = SMB_VFS_PWRITE_RECV(subreq, &state->err);
+	state->ret = SMB_VFS_PWRITE_RECV(subreq, &state->vfs_aio_state);
 	TALLOC_FREE(subreq);
 
 	if (state->ret <= 0) {
@@ -341,15 +332,16 @@ static void commit_pwrite_written(struct tevent_req *subreq)
 	tevent_req_done(req);
 }
 
-static ssize_t commit_pwrite_recv(struct tevent_req *req, int *err)
+static ssize_t commit_pwrite_recv(struct tevent_req *req,
+				  struct vfs_aio_state *vfs_aio_state)
 {
 	struct commit_pwrite_state *state =
 		tevent_req_data(req, struct commit_pwrite_state);
 
-	if (tevent_req_is_unix_error(req, err)) {
+	if (tevent_req_is_unix_error(req, &vfs_aio_state->error)) {
 		return -1;
 	}
-	*err = state->err;
+	*vfs_aio_state = state->vfs_aio_state;
 	return state->ret;
 }
 
@@ -385,7 +377,6 @@ static int commit_ftruncate(
 static struct vfs_fn_pointers vfs_commit_fns = {
         .open_fn = commit_open,
         .close_fn = commit_close,
-        .write_fn = commit_write,
         .pwrite_fn = commit_pwrite,
         .pwrite_send_fn = commit_pwrite_send,
         .pwrite_recv_fn = commit_pwrite_recv,
@@ -393,8 +384,8 @@ static struct vfs_fn_pointers vfs_commit_fns = {
         .ftruncate_fn = commit_ftruncate
 };
 
-NTSTATUS vfs_commit_init(void);
-NTSTATUS vfs_commit_init(void)
+static_decl_vfs;
+NTSTATUS vfs_commit_init(TALLOC_CTX *ctx)
 {
 	return smb_register_vfs(SMB_VFS_INTERFACE_VERSION, MODULE,
 				&vfs_commit_fns);

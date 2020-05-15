@@ -23,6 +23,7 @@ import itertools
 import heapq
 
 from samba.kcc.graph_utils import write_dot_file, verify_and_dot, verify_graph
+from samba.kcc.kcc_utils import KCCError
 from samba.ndr import ndr_pack
 from samba.dcerpc import misc
 
@@ -130,7 +131,7 @@ def combine_repl_info(info_a, info_b):
     info_c.interval = max(info_a.interval, info_b.interval)
     info_c.options = info_a.options & info_b.options
 
-    #schedule of None defaults to "always"
+    # schedule of None defaults to "always"
     if info_a.schedule is None:
         info_a.schedule = [0xFF] * 84
     if info_b.schedule is None:
@@ -184,10 +185,13 @@ def get_spanning_tree_edges(graph, my_site, label=None, verify=False,
                                vertices=graph_nodes, label=label)
 
             if verify:
-                verify_graph('spanning tree edge set %s' % edgeType,
-                             graph_edges, vertices=graph_nodes,
-                             properties=('complete', 'connected'),
-                             debug=DEBUG)
+                errors = verify_graph(graph_edges, vertices=graph_nodes,
+                                      properties=('complete', 'connected'))
+                if errors:
+                    DEBUG('spanning tree edge set %s FAILED' % edgeType)
+                    for p, e, doc in errors:
+                        DEBUG("%18s: %s" % (p, e))
+                    raise KCCError("spanning tree failed")
 
         # Run dijkstra's algorithm with just the red vertices as seeds
         # Seed from the full replicas
@@ -259,7 +263,7 @@ def get_spanning_tree_edges(graph, my_site, label=None, verify=False,
     if verify or dot_file_dir is not None:
         graph_edges = [[x.site.site_dnstr for x in e.vertices]
                        for e in edge_list]
-        #add the reverse edge if not directed.
+        # add the reverse edge if not directed.
         graph_edges.extend([x.site.site_dnstr
                             for x in reversed(e.vertices)]
                            for e in edge_list if not e.directed)
@@ -290,7 +294,7 @@ def create_edge(con_type, site_link, guid_to_vertex):
     e = MultiEdge()
     e.site_link = site_link
     e.vertices = []
-    for site_guid in site_link.site_list:
+    for site_guid, site_dn in site_link.site_list:
         if str(site_guid) in guid_to_vertex:
             e.vertices.extend(guid_to_vertex.get(str(site_guid)))
     e.repl_info.cost = site_link.cost
@@ -575,7 +579,7 @@ def kruskal(graph, edges):
     # Sorted based on internal comparison function of internal edge
     edges.sort()
 
-    #XXX expected_num_tree_edges is never used
+    # XXX expected_num_tree_edges is never used
     expected_num_tree_edges = 0  # TODO this value makes little sense
 
     count_edges = 0
@@ -731,7 +735,7 @@ class Vertex(object):
         #    SET v.Color to COLOR.RED
         # ELSEIF s contains one or more partial replicas of the NC
         #    SET v.Color to COLOR.BLACK
-        #ELSE
+        # ELSE
         #    SET v.Color to COLOR.WHITE
 
         # set to minimum (no replica)
@@ -804,6 +808,11 @@ class InternalEdge(object):
         self.repl_info = repl
         self.e_type = eType
         self.site_link = site_link
+
+    def __hash__(self):
+        return hash((
+            self.v1, self.v2, self.red_red, self.repl_info, self.e_type,
+            self.site_link))
 
     def __eq__(self, other):
         return not self < other and not other < self

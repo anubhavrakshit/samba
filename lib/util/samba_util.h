@@ -46,26 +46,24 @@ extern const char *panic_action;
 
 #include "lib/util/time.h"
 #include "lib/util/data_blob.h"
-#include "lib/util/xfile.h"
 #include "lib/util/byteorder.h"
 #include "lib/util/talloc_stack.h"
+#include "lib/util/talloc_keep_secret.h"
 
 #ifndef ABS
 #define ABS(a) ((a)>0?(a):(-(a)))
 #endif
 
 #include "lib/util/memory.h"
-
-#include "../libcli/util/ntstatus.h"
-#include "lib/util/string_wrappers.h"
+#include "lib/util/discard.h"
 
 #include "fault.h"
+
+#include "lib/util/util.h"
 
 /**
  * Write backtrace to debug log
  */
-_PUBLIC_ void call_backtrace(void);
-
 _PUBLIC_ void dump_core_setup(const char *progname, const char *logfile);
 
 /**
@@ -96,14 +94,49 @@ _PUBLIC_ int sys_getnameinfo(const struct sockaddr *psa,
 _PUBLIC_ uint32_t generate_random(void);
 
 /**
+  generate a single random uint64_t
+**/
+_PUBLIC_ uint64_t generate_random_u64(void);
+
+/**
   very basic password quality checker
 **/
 _PUBLIC_ bool check_password_quality(const char *s);
 
 /**
- * Generate a random text password.
+ * Generate a random text password (based on printable ascii characters).
+ * This function is designed to provide a password that
+ * meats the complexity requirements of UF_NORMAL_ACCOUNT objects
+ * and they should be human readable and writeable on any keyboard layout.
+ *
+ * Characters used are:
+ * ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+_-#.,@$%&!?:;<=>()[]~
  */
 _PUBLIC_ char *generate_random_password(TALLOC_CTX *mem_ctx, size_t min, size_t max);
+
+/**
+ * Generate a random machine password
+ *
+ * min and max are the number of utf16 characters used
+ * to generate on utf8 compatible password.
+ *
+ * Note: if 'unix charset' is not 'utf8' (the default)
+ * then each utf16 character is only filled with
+ * values from 0x01 to 0x7f (ascii values without 0x00).
+ * This is important as the password neets to be
+ * a valid value as utf8 string and at the same time
+ * a valid value in the 'unix charset'.
+ *
+ * If 'unix charset' is 'utf8' (the default) then
+ * each utf16 character is a random value from 0x0000
+ * 0xFFFF (exluding the surrogate ranges from 0xD800-0xDFFF)
+ * while the translation from CH_UTF16MUNGED
+ * to CH_UTF8 replaces invalid values (see utf16_munged_pull()).
+ *
+ * Note: these passwords may not pass the complexity requirements
+ * for UF_NORMAL_ACCOUNT objects (except krbtgt accounts).
+ */
+_PUBLIC_ char *generate_random_machine_password(TALLOC_CTX *mem_ctx, size_t min, size_t max);
 
 /**
  Use the random number generator to generate a random string.
@@ -126,7 +159,7 @@ _PUBLIC_ char *generate_random_str(TALLOC_CTX *mem_ctx, size_t len);
  * Characters used are: ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+_-#.,
  */
 _PUBLIC_ char** generate_unique_strs(TALLOC_CTX *mem_ctx, size_t len,
-                                         uint32_t num);
+					 uint32_t num);
 
 /* The following definitions come from lib/util/dprintf.c  */
 
@@ -180,6 +213,11 @@ _PUBLIC_ size_t strhex_to_str(char *p, size_t p_len, const char *strhex, size_t 
 _PUBLIC_ _PURE_ DATA_BLOB strhex_to_data_blob(TALLOC_CTX *mem_ctx, const char *strhex) ;
 
 /**
+ * Parse a hex dump and return a data blob
+ */
+_PUBLIC_ _PURE_ DATA_BLOB hexdump_to_data_blob(TALLOC_CTX *mem_ctx, const char *hexdump, size_t len);
+
+/**
  * Print a buf in hex. Assumes dst is at least (srclen*2)+1 large.
  */
 _PUBLIC_ void hex_encode_buf(char *dst, const uint8_t *src, size_t srclen);
@@ -194,23 +232,7 @@ _PUBLIC_ char *hex_encode_talloc(TALLOC_CTX *mem_ctx, const unsigned char *buff_
 /**
  Unescape a URL encoded string, in place.
 **/
-_PUBLIC_ void rfc1738_unescape(char *buf);
-
-
-/**
- * rfc1738_escape
- * Returns a static buffer that contains the RFC
- * 1738 compliant, escaped version of the given url. (escapes unsafe and % characters)
- **/
-_PUBLIC_ char *rfc1738_escape(TALLOC_CTX *mem_ctx, const char *url);
-
-/**
- * rfc1738_escape_unescaped
- *
- * Returns a static buffer that contains
- * the RFC 1738 compliant, escaped version of the given url (escapes unsafe chars only)
- **/
-_PUBLIC_ char *rfc1738_escape_unescaped(TALLOC_CTX *mem_ctx, const char *url);
+_PUBLIC_ char *rfc1738_unescape(char *buf);
 
 /**
  * rfc1738_escape_part 
@@ -220,15 +242,6 @@ _PUBLIC_ char *rfc1738_escape_unescaped(TALLOC_CTX *mem_ctx, const char *url);
  * and mangle paths (because of /).
  **/
 _PUBLIC_ char *rfc1738_escape_part(TALLOC_CTX *mem_ctx, const char *url);
-
-/**
- * Add a string to an array of strings.
- *
- * num should be a pointer to an integer that holds the current 
- * number of elements in strings. It will be updated by this function.
- */
-_PUBLIC_ bool add_string_to_array(TALLOC_CTX *mem_ctx,
-			 const char *str, const char ***strings, size_t *num);
 
 /**
   varient of strcmp() that handles NULL ptrs
@@ -287,6 +300,19 @@ _PUBLIC_ size_t utf16_len_n(const void *src, size_t n);
 _PUBLIC_ size_t ucs2_align(const void *base_ptr, const void *p, int flags);
 
 /**
+ * @brief Constant time compare to memory regions.
+ *
+ * @param[in]  s1  The first memory region to compare.
+ *
+ * @param[in]  s2  The second memory region to compare.
+ *
+ * @param[in]  n   The length of the memory to comapre.
+ *
+ * @return 0 when the memory regions are equal, 0 if not.
+ */
+_PUBLIC_ int memcmp_const_time(const void *s1, const void *s2, size_t n);
+
+/**
 Do a case-insensitive, whitespace-ignoring string compare.
 **/
 _PUBLIC_ int strwicmp(const char *psz1, const char *psz2);
@@ -297,145 +323,15 @@ _PUBLIC_ int strwicmp(const char *psz1, const char *psz2);
 _PUBLIC_ void string_replace(char *s, char oldc, char newc);
 
 /**
- Base64 decode a string, place into a data blob.  Caller to data_blob_free() the result.
-**/
-_PUBLIC_ DATA_BLOB base64_decode_data_blob_talloc(TALLOC_CTX *mem_ctx, const char *s);
-
-/**
- Base64 decode a string, place into a data blob on NULL context.
- Caller to data_blob_free() the result.
-**/
-_PUBLIC_ DATA_BLOB base64_decode_data_blob(const char *s);
-
-
-/**
- Base64 decode a string, inplace
-**/
-_PUBLIC_ void base64_decode_inplace(char *s);
-/**
- Base64 encode a binary data blob into a string
-**/
-_PUBLIC_ char *base64_encode_data_blob(TALLOC_CTX *mem_ctx, DATA_BLOB data);
-
-/**
  * Compare 2 strings.
  *
  * @note The comparison is case-insensitive.
  **/
 _PUBLIC_ bool strequal(const char *s1, const char *s2);
 
-/* The following definitions come from lib/util/util_strlist.c  */
+#include "util_strlist.h"
 
-/* separators for lists */
-#ifndef LIST_SEP
-#define LIST_SEP " \t,\n\r"
-#endif
-
-/**
-  build an empty (only NULL terminated) list of strings (for expansion with str_list_add() etc)
-*/
-_PUBLIC_ char **str_list_make_empty(TALLOC_CTX *mem_ctx);
-
-/**
-  place the only element 'entry' into a new, NULL terminated string list
-*/
-_PUBLIC_ char **str_list_make_single(TALLOC_CTX *mem_ctx,
-	const char *entry);
-
-/**
-  build a null terminated list of strings from a input string and a
-  separator list. The separator list must contain characters less than
-  or equal to 0x2f for this to work correctly on multi-byte strings
-*/
-_PUBLIC_ char **str_list_make(TALLOC_CTX *mem_ctx, const char *string,
-	const char *sep);
-
-/**
- * build a null terminated list of strings from an argv-like input string 
- * Entries are separated by spaces and can be enclosed by quotes.
- * Does NOT support escaping
- */
-_PUBLIC_ char **str_list_make_shell(TALLOC_CTX *mem_ctx, const char *string, const char *sep);
-
-/**
- * join a list back to one string 
- */
-_PUBLIC_ char *str_list_join(TALLOC_CTX *mem_ctx, const char **list, char separator);
-
-/** join a list back to one (shell-like) string; entries 
- * separated by spaces, using quotes where necessary */
-_PUBLIC_ char *str_list_join_shell(TALLOC_CTX *mem_ctx, const char **list, char sep);
-
-/**
-  return the number of elements in a string list
-*/
-_PUBLIC_ size_t str_list_length(const char * const *list);
-
-/**
-  copy a string list
-*/
-_PUBLIC_ char **str_list_copy(TALLOC_CTX *mem_ctx, const char **list);
-
-/**
-   Return true if all the elements of the list match exactly.
- */
-_PUBLIC_ bool str_list_equal(const char * const *list1, const char * const *list2);
-
-/**
-  add an entry to a string list
-*/
-_PUBLIC_ const char **str_list_add(const char **list, const char *s);
-
-/**
-  remove an entry from a string list
-*/
-_PUBLIC_ void str_list_remove(const char **list, const char *s);
-
-/**
-  return true if a string is in a list
-*/
-_PUBLIC_ bool str_list_check(const char **list, const char *s);
-
-/**
-  return true if a string is in a list, case insensitively
-*/
-_PUBLIC_ bool str_list_check_ci(const char **list, const char *s);
-/**
-  append one list to another - expanding list1
-*/
-_PUBLIC_ const char **str_list_append(const char **list1,
-	const char * const *list2);
-
-/**
- remove duplicate elements from a list 
-*/
-_PUBLIC_ const char **str_list_unique(const char **list);
-
-/*
-  very useful when debugging complex list related code
- */
-_PUBLIC_ void str_list_show(const char **list);
-
-
-/**
-  append one list to another - expanding list1
-  this assumes the elements of list2 are const pointers, so we can re-use them
-*/
-_PUBLIC_ const char **str_list_append_const(const char **list1,
-					    const char **list2);
-
-/**
-  add an entry to a string list
-  this assumes s will not change
-*/
-_PUBLIC_ const char **str_list_add_const(const char **list, const char *s);
-
-/**
-  copy a string list
-  this assumes list will not change
-*/
-_PUBLIC_ const char **str_list_copy_const(TALLOC_CTX *mem_ctx,
-					  const char **list);
+/* The following definitions come from lib/util/util_strlist_v3.c  */
 
 /**
  * Needed for making an "unconst" list "const"
@@ -459,16 +355,11 @@ const char **str_list_make_v3_const(TALLOC_CTX *mem_ctx,
 
 
 /**
-read a line from a file with possible \ continuation chars. 
-Blanks at the start or end of a line are stripped.
-The string will be allocated if s2 is NULL
-**/
-_PUBLIC_ char *fgets_slash(char *s2,int maxlen,XFILE *f);
-
-/**
  * Read one line (data until next newline or eof) and allocate it 
  */
 _PUBLIC_ char *afdgets(int fd, TALLOC_CTX *mem_ctx, size_t hint);
+
+char *fgets_slash(TALLOC_CTX *mem_ctx, char *s2, size_t maxlen, FILE *f);
 
 /**
 load a file into memory from a fd.
@@ -509,6 +400,11 @@ _PUBLIC_ int fdprintf(int fd, const char *format, ...) PRINTF_ATTRIBUTE(2,3);
   compare two files, return true if the two files have the same content
  */
 bool file_compare(const char *path1, const char *path2);
+
+/*
+  load from a pipe into memory.
+ */
+char *file_ploadv(char * const argl[], size_t *size);
 
 /* The following definitions come from lib/util/util.c  */
 
@@ -581,35 +477,6 @@ _PUBLIC_ bool process_exists_by_pid(pid_t pid);
  is dealt with in posix.c
 **/
 _PUBLIC_ bool fcntl_lock(int fd, int op, off_t offset, off_t count, int type);
-
-/**
- * Write dump of binary data to a callback
- */
-void dump_data_cb(const uint8_t *buf, int len,
-		  bool omit_zero_bytes,
-		  void (*cb)(const char *buf, void *private_data),
-		  void *private_data);
-
-/**
- * Write dump of binary data to a FILE
- */
-void dump_data_file(const uint8_t *buf, int len, bool omit_zero_bytes,
-		    FILE *f);
-
-/**
- * Write dump of binary data to the log file.
- *
- * The data is only written if the log level is at least level.
- */
-_PUBLIC_ void dump_data(int level, const uint8_t *buf,int len);
-
-/**
- * Write dump of binary data to the log file.
- *
- * The data is only written if the log level is at least level for
- * debug class dbgc_class.
- */
-_PUBLIC_ void dump_data_dbgc(int dbgc_class, int level, const uint8_t *buf, int len);
 
 /**
  * Write dump of binary data to the log file.
@@ -687,7 +554,8 @@ _PUBLIC_ int sys_fsusage(const char *path, uint64_t *dfree, uint64_t *dsize);
  * @brief MS-style Filename matching
  */
 
-int ms_fnmatch_protocol(const char *pattern, const char *string, int protocol);
+int ms_fnmatch_protocol(const char *pattern, const char *string, int protocol,
+			bool is_case_sensitive);
 
 /** a generic fnmatch function - uses for non-CIFS pattern matching */
 int gen_fnmatch(const char *pattern, const char *string);
@@ -695,33 +563,7 @@ int gen_fnmatch(const char *pattern, const char *string);
 #include "idtree.h"
 #include "idtree_random.h"
 
-/**
- Close the low 3 fd's and open dev/null in their place
-**/
-_PUBLIC_ void close_low_fds(bool stdin_too, bool stdout_too, bool stderr_too);
-
-/**
- Become a daemon, discarding the controlling terminal.
-**/
-_PUBLIC_ void become_daemon(bool do_fork, bool no_process_group, bool log_stdout);
-
-/**
- Exit daemon and print error message to the log at level 0
- Optionally report failure to systemd if systemd integration is enabled
-**/
-_PUBLIC_ void exit_daemon(const char *msg, int error);
-
-/**
- Report that the daemon is ready to serve connections to the log at level 0
- Optionally report status to systemd if systemd integration is enabled
-**/
-_PUBLIC_ void daemon_ready(const char *daemon);
-
-/*
- * Report the daemon status. For example if it is not ready to serve connections
- * and is waiting for some event to happen.
- */
-_PUBLIC_ void daemon_status(const char *name, const char *msg);
+#include "become_daemon.h"
 
 /**
  * @brief Get a password from the console.
@@ -750,7 +592,7 @@ _PUBLIC_ void daemon_status(const char *name, const char *msg);
  * @param[in]  prompt   The prompt to show to ask for the password.
  *
  * @param[out] buf    The buffer the password should be stored. It NEEDS to be
- *                      empty or filled out.
+ *		      empty or filled out.
  *
  * @param[in]  len      The length of the buffer.
  *
@@ -767,9 +609,15 @@ _PUBLIC_ int samba_getpass(const char *prompt, char *buf, size_t len,
  * Load a ini-style file.
  */
 bool pm_process( const char *fileName,
-                 bool (*sfunc)(const char *, void *),
-                 bool (*pfunc)(const char *, const char *, void *),
+		 bool (*sfunc)(const char *, void *),
+		 bool (*pfunc)(const char *, const char *, void *),
 				 void *userdata);
+bool pm_process_with_flags(const char *filename,
+			   bool allow_empty_values,
+			   bool (*sfunc)(const char *section, void *private_data),
+			   bool (*pfunc)(const char *name, const char *value,
+					 void *private_data),
+			   void *private_data);
 
 void print_asc(int level, const uint8_t *buf,int len);
 void print_asc_cb(const uint8_t *buf, int len,
@@ -813,61 +661,11 @@ struct tevent_req *samba_runcmd_send(TALLOC_CTX *mem_ctx,
 				     int stderr_log_level,
 				     const char * const *argv0, ...);
 int samba_runcmd_recv(struct tevent_req *req, int *perrno);
+int samba_runcmd_export_stdin(struct tevent_req *req);
 
 #ifdef DEVELOPER
 void samba_start_debugger(void);
 #endif
-
-/**
- * @brief Returns an absolute path to a file in the Samba modules directory.
- *
- * @param name File to find, relative to MODULESDIR.
- *
- * @retval Pointer to a string containing the full path.
- **/
-char *modules_path(TALLOC_CTX *mem_ctx, const char *name);
-
-/**
- * @brief Returns an absolute path to a file in the Samba data directory.
- *
- * @param name File to find, relative to CODEPAGEDIR.
- *
- * @retval Pointer to a talloc'ed string containing the full path.
- **/
-char *data_path(TALLOC_CTX *mem_ctx, const char *name);
-
-/**
- * @brief Returns the platform specific shared library extension.
- *
- * @retval Pointer to a const char * containing the extension.
- **/
-const char *shlib_ext(void);
-
-struct server_id;
-
-struct server_id_buf { char buf[48]; }; /* probably a bit too large ... */
-char *server_id_str_buf(struct server_id id, struct server_id_buf *dst);
-
-bool server_id_same_process(const struct server_id *p1,
-			    const struct server_id *p2);
-bool server_id_equal(const struct server_id *p1, const struct server_id *p2);
-struct server_id server_id_from_string(uint32_t local_vnn,
-				       const char *pid_string);
-
-/**
- * Set the serverid to the special value that represents a disconnected
- * client for (e.g.) durable handles.
- */
-void server_id_set_disconnected(struct server_id *id);
-
-/**
- * check whether a serverid is the special placeholder for
- * a disconnected client
- */
-bool server_id_is_disconnected(const struct server_id *id);
-
-void server_id_put(uint8_t buf[24], const struct server_id id);
-void server_id_get(struct server_id *id, const uint8_t buf[24]);
 
 /*
  * Samba code should use samba_tevent_context_init() instead of

@@ -281,7 +281,7 @@ static long read_log_data(FILE *in, unsigned char *buffer, long data_length)
 		}
 		if(!fscanf(in, "%02X", &tmp)) {
 			if(!quiet)
-				fprintf(stderr, "%ld: Log message formated incorrectly. "
+				fprintf(stderr, "%ld: Log message formatted incorrectly. "
 				    "Only first %ld bytes are logged, packet trace will "
 				    "be incomplete\n", line_num, i-1);
 			while ((tmp = getc(in)) != '\n');
@@ -302,13 +302,28 @@ int main(int argc, const char **argv)
 	int opt;
 	poptContext pc;
 	char buffer[4096];
-	long data_offset, data_length;
+	long data_offset = 0;
+	long data_length = 0;
 	long data_bytes_read = 0;
-	int in_packet = 0;
+	size_t in_packet = 0;
 	struct poptOption long_options[] = {
 		POPT_AUTOHELP
-		{ "quiet", 'q', POPT_ARG_NONE, &quiet, 0, "Be quiet, don't output warnings" },
-		{ "hex", 'h', POPT_ARG_NONE, &hexformat, 0, "Output format readable by text2pcap" },
+		{
+			.longName   = "quiet",
+			.shortName  = 'q',
+			.argInfo    = POPT_ARG_NONE,
+			.arg        = &quiet,
+			.val        = 0,
+			.descrip    = "Be quiet, don't output warnings",
+		},
+		{
+			.longName   = "hex",
+			.shortName  = 'h',
+			.argInfo    = POPT_ARG_NONE,
+			.arg        = &hexformat,
+			.val        = 0,
+			.descrip    = "Output format readable by text2pcap",
+		},
 		POPT_TABLEEND
 	};
 
@@ -330,6 +345,7 @@ int main(int argc, const char **argv)
 		in  = fopen(infile, "r");
 		if(!in) {
 			perror("fopen");
+			poptFreeContext(pc);
 			return 1;
 		}
 	} else in = stdin;
@@ -341,6 +357,7 @@ int main(int argc, const char **argv)
 		if(!out) {
 			perror("fopen");
 			fprintf(stderr, "Can't find %s, using stdout...\n", outfile);
+			poptFreeContext(pc);
 			return 1;
 		}
 	}
@@ -350,7 +367,13 @@ int main(int argc, const char **argv)
 	if(!hexformat)print_pcap_header(out);
 
 	while(!feof(in)) {
-		fgets(buffer, sizeof(buffer), in); line_num++;
+		char *p;
+		p = fgets(buffer, sizeof(buffer), in);
+		if (p == NULL) {
+			fprintf(stderr, "error reading from input file\n");
+			break;
+		}
+		line_num++;
 		if(buffer[0] == '[') { /* Header */
 			if(strstr(buffer, "show_msg")) {
 				in_packet++;
@@ -377,5 +400,6 @@ int main(int argc, const char **argv)
 		fclose(out);
 	}
 
+	poptFreeContext(pc);
 	return 0;
 }

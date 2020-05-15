@@ -25,6 +25,7 @@
 #include "libcli/security/security.h"
 #include "passdb/lookup_sid.h"
 #include "auth.h"
+#include "../auth/auth_util.h"
 
 /* what user is current? */
 extern struct current_user current_user;
@@ -89,7 +90,7 @@ static uint32_t create_share_access_mask(int snum,
 	uint32_t share_access = 0;
 
 	share_access_check(token,
-			lp_servicename(talloc_tos(), snum),
+			lp_const_servicename(snum),
 			MAXIMUM_ALLOWED_ACCESS,
 			&share_access);
 
@@ -147,10 +148,10 @@ NTSTATUS check_user_share_access(connection_struct *conn,
 
 	if ((share_access & (FILE_READ_DATA|FILE_WRITE_DATA)) == 0) {
 		/* No access, read or write. */
-		DEBUG(3,("user %s connection to %s denied due to share "
+		DBG_NOTICE("user %s connection to %s denied due to share "
 			 "security descriptor.\n",
 			 session_info->unix_info->unix_name,
-			 lp_servicename(talloc_tos(), snum)));
+			 lp_const_servicename(snum));
 		return NT_STATUS_ACCESS_DENIED;
 	}
 
@@ -158,9 +159,9 @@ NTSTATUS check_user_share_access(connection_struct *conn,
 	    !(share_access & FILE_WRITE_DATA)) {
 		/* smb.conf allows r/w, but the security descriptor denies
 		 * write. Fall back to looking at readonly. */
-		readonly_share = True;
-		DEBUG(5,("falling back to read-only access-evaluation due to "
-			 "security descriptor\n"));
+		readonly_share = true;
+		DBG_INFO("falling back to read-only access-evaluation due to "
+			 "security descriptor\n");
 	}
 
 	*p_share_access = share_access;
@@ -202,6 +203,7 @@ static bool check_user_ok(connection_struct *conn,
 			conn->session_info = ent->session_info;
 			conn->read_only = ent->read_only;
 			conn->share_access = ent->share_access;
+			conn->vuid = ent->vuid;
 			return(True);
 		}
 	}
@@ -239,9 +241,17 @@ static bool check_user_ok(connection_struct *conn,
 		return false;
 	}
 
+	if (admin_user) {
+		DEBUG(2,("check_user_ok: user %s is an admin user. "
+			"Setting uid as %d\n",
+			ent->session_info->unix_info->unix_name,
+			sec_initial_uid() ));
+		ent->session_info->unix_token->uid = sec_initial_uid();
+	}
+
 	/*
 	 * It's actually OK to call check_user_ok() with
-	 * vuid == UID_FIELD_INVALID as called from change_to_user_by_session().
+	 * vuid == UID_FIELD_INVALID as called from become_user_by_session().
 	 * All this will do is throw away one entry in the cache.
 	 */
 
@@ -250,6 +260,7 @@ static bool check_user_ok(connection_struct *conn,
 	ent->share_access = share_access;
 	free_conn_session_info_if_unused(conn);
 	conn->session_info = ent->session_info;
+	conn->vuid = ent->vuid;
 	if (vuid == UID_FIELD_INVALID) {
 		/*
 		 * Not strictly needed, just make it really
@@ -263,15 +274,29 @@ static bool check_user_ok(connection_struct *conn,
 	conn->read_only = readonly_share;
 	conn->share_access = share_access;
 
-	if (admin_user) {
-		DEBUG(2,("check_user_ok: user %s is an admin user. "
-			"Setting uid as %d\n",
-			conn->session_info->unix_info->unix_name,
-			sec_initial_uid() ));
-		conn->session_info->unix_token->uid = sec_initial_uid();
+	return(True);
+}
+
+static void print_impersonation_info(connection_struct *conn)
+{
+	struct smb_filename *cwdfname = NULL;
+
+	if (!CHECK_DEBUGLVL(DBGLVL_INFO)) {
+		return;
 	}
 
-	return(True);
+	cwdfname = vfs_GetWd(talloc_tos(), conn);
+	if (cwdfname == NULL) {
+		return;
+	}
+
+	DBG_INFO("Impersonated user: uid=(%d,%d), gid=(%d,%d), cwd=[%s]\n",
+		 (int)getuid(),
+		 (int)geteuid(),
+		 (int)getgid(),
+		 (int)getegid(),
+		 cwdfname->base_name);
+	TALLOC_FREE(cwdfname);
 }
 
 /****************************************************************************
@@ -279,27 +304,42 @@ static bool check_user_ok(connection_struct *conn,
  stack, but modify the current_user entries.
 ****************************************************************************/
 
-static bool change_to_user_internal(connection_struct *conn,
-				    const struct auth_session_info *session_info,
-				    uint64_t vuid)
+static bool change_to_user_impersonate(connection_struct *conn,
+				       const struct auth_session_info *session_info,
+				       uint64_t vuid)
 {
+	const struct loadparm_substitution *lp_sub =
+		loadparm_s3_global_substitution();
 	int snum;
 	gid_t gid;
 	uid_t uid;
+	const char *force_group_name;
 	char group_c;
 	int num_groups = 0;
 	gid_t *group_list = NULL;
 	bool ok;
 
+	if ((current_user.conn == conn) &&
+	    (current_user.vuid == vuid) &&
+	    (current_user.ut.uid == session_info->unix_token->uid))
+	{
+		DBG_INFO("Skipping user change - already user\n");
+		return true;
+	}
+
+	set_current_user_info(session_info->unix_info->sanitized_username,
+			      session_info->unix_info->unix_name,
+			      session_info->info->domain_name);
+
 	snum = SNUM(conn);
 
 	ok = check_user_ok(conn, vuid, session_info, snum);
 	if (!ok) {
-		DEBUG(2,("SMB user %s (unix user %s) "
+		DBG_WARNING("SMB user %s (unix user %s) "
 			 "not permitted access to share %s.\n",
 			 session_info->unix_info->sanitized_username,
 			 session_info->unix_info->unix_name,
-			 lp_servicename(talloc_tos(), snum)));
+			 lp_const_servicename(snum));
 		return false;
 	}
 
@@ -312,9 +352,39 @@ static bool change_to_user_internal(connection_struct *conn,
 	 * See if we should force group for this service. If so this overrides
 	 * any group set in the force user code.
 	 */
-	if((group_c = *lp_force_group(talloc_tos(), snum))) {
+	force_group_name = lp_force_group(talloc_tos(), lp_sub, snum);
+	group_c = *force_group_name;
 
-		SMB_ASSERT(conn->force_group_gid != (gid_t)-1);
+	if ((group_c != '\0') && (conn->force_group_gid == (gid_t)-1)) {
+		/*
+		 * This can happen if "force group" is added to a
+		 * share definition whilst an existing connection
+		 * to that share exists. In that case, don't change
+		 * the existing credentials for force group, only
+		 * do so for new connections.
+		 *
+		 * BUG: https://bugzilla.samba.org/show_bug.cgi?id=13690
+		 */
+		DBG_INFO("Not forcing group %s on existing connection to "
+			"share %s for SMB user %s (unix user %s)\n",
+			force_group_name,
+			lp_const_servicename(snum),
+			session_info->unix_info->sanitized_username,
+			session_info->unix_info->unix_name);
+	}
+
+	if((group_c != '\0') && (conn->force_group_gid != (gid_t)-1)) {
+		/*
+		 * Only force group for connections where
+		 * conn->force_group_gid has already been set
+		 * to the correct value (i.e. the connection
+		 * happened after the 'force group' definition
+		 * was added to the share definition. Connections
+		 * that were made before force group was added
+		 * should stay with their existing credentials.
+		 *
+		 * BUG: https://bugzilla.samba.org/show_bug.cgi?id=13690
+		 */
 
 		if (group_c == '+') {
 			int i;
@@ -343,73 +413,72 @@ static bool change_to_user_internal(connection_struct *conn,
 		}
 	}
 
-	/*Set current_user since we will immediately also call set_sec_ctx() */
-	current_user.ut.ngroups = num_groups;
-	current_user.ut.groups  = group_list;
-
 	set_sec_ctx(uid,
 		    gid,
-		    current_user.ut.ngroups,
-		    current_user.ut.groups,
+		    num_groups,
+		    group_list,
 		    conn->session_info->security_token);
 
 	current_user.conn = conn;
 	current_user.vuid = vuid;
-
-	DEBUG(5, ("Impersonated user: uid=(%d,%d), gid=(%d,%d)\n",
-		 (int)getuid(),
-		 (int)geteuid(),
-		 (int)getgid(),
-		 (int)getegid()));
-
 	return true;
 }
 
-bool change_to_user(connection_struct *conn, uint64_t vuid)
+/**
+ * Impersonate user and change directory to service
+ *
+ * change_to_user_and_service() is used to impersonate the user associated with
+ * the given vuid and to change the working directory of the process to the
+ * service base directory.
+ **/
+bool change_to_user_and_service(connection_struct *conn, uint64_t vuid)
 {
-	struct user_struct *vuser;
 	int snum = SNUM(conn);
+	struct auth_session_info *si = NULL;
+	NTSTATUS status;
+	bool ok;
 
-	if (!conn) {
-		DEBUG(2,("Connection not open\n"));
-		return(False);
-	}
-
-	vuser = get_valid_user_struct(conn->sconn, vuid);
-
-	if ((current_user.conn == conn) &&
-		   (vuser != NULL) && (current_user.vuid == vuid) &&
-		   (current_user.ut.uid == vuser->session_info->unix_token->uid)) {
-		DEBUG(4,("Skipping user change - already "
-			 "user\n"));
-		return(True);
-	}
-
-	if (vuser == NULL) {
-		/* Invalid vuid sent */
-		DEBUG(2,("Invalid vuid %llu used on share %s.\n",
-			 (unsigned long long)vuid, lp_servicename(talloc_tos(),
-								  snum)));
+	if (conn == NULL) {
+		DBG_WARNING("Connection not open\n");
 		return false;
 	}
 
-	return change_to_user_internal(conn, vuser->session_info, vuid);
-}
-
-static bool change_to_user_by_session(connection_struct *conn,
-				      const struct auth_session_info *session_info)
-{
-	SMB_ASSERT(conn != NULL);
-	SMB_ASSERT(session_info != NULL);
-
-	if ((current_user.conn == conn) &&
-	    (current_user.ut.uid == session_info->unix_token->uid)) {
-		DEBUG(7, ("Skipping user change - already user\n"));
-
-		return true;
+	status = smbXsrv_session_info_lookup(conn->sconn->client,
+					     vuid,
+					     &si);
+	if (!NT_STATUS_IS_OK(status)) {
+		DBG_WARNING("Invalid vuid %llu used on share %s.\n",
+			    (unsigned long long)vuid,
+			    lp_const_servicename(snum));
+		return false;
 	}
 
-	return change_to_user_internal(conn, session_info, UID_FIELD_INVALID);
+	ok = change_to_user_impersonate(conn, si, vuid);
+	if (!ok) {
+		return false;
+	}
+
+	if (conn->tcon_done) {
+		ok = chdir_current_service(conn);
+		if (!ok) {
+			return false;
+		}
+	}
+
+	print_impersonation_info(conn);
+	return true;
+}
+
+/**
+ * Impersonate user and change directory to service
+ *
+ * change_to_user_and_service_by_fsp() is used to impersonate the user
+ * associated with the given vuid and to change the working directory of the
+ * process to the service base directory.
+ **/
+bool change_to_user_and_service_by_fsp(struct files_struct *fsp)
+{
+	return change_to_user_and_service(fsp->conn, fsp->vuid);
 }
 
 /****************************************************************************
@@ -473,6 +542,7 @@ bool smbd_unbecome_authenticated_pipe_user(void)
 static void push_conn_ctx(void)
 {
 	struct conn_ctx *ctx_p;
+	extern userdom_struct current_user_info;
 
 	/* Check we don't overflow our stack */
 
@@ -486,6 +556,7 @@ static void push_conn_ctx(void)
 
 	ctx_p->conn = current_user.conn;
 	ctx_p->vuid = current_user.vuid;
+	ctx_p->user_info = current_user_info;
 
 	DEBUG(4, ("push_conn_ctx(%llu) : conn_ctx_stack_ndx = %d\n",
 		(unsigned long long)ctx_p->vuid, conn_ctx_stack_ndx));
@@ -507,11 +578,16 @@ static void pop_conn_ctx(void)
 	conn_ctx_stack_ndx--;
 	ctx_p = &conn_ctx_stack[conn_ctx_stack_ndx];
 
+	set_current_user_info(ctx_p->user_info.smb_name,
+			      ctx_p->user_info.unix_name,
+			      ctx_p->user_info.domain);
+
 	current_user.conn = ctx_p->conn;
 	current_user.vuid = ctx_p->vuid;
 
-	ctx_p->conn = NULL;
-	ctx_p->vuid = UID_FIELD_INVALID;
+	*ctx_p = (struct conn_ctx) {
+		.vuid = UID_FIELD_INVALID,
+	};
 }
 
 /****************************************************************************
@@ -545,31 +621,38 @@ void smbd_unbecome_root(void)
  Saves and restores the connection context.
 ****************************************************************************/
 
-bool become_user(connection_struct *conn, uint64_t vuid)
+bool become_user_without_service(connection_struct *conn, uint64_t vuid)
 {
-	if (!push_sec_ctx())
-		return False;
+	struct auth_session_info *session_info = NULL;
+	int snum = SNUM(conn);
+	NTSTATUS status;
+	bool ok;
 
-	push_conn_ctx();
-
-	if (!change_to_user(conn, vuid)) {
-		pop_sec_ctx();
-		pop_conn_ctx();
-		return False;
+	if (conn == NULL) {
+		DBG_WARNING("Connection not open\n");
+		return false;
 	}
 
-	return True;
-}
-
-bool become_user_by_session(connection_struct *conn,
-			    const struct auth_session_info *session_info)
-{
-	if (!push_sec_ctx())
+	status = smbXsrv_session_info_lookup(conn->sconn->client,
+					     vuid,
+					     &session_info);
+	if (!NT_STATUS_IS_OK(status)) {
+		/* Invalid vuid sent */
+		DBG_WARNING("Invalid vuid %llu used on share %s.\n",
+			    (unsigned long long)vuid,
+			    lp_const_servicename(snum));
 		return false;
+	}
+
+	ok = push_sec_ctx();
+	if (!ok) {
+		return false;
+	}
 
 	push_conn_ctx();
 
-	if (!change_to_user_by_session(conn, session_info)) {
+	ok = change_to_user_impersonate(conn, session_info, vuid);
+	if (!ok) {
 		pop_sec_ctx();
 		pop_conn_ctx();
 		return false;
@@ -578,7 +661,37 @@ bool become_user_by_session(connection_struct *conn,
 	return true;
 }
 
-bool unbecome_user(void)
+bool become_user_without_service_by_fsp(struct files_struct *fsp)
+{
+	return become_user_without_service(fsp->conn, fsp->vuid);
+}
+
+bool become_user_without_service_by_session(connection_struct *conn,
+			    const struct auth_session_info *session_info)
+{
+	bool ok;
+
+	SMB_ASSERT(conn != NULL);
+	SMB_ASSERT(session_info != NULL);
+
+	ok = push_sec_ctx();
+	if (!ok) {
+		return false;
+	}
+
+	push_conn_ctx();
+
+	ok = change_to_user_impersonate(conn, session_info, UID_FIELD_INVALID);
+	if (!ok) {
+		pop_sec_ctx();
+		pop_conn_ctx();
+		return false;
+	}
+
+	return true;
+}
+
+bool unbecome_user_without_service(void)
 {
 	pop_sec_ctx();
 	pop_conn_ctx();

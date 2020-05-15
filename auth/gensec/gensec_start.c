@@ -31,6 +31,11 @@
 #include "lib/param/param.h"
 #include "lib/util/tsort.h"
 #include "lib/util/samba_modules.h"
+#include "lib/util/base64.h"
+#include "lib/crypto/gnutls_helpers.h"
+
+#undef DBGC_CLASS
+#define DBGC_CLASS DBGC_AUTH
 
 /* the list of currently registered GENSEC backends */
 static const struct gensec_security_ops **generic_security_ops;
@@ -45,7 +50,17 @@ _PUBLIC_ const struct gensec_security_ops * const *gensec_security_all(void)
 
 bool gensec_security_ops_enabled(const struct gensec_security_ops *ops, struct gensec_security *security)
 {
-	return lpcfg_parm_bool(security->settings->lp_ctx, NULL, "gensec", ops->name, ops->enabled);
+	bool ok = lpcfg_parm_bool(security->settings->lp_ctx,
+				  NULL,
+				  "gensec",
+				  ops->name,
+				  ops->enabled);
+
+	if (!samba_gnutls_weak_crypto_allowed() && ops->weak_crypto) {
+		ok = false;
+	}
+
+	return ok;
 }
 
 /* Sometimes we want to force only kerberos, sometimes we want to
@@ -97,15 +112,12 @@ _PUBLIC_ const struct gensec_security_ops **gensec_use_kerberos_mechs(TALLOC_CTX
 
 	j = 0;
 	for (i=0; old_gensec_list && old_gensec_list[i]; i++) {
-		int oid_idx;
 		bool keep = false;
 
-		for (oid_idx = 0; old_gensec_list[i]->oid && old_gensec_list[i]->oid[oid_idx]; oid_idx++) {
-			if (strcmp(old_gensec_list[i]->oid[oid_idx], GENSEC_OID_SPNEGO) == 0) {
-				keep = true;
-				break;
-			}
-		}
+		/*
+		 * We want to keep SPNGEO and other backends
+		 */
+		keep = old_gensec_list[i]->glue;
 
 		if (old_gensec_list[i]->auth_type == DCERPC_AUTH_TYPE_SCHANNEL) {
 			keep = keep_schannel;
@@ -211,8 +223,10 @@ _PUBLIC_ const struct gensec_security_ops *gensec_security_by_sasl_name(
 	}
 	backends = gensec_security_mechs(gensec_security, mem_ctx);
 	for (i=0; backends && backends[i]; i++) {
-		if (!gensec_security_ops_enabled(backends[i], gensec_security))
-		    continue;
+		if (gensec_security != NULL &&
+		    !gensec_security_ops_enabled(backends[i], gensec_security)) {
+			continue;
+		}
 		if (backends[i]->sasl_name
 		    && (strcmp(backends[i]->sasl_name, sasl_name) == 0)) {
 			backend = backends[i];
@@ -232,7 +246,13 @@ _PUBLIC_ const struct gensec_security_ops *gensec_security_by_auth_type(
 	int i;
 	const struct gensec_security_ops **backends;
 	const struct gensec_security_ops *backend;
-	TALLOC_CTX *mem_ctx = talloc_new(gensec_security);
+	TALLOC_CTX *mem_ctx;
+
+	if (auth_type == DCERPC_AUTH_TYPE_NONE) {
+		return NULL;
+	}
+
+	mem_ctx = talloc_new(gensec_security);
 	if (!mem_ctx) {
 		return NULL;
 	}
@@ -253,8 +273,8 @@ _PUBLIC_ const struct gensec_security_ops *gensec_security_by_auth_type(
 	return NULL;
 }
 
-static const struct gensec_security_ops *gensec_security_by_name(struct gensec_security *gensec_security,
-								 const char *name)
+const struct gensec_security_ops *gensec_security_by_name(struct gensec_security *gensec_security,
+							  const char *name)
 {
 	int i;
 	const struct gensec_security_ops **backends;
@@ -536,6 +556,25 @@ _PUBLIC_ const char **gensec_security_oids(struct gensec_security *gensec_securi
 	return gensec_security_oids_from_ops(gensec_security, mem_ctx, ops, skip);
 }
 
+static int gensec_security_destructor(struct gensec_security *gctx)
+{
+	if (gctx->parent_security != NULL) {
+		if (gctx->parent_security->child_security == gctx) {
+			gctx->parent_security->child_security = NULL;
+		}
+		gctx->parent_security = NULL;
+	}
+
+	if (gctx->child_security != NULL) {
+		if (gctx->child_security->parent_security == gctx) {
+			gctx->child_security->parent_security = NULL;
+		}
+		gctx->child_security = NULL;
+	}
+
+	return 0;
+}
+
 /**
   Start the GENSEC system, returning a context pointer.
   @param mem_ctx The parent TALLOC memory context.
@@ -562,6 +601,7 @@ static NTSTATUS gensec_start(TALLOC_CTX *mem_ctx,
 	 * from it */
 	(*gensec_security)->auth_context = talloc_reference(*gensec_security, auth_context);
 
+	talloc_set_destructor((*gensec_security), gensec_security_destructor);
 	return NT_STATUS_OK;
 }
 
@@ -577,12 +617,17 @@ _PUBLIC_ NTSTATUS gensec_subcontext_start(TALLOC_CTX *mem_ctx,
 				 struct gensec_security *parent,
 				 struct gensec_security **gensec_security)
 {
+	if (parent->child_security != NULL) {
+		return NT_STATUS_INTERNAL_ERROR;
+	}
+
 	(*gensec_security) = talloc_zero(mem_ctx, struct gensec_security);
 	NT_STATUS_HAVE_NO_MEMORY(*gensec_security);
 
 	(**gensec_security) = *parent;
 	(*gensec_security)->ops = NULL;
 	(*gensec_security)->private_data = NULL;
+	(*gensec_security)->update_busy_ptr = NULL;
 
 	(*gensec_security)->subcontext = true;
 	(*gensec_security)->want_features = parent->want_features;
@@ -592,6 +637,23 @@ _PUBLIC_ NTSTATUS gensec_subcontext_start(TALLOC_CTX *mem_ctx,
 	(*gensec_security)->settings = talloc_reference(*gensec_security, parent->settings);
 	(*gensec_security)->auth_context = talloc_reference(*gensec_security, parent->auth_context);
 
+	talloc_set_destructor((*gensec_security), gensec_security_destructor);
+	return NT_STATUS_OK;
+}
+
+_PUBLIC_ NTSTATUS gensec_child_ready(struct gensec_security *parent,
+				     struct gensec_security *child)
+{
+	if (parent->child_security != NULL) {
+		return NT_STATUS_INTERNAL_ERROR;
+	}
+
+	if (child->parent_security != NULL) {
+		return NT_STATUS_INTERNAL_ERROR;
+	}
+
+	parent->child_security = child;
+	child->parent_security = parent;
 	return NT_STATUS_OK;
 }
 
@@ -650,9 +712,25 @@ _PUBLIC_ NTSTATUS gensec_server_start(TALLOC_CTX *mem_ctx,
 	return status;
 }
 
-NTSTATUS gensec_start_mech(struct gensec_security *gensec_security)
+static NTSTATUS gensec_start_mech(struct gensec_security *gensec_security)
 {
 	NTSTATUS status;
+
+	/*
+	 * Callers sometimes just reuse a context, we should
+	 * clear the internal state before starting it again.
+	 */
+	talloc_unlink(gensec_security, gensec_security->private_data);
+	gensec_security->private_data = NULL;
+
+	if (gensec_security->child_security != NULL) {
+		/*
+		 * The talloc_unlink(.., gensec_security->private_data)
+		 * should have cleared this via
+		 * gensec_security_destructor().
+		 */
+		return NT_STATUS_INTERNAL_ERROR;
+	}
 
 	if (gensec_security->credentials) {
 		const char *forced_mech = cli_credentials_get_forced_sasl_mech(gensec_security->credentials);
@@ -733,7 +811,17 @@ _PUBLIC_ NTSTATUS gensec_start_mech_by_authtype(struct gensec_security *gensec_s
 	gensec_want_feature(gensec_security, GENSEC_FEATURE_DCE_STYLE);
 	gensec_want_feature(gensec_security, GENSEC_FEATURE_ASYNC_REPLIES);
 	if (auth_level == DCERPC_AUTH_LEVEL_INTEGRITY) {
-		gensec_want_feature(gensec_security, GENSEC_FEATURE_SIGN);
+		if (gensec_security->gensec_role == GENSEC_CLIENT) {
+			gensec_want_feature(gensec_security, GENSEC_FEATURE_SIGN);
+		}
+	} else if (auth_level == DCERPC_AUTH_LEVEL_PACKET) {
+		/*
+		 * For connection oriented DCERPC DCERPC_AUTH_LEVEL_PACKET (4)
+		 * has the same behavior as DCERPC_AUTH_LEVEL_INTEGRITY (5).
+		 */
+		if (gensec_security->gensec_role == GENSEC_CLIENT) {
+			gensec_want_feature(gensec_security, GENSEC_FEATURE_SIGN);
+		}
 	} else if (auth_level == DCERPC_AUTH_LEVEL_PRIVACY) {
 		gensec_want_feature(gensec_security, GENSEC_FEATURE_SIGN);
 		gensec_want_feature(gensec_security, GENSEC_FEATURE_SEAL);
@@ -874,7 +962,8 @@ _PUBLIC_ NTSTATUS gensec_set_credentials(struct gensec_security *gensec_security
   The 'name' can be later used by other backends to find the operations
   structure for this backend.
 */
-_PUBLIC_ NTSTATUS gensec_register(const struct gensec_security_ops *ops)
+_PUBLIC_ NTSTATUS gensec_register(TALLOC_CTX *ctx,
+			const struct gensec_security_ops *ops)
 {
 	if (gensec_security_by_name(NULL, ops->name) != NULL) {
 		/* its already registered! */
@@ -883,7 +972,7 @@ _PUBLIC_ NTSTATUS gensec_register(const struct gensec_security_ops *ops)
 		return NT_STATUS_OBJECT_NAME_COLLISION;
 	}
 
-	generic_security_ops = talloc_realloc(talloc_autofree_context(),
+	generic_security_ops = talloc_realloc(ctx,
 					      generic_security_ops,
 					      const struct gensec_security_ops *,
 					      gensec_num_backends+2);
@@ -937,7 +1026,7 @@ bool gensec_setting_bool(struct gensec_settings *settings, const char *mechanism
 _PUBLIC_ NTSTATUS gensec_init(void)
 {
 	static bool initialized = false;
-#define _MODULE_PROTO(init) extern NTSTATUS init(void);
+#define _MODULE_PROTO(init) extern NTSTATUS init(TALLOC_CTX *);
 #ifdef STATIC_gensec_MODULES
 	STATIC_gensec_MODULES_PROTO;
 	init_module_fn static_init[] = { STATIC_gensec_MODULES };
@@ -951,8 +1040,8 @@ _PUBLIC_ NTSTATUS gensec_init(void)
 
 	shared_init = load_samba_modules(NULL, "gensec");
 
-	run_init_functions(static_init);
-	run_init_functions(shared_init);
+	run_init_functions(NULL, static_init);
+	run_init_functions(NULL, shared_init);
 
 	talloc_free(shared_init);
 

@@ -60,9 +60,14 @@ static tdb_off_t tdb_dump_record(struct tdb_context *tdb, int hash,
 
 static int tdb_dump_chain(struct tdb_context *tdb, int i)
 {
+	struct tdb_chainwalk_ctx chainwalk;
 	tdb_off_t rec_ptr, top;
 
-	top = TDB_HASH_TOP(i);
+	if (i == -1) {
+		top = FREELIST_TOP;
+	} else {
+		top = TDB_HASH_TOP(i);
+	}
 
 	if (tdb_lock(tdb, i, F_WRLCK) != 0)
 		return -1;
@@ -70,11 +75,19 @@ static int tdb_dump_chain(struct tdb_context *tdb, int i)
 	if (tdb_ofs_read(tdb, top, &rec_ptr) == -1)
 		return tdb_unlock(tdb, i, F_WRLCK);
 
+	tdb_chainwalk_init(&chainwalk, rec_ptr);
+
 	if (rec_ptr)
 		printf("hash=%d\n", i);
 
 	while (rec_ptr) {
+		bool ok;
 		rec_ptr = tdb_dump_record(tdb, i, rec_ptr);
+		ok = tdb_chainwalk_check(tdb, &chainwalk, rec_ptr);
+		if (!ok) {
+			printf("circular hash chain %d\n", i);
+			break;
+		}
 	}
 
 	return tdb_unlock(tdb, i, F_WRLCK);
@@ -82,7 +95,7 @@ static int tdb_dump_chain(struct tdb_context *tdb, int i)
 
 _PUBLIC_ void tdb_dump_all(struct tdb_context *tdb)
 {
-	int i;
+	uint32_t i;
 	for (i=0;i<tdb->hash_size;i++) {
 		tdb_dump_chain(tdb, i);
 	}

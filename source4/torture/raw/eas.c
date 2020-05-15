@@ -292,7 +292,8 @@ static bool test_max_eas(struct smbcli_state *cli, struct torture_context *tctx)
 	bool ret = true;
 	bool err = false;
 
-	int       i, j, k, last, total;
+	int       i, j, k, last;
+	size_t total;
 	DATA_BLOB eablob;
 	char      *eaname = NULL;
 	int       maxeasize;
@@ -304,7 +305,7 @@ static bool test_max_eas(struct smbcli_state *cli, struct torture_context *tctx)
 	maxeasize  = torture_setting_int(tctx, "maxeasize", 65536);
 	maxeanames = torture_setting_int(tctx, "maxeanames", 101);
 	maxeastart = torture_setting_int(tctx, "maxeastart", 1);
-	maxeadebug = torture_setting_int(tctx, "maxeadebug", 0);
+	maxeadebug = torture_setting_bool(tctx, "maxeadebug", false);
 
 	/* Do some sanity check on possibly passed parms */
 	if (maxeasize <= 0) {
@@ -317,10 +318,6 @@ static bool test_max_eas(struct smbcli_state *cli, struct torture_context *tctx)
 	}
 	if (maxeastart <= 0) {
 		torture_comment(tctx, "Invalid parameter 'maxeastart=%d'",maxeastart);
-		err = true;
-	}
-	if (maxeadebug < 0) {
-		torture_comment(tctx, "Invalid parameter 'maxeadebug=%d'",maxeadebug);
 		err = true;
 	}
 	if (err) {
@@ -402,7 +399,7 @@ static bool test_max_eas(struct smbcli_state *cli, struct torture_context *tctx)
 		last = j;
 	}
 
-	torture_comment(tctx, "Total EA size:%d\n", total);
+	torture_comment(tctx, "Total EA size:%zu\n", total);
 	if (i == maxeanames) {
 		torture_comment(tctx, "NOTE: More EAs could be available!\n");
 	}

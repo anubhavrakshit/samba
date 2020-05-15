@@ -43,11 +43,11 @@
 /*
  * See if autoconf has found us the internal headers in some form.
  */
-#if HAVE_COREFOUNDATION_CFSTRINGENCODINGCONVERTER_H
+#if defined(HAVE_COREFOUNDATION_CFSTRINGENCODINGCONVERTER_H)
 #	include <CoreFoundation/CFStringEncodingConverter.h>
 #	include <CoreFoundation/CFUnicodePrecomposition.h>
 #	define USE_INTERNAL_API 1
-#elif HAVE_CFSTRINGENCODINGCONVERTER_H
+#elif defined(HAVE_CFSTRINGENCODINGCONVERTER_H)
 #	include <CFStringEncodingConverter.h>
 #	include <CFUnicodePrecomposition.h>
 #	define USE_INTERNAL_API 1
@@ -457,10 +457,11 @@ static size_t macosxfs_encoding_pull(
 
 	switch(result) {
 	case kCFStringEncodingConversionSuccess:
-		if (*inbytesleft == srcCharsUsed)
+		if (*inbytesleft == srcCharsUsed) {
 			break;
-		else
-			; /*fall through*/
+		}
+
+		FALL_THROUGH;
 	case kCFStringEncodingInsufficientOutputBufferLength:
 		debug_out("String conversion: "
 			  "Output buffer too small\n");
@@ -546,10 +547,11 @@ static size_t macosxfs_encoding_push(
 
 	switch(result) {
 	case kCFStringEncodingConversionSuccess:
-		if (*inbytesleft/2 == srcCharsUsed)
+		if (*inbytesleft/2 == srcCharsUsed) {
 			break;
-		else
-			; /*fall through*/
+		}
+
+		FALL_THROUGH;
 	case kCFStringEncodingInsufficientOutputBufferLength:
 		debug_out("String conversion: "
 			  "Output buffer too small\n");

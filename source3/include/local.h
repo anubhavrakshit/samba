@@ -9,12 +9,7 @@
 /* to a maximum of 8 if old smb clients break because of long printer names. */
 #define MAXPRINTERLEN 15
 
-/* max number of directories open at once */
-/* note that with the new directory code this no longer requires a
-   file handle per directory, but large numbers do use more memory */
-#define MAX_OPEN_DIRECTORIES 256
-
-/* max number of directory handles */
+/* max number of SMB1 directory handles */
 /* As this now uses the bitmap code this can be
    quite large. */
 #define MAX_DIRECTORY_HANDLES 2048
@@ -96,10 +91,8 @@
 
 /* the following control timings of various actions. Don't change 
    them unless you know what you are doing. These are all in seconds */
-#define DEFAULT_SMBD_TIMEOUT (60*60*24*7)
 #define SMBD_RELOAD_CHECK (180)
 #define IDLE_CLOSED_TIMEOUT (60)
-#define DPTR_IDLE_TIMEOUT (120)
 #define SMBD_SELECT_TIMEOUT (60)
 #define NMBD_SELECT_LOOP (10)
 #define BROWSE_INTERVAL (60)
@@ -152,9 +145,6 @@
 /* the maximum age in seconds of a password. Should be a lp_ parameter */
 #define MAX_PASSWORD_AGE (21*24*60*60)
 
-/* Default allocation roundup. */
-#define SMB_ROUNDUP_ALLOCATION_SIZE 0x100000
-
 /* shall we deny oplocks to clients that get timeouts? */
 #define FASCIST_OPLOCK_BACKOFF 1
 
@@ -171,9 +161,6 @@
 #define SERVER_MUTEX_WAIT_TIME ( ((NUM_CLI_AUTH_CONNECT_RETRIES) * ((CLI_AUTH_TIMEOUT)/1000)) + 5)
 /* Number in seconds for winbindd to wait for the mutex. Make this 2 * smbd wait time. */
 #define WINBIND_SERVER_MUTEX_WAIT_TIME (( ((NUM_CLI_AUTH_CONNECT_RETRIES) * ((CLI_AUTH_TIMEOUT)/1000)) + 5)*2)
-
-/* Buffer size to use when printing backtraces */
-#define BACKTRACE_STACK_SIZE 64
 
 /* size of listen() backlog in smbd */
 #define SMBD_LISTEN_BACKLOG 50

@@ -80,7 +80,6 @@ struct cli_state {
 	bool fallback_after_kerberos;
 	bool use_ccache;
 	bool pw_nt_hash;
-	bool got_kerberos_mechanism; /* Server supports krb5 in SPNEGO. */
 
 	bool use_oplocks; /* should we use oplocks? */
 
@@ -88,10 +87,9 @@ struct cli_state {
 	char *dfs_mountpoint;
 
 	struct smbXcli_conn *conn;
-	const char *remote_realm;
 
 	struct {
-		uint16_t pid;
+		uint32_t pid;
 		uint16_t vc_num;
 		struct smbXcli_session *session;
 		struct smbXcli_tcon *tcon;
@@ -106,10 +104,13 @@ struct cli_state {
 
 struct file_info {
 	uint64_t size;
+	uint64_t allocated_size;
 	uint16_t mode;
 	uid_t uid;
 	gid_t gid;
+	uint64_t ino;
 	/* these times are normally kept in GMT */
+	struct timespec btime_ts; /* Birth-time if supported by system */
 	struct timespec mtime_ts;
 	struct timespec atime_ts;
 	struct timespec ctime_ts;
@@ -127,5 +128,7 @@ struct file_info {
 #define CLI_FULL_CONNECTION_FORCE_DOS_ERRORS 0x0080
 #define CLI_FULL_CONNECTION_FORCE_ASCII 0x0100
 #define CLI_FULL_CONNECTION_USE_NT_HASH 0x0200
+#define CLI_FULL_CONNECTION_FORCE_SMB1 0x0400
+#define CLI_FULL_CONNECTION_DISABLE_SMB1 0x0800
 
 #endif /* _CLIENT_H */

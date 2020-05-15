@@ -30,16 +30,16 @@
 #define DBGC_CLASS DBGC_IDMAP
 
 /*****************************
- Initialise idmap database. 
+ Initialise idmap database.
 *****************************/
 
 static NTSTATUS idmap_nss_int_init(struct idmap_domain *dom)
-{	
+{
 	return NT_STATUS_OK;
 }
 
 /**********************************
- lookup a set of unix ids. 
+ lookup a set of unix ids.
 **********************************/
 
 static NTSTATUS idmap_nss_unixids_to_sids(struct idmap_domain *dom, struct id_map **ids)
@@ -120,7 +120,7 @@ static NTSTATUS idmap_nss_unixids_to_sids(struct idmap_domain *dom, struct id_ma
 }
 
 /**********************************
- lookup a set of sids. 
+ lookup a set of sids.
 **********************************/
 
 static NTSTATUS idmap_nss_sids_to_unixids(struct idmap_domain *dom, struct id_map **ids)
@@ -202,7 +202,7 @@ static struct idmap_methods nss_methods = {
 	.sids_to_unixids = idmap_nss_sids_to_unixids,
 };
 
-NTSTATUS idmap_nss_init(void)
+NTSTATUS idmap_nss_init(TALLOC_CTX *mem_ctx)
 {
 	return smb_register_idmap(SMB_IDMAP_INTERFACE_VERSION, "nss", &nss_methods);
 }

@@ -186,7 +186,8 @@ static bool open_connection_no_level2_oplocks(struct torture_context *tctx,
 					torture_setting_string(tctx, "host", NULL),
 					lpcfg_smb_ports(tctx->lp_ctx),
 					torture_setting_string(tctx, "share", NULL),
-					NULL, lpcfg_socket_options(tctx->lp_ctx), cmdline_credentials,
+					NULL, lpcfg_socket_options(tctx->lp_ctx),
+					popt_get_cmdline_credentials(),
 					lpcfg_resolve_context(tctx->lp_ctx),
 					tctx->ev, &options, &session_options,
 					lpcfg_gensec_settings(tctx, tctx->lp_ctx));
@@ -3688,8 +3689,9 @@ static bool test_raw_oplock_batch26(struct torture_context *tctx,
 	io.ntcreatex.in.security_flags = 0;
 	io.ntcreatex.in.fname = fname1;
 
-	torture_comment(tctx, "BATCH26: open a file with an batch oplock "
-	    "(share mode: none)\n");
+	torture_comment(tctx,
+			"BATCH26: open a file with an batch oplock "
+			"(share mode: all)\n");
 
 	ZERO_STRUCT(break_info);
 	io.ntcreatex.in.flags = NTCREATEX_FLAGS_EXTENDED |
@@ -4549,14 +4551,26 @@ static struct hold_oplock_info {
 	uint32_t share_access;
 	uint16_t fnum;
 } hold_info[] = {
-	{ BASEDIR "\\notshared_close", true,  
-	  NTCREATEX_SHARE_ACCESS_NONE, },
-	{ BASEDIR "\\notshared_noclose", false, 
-	  NTCREATEX_SHARE_ACCESS_NONE, },
-	{ BASEDIR "\\shared_close", true,  
-	  NTCREATEX_SHARE_ACCESS_READ|NTCREATEX_SHARE_ACCESS_WRITE|NTCREATEX_SHARE_ACCESS_DELETE, },
-	{ BASEDIR "\\shared_noclose", false,  
-	  NTCREATEX_SHARE_ACCESS_READ|NTCREATEX_SHARE_ACCESS_WRITE|NTCREATEX_SHARE_ACCESS_DELETE, },
+	{
+		.fname          = BASEDIR "\\notshared_close",
+		.close_on_break = true,
+		.share_access   = NTCREATEX_SHARE_ACCESS_NONE,
+	},
+	{
+		.fname          = BASEDIR "\\notshared_noclose",
+		.close_on_break = false,
+		.share_access   = NTCREATEX_SHARE_ACCESS_NONE,
+	},
+	{
+		.fname          = BASEDIR "\\shared_close",
+		.close_on_break = true,
+		.share_access   = NTCREATEX_SHARE_ACCESS_READ|NTCREATEX_SHARE_ACCESS_WRITE|NTCREATEX_SHARE_ACCESS_DELETE,
+	},
+	{
+		.fname          = BASEDIR "\\shared_noclose",
+		.close_on_break = false,
+		.share_access   = NTCREATEX_SHARE_ACCESS_READ|NTCREATEX_SHARE_ACCESS_WRITE|NTCREATEX_SHARE_ACCESS_DELETE,
+	},
 };
 
 static bool oplock_handler_hold(struct smbcli_transport *transport, 

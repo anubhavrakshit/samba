@@ -24,6 +24,7 @@
 #include "../lib/tsocket/tsocket_internal.h"
 #include "../librpc/gen_ndr/ndr_named_pipe_auth.h"
 #include "../libcli/named_pipe_auth/npa_tstream.h"
+#include "../libcli/named_pipe_auth/tstream_u32_read.h"
 #include "../libcli/smb/smb_constants.h"
 
 static const struct tstream_context_ops tstream_npa_ops;
@@ -51,7 +52,6 @@ struct tstream_npa_connect_state {
 	struct iovec auth_req_iov;
 
 	struct named_pipe_auth_rep auth_rep;
-	DATA_BLOB auth_rep_blob;
 };
 
 static void tstream_npa_connect_unix_done(struct tevent_req *subreq);
@@ -60,10 +60,10 @@ struct tevent_req *tstream_npa_connect_send(TALLOC_CTX *mem_ctx,
 					    struct tevent_context *ev,
 					    const char *directory,
 					    const char *npipe,
-					    const struct tsocket_address *client,
-					    const char *client_name_in,
-					    const struct tsocket_address *server,
-					    const char *server_name,
+					    const struct tsocket_address *remote_client_addr,
+					    const char *remote_client_name_in,
+					    const struct tsocket_address *local_server_addr,
+					    const char *local_server_name_in,
 					    const struct auth_session_info_transport *session_info)
 {
 	struct tevent_req *req;
@@ -113,7 +113,7 @@ struct tevent_req *tstream_npa_connect_send(TALLOC_CTX *mem_ctx,
 
 	ZERO_STRUCT(state->auth_req);
 
-	if (!server) {
+	if (!local_server_addr) {
 		tevent_req_error(req, EINVAL);
 		goto post;
 	}
@@ -121,27 +121,30 @@ struct tevent_req *tstream_npa_connect_send(TALLOC_CTX *mem_ctx,
 	state->auth_req.level = 4;
 	info4 = &state->auth_req.info.info4;
 
-	info4->client_name = client_name_in;
-	info4->client_addr = tsocket_address_inet_addr_string(client, state);
-	if (!info4->client_addr) {
+	info4->remote_client_name = remote_client_name_in;
+	info4->remote_client_addr = tsocket_address_inet_addr_string(remote_client_addr,
+								     state);
+	if (!info4->remote_client_addr) {
 		/* errno might be EINVAL */
 		tevent_req_error(req, errno);
 		goto post;
 	}
-	info4->client_port = tsocket_address_inet_port(client);
-	if (!info4->client_name) {
-		info4->client_name = info4->client_addr;
+	info4->remote_client_port = tsocket_address_inet_port(remote_client_addr);
+	if (!info4->remote_client_name) {
+		info4->remote_client_name = info4->remote_client_addr;
 	}
 
-	info4->server_addr = tsocket_address_inet_addr_string(server, state);
-	if (!info4->server_addr) {
+	info4->local_server_name = local_server_name_in;
+	info4->local_server_addr = tsocket_address_inet_addr_string(local_server_addr,
+								    state);
+	if (!info4->local_server_addr) {
 		/* errno might be EINVAL */
 		tevent_req_error(req, errno);
 		goto post;
 	}
-	info4->server_port = tsocket_address_inet_port(server);
-	if (!info4->server_name) {
-		info4->server_name = info4->server_addr;
+	info4->local_server_port = tsocket_address_inet_port(local_server_addr);
+	if (!info4->local_server_name) {
+		info4->local_server_name = info4->local_server_addr;
 	}
 
 	info4->session_info = discard_const_p(struct auth_session_info_transport, session_info);
@@ -208,11 +211,6 @@ static void tstream_npa_connect_unix_done(struct tevent_req *subreq)
 	tevent_req_set_callback(subreq, tstream_npa_connect_writev_done, req);
 }
 
-static int tstream_npa_connect_next_vector(struct tstream_context *unix_stream,
-					   void *private_data,
-					   TALLOC_CTX *mem_ctx,
-					   struct iovec **_vector,
-					   size_t *_count);
 static void tstream_npa_connect_readv_done(struct tevent_req *subreq);
 
 static void tstream_npa_connect_writev_done(struct tevent_req *subreq)
@@ -233,79 +231,9 @@ static void tstream_npa_connect_writev_done(struct tevent_req *subreq)
 		return;
 	}
 
-	state->auth_rep_blob = data_blob_const(NULL, 0);
-
-	subreq = tstream_readv_pdu_send(state, state->caller.ev,
-					state->unix_stream,
-					tstream_npa_connect_next_vector,
-					state);
-	if (tevent_req_nomem(subreq, req)) {
-		return;
-	}
+	subreq = tstream_u32_read_send(
+		state, state->caller.ev, 0x00FFFFFF, state->unix_stream);
 	tevent_req_set_callback(subreq, tstream_npa_connect_readv_done, req);
-}
-
-static int tstream_npa_connect_next_vector(struct tstream_context *unix_stream,
-					   void *private_data,
-					   TALLOC_CTX *mem_ctx,
-					   struct iovec **_vector,
-					   size_t *_count)
-{
-	struct tstream_npa_connect_state *state = talloc_get_type_abort(private_data,
-					struct tstream_npa_connect_state);
-	struct iovec *vector;
-	size_t count;
-	off_t ofs = 0;
-
-	if (state->auth_rep_blob.length == 0) {
-		state->auth_rep_blob = data_blob_talloc(state, NULL, 4);
-		if (!state->auth_rep_blob.data) {
-			return -1;
-		}
-	} else if (state->auth_rep_blob.length == 4) {
-		uint32_t msg_len;
-
-		ofs = 4;
-
-		msg_len = RIVAL(state->auth_rep_blob.data, 0);
-
-		if (msg_len > 0x00FFFFFF) {
-			errno = EMSGSIZE;
-			return -1;
-		}
-
-		if (msg_len == 0) {
-			errno = EMSGSIZE;
-			return -1;
-		}
-
-		msg_len += ofs;
-
-		state->auth_rep_blob.data = talloc_realloc(state,
-						state->auth_rep_blob.data,
-						uint8_t, msg_len);
-		if (!state->auth_rep_blob.data) {
-			return -1;
-		}
-		state->auth_rep_blob.length = msg_len;
-	} else {
-		*_vector = NULL;
-		*_count = 0;
-		return 0;
-	}
-
-	/* we need to get a message header */
-	vector = talloc_array(mem_ctx, struct iovec, 1);
-	if (!vector) {
-		return -1;
-	}
-	vector[0].iov_base = (char *) (state->auth_rep_blob.data + ofs);
-	vector[0].iov_len = state->auth_rep_blob.length - ofs;
-	count = 1;
-
-	*_vector = vector;
-	*_count = count;
-	return 0;
 }
 
 static void tstream_npa_connect_readv_done(struct tevent_req *subreq)
@@ -316,23 +244,23 @@ static void tstream_npa_connect_readv_done(struct tevent_req *subreq)
 	struct tstream_npa_connect_state *state =
 		tevent_req_data(req,
 		struct tstream_npa_connect_state);
-	int ret;
-	int sys_errno;
+	DATA_BLOB in;
+	int err;
 	enum ndr_err_code ndr_err;
 
-	ret = tstream_readv_pdu_recv(subreq, &sys_errno);
+	err = tstream_u32_read_recv(subreq, state, &in.data, &in.length);
 	TALLOC_FREE(subreq);
-	if (ret == -1) {
-		tevent_req_error(req, sys_errno);
+	if (err != 0) {
+		tevent_req_error(req, err);
 		return;
 	}
 
-	DEBUG(10,("name_pipe_auth_rep(client)[%u]\n",
-		 (uint32_t)state->auth_rep_blob.length));
-	dump_data(11, state->auth_rep_blob.data, state->auth_rep_blob.length);
+	DBG_DEBUG("name_pipe_auth_rep(client)[%zu]\n", in.length);
+	dump_data(11, in.data, in.length);
 
-	ndr_err = ndr_pull_struct_blob(
-		&state->auth_rep_blob, state,
+	ndr_err = ndr_pull_struct_blob_all(
+		&in,
+		state,
 		&state->auth_rep,
 		(ndr_pull_flags_fn_t)ndr_pull_named_pipe_auth_rep);
 
@@ -761,7 +689,7 @@ static void tstream_npa_readv_msg_mode_handler(struct tevent_req *subreq)
 	}
 
 	/*
-	 * we do not set state->ret here as ret includes the headr size.
+	 * we do not set state->ret here as ret includes the header size.
 	 * we set it in tstream_npa_readv_pdu_next_vector()
 	 */
 
@@ -850,6 +778,9 @@ static struct tevent_req *tstream_npa_writev_send(TALLOC_CTX *mem_ctx,
 
 		msg_len = 0;
 		for (i=0; i < count; i++) {
+			/*
+			 * overflow check already done in tstream_writev_send
+			 */
 			msg_len += vector[i].iov_len;
 		}
 
@@ -1074,18 +1005,13 @@ struct tstream_npa_accept_state {
 
 	/* results */
 	NTSTATUS accept_status;
-	struct tsocket_address *client;
-	char *client_name;
-	struct tsocket_address *server;
-	char *server_name;
+	struct tsocket_address *remote_client_addr;
+	char *remote_client_name;
+	struct tsocket_address *local_server_addr;
+	char *local_server_name;
 	struct auth_session_info_transport *session_info;
 };
 
-static int tstream_npa_accept_next_vector(struct tstream_context *unix_stream,
-					  void *private_data,
-					  TALLOC_CTX *mem_ctx,
-					  struct iovec **_vector,
-					  size_t *_count);
 static void tstream_npa_accept_existing_reply(struct tevent_req *subreq);
 static void tstream_npa_accept_existing_done(struct tevent_req *subreq);
 
@@ -1115,21 +1041,13 @@ struct tevent_req *tstream_npa_accept_existing_send(TALLOC_CTX *mem_ctx,
 		goto post;
 	}
 
-	ZERO_STRUCTP(state);
-
 	state->ev = ev;
 	state->plain = plain;
 	state->file_type = file_type;
 	state->device_state = device_state;
 	state->alloc_size = allocation_size;
 
-	/*
-	 * The named pipe pdu's have the length as 8 byte (initial_read_size),
-	 * named_pipe_full_request provides the pdu length then.
-	 */
-	subreq = tstream_readv_pdu_send(state, ev, plain,
-					tstream_npa_accept_next_vector,
-					state);
+	subreq = tstream_u32_read_send(state, ev, 0x00FFFFFF, plain);
 	if (tevent_req_nomem(subreq, req)) {
 		goto post;
 	}
@@ -1144,82 +1062,6 @@ post:
 	return req;
 }
 
-static int tstream_npa_accept_next_vector(struct tstream_context *unix_stream,
-					  void *private_data,
-					  TALLOC_CTX *mem_ctx,
-					  struct iovec **_vector,
-					  size_t *_count)
-{
-	struct tstream_npa_accept_state *state =
-		talloc_get_type_abort(private_data,
-					struct tstream_npa_accept_state);
-	struct iovec *vector;
-	size_t count;
-	off_t ofs = 0;
-
-	if (state->npa_blob.length == 0) {
-		state->npa_blob = data_blob_talloc(state, NULL, 4);
-		if (!state->npa_blob.data) {
-			return -1;
-		}
-	} else if (state->npa_blob.length == 4) {
-		uint32_t msg_len;
-
-		ofs = 4;
-
-		msg_len = RIVAL(state->npa_blob.data, 0);
-
-		if (msg_len > 0x00FFFFFF) {
-			errno = EMSGSIZE;
-			return -1;
-		}
-
-		if (msg_len == 0) {
-			errno = EMSGSIZE;
-			return -1;
-		}
-
-		msg_len += ofs;
-
-		state->npa_blob.data = talloc_realloc(state,
-						      state->npa_blob.data,
-						      uint8_t, msg_len);
-		if (!state->npa_blob.data) {
-			return -1;
-		}
-		state->npa_blob.length = msg_len;
-	} else {
-		if (memcmp(&state->npa_blob.data[4],
-			   NAMED_PIPE_AUTH_MAGIC, 4) != 0) {
-			DEBUG(0, ("Wrong protocol\n"));
-#if defined(EPROTONOSUPPORT)
-			errno = EPROTONOSUPPORT;
-#elif defined(EPROTO)
-			errno = EPROTO;
-#else
-			errno = EINVAL;
-#endif
-			return -1;
-		}
-		*_vector = NULL;
-		*_count = 0;
-		return 0;
-	}
-
-	/* we need to get a message header */
-	vector = talloc_array(mem_ctx, struct iovec, 1);
-	if (!vector) {
-		return -1;
-	}
-	vector[0].iov_base = (char *) (state->npa_blob.data + ofs);
-	vector[0].iov_len = state->npa_blob.length - ofs;
-	count = 1;
-
-	*_vector = vector;
-	*_count = count;
-	return 0;
-}
-
 static void tstream_npa_accept_existing_reply(struct tevent_req *subreq)
 {
 	struct tevent_req *req =
@@ -1230,20 +1072,35 @@ static void tstream_npa_accept_existing_reply(struct tevent_req *subreq)
 	struct named_pipe_auth_rep pipe_reply;
 	struct named_pipe_auth_req_info4 i4;
 	enum ndr_err_code ndr_err;
-	DATA_BLOB out;
-	int sys_errno;
+	DATA_BLOB in, out;
+	int err;
 	int ret;
 
-	ret = tstream_readv_pdu_recv(subreq, &sys_errno);
-	TALLOC_FREE(subreq);
-	if (ret == -1) {
-		tevent_req_error(req, sys_errno);
+	err = tstream_u32_read_recv(subreq, state, &in.data, &in.length);
+	if (err != 0) {
+		tevent_req_error(req, err);
+		return;
+	}
+	if (in.length < 8) {
+		tevent_req_error(req, EMSGSIZE);
 		return;
 	}
 
-	DEBUG(10, ("Received packet of length %lu\n",
-		   (long)state->npa_blob.length));
-	dump_data(11, state->npa_blob.data, state->npa_blob.length);
+	if (memcmp(&in.data[4], NAMED_PIPE_AUTH_MAGIC, 4) != 0) {
+		DBG_ERR("Wrong protocol\n");
+#if defined(EPROTONOSUPPORT)
+		err = EPROTONOSUPPORT;
+#elif defined(EPROTO)
+		err = EPROTO;
+#else
+		err = EINVAL;
+#endif
+		tevent_req_error(req, err);
+		return;
+	}
+
+	DBG_DEBUG("Received packet of length %zu\n", in.length);
+	dump_data(11, in.data, in.length);
 
 	ZERO_STRUCT(pipe_reply);
 	pipe_reply.level = 0;
@@ -1260,8 +1117,10 @@ static void tstream_npa_accept_existing_reply(struct tevent_req *subreq)
 
 	/* parse the passed credentials */
 	ndr_err = ndr_pull_struct_blob_all(
-			&state->npa_blob, pipe_request, pipe_request,
-			(ndr_pull_flags_fn_t)ndr_pull_named_pipe_auth_req);
+		&in,
+		pipe_request,
+		pipe_request,
+		(ndr_pull_flags_fn_t)ndr_pull_named_pipe_auth_req);
 	if (!NDR_ERR_CODE_IS_SUCCESS(ndr_err)) {
 		pipe_reply.status = ndr_map_error2ntstatus(ndr_err);
 		DEBUG(2, ("Could not unmarshall named_pipe_auth_req: %s\n",
@@ -1289,40 +1148,42 @@ static void tstream_npa_accept_existing_reply(struct tevent_req *subreq)
 	pipe_reply.info.info4.allocation_size = state->alloc_size;
 
 	i4 = pipe_request->info.info4;
-	if (i4.server_addr == NULL) {
+	if (i4.local_server_addr == NULL) {
 		pipe_reply.status = NT_STATUS_INVALID_ADDRESS;
-		DEBUG(2, ("Missing server address\n"));
+		DEBUG(2, ("Missing local server address\n"));
 		goto reply;
 	}
-	if (i4.client_addr == NULL) {
+	if (i4.remote_client_addr == NULL) {
 		pipe_reply.status = NT_STATUS_INVALID_ADDRESS;
-		DEBUG(2, ("Missing client address\n"));
+		DEBUG(2, ("Missing remote client address\n"));
 		goto reply;
 	}
 
-	state->server_name = discard_const_p(char,
-					     talloc_move(state, &i4.server_name));
+	state->local_server_name = discard_const_p(char,
+						   talloc_move(state,
+							       &i4.local_server_name));
 	ret = tsocket_address_inet_from_strings(state, "ip",
-						i4.server_addr,
-						i4.server_port,
-						&state->server);
+						i4.local_server_addr,
+						i4.local_server_port,
+						&state->local_server_addr);
 	if (ret != 0) {
-		DEBUG(2, ("Invalid server address[%s:%u] - %s\n",
-			  i4.server_addr, i4.server_port,
+		DEBUG(2, ("Invalid local server address[%s:%u] - %s\n",
+			  i4.local_server_addr, i4.local_server_port,
 			  strerror(errno)));
 		pipe_reply.status = NT_STATUS_INVALID_ADDRESS;
 		goto reply;
 	}
 
-	state->client_name = discard_const_p(char,
-					     talloc_move(state, &i4.client_name));
+	state->remote_client_name = discard_const_p(char,
+						    talloc_move(state,
+								&i4.remote_client_name));
 	ret = tsocket_address_inet_from_strings(state, "ip",
-						i4.client_addr,
-						i4.client_port,
-						&state->client);
+						i4.remote_client_addr,
+						i4.remote_client_port,
+						&state->remote_client_addr);
 	if (ret != 0) {
-		DEBUG(2, ("Invalid client address[%s:%u] - %s\n",
-			  i4.client_addr, i4.client_port,
+		DEBUG(2, ("Invalid remote client address[%s:%u] - %s\n",
+			  i4.remote_client_addr, i4.remote_client_port,
 			  strerror(errno)));
 		pipe_reply.status = NT_STATUS_INVALID_ADDRESS;
 		goto reply;
@@ -1384,10 +1245,10 @@ int _tstream_npa_accept_existing_recv(struct tevent_req *req,
 				      int *perrno,
 				      TALLOC_CTX *mem_ctx,
 				      struct tstream_context **stream,
-				      struct tsocket_address **client,
-				      char **_client_name,
-				      struct tsocket_address **server,
-				      char **server_name,
+				      struct tsocket_address **remote_client_addr,
+				      char **_remote_client_name,
+				      struct tsocket_address **local_server_addr,
+				      char **local_server_name,
 				      struct auth_session_info_transport **session_info,
 				      const char *location)
 {
@@ -1398,7 +1259,7 @@ int _tstream_npa_accept_existing_recv(struct tevent_req *req,
 
 	ret = tsocket_simple_int_recv(req, perrno);
 	if (ret != 0) {
-		DEBUG(2, ("Failed to accept named pipe conection: %s\n",
+		DEBUG(2, ("Failed to accept named pipe connection: %s\n",
 			  strerror(*perrno)));
 		tevent_req_received(req);
 		return -1;
@@ -1412,7 +1273,7 @@ int _tstream_npa_accept_existing_recv(struct tevent_req *req,
 #else
 		*perrno = EINVAL;
 #endif
-		DEBUG(2, ("Failed to accept named pipe conection: %s => %s\n",
+		DEBUG(2, ("Failed to accept named pipe connection: %s => %s\n",
 			  nt_errstr(state->accept_status),
 			  strerror(*perrno)));
 		tevent_req_received(req);
@@ -1433,10 +1294,10 @@ int _tstream_npa_accept_existing_recv(struct tevent_req *req,
 	npas->unix_stream = state->plain;
 	npas->file_type = state->file_type;
 
-	*client = talloc_move(mem_ctx, &state->client);
-	*_client_name = talloc_move(mem_ctx, &state->client_name);
-	*server = talloc_move(mem_ctx, &state->server);
-	*server_name = talloc_move(mem_ctx, &state->server_name);
+	*remote_client_addr = talloc_move(mem_ctx, &state->remote_client_addr);
+	*_remote_client_name = talloc_move(mem_ctx, &state->remote_client_name);
+	*local_server_addr = talloc_move(mem_ctx, &state->local_server_addr);
+	*local_server_name = talloc_move(mem_ctx, &state->local_server_name);
 	*session_info = talloc_move(mem_ctx, &state->session_info);
 
 	tevent_req_received(req);

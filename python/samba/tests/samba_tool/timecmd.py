@@ -19,13 +19,14 @@ import os
 from time import localtime, strptime, mktime
 from samba.tests.samba_tool.base import SambaToolCmdTest
 
+
 class TimeCmdTestCase(SambaToolCmdTest):
     """Tests for samba-tool time subcommands"""
 
     def test_timeget(self):
         """Run time against the server and make sure it looks accurate"""
         (result, out, err) = self.runcmd("time", os.environ["SERVER"])
-        self.assertCmdSuccess(result, "Ensuring time ran successfully")
+        self.assertCmdSuccess(result, out, err, "Ensuring time ran successfully")
 
         timefmt = strptime(out, "%a %b %d %H:%M:%S %Y %Z\n")
         servertime = int(mktime(timefmt))
@@ -38,6 +39,6 @@ class TimeCmdTestCase(SambaToolCmdTest):
     def test_timefail(self):
         """Run time against a non-existent server, and make sure it fails"""
         (result, out, err) = self.runcmd("time", "notaserver")
-        self.assertEquals(result, -1, "check for result code")
-        self.assertTrue(err.strip().endswith("NT_STATUS_OBJECT_NAME_NOT_FOUND"), "ensure right error string")
-        self.assertEquals(out, "", "ensure no output returned")
+        self.assertEqual(result, -1, "check for result code")
+        self.assertNotEqual(err.strip().find("NT_STATUS_OBJECT_NAME_NOT_FOUND"), -1, "ensure right error string")
+        self.assertEqual(out, "", "ensure no output returned")

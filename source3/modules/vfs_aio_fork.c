@@ -26,9 +26,10 @@
 #include "smbd/globals.h"
 #include "lib/async_req/async_sock.h"
 #include "lib/util/tevent_unix.h"
-#include "lib/sys_rw.h"
-#include "lib/sys_rw_data.h"
-#include "lib/msghdr.h"
+#include "lib/util/sys_rw.h"
+#include "lib/util/sys_rw_data.h"
+#include "lib/util/msghdr.h"
+#include "smbprofile.h"
 
 #if !defined(HAVE_STRUCT_MSGHDR_MSG_CONTROL) && !defined(HAVE_STRUCT_MSGHDR_MSG_ACCRIGHTS)
 # error Can not pass file descriptors
@@ -40,13 +41,16 @@
 #define MAP_FILE 0
 #endif
 
+struct aio_child_list;
+
 struct aio_fork_config {
 	bool erratic_testing_mode;
+	struct aio_child_list *children;
 };
 
 struct mmap_area {
 	size_t size;
-	volatile void *ptr;
+	void *ptr;
 };
 
 static int mmap_area_destructor(struct mmap_area *area)
@@ -128,6 +132,7 @@ struct rw_cmd {
 struct rw_ret {
 	ssize_t size;
 	int ret_errno;
+	uint64_t duration;
 };
 
 struct aio_child_list;
@@ -146,11 +151,6 @@ struct aio_child_list {
 	struct aio_child *children;
 	struct tevent_timer *cleanup_event;
 };
-
-static void free_aio_children(void **p)
-{
-	TALLOC_FREE(*p);
-}
 
 static ssize_t read_fd(int fd, void *ptr, size_t nbytes, int *recvfd)
 {
@@ -256,7 +256,7 @@ static void aio_child_cleanup(struct tevent_context *event_ctx,
 		/*
 		 * Re-schedule the next cleanup round
 		 */
-		list->cleanup_event = tevent_add_timer(server_event_context(), list,
+		list->cleanup_event = tevent_add_timer(global_event_context(), list,
 						      timeval_add(&now, 30, 0),
 						      aio_child_cleanup, list);
 
@@ -265,19 +265,19 @@ static void aio_child_cleanup(struct tevent_context *event_ctx,
 
 static struct aio_child_list *init_aio_children(struct vfs_handle_struct *handle)
 {
-	struct aio_child_list *data = NULL;
+	struct aio_fork_config *config;
+	struct aio_child_list *children;
 
-	if (SMB_VFS_HANDLE_TEST_DATA(handle)) {
-		SMB_VFS_HANDLE_GET_DATA(handle, data, struct aio_child_list,
-					return NULL);
-	}
+	SMB_VFS_HANDLE_GET_DATA(handle, config, struct aio_fork_config,
+				return NULL);
 
-	if (data == NULL) {
-		data = talloc_zero(NULL, struct aio_child_list);
-		if (data == NULL) {
+	if (config->children == NULL) {
+		config->children = talloc_zero(config, struct aio_child_list);
+		if (config->children == NULL) {
 			return NULL;
 		}
 	}
+	children = config->children;
 
 	/*
 	 * Regardless of whether the child_list had been around or not, make
@@ -285,22 +285,18 @@ static struct aio_child_list *init_aio_children(struct vfs_handle_struct *handle
 	 * delete itself when it finds that no children are around anymore.
 	 */
 
-	if (data->cleanup_event == NULL) {
-		data->cleanup_event = tevent_add_timer(server_event_context(), data,
-						      timeval_current_ofs(30, 0),
-						      aio_child_cleanup, data);
-		if (data->cleanup_event == NULL) {
-			TALLOC_FREE(data);
+	if (children->cleanup_event == NULL) {
+		children->cleanup_event =
+			tevent_add_timer(global_event_context(), children,
+					 timeval_current_ofs(30, 0),
+					 aio_child_cleanup, children);
+		if (children->cleanup_event == NULL) {
+			TALLOC_FREE(config->children);
 			return NULL;
 		}
 	}
 
-	if (!SMB_VFS_HANDLE_TEST_DATA(handle)) {
-		SMB_VFS_HANDLE_SET_DATA(handle, data, free_aio_children,
-					struct aio_child_list, return False);
-	}
-
-	return data;
+	return children;
 }
 
 static void aio_child_loop(int sockfd, struct mmap_area *map)
@@ -310,6 +306,7 @@ static void aio_child_loop(int sockfd, struct mmap_area *map)
 		ssize_t ret;
 		struct rw_cmd cmd_struct;
 		struct rw_ret ret_struct;
+		struct timespec start, end;
 
 		ret = read_fd(sockfd, &cmd_struct, sizeof(cmd_struct), &fd);
 		if (ret != sizeof(cmd_struct)) {
@@ -334,16 +331,18 @@ static void aio_child_loop(int sockfd, struct mmap_area *map)
 			 * common parent state
 			 */
 			generate_random_buffer(&randval, sizeof(randval));
-			msecs = randval + 20;
+			msecs = (randval%20)+1;
 			DEBUG(10, ("delaying for %u msecs\n", msecs));
 			smb_msleep(msecs);
 		}
 
 		ZERO_STRUCT(ret_struct);
 
+		PROFILE_TIMESTAMP(&start);
+
 		switch (cmd_struct.cmd) {
 		case READ_CMD:
-			ret_struct.size = sys_pread(
+			ret_struct.size = sys_pread_full(
 				fd, discard_const(map->ptr), cmd_struct.n,
 				cmd_struct.offset);
 #if 0
@@ -354,7 +353,7 @@ static void aio_child_loop(int sockfd, struct mmap_area *map)
 #endif
 			break;
 		case WRITE_CMD:
-			ret_struct.size = sys_pwrite(
+			ret_struct.size = sys_pwrite_full(
 				fd, discard_const(map->ptr), cmd_struct.n,
 				cmd_struct.offset);
 			break;
@@ -366,6 +365,8 @@ static void aio_child_loop(int sockfd, struct mmap_area *map)
 			errno = EINVAL;
 		}
 
+		PROFILE_TIMESTAMP(&end);
+		ret_struct.duration = nsec_time_diff(&end, &start);
 		DEBUG(10, ("aio_child_loop: syscall returned %d\n",
 			   (int)ret_struct.size));
 
@@ -404,7 +405,7 @@ static int aio_child_destructor(struct aio_child *child)
 	 * closing the sockfd makes the child not return from recvmsg() on RHEL
 	 * 5.5 so instead force the child to exit by writing bad data to it
 	 */
-	write(child->sockfd, &c, sizeof(c));
+	sys_write_v(child->sockfd, &c, sizeof(c));
 	close(child->sockfd);
 	DLIST_REMOVE(child->list->children, child);
 	return 0;
@@ -533,8 +534,10 @@ static int get_idle_child(struct vfs_handle_struct *handle,
 
 struct aio_fork_pread_state {
 	struct aio_child *child;
+	size_t n;
+	void *data;
 	ssize_t ret;
-	int err;
+	struct vfs_aio_state vfs_aio_state;
 };
 
 static void aio_fork_pread_done(struct tevent_req *subreq);
@@ -561,6 +564,8 @@ static struct tevent_req *aio_fork_pread_send(struct vfs_handle_struct *handle,
 	if (req == NULL) {
 		return NULL;
 	}
+	state->n = n;
+	state->data = data;
 
 	if (n > 128*1024) {
 		/* TODO: support variable buffers */
@@ -628,32 +633,40 @@ static void aio_fork_pread_done(struct tevent_req *subreq)
 		return;
 	}
 
-	state->child->busy = false;
-
 	retbuf = (struct rw_ret *)buf;
 	state->ret = retbuf->size;
-	state->err = retbuf->ret_errno;
+	state->vfs_aio_state.error = retbuf->ret_errno;
+	state->vfs_aio_state.duration = retbuf->duration;
+
+	if ((size_t)state->ret > state->n) {
+		tevent_req_error(req, EIO);
+		state->child->busy = false;
+		return;
+	}
+	memcpy(state->data, state->child->map->ptr, state->ret);
+
+	state->child->busy = false;
+
 	tevent_req_done(req);
 }
 
-static ssize_t aio_fork_pread_recv(struct tevent_req *req, int *err)
+static ssize_t aio_fork_pread_recv(struct tevent_req *req,
+				   struct vfs_aio_state *vfs_aio_state)
 {
 	struct aio_fork_pread_state *state = tevent_req_data(
 		req, struct aio_fork_pread_state);
 
-	if (tevent_req_is_unix_error(req, err)) {
+	if (tevent_req_is_unix_error(req, &vfs_aio_state->error)) {
 		return -1;
 	}
-	if (state->ret == -1) {
-		*err = state->err;
-	}
+	*vfs_aio_state = state->vfs_aio_state;
 	return state->ret;
 }
 
 struct aio_fork_pwrite_state {
 	struct aio_child *child;
 	ssize_t ret;
-	int err;
+	struct vfs_aio_state vfs_aio_state;
 };
 
 static void aio_fork_pwrite_done(struct tevent_req *subreq);
@@ -689,6 +702,8 @@ static struct tevent_req *aio_fork_pwrite_send(
 		tevent_req_error(req, err);
 		return tevent_req_post(req, ev);
 	}
+
+	memcpy(state->child->map->ptr, data, n);
 
 	ZERO_STRUCT(cmd);
 	cmd.n = n;
@@ -748,28 +763,28 @@ static void aio_fork_pwrite_done(struct tevent_req *subreq)
 
 	retbuf = (struct rw_ret *)buf;
 	state->ret = retbuf->size;
-	state->err = retbuf->ret_errno;
+	state->vfs_aio_state.error = retbuf->ret_errno;
+	state->vfs_aio_state.duration = retbuf->duration;
 	tevent_req_done(req);
 }
 
-static ssize_t aio_fork_pwrite_recv(struct tevent_req *req, int *err)
+static ssize_t aio_fork_pwrite_recv(struct tevent_req *req,
+				    struct vfs_aio_state *vfs_aio_state)
 {
 	struct aio_fork_pwrite_state *state = tevent_req_data(
 		req, struct aio_fork_pwrite_state);
 
-	if (tevent_req_is_unix_error(req, err)) {
+	if (tevent_req_is_unix_error(req, &vfs_aio_state->error)) {
 		return -1;
 	}
-	if (state->ret == -1) {
-		*err = state->err;
-	}
+	*vfs_aio_state = state->vfs_aio_state;
 	return state->ret;
 }
 
 struct aio_fork_fsync_state {
 	struct aio_child *child;
 	ssize_t ret;
-	int err;
+	struct vfs_aio_state vfs_aio_state;
 };
 
 static void aio_fork_fsync_done(struct tevent_req *subreq);
@@ -856,21 +871,21 @@ static void aio_fork_fsync_done(struct tevent_req *subreq)
 
 	retbuf = (struct rw_ret *)buf;
 	state->ret = retbuf->size;
-	state->err = retbuf->ret_errno;
+	state->vfs_aio_state.error = retbuf->ret_errno;
+	state->vfs_aio_state.duration = retbuf->duration;
 	tevent_req_done(req);
 }
 
-static int aio_fork_fsync_recv(struct tevent_req *req, int *err)
+static int aio_fork_fsync_recv(struct tevent_req *req,
+			       struct vfs_aio_state *vfs_aio_state)
 {
 	struct aio_fork_fsync_state *state = tevent_req_data(
 		req, struct aio_fork_fsync_state);
 
-	if (tevent_req_is_unix_error(req, err)) {
+	if (tevent_req_is_unix_error(req, &vfs_aio_state->error)) {
 		return -1;
 	}
-	if (state->ret == -1) {
-		*err = state->err;
-	}
+	*vfs_aio_state = state->vfs_aio_state;
 	return state->ret;
 }
 
@@ -899,17 +914,6 @@ static int aio_fork_connect(vfs_handle_struct *handle, const char *service,
 				NULL, struct aio_fork_config,
 				return -1);
 
-	/*********************************************************************
-	 * How many threads to initialize ?
-	 * 100 per process seems insane as a default until you realize that
-	 * (a) Threads terminate after 1 second when idle.
-	 * (b) Throttling is done in SMB2 via the crediting algorithm.
-	 * (c) SMB1 clients are limited to max_mux (50) outstanding
-	 *     requests and Windows clients don't use this anyway.
-	 * Essentially we want this to be unlimited unless smb.conf
-	 * says different.
-	 *********************************************************************/
-	aio_pending_size = 100;
 	return 0;
 }
 
@@ -923,8 +927,8 @@ static struct vfs_fn_pointers vfs_aio_fork_fns = {
 	.fsync_recv_fn = aio_fork_fsync_recv,
 };
 
-NTSTATUS vfs_aio_fork_init(void);
-NTSTATUS vfs_aio_fork_init(void)
+static_decl_vfs;
+NTSTATUS vfs_aio_fork_init(TALLOC_CTX *ctx)
 {
 	return smb_register_vfs(SMB_VFS_INTERFACE_VERSION,
 				"aio_fork", &vfs_aio_fork_fns);

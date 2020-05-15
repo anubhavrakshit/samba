@@ -25,6 +25,10 @@
 bool init_systemtime(struct spoolss_Time *r,
 		     struct tm *unixtime);
 time_t spoolss_Time_to_time_t(const struct spoolss_Time *r);
+bool spoolss_timestr_to_NTTIME(const char *str,
+			       NTTIME *data);
+bool spoolss_driver_version_to_qword(const char *str,
+				     uint64_t *data);
 WERROR pull_spoolss_PrinterData(TALLOC_CTX *mem_ctx,
 				const DATA_BLOB *blob,
 				union spoolss_PrinterData *data,
@@ -43,5 +47,9 @@ WERROR spoolss_create_default_devmode(TALLOC_CTX *mem_ctx,
 
 WERROR spoolss_create_default_secdesc(TALLOC_CTX *mem_ctx,
 				      struct spoolss_security_descriptor **secdesc);
+const char *spoolss_get_short_filesys_environment(const char *environment);
+WERROR spoolss_init_spoolss_UserLevel1(TALLOC_CTX *mem_ctx,
+				       const char *username,
+				       struct spoolss_UserLevel1 *r);
 
 #endif /* _RPC_CLIENT_INIT_SPOOLSS_H_ */

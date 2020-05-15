@@ -41,15 +41,18 @@ static void print_data(TDB_DATA d)
 static int traverse_fn(TDB_CONTEXT *tdb, TDB_DATA key, TDB_DATA dbuf, void *state)
 {
 	printf("{\n");
-	printf("key(%d) = \"", (int)key.dsize);
+	printf("key(%zu) = \"", key.dsize);
 	print_data(key);
 	printf("\"\n");
-	printf("data(%d) = \"", (int)dbuf.dsize);
+	printf("data(%zu) = \"", dbuf.dsize);
 	print_data(dbuf);
 	printf("\"\n");
 	printf("}\n");
 	return 0;
 }
+
+static void log_stderr(struct tdb_context *tdb, enum tdb_debug_level level,
+		       const char *fmt, ...) PRINTF_ATTRIBUTE(3,4);
 
 static void log_stderr(struct tdb_context *tdb, enum tdb_debug_level level,
 		       const char *fmt, ...)
@@ -98,7 +101,9 @@ static int dump_tdb(const char *fname, const char *keyname, bool emergency)
 {
 	TDB_CONTEXT *tdb;
 	TDB_DATA key, value;
-	struct tdb_logging_context logfn = { log_stderr };
+	struct tdb_logging_context logfn = {
+		.log_fn = log_stderr,
+	};
 	int tdb_flags = TDB_DEFAULT;
 
 	/*

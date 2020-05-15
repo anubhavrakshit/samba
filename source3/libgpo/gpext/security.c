@@ -42,6 +42,8 @@
 #define GPTTMPL_SECTION_FILE_SECURITY		"File Security"
 #define GPTTMPL_SECTION_SERVICE_GENERAL_SETTING "Service General Setting"
 
+NTSTATUS gpext_security_init(TALLOC_CTX *mem_ctx);
+
 static TALLOC_CTX *ctx = NULL;
 
 struct gpttmpl_table {
@@ -62,7 +64,7 @@ struct gpttmpl_table {
 static NTSTATUS gpttmpl_parse_header(struct gp_inifile_context *ini_ctx,
 				     uint32_t *version_out)
 {
-	char *signature = NULL;
+	const char *signature = NULL;
 	NTSTATUS result;
 	int version;
 	bool is_unicode = false;
@@ -148,11 +150,11 @@ static NTSTATUS security_process_group_policy(TALLOC_CTX *mem_ctx,
 					      const struct GROUP_POLICY_OBJECT *deleted_gpo_list,
 					      const struct GROUP_POLICY_OBJECT *changed_gpo_list)
 {
-	NTSTATUS status;
+	NTSTATUS status = NT_STATUS_OK;
 	char *unix_path = NULL;
 	struct gp_inifile_context *ini_ctx = NULL;
 	const struct GROUP_POLICY_OBJECT *gpo;
-	char *gpo_cache_path = cache_path(GPO_CACHE_DIR);
+	char *gpo_cache_path = cache_path(talloc_tos(), GPO_CACHE_DIR);
 	if (gpo_cache_path == NULL) {
 		return NT_STATUS_NO_MEMORY;
 	}
@@ -277,7 +279,7 @@ static struct gp_extension_methods security_methods = {
 /****************************************************************
 ****************************************************************/
 
-NTSTATUS gpext_security_init(void)
+NTSTATUS gpext_security_init(TALLOC_CTX *mem_ctx)
 {
 	NTSTATUS status;
 

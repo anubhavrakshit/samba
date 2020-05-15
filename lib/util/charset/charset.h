@@ -112,6 +112,9 @@ size_t strlen_m(const char *s);
 size_t strlen_m_term(const char *s);
 size_t strlen_m_term_null(const char *s);
 char *alpha_strcpy(char *dest, const char *src, const char *other_safe_chars, size_t maxlength);
+char *talloc_alpha_strcpy(TALLOC_CTX *mem_ctx,
+			  const char *src,
+			  const char *other_safe_chars);
 void string_replace_m(char *s, char oldc, char newc);
 bool strcsequal(const char *s1,const char *s2);
 bool strequal_m(const char *s1, const char *s2);
@@ -164,25 +167,30 @@ bool convert_string_error(charset_t from, charset_t to,
 			  void *dest, size_t destlen,
 			  size_t *converted_size);
 
-extern struct smb_iconv_handle *global_iconv_handle;
 struct smb_iconv_handle *get_iconv_handle(void);
 struct smb_iconv_handle *get_iconv_testing_handle(TALLOC_CTX *mem_ctx, 
 						  const char *dos_charset, 
 						  const char *unix_charset,
 						  bool use_builtin_handlers);
+struct smb_iconv_handle *reinit_iconv_handle(TALLOC_CTX *mem_ctx,
+				const char *dos_charset,
+				const char *unix_charset);
+void free_iconv_handle(void);
+
 smb_iconv_t get_conv_handle(struct smb_iconv_handle *ic,
 			    charset_t from, charset_t to);
 const char *charset_name(struct smb_iconv_handle *ic, charset_t ch);
 
-codepoint_t next_codepoint_ext(const char *str, charset_t src_charset,
-			       size_t *size);
+codepoint_t next_codepoint_ext(const char *str, size_t len,
+			       charset_t src_charset, size_t *size);
 codepoint_t next_codepoint(const char *str, size_t *size);
 ssize_t push_codepoint(char *str, codepoint_t c);
 
 /* codepoints */
 codepoint_t next_codepoint_handle_ext(struct smb_iconv_handle *ic,
-			    const char *str, charset_t src_charset,
-			    size_t *size);
+				      const char *str, size_t len,
+				      charset_t src_charset,
+				      size_t *size);
 codepoint_t next_codepoint_handle(struct smb_iconv_handle *ic,
 			    const char *str, size_t *size);
 ssize_t push_codepoint_handle(struct smb_iconv_handle *ic,

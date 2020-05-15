@@ -24,6 +24,12 @@
 #include "secrets.h"
 #include "auth.h"
 
+/* Max DNS name is 253 + '\0' */
+#define MACHINE_NAME_SIZE 254
+
+static char local_machine[MACHINE_NAME_SIZE];
+static char remote_machine[MACHINE_NAME_SIZE];
+
 userdom_struct current_user_info;
 fstring remote_proto="UNKNOWN";
 
@@ -32,45 +38,25 @@ fstring remote_proto="UNKNOWN";
  * @param local_name the name we are being called
  * @param if this is the 'final' name for us, not be be changed again
  */
-
-static char *local_machine;
-
-void free_local_machine_name(void)
-{
-	TALLOC_FREE(local_machine);
-}
-
 bool set_local_machine_name(const char *local_name, bool perm)
 {
 	static bool already_perm = false;
-	char *tmp_local_machine = NULL;
-	size_t len;
+	char tmp[MACHINE_NAME_SIZE];
 
 	if (already_perm) {
 		return true;
 	}
 
-	tmp_local_machine = talloc_strdup(NULL, local_name);
-	if (!tmp_local_machine) {
-		return false;
-	}
-	trim_char(tmp_local_machine,' ',' ');
+	strlcpy(tmp, local_name, sizeof(tmp));
+	trim_char(tmp, ' ', ' ');
 
-	TALLOC_FREE(local_machine);
-	len = strlen(tmp_local_machine);
-	local_machine = (char *)TALLOC_ZERO(NULL, len+1);
-	if (!local_machine) {
-		TALLOC_FREE(tmp_local_machine);
-		return false;
-	}
-	/* alpha_strcpy includes the space for the terminating nul. */
-	alpha_strcpy(local_machine,tmp_local_machine,
-			SAFE_NETBIOS_CHARS,len+1);
+	alpha_strcpy(local_machine,
+		     tmp,
+		     SAFE_NETBIOS_CHARS,
+		     sizeof(local_machine) - 1);
 	if (!strlower_m(local_machine)) {
-		TALLOC_FREE(tmp_local_machine);
 		return false;
 	}
-	TALLOC_FREE(tmp_local_machine);
 
 	already_perm = perm;
 
@@ -79,7 +65,7 @@ bool set_local_machine_name(const char *local_name, bool perm)
 
 const char *get_local_machine_name(void)
 {
-	if (!local_machine || !*local_machine) {
+	if (local_machine[0] == '\0') {
 		return lp_netbios_name();
 	}
 
@@ -88,44 +74,29 @@ const char *get_local_machine_name(void)
 
 /**
  * Set the 'remote' machine name
+ *
  * @param remote_name the name our client wants to be called by
  * @param if this is the 'final' name for them, not be be changed again
  */
-
-static char *remote_machine;
-
 bool set_remote_machine_name(const char *remote_name, bool perm)
 {
 	static bool already_perm = False;
-	char *tmp_remote_machine;
-	size_t len;
+	char tmp[MACHINE_NAME_SIZE];
 
 	if (already_perm) {
 		return true;
 	}
 
-	tmp_remote_machine = talloc_strdup(NULL, remote_name);
-	if (!tmp_remote_machine) {
-		return false;
-	}
-	trim_char(tmp_remote_machine,' ',' ');
+	strlcpy(tmp, remote_name, sizeof(tmp));
+	trim_char(tmp, ' ', ' ');
 
-	TALLOC_FREE(remote_machine);
-	len = strlen(tmp_remote_machine);
-	remote_machine = (char *)TALLOC_ZERO(NULL, len+1);
-	if (!remote_machine) {
-		TALLOC_FREE(tmp_remote_machine);
-		return false;
-	}
-
-	/* alpha_strcpy includes the space for the terminating nul. */
-	alpha_strcpy(remote_machine,tmp_remote_machine,
-			SAFE_NETBIOS_CHARS,len+1);
+	alpha_strcpy(remote_machine,
+		     tmp,
+		     SAFE_NETBIOS_CHARS,
+		     sizeof(remote_machine) - 1);
 	if (!strlower_m(remote_machine)) {
-		TALLOC_FREE(tmp_remote_machine);
 		return false;
 	}
-	TALLOC_FREE(tmp_remote_machine);
 
 	already_perm = perm;
 
@@ -134,70 +105,7 @@ bool set_remote_machine_name(const char *remote_name, bool perm)
 
 const char *get_remote_machine_name(void)
 {
-	return remote_machine ? remote_machine : "";
-}
-
-/*******************************************************************
- Setup the string used by %U substitution.
-********************************************************************/
-
-static char *smb_user_name;
-
-void sub_set_smb_name(const char *name)
-{
-	char *tmp;
-	size_t len;
-	bool is_machine_account = false;
-
-	/* don't let anonymous logins override the name */
-	if (!name || !*name) {
-		return;
-	}
-
-	tmp = talloc_strdup(NULL, name);
-	if (!tmp) {
-		return;
-	}
-	trim_char(tmp, ' ', ' ');
-	if (!strlower_m(tmp)) {
-		TALLOC_FREE(tmp);
-		return;
-	}
-
-	len = strlen(tmp);
-
-	if (len == 0) {
-		TALLOC_FREE(tmp);
-		return;
-	}
-
-	/* long story but here goes....we have to allow usernames
-	   ending in '$' as they are valid machine account names.
-	   So check for a machine account and re-add the '$'
-	   at the end after the call to alpha_strcpy().   --jerry  */
-
-	if (tmp[len-1] == '$') {
-		is_machine_account = True;
-	}
-
-	TALLOC_FREE(smb_user_name);
-	smb_user_name = (char *)TALLOC_ZERO(NULL, len+1);
-	if (!smb_user_name) {
-		TALLOC_FREE(tmp);
-		return;
-	}
-
-	/* alpha_strcpy includes the space for the terminating nul. */
-	alpha_strcpy(smb_user_name, tmp,
-			SAFE_NETBIOS_CHARS,
-			len+1);
-
-	TALLOC_FREE(tmp);
-
-	if (is_machine_account) {
-		len = strlen(smb_user_name);
-		smb_user_name[len-1] = '$';
-	}
+	return remote_machine;
 }
 
 static char sub_peeraddr[INET6_ADDRSTRLEN];
@@ -232,11 +140,6 @@ void sub_set_socket_ids(const char *peeraddr, const char *peername,
 	strlcpy(sub_sockaddr, sockaddr, sizeof(sub_sockaddr));
 }
 
-static const char *get_smb_user_name(void)
-{
-	return smb_user_name ? smb_user_name : "";
-}
-
 /*******************************************************************
  Setup the strings used by substitutions. Called per packet. Ensure
  %U name is set correctly also.
@@ -247,14 +150,24 @@ static const char *get_smb_user_name(void)
 void set_current_user_info(const char *smb_name, const char *unix_name,
 			   const char *domain)
 {
+	static const void *last_smb_name;
+	static const void *last_unix_name;
+	static const void *last_domain;
+
+	if (likely(last_smb_name == smb_name &&
+	    last_unix_name == unix_name &&
+	    last_domain == domain))
+	{
+		return;
+	}
+
 	fstrcpy(current_user_info.smb_name, smb_name);
 	fstrcpy(current_user_info.unix_name, unix_name);
 	fstrcpy(current_user_info.domain, domain);
 
-	/* The following is safe as current_user_info.smb_name
-	 * has already been sanitised in register_existing_vuid. */
-
-	sub_set_smb_name(current_user_info.smb_name);
+	last_smb_name = smb_name;
+	last_unix_name = unix_name;
+	last_domain = domain;
 }
 
 /*******************************************************************
@@ -263,10 +176,6 @@ void set_current_user_info(const char *smb_name, const char *unix_name,
 
 const char *get_current_username(void)
 {
-	if (current_user_info.smb_name[0] == '\0' ) {
-		return get_smb_user_name();
-	}
-
 	return current_user_info.smb_name;
 }
 
@@ -454,9 +363,23 @@ void standard_sub_basic(const char *smb_name, const char *domain_name,
 	TALLOC_FREE( s );
 }
 
+/*
+ * Limit addresses to hexalpha charactes and underscore, safe for path
+ * components for Windows clients.
+ */
+static void make_address_pathsafe(char *addr)
+{
+	while(addr && *addr) {
+		if(!isxdigit(*addr)) {
+			*addr = '_';
+		}
+		++addr;
+	}
+}
+
 /****************************************************************************
  Do some standard substitutions in a string.
- This function will return an talloced string that has to be freed.
+ This function will return a talloced string that has to be freed.
 ****************************************************************************/
 
 char *talloc_sub_basic(TALLOC_CTX *mem_ctx,
@@ -484,7 +407,7 @@ char *talloc_sub_basic(TALLOC_CTX *mem_ctx,
 
 	tmp_ctx = talloc_stackframe();
 
-	for (b = s = a_string; (p = strchr_m(s, '%')); s = a_string + (p - b)) {
+	for (s = a_string; (p = strchr_m(s, '%')); s = a_string + (p - b)) {
 
 		r = NULL;
 		b = a_string;
@@ -499,13 +422,18 @@ char *talloc_sub_basic(TALLOC_CTX *mem_ctx,
 			break;
 		case 'G' : {
 			struct passwd *pass;
+			bool is_domain_name = false;
+			const char *sep = lp_winbind_separator();
 
-			if (domain_name != NULL && domain_name[0] != '\0') {
+			if (domain_name != NULL && domain_name[0] != '\0' &&
+			    (lp_security() == SEC_ADS ||
+			     lp_security() == SEC_DOMAIN)) {
 				r = talloc_asprintf(tmp_ctx,
 						    "%s%c%s",
 						    domain_name,
-						    *lp_winbind_separator(),
+						    *sep,
 						    smb_name);
+				is_domain_name = true;
 			} else {
 				r = talloc_strdup(tmp_ctx, smb_name);
 			}
@@ -515,9 +443,19 @@ char *talloc_sub_basic(TALLOC_CTX *mem_ctx,
 
 			pass = Get_Pwnam_alloc(tmp_ctx, r);
 			if (pass != NULL) {
-				a_string = realloc_string_sub(
-					a_string, "%G",
-					gidtoname(pass->pw_gid));
+				char *group_name;
+
+				group_name = gidtoname(pass->pw_gid);
+				if (is_domain_name) {
+					char *group_sep;
+					group_sep = strchr_m(group_name, *sep);
+					if (group_sep != NULL) {
+						group_name = group_sep + 1;
+					}
+				}
+				a_string = realloc_string_sub(a_string,
+							      "%G",
+							      group_name);
 			}
 			TALLOC_FREE(pass);
 			break;
@@ -535,11 +473,25 @@ char *talloc_sub_basic(TALLOC_CTX *mem_ctx,
 				sub_peeraddr[0] ? sub_peeraddr : "0.0.0.0");
 			break;
 		}
+		case 'J' : {
+			r = talloc_strdup(tmp_ctx,
+				sub_peeraddr[0] ? sub_peeraddr : "0.0.0.0");
+			make_address_pathsafe(r);
+			a_string = realloc_string_sub(a_string, "%J", r);
+			break;
+		}
 		case 'i': 
 			a_string = realloc_string_sub(
 				a_string, "%i",
 				sub_sockaddr[0] ? sub_sockaddr : "0.0.0.0");
 			break;
+		case 'j' : {
+			r = talloc_strdup(tmp_ctx,
+				sub_sockaddr[0] ? sub_sockaddr : "0.0.0.0");
+			make_address_pathsafe(r);
+			a_string = realloc_string_sub(a_string, "%j", r);
+			break;
+		}
 		case 'L' : 
 			if ( strncasecmp_m(p, "%LOGONSERVER%", strlen("%LOGONSERVER%")) == 0 ) {
 				break;
@@ -563,6 +515,10 @@ char *talloc_sub_basic(TALLOC_CTX *mem_ctx,
 		case 'T' :
 			a_string = realloc_string_sub(a_string, "%T", current_timestring(tmp_ctx, False));
 			break;
+		case 't' :
+			a_string = realloc_string_sub(a_string, "%t",
+						      current_minimal_timestring(tmp_ctx, False));
+			break;
 		case 'a' :
 			a_string = realloc_string_sub(a_string, "%a",
 					get_remote_arch_str());
@@ -576,9 +532,7 @@ char *talloc_sub_basic(TALLOC_CTX *mem_ctx,
 			break;
 		case 'm' :
 			a_string = realloc_string_sub(a_string, "%m",
-						      remote_machine
-						      ? remote_machine
-						      : "");
+						      remote_machine);
 			break;
 		case 'v' :
 			a_string = realloc_string_sub(a_string, "%v", samba_version_string());
@@ -644,7 +598,7 @@ char *talloc_sub_specified(TALLOC_CTX *mem_ctx,
 		goto done;
 	}
 
-	for (b = s = a_string; (p = strchr_m(s, '%')); s = a_string + (p - b)) {
+	for (s = a_string; (p = strchr_m(s, '%')); s = a_string + (p - b)) {
 
 		b = a_string;
 
@@ -733,20 +687,18 @@ char *talloc_sub_advanced(TALLOC_CTX *ctx,
 			const char *user,
 			const char *connectpath,
 			gid_t gid,
-			const char *smb_name,
-			const char *domain_name,
 			const char *str)
 {
-	char *a_string, *ret_string;
+	char *a_string;
 	char *b, *p, *s;
 
 	a_string = talloc_strdup(talloc_tos(), str);
 	if (a_string == NULL) {
-		DEBUG(0, ("talloc_sub_advanced: Out of memory!\n"));
+		DEBUG(0, ("talloc_sub_advanced_only: Out of memory!\n"));
 		return NULL;
 	}
 
-	for (b = s = a_string; (p = strchr_m(s, '%')); s = a_string + (p - b)) {
+	for (s = a_string; (p = strchr_m(s, '%')); s = a_string + (p - b)) {
 
 		b = a_string;
 
@@ -796,52 +748,27 @@ char *talloc_sub_advanced(TALLOC_CTX *ctx,
 		}
 	}
 
+	return a_string;
+}
+
+char *talloc_sub_full(TALLOC_CTX *ctx,
+			const char *servicename,
+			const char *user,
+			const char *connectpath,
+			gid_t gid,
+			const char *smb_name,
+			const char *domain_name,
+			const char *str)
+{
+	char *a_string, *ret_string;
+
+	a_string = talloc_sub_advanced(ctx, servicename, user, connectpath,
+				       gid, str);
+	if (a_string == NULL) {
+		return NULL;
+	}
+
 	ret_string = talloc_sub_basic(ctx, smb_name, domain_name, a_string);
 	TALLOC_FREE(a_string);
 	return ret_string;
-}
-
-void standard_sub_advanced(const char *servicename, const char *user,
-			   const char *connectpath, gid_t gid,
-			   const char *smb_name, const char *domain_name,
-			   char *str, size_t len)
-{
-	char *s = talloc_sub_advanced(talloc_tos(),
-				servicename, user, connectpath,
-				gid, smb_name, domain_name, str);
-
-	if (!s) {
-		return;
-	}
-	strlcpy( str, s, len );
-	TALLOC_FREE( s );
-}
-
-/******************************************************************************
- version of standard_sub_basic() for string lists; uses talloc_sub_basic()
- for the work
- *****************************************************************************/
-
-bool str_list_sub_basic( char **list, const char *smb_name,
-			 const char *domain_name )
-{
-	TALLOC_CTX *ctx = list;
-	char *s, *tmpstr;
-
-	while ( *list ) {
-		s = *list;
-		tmpstr = talloc_sub_basic(ctx, smb_name, domain_name, s);
-		if ( !tmpstr ) {
-			DEBUG(0,("str_list_sub_basic: "
-				"talloc_sub_basic() return NULL!\n"));
-			return false;
-		}
-
-		TALLOC_FREE(*list);
-		*list = tmpstr;
-
-		list++;
-	}
-
-	return true;
 }

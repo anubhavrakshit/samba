@@ -29,6 +29,7 @@
 #include "auth/auth.h"
 #include "param/param.h"
 #include "dsdb/samdb/samdb.h"
+#include "dsdb/common/util.h"
 #include "ldb_wrap.h"
 #include "popt.h"
 
@@ -40,7 +41,7 @@
 static unsigned calculate_popt_array_length(struct poptOption *opts)
 {
 	unsigned i;
-	struct poptOption zero_opt = { NULL };
+	struct poptOption zero_opt = { 0 };
 	for (i=0; memcmp(&zero_opt, &opts[i], sizeof(zero_opt)) != 0; i++) ;
 	return i;
 }
@@ -50,7 +51,7 @@ static struct poptOption cmdline_extensions[] = {
 	POPT_COMMON_CREDENTIALS
 	POPT_COMMON_CONNECTION
 	POPT_COMMON_VERSION
-	{ NULL }
+	{0}
 };
 
 /*
@@ -84,10 +85,15 @@ static int extensions_hook(struct ldb_context *ldb, enum ldb_module_hook_type t)
 		}
 		gensec_init();
 
-		if (ldb_set_opaque(ldb, "sessionInfo", system_session(cmdline_lp_ctx))) {
+		if (ldb_set_opaque(
+			ldb,
+			DSDB_SESSION_INFO,
+			system_session(cmdline_lp_ctx))) {
+
 			return ldb_operr(ldb);
 		}
-		if (ldb_set_opaque(ldb, "credentials", cmdline_credentials)) {
+		if (ldb_set_opaque(ldb, "credentials",
+				popt_get_cmdline_credentials())) {
 			return ldb_operr(ldb);
 		}
 		if (ldb_set_opaque(ldb, "loadparm", cmdline_lp_ctx)) {

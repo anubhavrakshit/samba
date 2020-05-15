@@ -81,11 +81,9 @@ static NTSTATUS ip_connect_complete(struct socket_context *sock, uint32_t flags)
 		return map_nt_error_from_unix_common(error);
 	}
 
-	if (!(flags & SOCKET_FLAG_BLOCK)) {
-		ret = set_blocking(sock->fd, false);
-		if (ret == -1) {
-			return map_nt_error_from_unix_common(errno);
-		}
+	ret = set_blocking(sock->fd, false);
+	if (ret == -1) {
+		return map_nt_error_from_unix_common(errno);
 	}
 
 	sock->state = SOCKET_STATE_CLIENT_CONNECTED;
@@ -201,11 +199,9 @@ static NTSTATUS ipv4_listen(struct socket_context *sock,
 		}
 	}
 
-	if (!(flags & SOCKET_FLAG_BLOCK)) {
-		ret = set_blocking(sock->fd, false);
-		if (ret == -1) {
-			return map_nt_error_from_unix_common(errno);
-		}
+	ret = set_blocking(sock->fd, false);
+	if (ret == -1) {
+		return map_nt_error_from_unix_common(errno);
 	}
 
 	sock->state= SOCKET_STATE_SERVER_LISTEN;
@@ -217,7 +213,7 @@ static NTSTATUS ipv4_accept(struct socket_context *sock, struct socket_context *
 {
 	struct sockaddr_in cli_addr;
 	socklen_t cli_addr_len = sizeof(cli_addr);
-	int new_fd;
+	int new_fd, ret;
 
 	if (sock->type != SOCKET_TYPE_STREAM) {
 		return NT_STATUS_INVALID_PARAMETER;
@@ -228,13 +224,14 @@ static NTSTATUS ipv4_accept(struct socket_context *sock, struct socket_context *
 		return map_nt_error_from_unix_common(errno);
 	}
 
-	if (!(sock->flags & SOCKET_FLAG_BLOCK)) {
-		int ret = set_blocking(new_fd, false);
-		if (ret == -1) {
-			close(new_fd);
-			return map_nt_error_from_unix_common(errno);
-		}
+	ret = set_blocking(new_fd, false);
+	if (ret == -1) {
+		close(new_fd);
+		return map_nt_error_from_unix_common(errno);
 	}
+
+	smb_set_close_on_exec(new_fd);
+
 
 	/* TODO: we could add a 'accept_check' hook here
 	 *	 which get the black/white lists via socket_set_accept_filter()
@@ -314,7 +311,8 @@ static NTSTATUS ipv4_recvfrom(struct socket_context *sock, void *buf,
 	if (gotlen == 0) {
 		talloc_free(src);
 		return NT_STATUS_END_OF_FILE;
-	} else if (gotlen == -1) {
+	}
+	if (gotlen == -1) {
 		talloc_free(src);
 		return map_nt_error_from_unix_common(errno);
 	}
@@ -554,7 +552,7 @@ _PUBLIC_ const struct socket_ops *socket_ipv4_ops(enum socket_type type)
 	return &ipv4_ops;
 }
 
-#if HAVE_IPV6
+#ifdef HAVE_IPV6
 
 static struct in6_addr interpret_addr6(const char *name)
 {
@@ -728,11 +726,9 @@ static NTSTATUS ipv6_listen(struct socket_context *sock,
 		}
 	}
 
-	if (!(flags & SOCKET_FLAG_BLOCK)) {
-		ret = set_blocking(sock->fd, false);
-		if (ret == -1) {
-			return map_nt_error_from_unix_common(errno);
-		}
+	ret = set_blocking(sock->fd, false);
+	if (ret == -1) {
+		return map_nt_error_from_unix_common(errno);
 	}
 
 	sock->state= SOCKET_STATE_SERVER_LISTEN;
@@ -744,7 +740,7 @@ static NTSTATUS ipv6_tcp_accept(struct socket_context *sock, struct socket_conte
 {
 	struct sockaddr_in6 cli_addr;
 	socklen_t cli_addr_len = sizeof(cli_addr);
-	int new_fd;
+	int new_fd, ret;
 	
 	if (sock->type != SOCKET_TYPE_STREAM) {
 		return NT_STATUS_INVALID_PARAMETER;
@@ -755,13 +751,12 @@ static NTSTATUS ipv6_tcp_accept(struct socket_context *sock, struct socket_conte
 		return map_nt_error_from_unix_common(errno);
 	}
 
-	if (!(sock->flags & SOCKET_FLAG_BLOCK)) {
-		int ret = set_blocking(new_fd, false);
-		if (ret == -1) {
-			close(new_fd);
-			return map_nt_error_from_unix_common(errno);
-		}
+	ret = set_blocking(new_fd, false);
+	if (ret == -1) {
+		close(new_fd);
+		return map_nt_error_from_unix_common(errno);
 	}
+	smb_set_close_on_exec(new_fd);
 
 	/* TODO: we could add a 'accept_check' hook here
 	 *	 which get the black/white lists via socket_set_accept_filter()
@@ -861,7 +856,8 @@ static NTSTATUS ipv6_sendto(struct socket_context *sock,
 		
 		ZERO_STRUCT(srv_addr);
 		addr                     = interpret_addr6(dest_addr->addr);
-		if (addr.s6_addr == 0) {
+		if (memcmp(&addr.s6_addr, &in6addr_any,
+			   sizeof(addr.s6_addr)) == 0) {
 			return NT_STATUS_HOST_UNREACHABLE;
 		}
 		srv_addr.sin6_addr = addr;
@@ -994,7 +990,7 @@ static struct socket_address *ipv6_tcp_get_my_addr(struct socket_context *sock, 
 		return NULL;
 	}
 	
-	local->addr = talloc_strdup(mem_ctx, addrstring);
+	local->addr = talloc_strdup(local, addrstring);
 	if (!local->addr) {
 		talloc_free(local);
 		return NULL;

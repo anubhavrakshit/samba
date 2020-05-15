@@ -1063,8 +1063,12 @@ sub check_tar {
     my $i = Archive::Tar->iter($tar, 1, {md5 => 1});
     while (my $f = $i->()) {
         if ($f->has_content) {
-            $total++;
             my $p = $f->full_path;
+
+	    # we skip pseudo files of Pax format archives
+            next if ($p =~ m/\/PaxHeader/);
+
+            $total++;
             $p =~ s{^\./+}{};
 
             # file that shouldn't be there
@@ -1507,7 +1511,7 @@ sub DESTROY {
 
 =head4 C<< File::walk( sub { ... }, @files) >>
 
-Iterate on file hierachy in C<@files> and return accumulated results.
+Iterate on file hierarchy in C<@files> and return accumulated results.
 
 Use C<$_> in the sub to access the current C<File>.
 

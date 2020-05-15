@@ -30,6 +30,13 @@ required_result ()
     fi
 }
 
+required_error ()
+{
+	rc=$(errcode $1)
+	shift
+	required_result $rc "$@"
+}
+
 ok ()
 {
     required_result 0 "$@"
@@ -67,7 +74,7 @@ result_print ()
     _out="$2"
     _rc="$3"
 
-    if "$TEST_VERBOSE" || ! $_passed ; then
+    if "$CTDB_TEST_VERBOSE" || ! $_passed ; then
 	extra_header
 
 cat <<EOF
@@ -75,7 +82,8 @@ cat <<EOF
 Output (Exit status: ${_rc}):
 --------------------------------------------------
 EOF
-	echo "$_out" | cat $TEST_CAT_RESULTS_OPTS
+	# Avoid echo, which might expand unintentional escapes
+	printf '%s\n' "$_out" | result_filter | cat $CTDB_TEST_CAT_RESULTS_OPTS
     fi
 
     if ! $_passed ; then
@@ -84,14 +92,17 @@ EOF
 Required output (Exit status: ${required_rc}):
 --------------------------------------------------
 EOF
-	echo "$required_output" | cat $TEST_CAT_RESULTS_OPTS
+	# Avoid echo, which might expand unintentional escapes
+	printf '%s\n' "$required_output" | cat $CTDB_TEST_CAT_RESULTS_OPTS
 
-	if $TEST_DIFF_RESULTS ; then
+	if $CTDB_TEST_DIFF_RESULTS ; then
 	    _outr=$(mktemp)
-	    echo "$required_output" >"$_outr"
+	    # Avoid echo, which might expand unintentional escapes
+	    printf '%s\n' "$required_output" >"$_outr"
 
 	    _outf=$(mktemp)
-	    echo "$_fout" >"$_outf"
+	    # Avoid echo, which might expand unintentional escapes
+	    printf '%s\n' "$_fout" >"$_outf"
 
 	    cat <<EOF
 --------------------------------------------------
@@ -108,7 +119,7 @@ result_footer ()
 {
     _passed="$1"
 
-    if "$TEST_VERBOSE" || ! $_passed ; then
+    if "$CTDB_TEST_VERBOSE" || ! $_passed ; then
 	extra_footer
     fi
 
@@ -143,7 +154,8 @@ result_check ()
 {
     _rc=$?
 
-    _fout=$(echo "$_out" | result_filter)
+    # Avoid echo, which might expand unintentional escapes
+    _fout=$(printf '%s\n' "$_out" | result_filter)
 
     if [ "$_fout" = "$required_output" -a $_rc = $required_rc ] ; then
 	_passed=true
@@ -184,7 +196,7 @@ unit_test ()
     test_header "$@"
 
     _wrapper="$VALGRIND"
-    if $TEST_COMMAND_TRACE ; then
+    if $CTDB_TEST_COMMAND_TRACE ; then
 	_wrapper="strace"
     fi
     _out=$($_wrapper "$@" 2>&1)
@@ -198,13 +210,23 @@ script_test ()
     test_header "$@"
 
     _shell=""
-    if ${TEST_COMMAND_TRACE} ; then
+    if ${CTDB_TEST_COMMAND_TRACE} ; then
 	_shell="sh -x"
     else
 	_shell="sh"
     fi
 
     _out=$($_shell "$@" 2>&1)
+
+    result_check || exit $?
+}
+
+# Simple test harness for running tests without tracing
+unit_test_notrace ()
+{
+    test_header "$@"
+
+    _out=$("$@" 2>&1)
 
     result_check || exit $?
 }
@@ -218,7 +240,7 @@ test_cleanup ()
 
 trap 'eval $test_cleanup_hooks' 0
 
-local="${TEST_SUBDIR}/scripts/local.sh"
+local="${CTDB_TEST_SUITE_DIR}/scripts/local.sh"
 if [ -r "$local" ] ; then
     . "$local"
 fi

@@ -37,9 +37,7 @@ struct idmap_rid_context {
 
 static NTSTATUS idmap_rid_initialize(struct idmap_domain *dom)
 {
-	NTSTATUS ret;
 	struct idmap_rid_context *ctx;
-	char *config_option = NULL;
 
 	ctx = talloc_zero(dom, struct idmap_rid_context);
 	if (ctx == NULL) {
@@ -47,28 +45,15 @@ static NTSTATUS idmap_rid_initialize(struct idmap_domain *dom)
 		return NT_STATUS_NO_MEMORY;
 	}
 
-	config_option = talloc_asprintf(ctx, "idmap config %s", dom->name);
-	if ( ! config_option) {
-		DEBUG(0, ("Out of memory!\n"));
-		ret = NT_STATUS_NO_MEMORY;
-		goto failed;
-	}
-
-	ctx->base_rid = lp_parm_int(-1, config_option, "base_rid", 0);
+	ctx->base_rid = idmap_config_int(dom->name, "base_rid", 0);
 
 	dom->private_data = ctx;
 
-	talloc_free(config_option);
 	return NT_STATUS_OK;
-
-failed:
-	talloc_free(ctx);
-	return ret;
 }
 
 static NTSTATUS idmap_rid_id_to_sid(struct idmap_domain *dom, struct id_map *map)
 {
-	struct winbindd_domain *domain;
 	struct idmap_rid_context *ctx;
 
 	ctx = talloc_get_type(dom->private_data, struct idmap_rid_context);
@@ -80,12 +65,13 @@ static NTSTATUS idmap_rid_id_to_sid(struct idmap_domain *dom, struct id_map *map
 		return NT_STATUS_NONE_MAPPED;
 	}
 
-	domain = find_domain_from_name_noinit(dom->name);
-	if (domain == NULL ) {
-		return NT_STATUS_NO_SUCH_DOMAIN;
+	if (is_null_sid(&dom->dom_sid)) {
+		DBG_INFO("idmap domain '%s' without SID\n", dom->name);
+		return NT_STATUS_NONE_MAPPED;
 	}
 
-	sid_compose(map->sid, &domain->sid, map->xid.id - dom->low_id + ctx->base_rid);
+	sid_compose(map->sid, &dom->dom_sid,
+		    map->xid.id - dom->low_id + ctx->base_rid);
 
 	map->status = ID_MAPPED;
 	map->xid.type = ID_TYPE_BOTH;
@@ -94,7 +80,7 @@ static NTSTATUS idmap_rid_id_to_sid(struct idmap_domain *dom, struct id_map *map
 }
 
 /**********************************
- Single sid to id lookup function. 
+ Single sid to id lookup function.
 **********************************/
 
 static NTSTATUS idmap_rid_sid_to_id(struct idmap_domain *dom, struct id_map *map)
@@ -123,7 +109,7 @@ static NTSTATUS idmap_rid_sid_to_id(struct idmap_domain *dom, struct id_map *map
 }
 
 /**********************************
- lookup a set of unix ids. 
+ lookup a set of unix ids.
 **********************************/
 
 static NTSTATUS idmap_rid_unixids_to_sids(struct idmap_domain *dom, struct id_map **ids)
@@ -143,7 +129,9 @@ static NTSTATUS idmap_rid_unixids_to_sids(struct idmap_domain *dom, struct id_ma
 		if (( ! NT_STATUS_IS_OK(ret)) &&
 		    ( ! NT_STATUS_EQUAL(ret, NT_STATUS_NONE_MAPPED))) {
 			/* some fatal error occurred, log it */
-			DEBUG(3, ("Unexpected error resolving an ID (%d)\n", ids[i]->xid.id));
+			DBG_NOTICE("Unexpected error resolving an ID "
+				   "(%d): %s\n", ids[i]->xid.id,
+				   nt_errstr(ret));
 		}
 	}
 
@@ -151,7 +139,7 @@ static NTSTATUS idmap_rid_unixids_to_sids(struct idmap_domain *dom, struct id_ma
 }
 
 /**********************************
- lookup a set of sids. 
+ lookup a set of sids.
 **********************************/
 
 static NTSTATUS idmap_rid_sids_to_unixids(struct idmap_domain *dom, struct id_map **ids)
@@ -170,9 +158,10 @@ static NTSTATUS idmap_rid_sids_to_unixids(struct idmap_domain *dom, struct id_ma
 
 		if (( ! NT_STATUS_IS_OK(ret)) &&
 		    ( ! NT_STATUS_EQUAL(ret, NT_STATUS_NONE_MAPPED))) {
+			struct dom_sid_buf buf;
 			/* some fatal error occurred, log it */
 			DEBUG(3, ("Unexpected error resolving a SID (%s)\n",
-				  sid_string_dbg(ids[i]->sid)));
+				  dom_sid_str_buf(ids[i]->sid, &buf)));
 		}
 	}
 
@@ -186,7 +175,7 @@ static struct idmap_methods rid_methods = {
 };
 
 static_decl_idmap;
-NTSTATUS idmap_rid_init(void)
+NTSTATUS idmap_rid_init(TALLOC_CTX *ctx)
 {
 	return smb_register_idmap(SMB_IDMAP_INTERFACE_VERSION, "rid", &rid_methods);
 }

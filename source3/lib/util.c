@@ -24,14 +24,19 @@
 #include "includes.h"
 #include "system/passwd.h"
 #include "system/filesys.h"
+#include "lib/util/server_id.h"
 #include "util_tdb.h"
 #include "ctdbd_conn.h"
 #include "../lib/util/util_pw.h"
 #include "messages.h"
+#include "lib/messaging/messages_dgm.h"
 #include "libcli/security/security.h"
 #include "serverid.h"
-#include "lib/sys_rw.h"
-#include "lib/sys_rw_data.h"
+#include "lib/util/sys_rw.h"
+#include "lib/util/sys_rw_data.h"
+#include "lib/util/util_process.h"
+#include "lib/dbwrap/dbwrap_ctdb.h"
+#include "lib/gencache.h"
 
 #ifdef HAVE_SYS_PRCTL_H
 #include <sys/prctl.h>
@@ -41,6 +46,17 @@
 #define MAX_ALLOC_SIZE (1024*1024*256)
 
 #if (defined(HAVE_NETGROUP) && defined (WITH_AUTOMOUNT))
+/* rpc/xdr.h uses TRUE and FALSE */
+#ifdef TRUE
+#undef TRUE
+#endif
+
+#ifdef FALSE
+#undef FALSE
+#endif
+
+#include "system/nis.h"
+
 #ifdef WITH_NISPLUS_HOME
 #ifdef BROKEN_NISPLUS_INCLUDE_FILES
 /*
@@ -423,6 +439,7 @@ static void reinit_after_fork_pipe_handler(struct tevent_context *ev,
 		 * we have reached EOF on stdin, which means the
 		 * parent has exited. Shutdown the server
 		 */
+		TALLOC_FREE(fde);
 		(void)kill(getpid(), SIGTERM);
 	}
 }
@@ -430,20 +447,23 @@ static void reinit_after_fork_pipe_handler(struct tevent_context *ev,
 
 NTSTATUS reinit_after_fork(struct messaging_context *msg_ctx,
 			   struct tevent_context *ev_ctx,
-			   bool parent_longlived)
+			   bool parent_longlived,
+			   const char *comment)
 {
 	NTSTATUS status = NT_STATUS_OK;
+	int ret;
+
+	/*
+	 * The main process thread should never
+	 * allow per_thread_cwd_enable() to be
+	 * called.
+	 */
+	per_thread_cwd_disable();
 
 	if (reinit_after_fork_pipe[1] != -1) {
 		close(reinit_after_fork_pipe[1]);
 		reinit_after_fork_pipe[1] = -1;
 	}
-
-	/* Reset the state of the random
-	 * number generation system, so
-	 * children do not get the same random
-	 * numbers as each other */
-	set_need_random_reseed();
 
 	/* tdb needs special fork handling */
 	if (tdb_reopen_all(parent_longlived ? 1 : 0) != 0) {
@@ -480,7 +500,22 @@ NTSTATUS reinit_after_fork(struct messaging_context *msg_ctx,
 			DEBUG(0,("messaging_reinit() failed: %s\n",
 				 nt_errstr(status)));
 		}
+
+		if (lp_clustering()) {
+			ret = ctdb_async_ctx_reinit(
+				NULL, messaging_tevent_context(msg_ctx));
+			if (ret != 0) {
+				DBG_ERR("db_ctdb_async_ctx_reinit failed: %s\n",
+					strerror(errno));
+				return map_nt_error_from_unix(ret);
+			}
+		}
 	}
+
+	if (comment) {
+		prctl_set_comment("%s", comment);
+	}
+
  done:
 	return status;
 }
@@ -595,9 +630,11 @@ static char *strip_mount_options(TALLOC_CTX *ctx, const char *str)
 #ifdef WITH_NISPLUS_HOME
 char *automount_lookup(TALLOC_CTX *ctx, const char *user_name)
 {
+	const struct loadparm_substitution *lp_sub =
+		loadparm_s3_global_substitution();
 	char *value = NULL;
 
-	char *nis_map = (char *)lp_homedir_map();
+	char *nis_map = (char *)lp_homedir_map(talloc_tos(), lp_sub);
 
 	char buffer[NIS_MAXATTRVAL + 1];
 	nis_result *result;
@@ -643,13 +680,15 @@ char *automount_lookup(TALLOC_CTX *ctx, const char *user_name)
 
 char *automount_lookup(TALLOC_CTX *ctx, const char *user_name)
 {
+	const struct loadparm_substitution *lp_sub =
+		loadparm_s3_global_substitution();
 	char *value = NULL;
 
 	int nis_error;        /* returned by yp all functions */
 	char *nis_result;     /* yp_match inits this */
 	int nis_result_len;  /* and set this */
 	char *nis_domain;     /* yp_get_default_domain inits this */
-	char *nis_map = lp_homedir_map(talloc_tos());
+	char *nis_map = lp_homedir_map(talloc_tos(), lp_sub);
 
 	if ((nis_error = yp_get_default_domain(&nis_domain)) != 0) {
 		DEBUG(3, ("YP Error: %s\n", yperr_string(nis_error)));
@@ -782,12 +821,10 @@ gid_t nametogid(const char *name)
 
 void smb_panic_s3(const char *why)
 {
+	const struct loadparm_substitution *lp_sub =
+		loadparm_s3_global_substitution();
 	char *cmd;
 	int result;
-
-	DEBUG(0,("PANIC (pid %llu): %s\n",
-		    (unsigned long long)getpid(), why));
-	log_stack_trace();
 
 #if defined(HAVE_PRCTL) && defined(PR_SET_PTRACER)
 	/*
@@ -796,7 +833,7 @@ void smb_panic_s3(const char *why)
 	prctl(PR_SET_PTRACER, getpid(), 0, 0, 0);
 #endif
 
-	cmd = lp_panic_action(talloc_tos());
+	cmd = lp_panic_action(talloc_tos(), lp_sub);
 	if (cmd && *cmd) {
 		DEBUG(0, ("smb_panic(): calling panic action [%s]\n", cmd));
 		result = system(cmd);
@@ -810,145 +847,6 @@ void smb_panic_s3(const char *why)
 	}
 
 	dump_core();
-}
-
-/*******************************************************************
- Print a backtrace of the stack to the debug log. This function
- DELIBERATELY LEAKS MEMORY. The expectation is that you should
- exit shortly after calling it.
-********************************************************************/
-
-#ifdef HAVE_LIBUNWIND_H
-#include <libunwind.h>
-#endif
-
-#ifdef HAVE_EXECINFO_H
-#include <execinfo.h>
-#endif
-
-#ifdef HAVE_LIBEXC_H
-#include <libexc.h>
-#endif
-
-void log_stack_trace(void)
-{
-#ifdef HAVE_LIBUNWIND
-	/* Try to use libunwind before any other technique since on ia64
-	 * libunwind correctly walks the stack in more circumstances than
-	 * backtrace.
-	 */ 
-	unw_cursor_t cursor;
-	unw_context_t uc;
-	unsigned i = 0;
-
-	char procname[256];
-	unw_word_t ip, sp, off;
-
-	procname[sizeof(procname) - 1] = '\0';
-
-	if (unw_getcontext(&uc) != 0) {
-		goto libunwind_failed;
-	}
-
-	if (unw_init_local(&cursor, &uc) != 0) {
-		goto libunwind_failed;
-	}
-
-	DEBUG(0, ("BACKTRACE:\n"));
-
-	do {
-	    ip = sp = 0;
-	    unw_get_reg(&cursor, UNW_REG_IP, &ip);
-	    unw_get_reg(&cursor, UNW_REG_SP, &sp);
-
-	    switch (unw_get_proc_name(&cursor,
-			procname, sizeof(procname) - 1, &off) ) {
-	    case 0:
-		    /* Name found. */
-	    case -UNW_ENOMEM:
-		    /* Name truncated. */
-		    DEBUGADD(0, (" #%u %s + %#llx [ip=%#llx] [sp=%#llx]\n",
-			    i, procname, (long long)off,
-			    (long long)ip, (long long) sp));
-		    break;
-	    default:
-	    /* case -UNW_ENOINFO: */
-	    /* case -UNW_EUNSPEC: */
-		    /* No symbol name found. */
-		    DEBUGADD(0, (" #%u %s [ip=%#llx] [sp=%#llx]\n",
-			    i, "<unknown symbol>",
-			    (long long)ip, (long long) sp));
-	    }
-	    ++i;
-	} while (unw_step(&cursor) > 0);
-
-	return;
-
-libunwind_failed:
-	DEBUG(0, ("unable to produce a stack trace with libunwind\n"));
-
-#elif HAVE_BACKTRACE_SYMBOLS
-	void *backtrace_stack[BACKTRACE_STACK_SIZE];
-	size_t backtrace_size;
-	char **backtrace_strings;
-
-	/* get the backtrace (stack frames) */
-	backtrace_size = backtrace(backtrace_stack,BACKTRACE_STACK_SIZE);
-	backtrace_strings = backtrace_symbols(backtrace_stack, backtrace_size);
-
-	DEBUG(0, ("BACKTRACE: %lu stack frames:\n", 
-		  (unsigned long)backtrace_size));
-
-	if (backtrace_strings) {
-		int i;
-
-		for (i = 0; i < backtrace_size; i++)
-			DEBUGADD(0, (" #%u %s\n", i, backtrace_strings[i]));
-
-		/* Leak the backtrace_strings, rather than risk what free() might do */
-	}
-
-#elif HAVE_LIBEXC
-
-	/* The IRIX libexc library provides an API for unwinding the stack. See
-	 * libexc(3) for details. Apparantly trace_back_stack leaks memory, but
-	 * since we are about to abort anyway, it hardly matters.
-	 */
-
-#define NAMESIZE 32 /* Arbitrary */
-
-	__uint64_t	addrs[BACKTRACE_STACK_SIZE];
-	char *      	names[BACKTRACE_STACK_SIZE];
-	char		namebuf[BACKTRACE_STACK_SIZE * NAMESIZE];
-
-	int		i;
-	int		levels;
-
-	ZERO_ARRAY(addrs);
-	ZERO_ARRAY(names);
-	ZERO_ARRAY(namebuf);
-
-	/* We need to be root so we can open our /proc entry to walk
-	 * our stack. It also helps when we want to dump core.
-	 */
-	become_root();
-
-	for (i = 0; i < BACKTRACE_STACK_SIZE; i++) {
-		names[i] = namebuf + (i * NAMESIZE);
-	}
-
-	levels = trace_back_stack(0, addrs, names,
-			BACKTRACE_STACK_SIZE, NAMESIZE - 1);
-
-	DEBUG(0, ("BACKTRACE: %d stack frames:\n", levels));
-	for (i = 0; i < levels; i++) {
-		DEBUGADD(0, (" #%d 0x%llx %s\n", i, addrs[i], names[i]));
-	}
-#undef NAMESIZE
-
-#else
-	DEBUG(0, ("unable to produce a stack trace on this platform\n"));
-#endif
 }
 
 /*******************************************************************
@@ -1148,13 +1046,13 @@ void set_namearray(name_compare_entry **ppname_array, const char *namelist_in)
  F_UNLCK in *ptype if the region is unlocked). False if the call failed.
 ****************************************************************************/
 
-bool fcntl_getlock(int fd, off_t *poffset, off_t *pcount, int *ptype, pid_t *ppid)
+bool fcntl_getlock(int fd, int op, off_t *poffset, off_t *pcount, int *ptype, pid_t *ppid)
 {
 	struct flock lock;
 	int ret;
 
-	DEBUG(8,("fcntl_getlock fd=%d offset=%.0f count=%.0f type=%d\n",
-		    fd,(double)*poffset,(double)*pcount,*ptype));
+	DEBUG(8,("fcntl_getlock fd=%d op=%d offset=%.0f count=%.0f type=%d\n",
+		    fd,op,(double)*poffset,(double)*pcount,*ptype));
 
 	lock.l_type = *ptype;
 	lock.l_whence = SEEK_SET;
@@ -1162,7 +1060,7 @@ bool fcntl_getlock(int fd, off_t *poffset, off_t *pcount, int *ptype, pid_t *ppi
 	lock.l_len = *pcount;
 	lock.l_pid = 0;
 
-	ret = sys_fcntl_ptr(fd,F_GETLK,&lock);
+	ret = sys_fcntl_ptr(fd,op,&lock);
 
 	if (ret == -1) {
 		int sav = errno;
@@ -1181,6 +1079,34 @@ bool fcntl_getlock(int fd, off_t *poffset, off_t *pcount, int *ptype, pid_t *ppi
 			fd, (int)lock.l_type, (unsigned int)lock.l_pid));
 	return True;
 }
+
+#if defined(HAVE_OFD_LOCKS)
+int map_process_lock_to_ofd_lock(int op)
+{
+	switch (op) {
+	case F_GETLK:
+	case F_OFD_GETLK:
+		op = F_OFD_GETLK;
+		break;
+	case F_SETLK:
+	case F_OFD_SETLK:
+		op = F_OFD_SETLK;
+		break;
+	case F_SETLKW:
+	case F_OFD_SETLKW:
+		op = F_OFD_SETLKW;
+		break;
+	default:
+		return -1;
+	}
+	return op;
+}
+#else /* HAVE_OFD_LOCKS */
+int map_process_lock_to_ofd_lock(int op)
+{
+	return op;
+}
+#endif /* HAVE_OFD_LOCKS */
 
 #undef DBGC_CLASS
 #define DBGC_CLASS DBGC_ALL
@@ -1228,14 +1154,46 @@ void ra_lanman_string( const char *native_lanman )
 		set_remote_arch( RA_WIN2K3 );
 }
 
-static const char *remote_arch_str;
+static const char *remote_arch_strings[] = {
+	[RA_UNKNOWN] =	"UNKNOWN",
+	[RA_WFWG] =	"WfWg",
+	[RA_OS2] =	"OS2",
+	[RA_WIN95] =	"Win95",
+	[RA_WINNT] =	"WinNT",
+	[RA_WIN2K] =	"Win2K",
+	[RA_WINXP] =	"WinXP",
+	[RA_WIN2K3] =	"Win2K3",
+	[RA_VISTA] =	"Vista",
+	[RA_SAMBA] =	"Samba",
+	[RA_CIFSFS] =	"CIFSFS",
+	[RA_WINXP64] =	"WinXP64",
+	[RA_OSX] =	"OSX",
+};
 
 const char *get_remote_arch_str(void)
 {
-	if (!remote_arch_str) {
-		return "UNKNOWN";
+	if (ra_type >= ARRAY_SIZE(remote_arch_strings)) {
+		/*
+		 * set_remote_arch() already checks this so ra_type
+		 * should be in the allowed range, but anyway, let's
+		 * do another bound check here.
+		 */
+		DBG_ERR("Remote arch info out of sync [%d] missing\n", ra_type);
+		ra_type = RA_UNKNOWN;
 	}
-	return remote_arch_str;
+	return remote_arch_strings[ra_type];
+}
+
+enum remote_arch_types get_remote_arch_from_str(const char *remote_arch_string)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(remote_arch_strings); i++) {
+		if (strcmp(remote_arch_string, remote_arch_strings[i]) == 0) {
+			return i;
+		}
+	}
+	return RA_UNKNOWN;
 }
 
 /*******************************************************************
@@ -1244,52 +1202,20 @@ const char *get_remote_arch_str(void)
 
 void set_remote_arch(enum remote_arch_types type)
 {
-	ra_type = type;
-	switch( type ) {
-	case RA_WFWG:
-		remote_arch_str = "WfWg";
-		break;
-	case RA_OS2:
-		remote_arch_str = "OS2";
-		break;
-	case RA_WIN95:
-		remote_arch_str = "Win95";
-		break;
-	case RA_WINNT:
-		remote_arch_str = "WinNT";
-		break;
-	case RA_WIN2K:
-		remote_arch_str = "Win2K";
-		break;
-	case RA_WINXP:
-		remote_arch_str = "WinXP";
-		break;
-	case RA_WINXP64:
-		remote_arch_str = "WinXP64";
-		break;
-	case RA_WIN2K3:
-		remote_arch_str = "Win2K3";
-		break;
-	case RA_VISTA:
-		remote_arch_str = "Vista";
-		break;
-	case RA_SAMBA:
-		remote_arch_str = "Samba";
-		break;
-	case RA_CIFSFS:
-		remote_arch_str = "CIFSFS";
-		break;
-	case RA_OSX:
-		remote_arch_str = "OSX";
-		break;
-	default:
+	if (ra_type >= ARRAY_SIZE(remote_arch_strings)) {
+		/*
+		 * This protects against someone adding values to enum
+		 * remote_arch_types without updating
+		 * remote_arch_strings array.
+		 */
+		DBG_ERR("Remote arch info out of sync [%d] missing\n", ra_type);
 		ra_type = RA_UNKNOWN;
-		remote_arch_str = "UNKNOWN";
-		break;
+		return;
 	}
 
+	ra_type = type;
 	DEBUG(10,("set_remote_arch: Client arch is \'%s\'\n",
-				remote_arch_str));
+		  get_remote_arch_str()));
 }
 
 /*******************************************************************
@@ -1299,6 +1225,148 @@ void set_remote_arch(enum remote_arch_types type)
 enum remote_arch_types get_remote_arch(void)
 {
 	return ra_type;
+}
+
+#define RA_CACHE_TTL 7*24*3600
+
+static bool remote_arch_cache_key(const struct GUID *client_guid,
+				  fstring key)
+{
+	struct GUID_txt_buf guid_buf;
+	const char *guid_string = NULL;
+
+	guid_string = GUID_buf_string(client_guid, &guid_buf);
+	if (guid_string == NULL) {
+		return false;
+	}
+
+	fstr_sprintf(key, "RA/%s", guid_string);
+	return true;
+}
+
+struct ra_parser_state {
+	bool found;
+	enum remote_arch_types ra;
+};
+
+static void ra_parser(const struct gencache_timeout *t,
+		      DATA_BLOB blob,
+		      void *priv_data)
+{
+	struct ra_parser_state *state = (struct ra_parser_state *)priv_data;
+	const char *ra_str = NULL;
+
+	if (gencache_timeout_expired(t)) {
+		return;
+	}
+
+	if ((blob.length == 0) || (blob.data[blob.length-1] != '\0')) {
+		DBG_ERR("Remote arch cache key not a string\n");
+		return;
+	}
+
+	ra_str = (const char *)blob.data;
+	DBG_INFO("Got remote arch [%s] from cache\n", ra_str);
+
+	state->ra = get_remote_arch_from_str(ra_str);
+	state->found = true;
+	return;
+}
+
+static bool remote_arch_cache_get(const struct GUID *client_guid)
+{
+	bool ok;
+	fstring ra_key;
+	struct ra_parser_state state = (struct ra_parser_state) {
+		.found = false,
+		.ra = RA_UNKNOWN,
+	};
+
+	ok = remote_arch_cache_key(client_guid, ra_key);
+	if (!ok) {
+		return false;
+	}
+
+	ok = gencache_parse(ra_key, ra_parser, &state);
+	if (!ok || !state.found) {
+		return true;
+	}
+
+	if (state.ra == RA_UNKNOWN) {
+		return true;
+	}
+
+	set_remote_arch(state.ra);
+	return true;
+}
+
+static bool remote_arch_cache_set(const struct GUID *client_guid)
+{
+	bool ok;
+	fstring ra_key;
+	const char *ra_str = NULL;
+
+	if (get_remote_arch() == RA_UNKNOWN) {
+		return true;
+	}
+
+	ok = remote_arch_cache_key(client_guid, ra_key);
+	if (!ok) {
+		return false;
+	}
+
+	ra_str = get_remote_arch_str();
+	if (ra_str == NULL) {
+		return false;
+	}
+
+	ok = gencache_set(ra_key, ra_str, time(NULL) + RA_CACHE_TTL);
+	if (!ok) {
+		return false;
+	}
+
+	return true;
+}
+
+bool remote_arch_cache_update(const struct GUID *client_guid)
+{
+	bool ok;
+
+	if (get_remote_arch() == RA_UNKNOWN) {
+
+		become_root();
+		ok = remote_arch_cache_get(client_guid);
+		unbecome_root();
+
+		return ok;
+	}
+
+	become_root();
+	ok = remote_arch_cache_set(client_guid);
+	unbecome_root();
+
+	return ok;
+}
+
+bool remote_arch_cache_delete(const struct GUID *client_guid)
+{
+	bool ok;
+	fstring ra_key;
+
+	ok = remote_arch_cache_key(client_guid, ra_key);
+	if (!ok) {
+		return false;
+	}
+
+	become_root();
+	ok = gencache_del(ra_key);
+	unbecome_root();
+
+	if (!ok) {
+		return false;
+	}
+
+	return true;
 }
 
 const char *tab_depth(int level, int depth)
@@ -1444,25 +1512,6 @@ void *smb_xmalloc_array(size_t size, unsigned int count)
 	return p;
 }
 
-/*
-  vasprintf that aborts on malloc fail
-*/
-
- int smb_xvasprintf(char **ptr, const char *format, va_list ap)
-{
-	int n;
-	va_list ap2;
-
-	va_copy(ap2, ap);
-
-	n = vasprintf(ptr, format, ap2);
-	va_end(ap2);
-	if (n == -1 || ! *ptr) {
-		smb_panic("smb_xvasprintf: out of memory");
-	}
-	return n;
-}
-
 /*****************************************************************
  Get local hostname and cache result.
 *****************************************************************/
@@ -1492,78 +1541,6 @@ char *myhostname_upper(void)
 		talloc_free(name);
 	}
 	return ret;
-}
-
-/**
- * @brief Returns an absolute path to a file concatenating the provided
- * @a rootpath and @a basename
- *
- * @param name Filename, relative to @a rootpath
- *
- * @retval Pointer to a string containing the full path.
- **/
-
-static char *xx_path(const char *name, const char *rootpath)
-{
-	char *fname = NULL;
-
-	fname = talloc_strdup(talloc_tos(), rootpath);
-	if (!fname) {
-		return NULL;
-	}
-	trim_string(fname,"","/");
-
-	if (!directory_exist(fname)) {
-		if (mkdir(fname,0755) == -1) {
-			/* Did someone else win the race ? */
-			if (errno != EEXIST) {
-				DEBUG(1, ("Unable to create directory %s for file %s. "
-					"Error was %s\n", fname, name, strerror(errno)));
-				return NULL;
-			}
-		}
-	}
-
-	return talloc_asprintf_append(fname, "/%s", name);
-}
-
-/**
- * @brief Returns an absolute path to a file in the Samba lock directory.
- *
- * @param name File to find, relative to LOCKDIR.
- *
- * @retval Pointer to a talloc'ed string containing the full path.
- **/
-
-char *lock_path(const char *name)
-{
-	return xx_path(name, lp_lock_directory());
-}
-
-/**
- * @brief Returns an absolute path to a file in the Samba state directory.
- *
- * @param name File to find, relative to STATEDIR.
- *
- * @retval Pointer to a talloc'ed string containing the full path.
- **/
-
-char *state_path(const char *name)
-{
-	return xx_path(name, lp_state_directory());
-}
-
-/**
- * @brief Returns an absolute path to a file in the Samba cache directory.
- *
- * @param name File to find, relative to CACHEDIR.
- *
- * @retval Pointer to a talloc'ed string containing the full path.
- **/
-
-char *cache_path(const char *name)
-{
-	return xx_path(name, lp_cache_directory());
 }
 
 /*******************************************************************
@@ -1609,11 +1586,6 @@ bool ms_has_wild(const char *s)
 {
 	char c;
 
-	if (lp_posix_pathnames()) {
-		/* With posix pathnames no characters are wild. */
-		return False;
-	}
-
 	while ((c = *s++)) {
 		switch (c) {
 		case '*':
@@ -1656,7 +1628,7 @@ bool mask_match(const char *string, const char *pattern, bool is_case_sensitive)
 	if (ISDOT(pattern))
 		return False;
 
-	return ms_fnmatch(pattern, string, Protocol <= PROTOCOL_LANMAN2, is_case_sensitive) == 0;
+	return ms_fnmatch_protocol(pattern, string, Protocol, is_case_sensitive) == 0;
 }
 
 /*******************************************************************
@@ -1687,152 +1659,6 @@ bool mask_match_list(const char *string, char **list, int listLen, bool is_case_
                        return True;
        }
        return False;
-}
-
-/*********************************************************
- Recursive routine that is called by unix_wild_match.
-*********************************************************/
-
-static bool unix_do_match(const char *regexp, const char *str)
-{
-	const char *p;
-
-	for( p = regexp; *p && *str; ) {
-
-		switch(*p) {
-			case '?':
-				str++;
-				p++;
-				break;
-
-			case '*':
-
-				/*
-				 * Look for a character matching 
-				 * the one after the '*'.
-				 */
-				p++;
-				if(!*p)
-					return true; /* Automatic match */
-				while(*str) {
-
-					while(*str && (*p != *str))
-						str++;
-
-					/*
-					 * Patch from weidel@multichart.de. In the case of the regexp
-					 * '*XX*' we want to ensure there are at least 2 'X' characters
-					 * in the string after the '*' for a match to be made.
-					 */
-
-					{
-						int matchcount=0;
-
-						/*
-						 * Eat all the characters that match, but count how many there were.
-						 */
-
-						while(*str && (*p == *str)) {
-							str++;
-							matchcount++;
-						}
-
-						/*
-						 * Now check that if the regexp had n identical characters that
-						 * matchcount had at least that many matches.
-						 */
-
-						while ( *(p+1) && (*(p+1) == *p)) {
-							p++;
-							matchcount--;
-						}
-
-						if ( matchcount <= 0 )
-							return false;
-					}
-
-					str--; /* We've eaten the match char after the '*' */
-
-					if(unix_do_match(p, str))
-						return true;
-
-					if(!*str)
-						return false;
-					else
-						str++;
-				}
-				return false;
-
-			default:
-				if(*str != *p)
-					return false;
-				str++;
-				p++;
-				break;
-		}
-	}
-
-	if(!*p && !*str)
-		return true;
-
-	if (!*p && str[0] == '.' && str[1] == 0)
-		return true;
-
-	if (!*str && *p == '?') {
-		while (*p == '?')
-			p++;
-		return(!*p);
-	}
-
-	if(!*str && (*p == '*' && p[1] == '\0'))
-		return true;
-
-	return false;
-}
-
-/*******************************************************************
- Simple case insensitive interface to a UNIX wildcard matcher.
- Returns True if match, False if not.
-*******************************************************************/
-
-bool unix_wild_match(const char *pattern, const char *string)
-{
-	TALLOC_CTX *ctx = talloc_stackframe();
-	char *p2;
-	char *s2;
-	char *p;
-	bool ret = false;
-
-	p2 = talloc_strdup(ctx,pattern);
-	s2 = talloc_strdup(ctx,string);
-	if (!p2 || !s2) {
-		TALLOC_FREE(ctx);
-		return false;
-	}
-	if (!strlower_m(p2)) {
-		TALLOC_FREE(ctx);
-		return false;
-	}
-	if (!strlower_m(s2)) {
-		TALLOC_FREE(ctx);
-		return false;
-	}
-
-	/* Remove any *? and ** from the pattern as they are meaningless */
-	for(p = p2; *p; p++) {
-		while( *p == '*' && (p[1] == '?' ||p[1] == '*')) {
-			memmove(&p[1], &p[2], strlen(&p[2])+1);
-		}
-	}
-
-	if (strequal(p2,"*")) {
-		TALLOC_FREE(ctx);
-		return true;
-	}
-
-	ret = unix_do_match(p2, s2);
-	TALLOC_FREE(ctx);
-	return ret;
 }
 
 /**********************************************************************
@@ -1893,32 +1719,6 @@ bool name_to_fqdn(fstring fqdn, const char *name)
 	return true;
 }
 
-/**********************************************************************
- Append a DATA_BLOB to a talloc'ed object
-***********************************************************************/
-
-void *talloc_append_blob(TALLOC_CTX *mem_ctx, void *buf, DATA_BLOB blob)
-{
-	size_t old_size = 0;
-	char *result;
-
-	if (blob.length == 0) {
-		return buf;
-	}
-
-	if (buf != NULL) {
-		old_size = talloc_get_size(buf);
-	}
-
-	result = (char *)TALLOC_REALLOC(mem_ctx, buf, old_size + blob.length);
-	if (result == NULL) {
-		return NULL;
-	}
-
-	memcpy(result + old_size, blob.data, blob.length);
-	return result;
-}
-
 uint32_t map_share_mode_to_deny_mode(uint32_t share_access, uint32_t private_options)
 {
 	switch (share_access & ~FILE_SHARE_DELETE) {
@@ -1940,70 +1740,9 @@ uint32_t map_share_mode_to_deny_mode(uint32_t share_access, uint32_t private_opt
 	return (uint32_t)-1;
 }
 
-pid_t procid_to_pid(const struct server_id *proc)
-{
-	return proc->pid;
-}
-
-static uint32_t my_vnn = NONCLUSTER_VNN;
-
-void set_my_vnn(uint32_t vnn)
-{
-	DEBUG(10, ("vnn pid %d = %u\n", (int)getpid(), (unsigned int)vnn));
-	my_vnn = vnn;
-}
-
-uint32_t get_my_vnn(void)
-{
-	return my_vnn;
-}
-
-static uint64_t my_unique_id = 0;
-
-void set_my_unique_id(uint64_t unique_id)
-{
-	my_unique_id = unique_id;
-}
-
-struct server_id pid_to_procid(pid_t pid)
-{
-	struct server_id result;
-	result.pid = pid;
-	result.task_id = 0;
-	result.unique_id = my_unique_id;
-	result.vnn = my_vnn;
-	return result;
-}
-
-struct server_id procid_self(void)
-{
-	return pid_to_procid(getpid());
-}
-
-bool procid_is_me(const struct server_id *pid)
-{
-	if (pid->pid != getpid())
-		return False;
-	if (pid->task_id != 0)
-		return False;
-	if (pid->vnn != my_vnn)
-		return False;
-	return True;
-}
-
 struct server_id interpret_pid(const char *pid_string)
 {
 	return server_id_from_string(get_my_vnn(), pid_string);
-}
-
-bool procid_valid(const struct server_id *pid)
-{
-	return (pid->pid != (uint64_t)-1);
-}
-
-bool procid_is_local(const struct server_id *pid)
-{
-	return pid->vnn == my_vnn;
 }
 
 /****************************************************************
@@ -2094,7 +1833,7 @@ int get_safe_IVAL(const char *buf_base, size_t buf_len, char *ptr, size_t off, i
  call (they take care of winbind separator and other winbind specific settings).
 ****************************************************************/
 
-void split_domain_user(TALLOC_CTX *mem_ctx,
+bool split_domain_user(TALLOC_CTX *mem_ctx,
 		       const char *full_name,
 		       char **domain,
 		       char **user)
@@ -2106,11 +1845,23 @@ void split_domain_user(TALLOC_CTX *mem_ctx,
 	if (p != NULL) {
 		*domain = talloc_strndup(mem_ctx, full_name,
 					 PTR_DIFF(p, full_name));
+		if (*domain == NULL) {
+			return false;
+		}
 		*user = talloc_strdup(mem_ctx, p+1);
+		if (*user == NULL) {
+			TALLOC_FREE(*domain);
+			return false;
+		}
 	} else {
-		*domain = talloc_strdup(mem_ctx, "");
+		*domain = NULL;
 		*user = talloc_strdup(mem_ctx, full_name);
+		if (*user == NULL) {
+			return false;
+		}
 	}
+
+	return true;
 }
 
 /****************************************************************
@@ -2377,6 +2128,61 @@ struct security_unix_token *copy_unix_token(TALLOC_CTX *ctx, const struct securi
 		cpy->groups = NULL;
 	}
 	return cpy;
+}
+
+/****************************************************************************
+ Return a root token
+****************************************************************************/
+
+struct security_unix_token *root_unix_token(TALLOC_CTX *mem_ctx)
+{
+	struct security_unix_token *t = NULL;
+
+	t = talloc_zero(mem_ctx, struct security_unix_token);
+	if (t == NULL) {
+		return NULL;
+	}
+
+	/*
+	 * This is not needed, but lets make it explicit, not implicit.
+	 */
+	*t = (struct security_unix_token) {
+		.uid = 0,
+		.gid = 0,
+		.ngroups = 0,
+		.groups = NULL
+	};
+
+	return t;
+}
+
+char *utok_string(TALLOC_CTX *mem_ctx, const struct security_unix_token *tok)
+{
+	char *str;
+	uint32_t i;
+
+	str = talloc_asprintf(
+		mem_ctx,
+		"uid=%ju, gid=%ju, %"PRIu32" groups:",
+		(uintmax_t)(tok->uid),
+		(uintmax_t)(tok->gid),
+		tok->ngroups);
+	if (str == NULL) {
+		return NULL;
+	}
+
+	for (i=0; i<tok->ngroups; i++) {
+		char *tmp;
+		tmp = talloc_asprintf_append_buffer(
+			str, " %ju", (uintmax_t)tok->groups[i]);
+		if (tmp == NULL) {
+			TALLOC_FREE(str);
+			return NULL;
+		}
+		str = tmp;
+	}
+
+	return str;
 }
 
 /****************************************************************************

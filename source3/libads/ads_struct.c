@@ -132,7 +132,8 @@ char *ads_build_domain(const char *dn)
 */
 ADS_STRUCT *ads_init(const char *realm, 
 		     const char *workgroup,
-		     const char *ldap_server)
+		     const char *ldap_server,
+		     enum ads_sasl_state_e sasl_state)
 {
 	ADS_STRUCT *ads;
 	int wrap_flags;
@@ -144,14 +145,6 @@ ADS_STRUCT *ads_init(const char *realm,
 	ads->server.workgroup = workgroup ? SMB_STRDUP(workgroup) : NULL;
 	ads->server.ldap_server = ldap_server? SMB_STRDUP(ldap_server) : NULL;
 
-	/* we need to know if this is a foreign realm */
-	if (realm && *realm && !strequal(lp_realm(), realm)) {
-		ads->server.foreign = 1;
-	}
-	if (workgroup && *workgroup && !strequal(lp_workgroup(), workgroup)) {
-		ads->server.foreign = 1;
-	}
-
 	/* the caller will own the memory by default */
 	ads->is_mine = 1;
 
@@ -160,11 +153,22 @@ ADS_STRUCT *ads_init(const char *realm,
 		wrap_flags = 0;
 	}
 
+	switch (sasl_state) {
+	case ADS_SASL_PLAIN:
+		break;
+	case ADS_SASL_SIGN:
+		wrap_flags |= ADS_AUTH_SASL_SIGN;
+		break;
+	case ADS_SASL_SEAL:
+		wrap_flags |= ADS_AUTH_SASL_SEAL;
+		break;
+	}
+
 	ads->auth.flags = wrap_flags;
 
-	/* Start with a page size of 1000 when the connection is new,
+	/* Start with the configured page size when the connection is new,
 	 * we will drop it by half we get a timeout.   */
-	ads->config.ldap_page_size     = 1000;
+	ads->config.ldap_page_size     = lp_ldap_page_size();
 
 	return ads;
 }
@@ -192,7 +196,7 @@ void ads_destroy(ADS_STRUCT **ads)
 		bool is_mine;
 
 		is_mine = (*ads)->is_mine;
-#if HAVE_LDAP
+#ifdef HAVE_LDAP
 		ads_disconnect(*ads);
 #endif
 		SAFE_FREE((*ads)->server.realm);

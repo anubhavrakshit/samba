@@ -105,6 +105,7 @@ struct file_lists {
 	time_t modtime;
 };
 
+#define DEFAULT_NAME_RESOLVE_ORDER "lmhosts wins host bcast"
 #define FLAG_DEPRECATED 0x1000 /* options that should no longer be used */
 #define FLAG_SYNONYM	0x2000 /* options that is a synonym of another option */
 #define FLAG_CMDLINE	0x10000 /* option has been overridden */
@@ -178,6 +179,10 @@ struct file_lists {
 #define KERBEROS_VERIFY_DEDICATED_KEYTAB 2
 #define KERBEROS_VERIFY_SECRETS_AND_KEYTAB 3
 
+#define KERBEROS_ETYPES_ALL 0
+#define KERBEROS_ETYPES_STRONG 1
+#define KERBEROS_ETYPES_LEGACY 2
+
 /* ACL compatibility */
 enum acl_compatibility {ACL_COMPAT_AUTO, ACL_COMPAT_WINNT, ACL_COMPAT_WIN2K};
 
@@ -190,6 +195,11 @@ enum printing_types {PRINT_BSD,PRINT_SYSV,PRINT_AIX,PRINT_HPUX,
 #endif /* DEVELOPER */
 };
 
+#define SERVER_TCP_LOW_PORT  49152
+#define SERVER_TCP_HIGH_PORT 65535
+
+#define SERVER_TCP_PORT_MIN 1024
+#define SERVER_TCP_PORT_MAX 65535
 
 
 
@@ -204,8 +214,17 @@ enum printing_types {PRINT_BSD,PRINT_SYSV,PRINT_AIX,PRINT_HPUX,
 #define ADS_AUTH_SASL_FORCE       0x0080
 #define ADS_AUTH_USER_CREDS       0x0100
 
+enum ldap_server_require_strong_auth {
+	LDAP_SERVER_REQUIRE_STRONG_AUTH_NO,
+	LDAP_SERVER_REQUIRE_STRONG_AUTH_ALLOW_SASL_OVER_TLS,
+	LDAP_SERVER_REQUIRE_STRONG_AUTH_YES,
+};
+
 /* DNS update settings */
 enum dns_update_settings {DNS_UPDATE_OFF, DNS_UPDATE_ON, DNS_UPDATE_SIGNED};
+
+/* MDNS name sources */
+enum mdns_name_values {MDNS_NAME_NETBIOS, MDNS_NAME_MDNS};
 
 /* LDAP SSL options */
 enum ldap_ssl_types {LDAP_SSL_OFF, LDAP_SSL_START_TLS};
@@ -218,6 +237,30 @@ enum mapreadonly_options {MAP_READONLY_NO, MAP_READONLY_YES, MAP_READONLY_PERMIS
 
 /* case handling */
 enum case_handling {CASE_LOWER,CASE_UPPER};
+
+/* inherit owner options */
+enum inheritowner_options {
+	INHERIT_OWNER_NO,
+	INHERIT_OWNER_WINDOWS_AND_UNIX,
+	INHERIT_OWNER_UNIX_ONLY
+};
+
+/* mangled names options */
+enum mangled_names_options {MANGLED_NAMES_NO, MANGLED_NAMES_YES, MANGLED_NAMES_ILLEGAL};
+
+/* Spotlight backend options */
+enum spotlight_backend_options {
+	SPOTLIGHT_BACKEND_NOINDEX,
+	SPOTLIGHT_BACKEND_TRACKER,
+	SPOTLIGHT_BACKEND_ES,
+};
+
+/* FIPS values */
+enum samba_weak_crypto {
+	SAMBA_WEAK_CRYPTO_UNKNOWN,
+	SAMBA_WEAK_CRYPTO_ALLOWED,
+	SAMBA_WEAK_CRYPTO_DISALLOWED,
+};
 
 /*
  * Default passwd chat script.
@@ -255,7 +298,9 @@ enum case_handling {CASE_LOWER,CASE_UPPER};
 #define LOADPARM_EXTRA_GLOBALS \
 	struct parmlist_entry *param_opt;				\
 	char *dnsdomain;						\
-	char *realm_original;
+	int rpc_low_port;						\
+	int rpc_high_port;						\
+	enum samba_weak_crypto weak_crypto;
 
 const char* server_role_str(uint32_t role);
 int lp_find_server_role(int server_role, int security, int domain_logons, int domain_master);
@@ -264,7 +309,6 @@ bool lp_is_security_and_server_role_valid(int server_role, int security);
 
 struct loadparm_global * get_globals(void);
 unsigned int * get_flags(void);
-char * lp_string(TALLOC_CTX *, const char *);
 int getservicebyname(const char *, struct loadparm_service *);
 bool lp_include(struct loadparm_context *, struct loadparm_service *,
 	       	const char *, char **);
@@ -272,5 +316,22 @@ bool lp_do_section(const char *pszSectionName, void *userdata);
 bool store_lp_set_cmdline(const char *pszParmName, const char *pszParmValue);
 
 int num_parameters(void);
+
+struct loadparm_substitution;
+#ifdef LOADPARM_SUBSTITUTION_INTERNALS
+struct loadparm_substitution {
+	char *(*substituted_string_fn)(
+			TALLOC_CTX *mem_ctx,
+			const struct loadparm_substitution *lp_sub,
+			const char *raw_value,
+			void *private_data);
+	void *private_data;
+};
+#endif /* LOADPARM_SUBSTITUTION_INTERNALS */
+
+const struct loadparm_substitution *lpcfg_noop_substitution(void);
+char *lpcfg_substituted_string(TALLOC_CTX *mem_ctx,
+			       const struct loadparm_substitution *lp_sub,
+			       const char *raw_value);
 
 #endif /* _LOADPARM_H */

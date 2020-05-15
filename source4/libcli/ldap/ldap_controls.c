@@ -1,5 +1,5 @@
 /* 
-   Unix SMB/CIFS mplementation.
+   Unix SMB/CIFS implementation.
    LDAP protocol helper functions for SAMBA
    
    Copyright (C) Simo Sorce 2005
@@ -20,6 +20,9 @@
 */
 
 #include "includes.h"
+
+#include <ldb.h>
+
 #include "../lib/util/asn1.h"
 #include "libcli/ldap/libcli_ldap.h"
 #include "libcli/ldap/ldap_proto.h"
@@ -29,7 +32,7 @@ static bool decode_server_sort_response(void *mem_ctx, DATA_BLOB in, void *_out)
 {
 	void **out = (void **)_out;
 	DATA_BLOB attr;
-	struct asn1_data *data = asn1_init(mem_ctx);
+	struct asn1_data *data = asn1_init(mem_ctx, ASN1_MAX_TREE_DEPTH);
 	struct ldb_sort_resp_control *lsrc;
 
 	if (!data) return false;
@@ -76,7 +79,7 @@ static bool decode_server_sort_request(void *mem_ctx, DATA_BLOB in, void *_out)
 	void **out = (void **)_out;
 	DATA_BLOB attr;
 	DATA_BLOB rule;
-	struct asn1_data *data = asn1_init(mem_ctx);
+	struct asn1_data *data = asn1_init(mem_ctx, ASN1_MAX_TREE_DEPTH);
 	struct ldb_server_sort_control **lssc;
 	int num;
 
@@ -114,9 +117,9 @@ static bool decode_server_sort_request(void *mem_ctx, DATA_BLOB in, void *_out)
 		if (!lssc [num]->attributeName) {
 			return false;
 		}
-	
-		if (asn1_peek_tag(data, ASN1_OCTET_STRING)) {
-			if (!asn1_read_OctetString(data, mem_ctx, &rule)) {
+
+		if (asn1_peek_tag(data, ASN1_CONTEXT_SIMPLE(0))) {
+			if (!asn1_read_ContextSimple(data, mem_ctx, 0, &rule)) {
 				return false;
 			}
 			lssc[num]->orderingRule = talloc_strndup(lssc[num], (const char *)rule.data, rule.length);
@@ -163,7 +166,7 @@ static bool decode_extended_dn_request(void *mem_ctx, DATA_BLOB in, void *_out)
 		return true;
 	}
 
-	data = asn1_init(mem_ctx);
+	data = asn1_init(mem_ctx, ASN1_MAX_TREE_DEPTH);
 	if (!data) return false;
 
 	if (!asn1_load(data, in)) {
@@ -195,7 +198,7 @@ static bool decode_extended_dn_request(void *mem_ctx, DATA_BLOB in, void *_out)
 static bool decode_sd_flags_request(void *mem_ctx, DATA_BLOB in, void *_out)
 {
 	void **out = (void **)_out;
-	struct asn1_data *data = asn1_init(mem_ctx);
+	struct asn1_data *data = asn1_init(mem_ctx, ASN1_MAX_TREE_DEPTH);
 	struct ldb_sd_flags_control *lsdfc;
 
 	if (!data) return false;
@@ -229,7 +232,7 @@ static bool decode_sd_flags_request(void *mem_ctx, DATA_BLOB in, void *_out)
 static bool decode_search_options_request(void *mem_ctx, DATA_BLOB in, void *_out)
 {
 	void **out = (void **)_out;
-	struct asn1_data *data = asn1_init(mem_ctx);
+	struct asn1_data *data = asn1_init(mem_ctx, ASN1_MAX_TREE_DEPTH);
 	struct ldb_search_options_control *lsoc;
 
 	if (!data) return false;
@@ -264,7 +267,7 @@ static bool decode_paged_results_request(void *mem_ctx, DATA_BLOB in, void *_out
 {
 	void **out = (void **)_out;
 	DATA_BLOB cookie;
-	struct asn1_data *data = asn1_init(mem_ctx);
+	struct asn1_data *data = asn1_init(mem_ctx, ASN1_MAX_TREE_DEPTH);
 	struct ldb_paged_control *lprc;
 
 	if (!data) return false;
@@ -313,7 +316,7 @@ static bool decode_dirsync_request(void *mem_ctx, DATA_BLOB in, void *_out)
 {
 	void **out = (void **)_out;
 	DATA_BLOB cookie;
-	struct asn1_data *data = asn1_init(mem_ctx);
+	struct asn1_data *data = asn1_init(mem_ctx, ASN1_MAX_TREE_DEPTH);
 	struct ldb_dirsync_control *ldc;
 
 	if (!data) return false;
@@ -369,7 +372,7 @@ static bool decode_asq_control(void *mem_ctx, DATA_BLOB in, void *_out)
 {
 	void **out = (void **)_out;
 	DATA_BLOB source_attribute;
-	struct asn1_data *data = asn1_init(mem_ctx);
+	struct asn1_data *data = asn1_init(mem_ctx, ASN1_MAX_TREE_DEPTH);
 	struct ldb_asq_control *lac;
 
 	if (!data) return false;
@@ -430,7 +433,7 @@ static bool decode_verify_name_request(void *mem_ctx, DATA_BLOB in, void *_out)
 {
 	void **out = (void **)_out;
 	DATA_BLOB name;
-	struct asn1_data *data = asn1_init(mem_ctx);
+	struct asn1_data *data = asn1_init(mem_ctx, ASN1_MAX_TREE_DEPTH);
 	struct ldb_verify_name_control *lvnc;
 	int len;
 
@@ -482,7 +485,7 @@ static bool decode_verify_name_request(void *mem_ctx, DATA_BLOB in, void *_out)
 static bool encode_verify_name_request(void *mem_ctx, void *in, DATA_BLOB *out)
 {
 	struct ldb_verify_name_control *lvnc = talloc_get_type(in, struct ldb_verify_name_control);
-	struct asn1_data *data = asn1_init(mem_ctx);
+	struct asn1_data *data = asn1_init(mem_ctx, ASN1_MAX_TREE_DEPTH);
 	DATA_BLOB gc_utf16;
 
 	if (!data) return false;
@@ -512,10 +515,10 @@ static bool encode_verify_name_request(void *mem_ctx, void *in, DATA_BLOB *out)
 		return false;
 	}
 
-	*out = data_blob_talloc(mem_ctx, data->data, data->length);
-	if (out->data == NULL) {
+	if (!asn1_extract_blob(data, mem_ctx, out)) {
 		return false;
 	}
+
 	talloc_free(data);
 
 	return true;
@@ -525,7 +528,7 @@ static bool decode_vlv_request(void *mem_ctx, DATA_BLOB in, void *_out)
 {
 	void **out = (void **)_out;
 	DATA_BLOB assertion_value, context_id;
-	struct asn1_data *data = asn1_init(mem_ctx);
+	struct asn1_data *data = asn1_init(mem_ctx, ASN1_MAX_TREE_DEPTH);
 	struct ldb_vlv_req_control *lvrc;
 
 	if (!data) return false;
@@ -554,12 +557,8 @@ static bool decode_vlv_request(void *mem_ctx, DATA_BLOB in, void *_out)
 	if (asn1_peek_tag(data, ASN1_CONTEXT(0))) {
 
 		lvrc->type = 0;
-		
-		if (!asn1_start_tag(data, ASN1_CONTEXT(0))) {
-			return false;
-		}
 
-		if (!asn1_start_tag(data, ASN1_SEQUENCE(0))) {
+		if (!asn1_start_tag(data, ASN1_CONTEXT(0))) {
 			return false;
 		}
 
@@ -571,10 +570,6 @@ static bool decode_vlv_request(void *mem_ctx, DATA_BLOB in, void *_out)
 			return false;
 		}
 
-		if (!asn1_end_tag(data)) { /*SEQUENCE*/
-			return false;
-		}
-
 		if (!asn1_end_tag(data)) { /*CONTEXT*/
 			return false;
 		}
@@ -583,13 +578,10 @@ static bool decode_vlv_request(void *mem_ctx, DATA_BLOB in, void *_out)
 
 		lvrc->type = 1;
 
-		if (!asn1_start_tag(data, ASN1_CONTEXT(1))) {
+		if (!asn1_read_ContextSimple(data, mem_ctx, 1, &assertion_value)){
 			return false;
 		}
 
-		if (!asn1_read_OctetString(data, mem_ctx, &assertion_value)) {
-			return false;
-		}
 		lvrc->match.gtOrEq.value_len = assertion_value.length;
 		if (lvrc->match.gtOrEq.value_len) {
 			lvrc->match.gtOrEq.value = talloc_memdup(lvrc, assertion_value.data, assertion_value.length);
@@ -599,10 +591,6 @@ static bool decode_vlv_request(void *mem_ctx, DATA_BLOB in, void *_out)
 			}
 		} else {
 			lvrc->match.gtOrEq.value = NULL;
-		}
-
-		if (!asn1_end_tag(data)) { /*CONTEXT*/
-			return false;
 		}
 	}
 
@@ -638,7 +626,7 @@ static bool decode_vlv_response(void *mem_ctx, DATA_BLOB in, void *_out)
 {
 	void **out = (void **)_out;
 	DATA_BLOB context_id;
-	struct asn1_data *data = asn1_init(mem_ctx);
+	struct asn1_data *data = asn1_init(mem_ctx, ASN1_MAX_TREE_DEPTH);
 	struct ldb_vlv_resp_control *lvrc;
 
 	if (!data) return false;
@@ -672,7 +660,7 @@ static bool decode_vlv_response(void *mem_ctx, DATA_BLOB in, void *_out)
 		if (!asn1_read_OctetString(data, mem_ctx, &context_id)) {
 			return false;
 		}
-		lvrc->contextId = talloc_strndup(lvrc, (const char *)context_id.data, context_id.length);
+		lvrc->contextId = talloc_memdup(lvrc, (const char *)context_id.data, context_id.length);
 		if (!lvrc->contextId) {
 			return false;
 		}
@@ -694,7 +682,7 @@ static bool decode_vlv_response(void *mem_ctx, DATA_BLOB in, void *_out)
 static bool encode_server_sort_response(void *mem_ctx, void *in, DATA_BLOB *out)
 {
 	struct ldb_sort_resp_control *lsrc = talloc_get_type(in, struct ldb_sort_resp_control);
-	struct asn1_data *data = asn1_init(mem_ctx);
+	struct asn1_data *data = asn1_init(mem_ctx, ASN1_MAX_TREE_DEPTH);
 
 	if (!data) return false;
 
@@ -716,10 +704,10 @@ static bool encode_server_sort_response(void *mem_ctx, void *in, DATA_BLOB *out)
 		return false;
 	}
 
-	*out = data_blob_talloc(mem_ctx, data->data, data->length);
-	if (out->data == NULL) {
+	if (!asn1_extract_blob(data, mem_ctx, out)) {
 		return false;
 	}
+
 	talloc_free(data);
 
 	return true;
@@ -728,7 +716,7 @@ static bool encode_server_sort_response(void *mem_ctx, void *in, DATA_BLOB *out)
 static bool encode_server_sort_request(void *mem_ctx, void *in, DATA_BLOB *out)
 {
 	struct ldb_server_sort_control **lssc = talloc_get_type(in, struct ldb_server_sort_control *);
-	struct asn1_data *data = asn1_init(mem_ctx);
+	struct asn1_data *data = asn1_init(mem_ctx, ASN1_MAX_TREE_DEPTH);
 	int num;
 
 	if (!data) return false;
@@ -754,7 +742,8 @@ static bool encode_server_sort_request(void *mem_ctx, void *in, DATA_BLOB *out)
 		}
 
 		if (lssc[num]->orderingRule) {
-			if (!asn1_write_OctetString(data, lssc[num]->orderingRule, strlen(lssc[num]->orderingRule))) {
+			DATA_BLOB order = data_blob_string_const(lssc[num]->orderingRule);
+			if (!asn1_write_ContextSimple(data, 0, &order)) {
 				return false;
 			}
 		}
@@ -774,10 +763,10 @@ static bool encode_server_sort_request(void *mem_ctx, void *in, DATA_BLOB *out)
 		return false;
 	}
 
-	*out = data_blob_talloc(mem_ctx, data->data, data->length);
-	if (out->data == NULL) {
+	if (!asn1_extract_blob(data, mem_ctx, out)) {
 		return false;
 	}
+
 	talloc_free(data);
 
 	return true;
@@ -793,7 +782,7 @@ static bool encode_extended_dn_request(void *mem_ctx, void *in, DATA_BLOB *out)
 		return true;
 	}
 
-	data = asn1_init(mem_ctx);
+	data = asn1_init(mem_ctx, ASN1_MAX_TREE_DEPTH);
 
 	if (!data) return false;
 
@@ -809,10 +798,10 @@ static bool encode_extended_dn_request(void *mem_ctx, void *in, DATA_BLOB *out)
 		return false;
 	}
 
-	*out = data_blob_talloc(mem_ctx, data->data, data->length);
-	if (out->data == NULL) {
+	if (!asn1_extract_blob(data, mem_ctx, out)) {
 		return false;
 	}
+
 	talloc_free(data);
 
 	return true;
@@ -821,7 +810,7 @@ static bool encode_extended_dn_request(void *mem_ctx, void *in, DATA_BLOB *out)
 static bool encode_sd_flags_request(void *mem_ctx, void *in, DATA_BLOB *out)
 {
 	struct ldb_sd_flags_control *lsdfc = talloc_get_type(in, struct ldb_sd_flags_control);
-	struct asn1_data *data = asn1_init(mem_ctx);
+	struct asn1_data *data = asn1_init(mem_ctx, ASN1_MAX_TREE_DEPTH);
 
 	if (!data) return false;
 
@@ -837,10 +826,10 @@ static bool encode_sd_flags_request(void *mem_ctx, void *in, DATA_BLOB *out)
 		return false;
 	}
 
-	*out = data_blob_talloc(mem_ctx, data->data, data->length);
-	if (out->data == NULL) {
+	if (!asn1_extract_blob(data, mem_ctx, out)) {
 		return false;
 	}
+
 	talloc_free(data);
 
 	return true;
@@ -849,7 +838,7 @@ static bool encode_sd_flags_request(void *mem_ctx, void *in, DATA_BLOB *out)
 static bool encode_search_options_request(void *mem_ctx, void *in, DATA_BLOB *out)
 {
 	struct ldb_search_options_control *lsoc = talloc_get_type(in, struct ldb_search_options_control);
-	struct asn1_data *data = asn1_init(mem_ctx);
+	struct asn1_data *data = asn1_init(mem_ctx, ASN1_MAX_TREE_DEPTH);
 
 	if (!data) return false;
 
@@ -865,10 +854,10 @@ static bool encode_search_options_request(void *mem_ctx, void *in, DATA_BLOB *ou
 		return false;
 	}
 
-	*out = data_blob_talloc(mem_ctx, data->data, data->length);
-	if (out->data == NULL) {
+	if (!asn1_extract_blob(data, mem_ctx, out)) {
 		return false;
 	}
+
 	talloc_free(data);
 
 	return true;
@@ -877,7 +866,7 @@ static bool encode_search_options_request(void *mem_ctx, void *in, DATA_BLOB *ou
 static bool encode_paged_results_request(void *mem_ctx, void *in, DATA_BLOB *out)
 {
 	struct ldb_paged_control *lprc = talloc_get_type(in, struct ldb_paged_control);
-	struct asn1_data *data = asn1_init(mem_ctx);
+	struct asn1_data *data = asn1_init(mem_ctx, ASN1_MAX_TREE_DEPTH);
 
 	if (!data) return false;
 
@@ -897,10 +886,10 @@ static bool encode_paged_results_request(void *mem_ctx, void *in, DATA_BLOB *out
 		return false;
 	}
 
-	*out = data_blob_talloc(mem_ctx, data->data, data->length);
-	if (out->data == NULL) {
+	if (!asn1_extract_blob(data, mem_ctx, out)) {
 		return false;
 	}
+
 	talloc_free(data);
 
 	return true;
@@ -912,7 +901,7 @@ static bool encode_paged_results_request(void *mem_ctx, void *in, DATA_BLOB *out
 static bool encode_asq_control(void *mem_ctx, void *in, DATA_BLOB *out)
 {
 	struct ldb_asq_control *lac = talloc_get_type(in, struct ldb_asq_control);
-	struct asn1_data *data = asn1_init(mem_ctx);
+	struct asn1_data *data = asn1_init(mem_ctx, ASN1_MAX_TREE_DEPTH);
 
 	if (!data) return false;
 
@@ -935,10 +924,10 @@ static bool encode_asq_control(void *mem_ctx, void *in, DATA_BLOB *out)
 		return false;
 	}
 
-	*out = data_blob_talloc(mem_ctx, data->data, data->length);
-	if (out->data == NULL) {
+	if (!asn1_extract_blob(data, mem_ctx, out)) {
 		return false;
 	}
+
 	talloc_free(data);
 
 	return true;
@@ -947,7 +936,7 @@ static bool encode_asq_control(void *mem_ctx, void *in, DATA_BLOB *out)
 static bool encode_dirsync_request(void *mem_ctx, void *in, DATA_BLOB *out)
 {
 	struct ldb_dirsync_control *ldc = talloc_get_type(in, struct ldb_dirsync_control);
-	struct asn1_data *data = asn1_init(mem_ctx);
+	struct asn1_data *data = asn1_init(mem_ctx, ASN1_MAX_TREE_DEPTH);
 
 	if (!data) return false;
 
@@ -971,10 +960,10 @@ static bool encode_dirsync_request(void *mem_ctx, void *in, DATA_BLOB *out)
 		return false;
 	}
 
-	*out = data_blob_talloc(mem_ctx, data->data, data->length);
-	if (out->data == NULL) {
+	if (!asn1_extract_blob(data, mem_ctx, out)) {
 		return false;
 	}
+
 	talloc_free(data);
 
 	return true;
@@ -983,7 +972,7 @@ static bool encode_dirsync_request(void *mem_ctx, void *in, DATA_BLOB *out)
 static bool encode_vlv_request(void *mem_ctx, void *in, DATA_BLOB *out)
 {
 	struct ldb_vlv_req_control *lvrc = talloc_get_type(in, struct ldb_vlv_req_control);
-	struct asn1_data *data = asn1_init(mem_ctx);
+	struct asn1_data *data = asn1_init(mem_ctx, ASN1_MAX_TREE_DEPTH);
 
 	if (!data) return false;
 
@@ -1004,10 +993,6 @@ static bool encode_vlv_request(void *mem_ctx, void *in, DATA_BLOB *out)
 			return false;
 		}
 		
-		if (!asn1_push_tag(data, ASN1_SEQUENCE(0))) {
-			return false;
-		}
-		
 		if (!asn1_write_Integer(data, lvrc->match.byOffset.offset)) {
 			return false;
 		}
@@ -1016,19 +1001,15 @@ static bool encode_vlv_request(void *mem_ctx, void *in, DATA_BLOB *out)
 			return false;
 		}
 
-		if (!asn1_pop_tag(data)) { /*SEQUENCE*/
-			return false;
-		}
-
 		if (!asn1_pop_tag(data)) { /*CONTEXT*/
 			return false;
 		}
 	} else {
-		if (!asn1_push_tag(data, ASN1_CONTEXT(1))) {
+		if (!asn1_push_tag(data, ASN1_CONTEXT_SIMPLE(1))) {
 			return false;
 		}
 		
-		if (!asn1_write_OctetString(data, lvrc->match.gtOrEq.value, lvrc->match.gtOrEq.value_len)) {
+		if (!asn1_write(data, lvrc->match.gtOrEq.value, lvrc->match.gtOrEq.value_len)) {
 			return false;
 		}
 
@@ -1047,10 +1028,10 @@ static bool encode_vlv_request(void *mem_ctx, void *in, DATA_BLOB *out)
 		return false;
 	}
 
-	*out = data_blob_talloc(mem_ctx, data->data, data->length);
-	if (out->data == NULL) {
+	if (!asn1_extract_blob(data, mem_ctx, out)) {
 		return false;
 	}
+
 	talloc_free(data);
 
 	return true;
@@ -1059,7 +1040,7 @@ static bool encode_vlv_request(void *mem_ctx, void *in, DATA_BLOB *out)
 static bool encode_vlv_response(void *mem_ctx, void *in, DATA_BLOB *out)
 {
 	struct ldb_vlv_resp_control *lvrc = talloc_get_type(in, struct ldb_vlv_resp_control);
-	struct asn1_data *data = asn1_init(mem_ctx);
+	struct asn1_data *data = asn1_init(mem_ctx, ASN1_MAX_TREE_DEPTH);
 
 	if (!data) return false;
 
@@ -1089,10 +1070,10 @@ static bool encode_vlv_response(void *mem_ctx, void *in, DATA_BLOB *out)
 		return false;
 	}
 
-	*out = data_blob_talloc(mem_ctx, data->data, data->length);
-	if (out->data == NULL) {
+	if (!asn1_extract_blob(data, mem_ctx, out)) {
 		return false;
 	}
+
 	talloc_free(data);
 
 	return true;
@@ -1102,7 +1083,7 @@ static bool encode_openldap_dereference(void *mem_ctx, void *in, DATA_BLOB *out)
 {
 	struct dsdb_openldap_dereference_control *control = talloc_get_type(in, struct dsdb_openldap_dereference_control);
 	int i,j;
-	struct asn1_data *data = asn1_init(mem_ctx);
+	struct asn1_data *data = asn1_init(mem_ctx, ASN1_MAX_TREE_DEPTH);
 
 	if (!data) return false;
 	
@@ -1140,10 +1121,10 @@ static bool encode_openldap_dereference(void *mem_ctx, void *in, DATA_BLOB *out)
 		return false;
 	}
 
-	*out = data_blob_talloc(mem_ctx, data->data, data->length);
-	if (out->data == NULL) {
+	if (!asn1_extract_blob(data, mem_ctx, out)) {
 		return false;
 	}
+
 	talloc_free(data);
 	return true;
 }
@@ -1151,7 +1132,7 @@ static bool encode_openldap_dereference(void *mem_ctx, void *in, DATA_BLOB *out)
 static bool decode_openldap_dereference(void *mem_ctx, DATA_BLOB in, void *_out)
 {
 	void **out = (void **)_out;
-	struct asn1_data *data = asn1_init(mem_ctx);
+	struct asn1_data *data = asn1_init(mem_ctx, ASN1_MAX_TREE_DEPTH);
 	struct dsdb_openldap_dereference_result_control *control;
 	struct dsdb_openldap_dereference_result **r = NULL;
 	int i = 0;
@@ -1256,6 +1237,7 @@ static const struct ldap_control_handler ldap_known_controls[] = {
 	{ LDB_CONTROL_SORT_RESP_OID, decode_server_sort_response, encode_server_sort_response },
 	{ LDB_CONTROL_ASQ_OID, decode_asq_control, encode_asq_control },
 	{ LDB_CONTROL_DIRSYNC_OID, decode_dirsync_request, encode_dirsync_request },
+	{ LDB_CONTROL_DIRSYNC_EX_OID, decode_dirsync_request, encode_dirsync_request },
 	{ LDB_CONTROL_VLV_REQ_OID, decode_vlv_request, encode_vlv_request },
 	{ LDB_CONTROL_VLV_RESP_OID, decode_vlv_response, encode_vlv_response },
 	{ LDB_CONTROL_PERMISSIVE_MODIFY_OID, decode_flag_request, encode_flag_request },
@@ -1280,6 +1262,7 @@ static const struct ldap_control_handler ldap_known_controls[] = {
 	{ DSDB_CONTROL_PASSWORD_CHANGE_STATUS_OID, NULL, NULL },
 	{ DSDB_CONTROL_PASSWORD_HASH_VALUES_OID, NULL, NULL },
 	{ DSDB_CONTROL_PASSWORD_CHANGE_OID, NULL, NULL },
+	{ DSDB_CONTROL_PASSWORD_ACL_VALIDATION_OID, NULL, NULL },
 	{ DSDB_CONTROL_APPLY_LINKS, NULL, NULL },
 	{ LDB_CONTROL_BYPASS_OPERATIONAL_OID, NULL, NULL },
 	{ DSDB_CONTROL_CHANGEREPLMETADATA_OID, NULL, NULL },
@@ -1289,6 +1272,7 @@ static const struct ldap_control_handler ldap_known_controls[] = {
 	{ DSDB_EXTENDED_ALLOCATE_RID_POOL, NULL, NULL },
 	{ DSDB_CONTROL_NO_GLOBAL_CATALOG, NULL, NULL },
 	{ DSDB_EXTENDED_SCHEMA_UPGRADE_IN_PROGRESS_OID, NULL, NULL },
+	{ DSDB_CONTROL_TRANSACTION_IDENTIFIER_OID, NULL, NULL},
 	{ NULL, NULL, NULL }
 };
 

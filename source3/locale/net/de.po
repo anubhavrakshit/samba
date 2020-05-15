@@ -495,8 +495,8 @@ msgid "  Use 'net help help' to list usage information for 'net' commands."
 msgstr ""
 
 #: ../../utils/net.c:759
-msgid "Encrypt SMB transport (UNIX extended servers only)"
-msgstr "SMB Übertragung verschlüsseln (nur UNIX erweiterte Server)"
+msgid "Encrypt SMB transport"
+msgstr "SMB Übertragung verschlüsseln"
 
 #: ../../utils/net.c:827
 msgid ""
@@ -1613,7 +1613,7 @@ msgid ""
 msgstr ""
 
 #: ../../utils/net_ads.c:2636
-msgid "Perfom CLDAP query on DC"
+msgid "Perform CLDAP query on DC"
 msgstr ""
 
 #: ../../utils/net_ads.c:2637
@@ -1761,7 +1761,7 @@ msgstr ""
 
 #: ../../utils/net_ads_gpo.c:458
 msgid ""
-"  Lists gPLink of a containter\n"
+"  Lists gPLink of a container\n"
 "    container\tContainer to get link for\n"
 msgstr ""
 
@@ -1828,13 +1828,13 @@ msgid ""
 msgstr ""
 
 #: ../../utils/net_ads_gpo.c:667
-msgid "Lists gPLink of containter"
+msgid "Lists gPLink of container"
 msgstr ""
 
 #: ../../utils/net_ads_gpo.c:668
 msgid ""
 "net ads gpo linkget\n"
-"    Lists gPLink of containter"
+"    Lists gPLink of container"
 msgstr ""
 
 #: ../../utils/net_ads_gpo.c:675
@@ -3061,8 +3061,8 @@ msgid "\t-P or --machine-pass\t\tAuthenticate as machine account\n"
 msgstr "\t-P oder --machine-pass\t\tMit Rechnerkonto authentifizieren\n"
 
 #: ../../utils/net_help_common.c:52
-msgid "\t-e or --encrypt\t\t\tEncrypt SMB transport (UNIX extended servers only)\n"
-msgstr "\t-e oder --encrypt\t\t\tSMB Übertragung verschlüsseln  (nur UNIX erweiterte Server)\n"
+msgid "\t-e or --encrypt\t\t\tEncrypt SMB transport\n"
+msgstr "\t-e oder --encrypt\t\t\tSMB Übertragung verschlüsseln\n"
 
 #: ../../utils/net_help_common.c:54
 msgid "\t-k or --kerberos\t\tUse kerberos (active directory) authentication\n"
@@ -5455,13 +5455,13 @@ msgid ""
 msgstr ""
 
 #: ../../utils/net_rpc.c:6811
-msgid "Mirgate printer ACLs to local server"
+msgid "Migrate printer ACLs to local server"
 msgstr ""
 
 #: ../../utils/net_rpc.c:6812
 msgid ""
 "net rpc printer migrate security\n"
-"    Mirgate printer ACLs to local server"
+"    Migrate printer ACLs to local server"
 msgstr ""
 
 #: ../../utils/net_rpc.c:6819
@@ -6630,7 +6630,7 @@ msgstr ""
 #: ../../utils/net_rpc_registry.c:1368
 msgid ""
 "net rpc registry getsd\n"
-"    Get security descriptior"
+"    Get security descriptor"
 msgstr ""
 
 #: ../../utils/net_rpc_rights.c:203

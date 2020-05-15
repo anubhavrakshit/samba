@@ -78,7 +78,7 @@ static bool torture_syntax_add_OR_Name(struct torture_context *tctx,
 	ldb_ldif_read_free(ldb, ldif);
 	torture_assert_werr_ok(tctx, werr, "dsdb_set_attribute_from_ldb() failed!");
 
-	ldb_res = dsdb_set_schema(ldb, schema);
+	ldb_res = dsdb_set_schema(ldb, schema, SCHEMA_WRITE);
 	torture_assert_int_equal(tctx, ldb_res, LDB_SUCCESS, "dsdb_set_schema() failed");
 
 	return true;
@@ -225,6 +225,7 @@ static bool torture_dsdb_syntax_tcase_teardown(struct torture_context *tctx, voi
 	struct torture_dsdb_syntax *priv;
 
 	priv = talloc_get_type_abort(data, struct torture_dsdb_syntax);
+	talloc_unlink(priv, priv->ldb);
 	talloc_free(priv);
 
 	return true;

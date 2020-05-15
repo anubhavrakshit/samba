@@ -24,6 +24,7 @@
 #include "librpc/gen_ndr/ndr_lsa_c.h"
 #include "librpc/gen_ndr/ndr_samr_c.h"
 #include "auth/credentials/credentials.h"
+#include "auth/credentials/credentials_krb5.h"
 #include "torture/rpc/torture_rpc.h"
 #include "lib/cmdline/popt_common.h"
 #include "../libcli/auth/schannel.h"
@@ -62,6 +63,7 @@ bool test_netlogon_ex_ops(struct dcerpc_pipe *p, struct torture_context *tctx,
 	struct netr_SamBaseInfo *base = NULL;
 	const char *crypto_alg = "";
 	bool can_do_validation_6 = true;
+	enum dcerpc_AuthLevel auth_level = DCERPC_AUTH_LEVEL_NONE;
 
 	if (lpcfg_client_lanman_auth(tctx->lp_ctx)) {
 		flags |= CLI_CRED_LANMAN_AUTH;
@@ -71,9 +73,10 @@ bool test_netlogon_ex_ops(struct dcerpc_pipe *p, struct torture_context *tctx,
 		flags |= CLI_CRED_NTLMv2_AUTH;
 	}
 
-	cli_credentials_get_ntlm_username_domain(cmdline_credentials, tctx,
-						 &ninfo.identity_info.account_name.string,
-						 &ninfo.identity_info.domain_name.string);
+	cli_credentials_get_ntlm_username_domain(popt_get_cmdline_credentials(),
+				tctx,
+				&ninfo.identity_info.account_name.string,
+				&ninfo.identity_info.domain_name.string);
 
 	generate_random_buffer(ninfo.challenge,
 			       sizeof(ninfo.challenge));
@@ -83,12 +86,15 @@ bool test_netlogon_ex_ops(struct dcerpc_pipe *p, struct torture_context *tctx,
 	names_blob = NTLMv2_generate_names_blob(tctx, cli_credentials_get_workstation(credentials),
 						cli_credentials_get_domain(credentials));
 
-	status = cli_credentials_get_ntlm_response(cmdline_credentials, tctx,
-						   &flags,
-						   chal,
-						   names_blob,
-						   &lm_resp, &nt_resp,
-						   NULL, NULL);
+	status = cli_credentials_get_ntlm_response(
+			popt_get_cmdline_credentials(),
+			tctx,
+			&flags,
+			chal,
+			NULL, /* server_timestamp */
+			names_blob,
+			&lm_resp, &nt_resp,
+			NULL, NULL);
 	torture_assert_ntstatus_ok(tctx, status,
 				   "cli_credentials_get_ntlm_response failed");
 
@@ -99,8 +105,7 @@ bool test_netlogon_ex_ops(struct dcerpc_pipe *p, struct torture_context *tctx,
 	ninfo.nt.length = nt_resp.length;
 
 	ninfo.identity_info.parameter_control = 0;
-	ninfo.identity_info.logon_id_low = 0;
-	ninfo.identity_info.logon_id_high = 0;
+	ninfo.identity_info.logon_id = 0;
 	ninfo.identity_info.workstation.string = cli_credentials_get_workstation(credentials);
 
 	logon.network = &ninfo;
@@ -131,16 +136,26 @@ bool test_netlogon_ex_ops(struct dcerpc_pipe *p, struct torture_context *tctx,
 		}
 	}
 
-	r.in.validation_level = 6;
+	dcerpc_binding_handle_auth_info(b, NULL, &auth_level);
+	if (auth_level == DCERPC_AUTH_LEVEL_PRIVACY) {
+		r.in.validation_level = 6;
 
-	torture_comment(tctx,
-			"Testing LogonSamLogonEx with name %s using %s and validation_level: %d\n",
-			ninfo.identity_info.account_name.string, crypto_alg,
-			r.in.validation_level);
+		torture_comment(tctx,
+				"Testing LogonSamLogonEx with name %s using %s and validation_level: %d\n",
+				ninfo.identity_info.account_name.string, crypto_alg,
+				r.in.validation_level);
 
-	torture_assert_ntstatus_ok(tctx,
-		dcerpc_netr_LogonSamLogonEx_r(b, tctx, &r),
-		"LogonSamLogonEx failed");
+		torture_assert_ntstatus_ok(tctx,
+			dcerpc_netr_LogonSamLogonEx_r(b, tctx, &r),
+			"LogonSamLogonEx failed");
+	} else {
+		torture_comment(tctx,
+				"Skip auth_level[%u] Testing LogonSamLogonEx with name %s using %s and validation_level: %d\n",
+				auth_level, ninfo.identity_info.account_name.string, crypto_alg,
+				r.in.validation_level);
+		r.out.result = NT_STATUS_INVALID_INFO_CLASS;
+	}
+
 	if (NT_STATUS_EQUAL(r.out.result, NT_STATUS_INVALID_INFO_CLASS)) {
 		can_do_validation_6 = false;
 	} else {
@@ -455,7 +470,7 @@ static bool test_schannel(struct torture_context *tctx,
 		"failed to connect lsarpc with schannel");
 
 	torture_assert(tctx,
-		test_many_LookupSids(p_lsa, tctx, NULL),
+		test_many_LookupSids(p_lsa, tctx, NULL, LSA_LOOKUP_NAMES_ALL),
 		"LsaLookupSids3 failed!\n");
 
 	status = dcerpc_binding_set_transport(b, transport);
@@ -696,7 +711,7 @@ bool torture_rpc_schannel2(struct torture_context *torture)
 	struct dcerpc_binding *b;
 	struct dcerpc_pipe *p1 = NULL, *p2 = NULL;
 	struct cli_credentials *credentials1, *credentials2;
-	uint32_t dcerpc_flags = DCERPC_SCHANNEL | DCERPC_SIGN;
+	uint32_t dcerpc_flags = DCERPC_SCHANNEL | DCERPC_SCHANNEL_AUTO | DCERPC_SIGN;
 
 	join_ctx = torture_join_domain(torture, talloc_asprintf(torture, "%s2", TEST_MACHINE_NAME),
 				       ACB_WSTRUST, &credentials1);
@@ -842,6 +857,7 @@ static bool torture_schannel_bench_start(struct torture_schannel_bench_conn *con
 	status = cli_credentials_get_ntlm_response(user_creds, conn->tmp,
 						   &flags,
 						   chal,
+						   NULL, /* server_timestamp */
 						   names_blob,
 						   &lm_resp, &nt_resp,
 						   NULL, NULL);
@@ -855,8 +871,7 @@ static bool torture_schannel_bench_start(struct torture_schannel_bench_conn *con
 	conn->ninfo.nt.length = nt_resp.length;
 
 	conn->ninfo.identity_info.parameter_control = 0;
-	conn->ninfo.identity_info.logon_id_low = 0;
-	conn->ninfo.identity_info.logon_id_high = 0;
+	conn->ninfo.identity_info.logon_id = 0;
 	conn->ninfo.identity_info.workstation.string = cli_credentials_get_workstation(conn->wks_creds);
 
 	conn->r.in.server_name = talloc_asprintf(conn->tmp, "\\\\%s", dcerpc_server_name(conn->pipe));
@@ -928,12 +943,14 @@ bool torture_rpc_schannel_bench1(struct torture_context *torture)
 	s->nprocs = torture_setting_int(torture, "nprocs", 4);
 	s->conns = talloc_zero_array(s, struct torture_schannel_bench_conn, s->nprocs);
 
-	s->user1_creds = cli_credentials_shallow_copy(s, cmdline_credentials);
+	s->user1_creds = cli_credentials_shallow_copy(s,
+				popt_get_cmdline_credentials());
 	tmp = torture_setting_string(s->tctx, "extra_user1", NULL);
 	if (tmp) {
 		cli_credentials_parse_string(s->user1_creds, tmp, CRED_SPECIFIED);
 	}
-	s->user2_creds = cli_credentials_shallow_copy(s, cmdline_credentials);
+	s->user2_creds = cli_credentials_shallow_copy(s,
+				popt_get_cmdline_credentials());
 	tmp = torture_setting_string(s->tctx, "extra_user2", NULL);
 	if (tmp) {
 		cli_credentials_parse_string(s->user1_creds, tmp, CRED_SPECIFIED);

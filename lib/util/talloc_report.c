@@ -27,10 +27,14 @@
 
 static char *talloc_vasprintf_append_largebuf(char *buf, ssize_t *pstr_len,
 					      const char *fmt, va_list ap)
+					      PRINTF_ATTRIBUTE(3,0);
+
+static char *talloc_vasprintf_append_largebuf(char *buf, ssize_t *pstr_len,
+					      const char *fmt, va_list ap)
 {
 	ssize_t str_len = *pstr_len;
-	size_t buflen, needed, space;
-	char *start, *tmpbuf;
+	size_t buflen, needed, space = 0;
+	char *start = NULL, *tmpbuf = NULL;
 	va_list ap2;
 	int printlen;
 
@@ -40,14 +44,16 @@ static char *talloc_vasprintf_append_largebuf(char *buf, ssize_t *pstr_len,
 	if (buf == NULL) {
 		return NULL;
 	}
+	if (fmt == NULL) {
+		return NULL;
+	}
 	buflen = talloc_get_size(buf);
 
-	if (buflen > str_len) {
+	if (buflen > (size_t)str_len) {
 		start = buf + str_len;
 		space = buflen - str_len;
 	} else {
-		start = NULL;
-		space = 0;
+		return NULL;
 	}
 
 	va_copy(ap2, ap);
@@ -83,6 +89,10 @@ fail:
 	*pstr_len = -1;
 	return buf;
 }
+
+static char *talloc_asprintf_append_largebuf(char *buf, ssize_t *pstr_len,
+					     const char *fmt, ...)
+					     PRINTF_ATTRIBUTE(3,4);
 
 static char *talloc_asprintf_append_largebuf(char *buf, ssize_t *pstr_len,
 					     const char *fmt, ...)
@@ -135,18 +145,18 @@ static void talloc_report_str_helper(const void *ptr, int depth, int max_depth,
 		state->s = talloc_asprintf_append_largebuf(
 			state->s, &state->str_len,
 			"%*s%-30s contains %6lu bytes in %3lu blocks "
-			"(ref %d): %*s\n", depth*4, "",	name,
+			"(ref %zu): %*s\n", depth*4, "", name,
 			(unsigned long)talloc_total_size(ptr),
 			(unsigned long)talloc_total_blocks(ptr),
 			talloc_reference_count(ptr),
-			MIN(50, talloc_get_size(ptr)),
+			(int)MIN(50, talloc_get_size(ptr)),
 			(const char *)ptr);
 		return;
 	}
 
 	state->s = talloc_asprintf_append_largebuf(
 		state->s, &state->str_len,
-		"%*s%-30s contains %6lu bytes in %3lu blocks (ref %d) %p\n",
+		"%*s%-30s contains %6lu bytes in %3lu blocks (ref %zu) %p\n",
 		depth*4, "", name,
 		(unsigned long)talloc_total_size(ptr),
 		(unsigned long)talloc_total_blocks(ptr),

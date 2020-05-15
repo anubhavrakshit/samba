@@ -48,13 +48,8 @@ bool snum_is_shared_printer(int snum)
  *
  * This function should normally only be called as a callback on a successful
  * pcap_cache_reload(), or on client enumeration.
- *
- * @param[in] ev        The event context.
- *
- * @param[in] msg_ctx   The messaging context.
  */
-void delete_and_reload_printers(struct tevent_context *ev,
-				struct messaging_context *msg_ctx)
+void delete_and_reload_printers(void)
 {
 	int n_services;
 	int pnum;
@@ -63,6 +58,8 @@ void delete_and_reload_printers(struct tevent_context *ev,
 	bool ok;
 	time_t pcap_last_update;
 	TALLOC_CTX *frame = talloc_stackframe();
+	const struct loadparm_substitution *lp_sub =
+		loadparm_s3_global_substitution();
 
 	ok = pcap_cache_loaded(&pcap_last_update);
 	if (!ok) {
@@ -79,7 +76,7 @@ void delete_and_reload_printers(struct tevent_context *ev,
 	reload_last_pcap_time = pcap_last_update;
 
 	/* Get pcap printers updated */
-	load_printers(ev, msg_ctx);
+	load_printers();
 
 	n_services = lp_numservices();
 	pnum = lp_servicenumber(PRINTERS_NAME);
@@ -101,7 +98,7 @@ void delete_and_reload_printers(struct tevent_context *ev,
 			continue;
 		}
 
-		pname = lp_printername(frame, snum);
+		pname = lp_printername(frame, lp_sub, snum);
 
 		/* check printer, but avoid removing non-autoloaded printers */
 		if (lp_autoloaded(snum) && !pcap_printername_ok(pname)) {
@@ -110,7 +107,7 @@ void delete_and_reload_printers(struct tevent_context *ev,
 	}
 
 	/* Make sure deleted printers are gone */
-	load_printers(ev, msg_ctx);
+	load_printers();
 
 	talloc_free(frame);
 }
@@ -123,11 +120,13 @@ bool reload_services(struct smbd_server_connection *sconn,
 		     bool (*snumused) (struct smbd_server_connection *, int),
 		     bool test)
 {
+	const struct loadparm_substitution *lp_sub =
+		loadparm_s3_global_substitution();
 	struct smbXsrv_connection *xconn = NULL;
 	bool ret;
 
 	if (lp_loaded()) {
-		char *fname = lp_next_configfile(talloc_tos());
+		char *fname = lp_next_configfile(talloc_tos(), lp_sub);
 		if (file_exist(fname) &&
 		    !strcsequal(fname, get_dyn_CONFIGFILE())) {
 			set_dyn_CONFIGFILE(fname);
@@ -164,9 +163,7 @@ bool reload_services(struct smbd_server_connection *sconn,
 
 	mangle_reset_cache();
 	reset_stat_cache();
-
-	/* this forces service parameters to be flushed */
-	set_current_service(NULL,0,True);
+	flush_dfree_cache();
 
 	return(ret);
 }

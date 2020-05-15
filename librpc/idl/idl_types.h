@@ -40,6 +40,7 @@
 #define NDR_ALIGN2        LIBNDR_FLAG_ALIGN2
 #define NDR_ALIGN4        LIBNDR_FLAG_ALIGN4
 #define NDR_ALIGN8        LIBNDR_FLAG_ALIGN8
+#define NDR_NO_COMP       LIBNDR_FLAG_NO_COMPRESSION
 
 /* this flag is used to force a section of IDL as little endian. It is
    needed for the epmapper IDL, which is defined as always being LE */
@@ -50,6 +51,12 @@
   this is used to control formatting of uint8 arrays
 */
 #define NDR_PAHEX LIBNDR_PRINT_ARRAY_HEX
+
+/*
+ * Mark an element as SECRET, it won't be printed by
+ * via ndr_print* unless NDR_PRINT_SECRETS is specified.
+ */
+#define NDR_SECRET LIBNDR_FLAG_IS_SECRET
 
 #define NDR_RELATIVE_REVERSE LIBNDR_FLAG_RELATIVE_REVERSE
 #define NDR_NO_RELATIVE_REVERSE LIBNDR_FLAG_NO_RELATIVE_REVERSE

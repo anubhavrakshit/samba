@@ -21,6 +21,7 @@
 #define _PARAM_H 
 
 struct loadparm_s3_helpers;
+struct loadparm_substitution;
 
 struct parmlist_entry;
 
@@ -39,8 +40,6 @@ struct smbsrv_connection;
 
 #define Auto (2)
 
-#include "libds/common/roles.h"
-
 struct loadparm_context;
 struct loadparm_service;
 struct smbcli_options;
@@ -48,8 +47,6 @@ struct smbcli_session_options;
 struct gensec_settings;
 struct bitmap;
 struct file_lists;
-
-typedef bool (*lpcfg_defaults_hook) (struct loadparm_context *);
 
 #ifdef CONFIG_H_IS_FROM_SAMBA
 #include "lib/param/param_proto.h"
@@ -60,6 +57,7 @@ const char **lpcfg_interfaces(struct loadparm_context *);
 const char *lpcfg_realm(struct loadparm_context *);
 const char *lpcfg_netbios_name(struct loadparm_context *);
 const char *lpcfg_private_dir(struct loadparm_context *);
+const char *lpcfg_binddns_dir(struct loadparm_context *);
 int lpcfg_server_role(struct loadparm_context *);
 int lpcfg_allow_dns_updates(struct loadparm_context *);
 
@@ -100,6 +98,10 @@ int lpcfg_parm_bytes(struct loadparm_context *lp_ctx,
 unsigned long lpcfg_parm_ulong(struct loadparm_context *lp_ctx,
 			    struct loadparm_service *service, const char *type,
 			    const char *option, unsigned long default_v);
+unsigned long long lpcfg_parm_ulonglong(struct loadparm_context *lp_ctx,
+					struct loadparm_service *service,
+					const char *type, const char *option,
+					unsigned long long default_v);
 long lpcfg_parm_long(struct loadparm_context *lp_ctx,
 		     struct loadparm_service *service, const char *type,
 		     const char *option, long default_v);
@@ -214,20 +216,6 @@ const char *lpcfg_socket_options(struct loadparm_context *);
 struct dcerpc_server_info *lpcfg_dcerpc_server_info(TALLOC_CTX *mem_ctx, struct loadparm_context *lp_ctx);
 struct gensec_settings *lpcfg_gensec_settings(TALLOC_CTX *, struct loadparm_context *);
 
-/* Hooks to override defaults.
- *
- * Every time a loadparm context is initialized, the hooks are
- * called on it, once Samba itself has set defaults.
- *
- * This allows modules to tweak defaults (before any smb.conf file or registry
- * is loaded). Usually they would do this by calling lpcfg_do_global_parameter
- * or lpcfg_do_service_parameter.
- *
- * A good use case for this is OpenChange, which by default enables its
- * DCE/RPC services when it is installed.
- * */
-bool lpcfg_register_defaults_hook(const char *name, lpcfg_defaults_hook hook);
-
 /* The following definitions come from param/util.c  */
 
 
@@ -299,16 +287,17 @@ char *smbd_tmp_path(TALLOC_CTX *mem_ctx,
 
 const char *lpcfg_imessaging_path(TALLOC_CTX *mem_ctx,
 				       struct loadparm_context *lp_ctx);
-struct smb_iconv_handle *smb_iconv_handle_reinit_lp(TALLOC_CTX *mem_ctx,
-							      struct loadparm_context *lp_ctx,
-							      struct smb_iconv_handle *old_ic);
-
 const char *lpcfg_sam_name(struct loadparm_context *lp_ctx);
+const char *lpcfg_sam_dnsname(struct loadparm_context *lp_ctx);
 
-void lpcfg_default_kdc_policy(struct loadparm_context *lp_ctx,
+void lpcfg_default_kdc_policy(TALLOC_CTX *mem_ctx,
+				struct loadparm_context *lp_ctx,
 				time_t *svc_tkt_lifetime,
 				time_t *usr_tkt_lifetime,
 				time_t *renewal_lifetime);
+
+int lpcfg_rpc_port_low(struct loadparm_context *lp_ctx);
+int lpcfg_rpc_port_high(struct loadparm_context *lp_ctx);
 
 /* The following definitions come from lib/version.c  */
 

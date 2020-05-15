@@ -1,28 +1,24 @@
-import Build
-from samba_utils import *
-from Configure import conf
-
+from waflib import Utils
+from waflib.Configure import conf
+from samba_utils import get_string
 done = {}
 
 @conf
 def SAMBA_CHECK_PERL(conf, mandatory=True, version=(5,0,0)):
-    #
-    # TODO: use the @runonce mechanism for this.
-    # The problem is that @runonce currently does
-    # not seem to work together with @conf...
-    # So @runonce (and/or) @conf needs fixing.
-    #
     if "done" in done:
         return
     done["done"] = True
     conf.find_program('perl', var='PERL', mandatory=mandatory)
-    conf.check_tool('perl')
+    conf.load('perl')
     path_perl = conf.find_program('perl')
     conf.env.PERL_SPECIFIED = (conf.env.PERL != path_perl)
     conf.check_perl_version(version)
 
     def read_perl_config_var(cmd):
-        return Utils.to_list(Utils.cmd_output([conf.env.PERL, '-MConfig', '-e', cmd]))
+        output = Utils.cmd_output([conf.env.get_flat('PERL'), '-MConfig', '-e', cmd])
+        if not isinstance(output, str):
+            output = get_string(output)
+        return Utils.to_list(output)
 
     def check_perl_config_var(var):
         conf.start_msg("Checking for perl $Config{%s}:" % var)
@@ -56,7 +52,8 @@ def SAMBA_CHECK_PERL(conf, mandatory=True, version=(5,0,0)):
     conf.env.PERL_LIB_INSTALL_DIR = perl_lib_install_dir
 
     perl_inc = read_perl_config_var('print "@INC"')
-    perl_inc.remove('.')
+    if '.' in perl_inc:
+        perl_inc.remove('.')
     conf.start_msg("PERL_INC: ")
     conf.end_msg("%s" % (perl_inc), 'GREEN')
     conf.env.PERL_INC = perl_inc

@@ -1,4 +1,4 @@
-/* 
+/*
    Unix SMB/CIFS implementation.
 
    User credentials handling (as regards on-disk files)
@@ -6,17 +6,17 @@
    Copyright (C) Jelmer Vernooij 2005
    Copyright (C) Tim Potter 2001
    Copyright (C) Andrew Bartlett <abartlet@samba.org> 2005
-   
+
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
    the Free Software Foundation; either version 3 of the License, or
    (at your option) any later version.
-   
+
    This program is distributed in the hope that it will be useful,
    but WITHOUT ANY WARRANTY; without even the implied warranty of
    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
    GNU General Public License for more details.
-   
+
    You should have received a copy of the GNU General Public License
    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
@@ -39,28 +39,31 @@
 #include "dbwrap/dbwrap.h"
 #include "dbwrap/dbwrap_open.h"
 #include "lib/util/util_tdb.h"
+#include "libds/common/roles.h"
 
+#undef DBGC_CLASS
+#define DBGC_CLASS DBGC_AUTH
 
 /**
  * Fill in credentials for the machine trust account, from the secrets database.
- * 
+ *
  * @param cred Credentials structure to fill in
  * @retval NTSTATUS error detailing any failure
  */
-static NTSTATUS cli_credentials_set_secrets_lct(struct cli_credentials *cred, 
+static NTSTATUS cli_credentials_set_secrets_lct(struct cli_credentials *cred,
 						struct loadparm_context *lp_ctx,
 						struct ldb_context *ldb,
 						const char *base,
-						const char *filter, 
+						const char *filter,
 						time_t secrets_tdb_last_change_time,
 						const char *secrets_tdb_password,
 						char **error_string)
 {
 	TALLOC_CTX *mem_ctx;
-	
+
 	int ldb_ret;
 	struct ldb_message *msg;
-	
+
 	const char *machine_account;
 	const char *password;
 	const char *domain;
@@ -106,7 +109,7 @@ static NTSTATUS cli_credentials_set_secrets_lct(struct cli_credentials *cred,
 
 	whenChanged = ldb_msg_find_ldb_val(msg, "whenChanged");
 	if (!whenChanged || ldb_val_to_time(whenChanged, &lct) != LDB_SUCCESS) {
-		/* This attribute is mandetory */
+		/* This attribute is mandatory */
 		talloc_free(mem_ctx);
 		return NT_STATUS_NOT_FOUND;
 	}
@@ -116,23 +119,26 @@ static NTSTATUS cli_credentials_set_secrets_lct(struct cli_credentials *cred,
 		talloc_free(mem_ctx);
 		return NT_STATUS_NOT_FOUND;
 	}
-	
-	if (lct == secrets_tdb_last_change_time && secrets_tdb_password && strcmp(password, secrets_tdb_password) != 0) {
+
+	if ((lct == secrets_tdb_last_change_time) &&
+	    (secrets_tdb_password != NULL) &&
+	    (password != NULL) &&
+	    (strcmp(password, secrets_tdb_password) != 0)) {
 		talloc_free(mem_ctx);
 		return NT_STATUS_NOT_FOUND;
 	}
-	
+
 	cli_credentials_set_password_last_changed_time(cred, lct);
-	
+
 	machine_account = ldb_msg_find_attr_as_string(msg, "samAccountName", NULL);
 
 	if (!machine_account) {
 		machine_account = ldb_msg_find_attr_as_string(msg, "servicePrincipalName", NULL);
-		
+
 		if (!machine_account) {
 			const char *ldap_bind_dn = ldb_msg_find_attr_as_string(msg, "ldapBindDn", NULL);
 			if (!ldap_bind_dn) {
-				*error_string = talloc_asprintf(cred, 
+				*error_string = talloc_asprintf(cred,
 								"Could not find 'samAccountName', "
 								"'servicePrincipalName' or "
 								"'ldapBindDn' in secrets record: %s",
@@ -148,20 +154,20 @@ static NTSTATUS cli_credentials_set_secrets_lct(struct cli_credentials *cred,
 
 	salt_principal = ldb_msg_find_attr_as_string(msg, "saltPrincipal", NULL);
 	cli_credentials_set_salt_principal(cred, salt_principal);
-	
+
 	sct = ldb_msg_find_attr_as_int(msg, "secureChannelType", 0);
-	if (sct) { 
+	if (sct) {
 		cli_credentials_set_secure_channel_type(cred, sct);
 	}
-	
+
 	if (!password) {
 		const struct ldb_val *nt_password_hash = ldb_msg_find_ldb_val(msg, "unicodePwd");
 		struct samr_Password hash;
 		ZERO_STRUCT(hash);
 		if (nt_password_hash) {
-			memcpy(hash.hash, nt_password_hash->data, 
+			memcpy(hash.hash, nt_password_hash->data,
 			       MIN(nt_password_hash->length, sizeof(hash.hash)));
-		
+
 			cli_credentials_set_nt_hash(cred, &hash, CRED_SPECIFIED);
 		} else {
 			cli_credentials_set_password(cred, NULL, CRED_SPECIFIED);
@@ -170,7 +176,6 @@ static NTSTATUS cli_credentials_set_secrets_lct(struct cli_credentials *cred,
 		cli_credentials_set_password(cred, password, CRED_SPECIFIED);
 	}
 
-	
 	domain = ldb_msg_find_attr_as_string(msg, "flatname", NULL);
 	if (domain) {
 		cli_credentials_set_domain(cred, domain, CRED_SPECIFIED);
@@ -196,22 +201,22 @@ static NTSTATUS cli_credentials_set_secrets_lct(struct cli_credentials *cred,
 		talloc_free(keytab);
 	}
 	talloc_free(mem_ctx);
-	
+
 	return NT_STATUS_OK;
 }
 
 
 /**
  * Fill in credentials for the machine trust account, from the secrets database.
- * 
+ *
  * @param cred Credentials structure to fill in
  * @retval NTSTATUS error detailing any failure
  */
-_PUBLIC_ NTSTATUS cli_credentials_set_secrets(struct cli_credentials *cred, 
+_PUBLIC_ NTSTATUS cli_credentials_set_secrets(struct cli_credentials *cred,
 					      struct loadparm_context *lp_ctx,
 					      struct ldb_context *ldb,
 					      const char *base,
-					      const char *filter, 
+					      const char *filter,
 					      char **error_string)
 {
 	NTSTATUS status = cli_credentials_set_secrets_lct(cred, lp_ctx, ldb, base, filter, 0, NULL, error_string);
@@ -224,7 +229,7 @@ _PUBLIC_ NTSTATUS cli_credentials_set_secrets(struct cli_credentials *cred,
 
 /**
  * Fill in credentials for the machine trust account, from the secrets database.
- * 
+ *
  * @param cred Credentials structure to fill in
  * @retval NTSTATUS error detailing any failure
  */
@@ -233,16 +238,25 @@ _PUBLIC_ NTSTATUS cli_credentials_set_machine_account(struct cli_credentials *cr
 {
 	struct db_context *db_ctx;
 	char *secrets_tdb_path;
+	int hash_size, tdb_flags;
 
 	secrets_tdb_path = lpcfg_private_db_path(cred, lp_ctx, "secrets");
 	if (secrets_tdb_path == NULL) {
 		return NT_STATUS_NO_MEMORY;
 	}
 
-	db_ctx = dbwrap_local_open(cred, lp_ctx, secrets_tdb_path, 0,
-				   TDB_DEFAULT, O_RDWR, 0600,
-				   DBWRAP_LOCK_ORDER_1,
-				   DBWRAP_FLAG_NONE);
+	hash_size = lpcfg_tdb_hash_size(lp_ctx, secrets_tdb_path);
+	tdb_flags = lpcfg_tdb_flags(lp_ctx, TDB_DEFAULT);
+
+	db_ctx = dbwrap_local_open(
+		cred,
+		secrets_tdb_path,
+		hash_size,
+		tdb_flags,
+		O_RDWR,
+		0600,
+		DBWRAP_LOCK_ORDER_1,
+		DBWRAP_FLAG_NONE);
 	TALLOC_FREE(secrets_tdb_path);
 
 	/*
@@ -277,6 +291,8 @@ _PUBLIC_ NTSTATUS cli_credentials_set_machine_account_db_ctx(struct cli_credenti
 	char *secrets_tdb_password = NULL;
 	char *secrets_tdb_old_password = NULL;
 	uint32_t secrets_tdb_secure_channel_type = SEC_CHAN_NULL;
+	int server_role = lpcfg_server_role(lp_ctx);
+	int security = lpcfg_security(lp_ctx);
 	char *keystr;
 	char *keystr_upper = NULL;
 	TALLOC_CTX *tmp_ctx = talloc_named(cred, 0, "cli_credentials_set_secrets from ldb");
@@ -355,13 +371,27 @@ _PUBLIC_ NTSTATUS cli_credentials_set_machine_account_db_ctx(struct cli_credenti
 	}
 
 	if (secrets_tdb_password_more_recent) {
+		enum credentials_use_kerberos use_kerberos = CRED_DONT_USE_KERBEROS;
 		char *machine_account = talloc_asprintf(tmp_ctx, "%s$", lpcfg_netbios_name(lp_ctx));
 		cli_credentials_set_password(cred, secrets_tdb_password, CRED_SPECIFIED);
 		cli_credentials_set_old_password(cred, secrets_tdb_old_password, CRED_SPECIFIED);
 		cli_credentials_set_domain(cred, domain, CRED_SPECIFIED);
 		if (strequal(domain, lpcfg_workgroup(lp_ctx))) {
 			cli_credentials_set_realm(cred, lpcfg_realm(lp_ctx), CRED_SPECIFIED);
+
+			switch (server_role) {
+			case ROLE_DOMAIN_MEMBER:
+				if (security != SEC_ADS) {
+					break;
+				}
+
+				FALL_THROUGH;
+			case ROLE_ACTIVE_DIRECTORY_DC:
+				use_kerberos = CRED_AUTO_USE_KERBEROS;
+				break;
+			}
 		}
+		cli_credentials_set_kerberos_state(cred, use_kerberos);
 		cli_credentials_set_username(cred, machine_account, CRED_SPECIFIED);
 		cli_credentials_set_password_last_changed_time(cred, secrets_tdb_lct);
 		cli_credentials_set_secure_channel_type(cred, secrets_tdb_secure_channel_type);
@@ -397,14 +427,14 @@ _PUBLIC_ NTSTATUS cli_credentials_set_machine_account_db_ctx(struct cli_credenti
 		/* set anonymous as the fallback, if the machine account won't work */
 		cli_credentials_set_anonymous(cred);
 	}
-	
+
 	TALLOC_FREE(tmp_ctx);
 	return status;
 }
 
 /**
- * Fill in credentials for a particular prinicpal, from the secrets database.
- * 
+ * Fill in credentials for a particular principal, from the secrets database.
+ *
  * @param cred Credentials structure to fill in
  * @retval NTSTATUS error detailing any failure
  */
@@ -437,9 +467,9 @@ _PUBLIC_ NTSTATUS cli_credentials_set_stored_principal(struct cli_credentials *c
 /**
  * Ask that when required, the credentials system will be filled with
  * machine trust account, from the secrets database.
- * 
+ *
  * @param cred Credentials structure to fill in
- * @note This function is used to call the above function after, rather 
+ * @note This function is used to call the above function after, rather
  *       than during, popt processing.
  *
  */

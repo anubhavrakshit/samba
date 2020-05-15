@@ -26,6 +26,9 @@
 
 #ifdef HAVE_LIBREADLINE
 #  ifdef HAVE_READLINE_READLINE_H
+#    ifdef HAVE_READLINE_READLINE_WORKAROUND
+#      define _FUNCTION_DEF
+#    endif
 #    include <readline/readline.h>
 #    ifdef HAVE_READLINE_HISTORY_H
 #      include <readline/history.h>
@@ -45,7 +48,7 @@
 #ifdef HAVE_NEW_LIBREADLINE
 #ifdef HAVE_CPPFUNCTION
 #  define RL_COMPLETION_CAST (CPPFunction *)
-#elif HAVE_RL_COMPLETION_T
+#elif defined(HAVE_RL_COMPLETION_T)
 #  define RL_COMPLETION_CAST (rl_completion_t *)
 #else
 #  define RL_COMPLETION_CAST

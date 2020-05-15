@@ -1,5 +1,5 @@
 /*
-   Unix SMB/CIFS mplementation.
+   Unix SMB/CIFS implementation.
 
    run a child command
 
@@ -29,31 +29,49 @@
 #include "system/filesys.h"
 #include <tevent.h>
 #include "../lib/util/tevent_unix.h"
+#include "../lib/util/tfork.h"
+#include "../lib/util/sys_rw.h"
 
 struct samba_runcmd_state {
 	int stdout_log_level;
 	int stderr_log_level;
 	struct tevent_fd *fde_stdout;
 	struct tevent_fd *fde_stderr;
-	int fd_stdin, fd_stdout, fd_stderr;
+	struct tevent_fd *fde_status;
+	int fd_stdin, fd_stdout, fd_stderr, fd_status;
 	char *arg0;
 	pid_t pid;
+	struct tfork *tfork;
 	char buf[1024];
 	uint16_t buf_used;
 };
 
-static int samba_runcmd_state_destructor(struct samba_runcmd_state *state)
+static void samba_runcmd_cleanup_fn(struct tevent_req *req,
+				    enum tevent_req_state req_state)
 {
-	if (state->pid > 0) {
-		kill(state->pid, SIGKILL);
-		waitpid(state->pid, NULL, 0);
-		state->pid = -1;
+	struct samba_runcmd_state *state = tevent_req_data(
+		req, struct samba_runcmd_state);
+
+	if (state->tfork != NULL) {
+		tfork_destroy(&state->tfork);
 	}
+	state->pid = -1;
 
 	if (state->fd_stdin != -1) {
 		close(state->fd_stdin);
+		state->fd_stdin = -1;
 	}
-	return 0;
+}
+
+int samba_runcmd_export_stdin(struct tevent_req *req)
+{
+	struct samba_runcmd_state *state = tevent_req_data(req,
+					   struct samba_runcmd_state);
+	int ret = state->fd_stdin;
+
+	state->fd_stdin = -1;
+
+	return ret;
 }
 
 static void samba_runcmd_io_handler(struct tevent_context *ev,
@@ -118,8 +136,8 @@ struct tevent_req *samba_runcmd_send(TALLOC_CTX *mem_ctx,
 		return tevent_req_post(req, ev);
 	}
 
-	state->pid = fork();
-	if (state->pid == (pid_t)-1) {
+	state->tfork = tfork_create();
+	if (state->tfork == NULL) {
 		close(p1[0]);
 		close(p1[1]);
 		close(p2[0]);
@@ -129,7 +147,7 @@ struct tevent_req *samba_runcmd_send(TALLOC_CTX *mem_ctx,
 		tevent_req_error(req, errno);
 		return tevent_req_post(req, ev);
 	}
-
+	state->pid = tfork_child_pid(state->tfork);
 	if (state->pid != 0) {
 		/* the parent */
 		close(p1[1]);
@@ -138,16 +156,19 @@ struct tevent_req *samba_runcmd_send(TALLOC_CTX *mem_ctx,
 		state->fd_stdout = p1[0];
 		state->fd_stderr = p2[0];
 		state->fd_stdin  = p3[1];
+		state->fd_status = tfork_event_fd(state->tfork);
 
 		set_blocking(state->fd_stdout, false);
 		set_blocking(state->fd_stderr, false);
 		set_blocking(state->fd_stdin,  false);
+		set_blocking(state->fd_status, false);
 
 		smb_set_close_on_exec(state->fd_stdin);
 		smb_set_close_on_exec(state->fd_stdout);
 		smb_set_close_on_exec(state->fd_stderr);
+		smb_set_close_on_exec(state->fd_status);
 
-		talloc_set_destructor(state, samba_runcmd_state_destructor);
+		tevent_req_set_cleanup_fn(req, samba_runcmd_cleanup_fn);
 
 		state->fde_stdout = tevent_add_fd(ev, state,
 						  state->fd_stdout,
@@ -157,6 +178,7 @@ struct tevent_req *samba_runcmd_send(TALLOC_CTX *mem_ctx,
 		if (tevent_req_nomem(state->fde_stdout, req)) {
 			close(state->fd_stdout);
 			close(state->fd_stderr);
+			close(state->fd_status);
 			return tevent_req_post(req, ev);
 		}
 		tevent_fd_set_auto_close(state->fde_stdout);
@@ -167,10 +189,25 @@ struct tevent_req *samba_runcmd_send(TALLOC_CTX *mem_ctx,
 						  samba_runcmd_io_handler,
 						  req);
 		if (tevent_req_nomem(state->fde_stdout, req)) {
+			close(state->fd_stdout);
 			close(state->fd_stderr);
+			close(state->fd_status);
 			return tevent_req_post(req, ev);
 		}
 		tevent_fd_set_auto_close(state->fde_stderr);
+
+		state->fde_status = tevent_add_fd(ev, state,
+						  state->fd_status,
+						  TEVENT_FD_READ,
+						  samba_runcmd_io_handler,
+						  req);
+		if (tevent_req_nomem(state->fde_stdout, req)) {
+			close(state->fd_stdout);
+			close(state->fd_stderr);
+			close(state->fd_status);
+			return tevent_req_post(req, ev);
+		}
+		tevent_fd_set_auto_close(state->fde_status);
 
 		if (!timeval_is_zero(&endtime)) {
 			tevent_req_set_endtime(req, ev, endtime);
@@ -243,6 +280,10 @@ static void samba_runcmd_io_handler(struct tevent_context *ev,
 	char *p;
 	int n, fd;
 
+	if (!(flags & TEVENT_FD_READ)) {
+		return;
+	}
+
 	if (fde == state->fde_stdout) {
 		level = state->stdout_log_level;
 		fd = state->fd_stdout;
@@ -250,10 +291,35 @@ static void samba_runcmd_io_handler(struct tevent_context *ev,
 		level = state->stderr_log_level;
 		fd = state->fd_stderr;
 	} else {
-		return;
-	}
+		int status;
 
-	if (!(flags & TEVENT_FD_READ)) {
+		status = tfork_status(&state->tfork, false);
+		if (status == -1) {
+			if (errno == EAGAIN || errno == EWOULDBLOCK) {
+				return;
+			}
+			DBG_ERR("Bad read on status pipe\n");
+			tevent_req_error(req, errno);
+			return;
+		}
+		state->pid = -1;
+		TALLOC_FREE(fde);
+
+		if (WIFEXITED(status)) {
+			status = WEXITSTATUS(status);
+		} else if (WIFSIGNALED(status)) {
+			status = WTERMSIG(status);
+		} else {
+			status = ECHILD;
+		}
+
+		DBG_NOTICE("Child %s exited %d\n", state->arg0, status);
+		if (status != 0) {
+			tevent_req_error(req, status);
+			return;
+		}
+
+		tevent_req_done(req);
 		return;
 	}
 
@@ -265,53 +331,11 @@ static void samba_runcmd_io_handler(struct tevent_context *ev,
 		if (fde == state->fde_stdout) {
 			talloc_free(fde);
 			state->fde_stdout = NULL;
+			return;
 		}
 		if (fde == state->fde_stderr) {
 			talloc_free(fde);
 			state->fde_stderr = NULL;
-		}
-		if (state->fde_stdout == NULL &&
-		    state->fde_stderr == NULL) {
-			int status;
-			/* the child has closed both stdout and
-			 * stderr, assume its dead */
-			pid_t pid = waitpid(state->pid, &status, 0);
-			if (pid != state->pid) {
-				if (errno == ECHILD) {
-					/* this happens when the
-					   parent has set SIGCHLD to
-					   SIG_IGN. In that case we
-					   can only get error
-					   information for the child
-					   via its logging. We should
-					   stop using SIG_IGN on
-					   SIGCHLD in the standard
-					   process model.
-					*/
-					DEBUG(0, ("Error in waitpid() unexpectedly got ECHILD "
-						  "for %s child %d - %s, "
-						  "someone has set SIGCHLD to SIG_IGN!\n",
-					state->arg0, (int)state->pid, strerror(errno)));
-					tevent_req_error(req, errno);
-					return;
-				}
-				DEBUG(0,("Error in waitpid() for child %s - %s \n",
-					 state->arg0, strerror(errno)));
-				if (errno == 0) {
-					errno = ECHILD;
-				}
-				tevent_req_error(req, errno);
-				return;
-			}
-			status = WEXITSTATUS(status);
-			DEBUG(3,("Child %s exited with status %d - %s\n",
-				 state->arg0, status, strerror(status)));
-			if (status != 0) {
-				tevent_req_error(req, status);
-				return;
-			}
-
-			tevent_req_done(req);
 			return;
 		}
 		return;

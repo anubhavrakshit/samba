@@ -23,6 +23,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <stdlib.h>
 #include "smnotify.h"
 #include "popt.h"
 
@@ -33,7 +34,7 @@ static int stateval       = 0;
 static int clientport     = 0;
 static int sendport       = 0;
 
-static void useage(void)
+static void usage(void)
 {
 	exit(0);
 }
@@ -43,14 +44,14 @@ static int create_socket(const char *addr, int port)
 	int s;
         struct sockaddr_in sock_in;
 
-	s = socket(PF_INET, SOCK_DGRAM, IPPROTO_UDP);
+	s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
 	if (s == -1) {
 		printf("Failed to open local socket\n");
 		exit(10);
 	}
 
 	bzero(&sock_in, sizeof(sock_in));
-	sock_in.sin_family = PF_INET;
+	sock_in.sin_family = AF_INET;
 	sock_in.sin_port   = htons(port);
 	inet_aton(addr, &sock_in.sin_addr);
 	if (bind(s, (struct sockaddr *)&sock_in, sizeof(sock_in)) == -1) {
@@ -94,22 +95,22 @@ int main(int argc, const char *argv[])
 
 	if (client == NULL) {
 		printf("ERROR: client not specified\n");
-		useage();
+		usage();
 	}
 
 	if (ip == NULL) {
 		printf("ERROR: ip not specified\n");
-		useage();
+		usage();
 	}
 
 	if (server == NULL) {
 		printf("ERROR: server not specified\n");
-		useage();
+		usage();
 	}
 
 	if (stateval == 0) {
 		printf("ERROR: stateval not specified\n");
-		useage();
+		usage();
 	}
 
 
@@ -124,7 +125,7 @@ int main(int argc, const char *argv[])
 
 	/* Setup a sockaddr_in for the client we want to notify */
 	bzero(&sock_cl, sizeof(sock_cl));
-	sock_cl.sin_family = PF_INET;
+	sock_cl.sin_family = AF_INET;
 	sock_cl.sin_port   = htons(clientport);
 	inet_aton(client, &sock_cl.sin_addr);
 
@@ -137,7 +138,7 @@ int main(int argc, const char *argv[])
 		exit(10);
 	}
 
-	/* we dont want to wait for any reply */
+	/* we don't want to wait for any reply */
 	w.tv_sec = 0;
 	w.tv_usec = 0;
 	clnt_control(clnt, CLSET_TIMEOUT, (char *)&w);

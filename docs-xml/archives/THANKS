@@ -41,12 +41,12 @@ Isaac Heizer (isaache@microsoft.com)
     regularly to clarify points and to offer help.
     
     Dan has put me in touch with NT developers to help sort out bugs and
-    compatability issues. He has also supplied me with a copy of the
+    compatibility issues. He has also supplied me with a copy of the
     NT browsing spec, which will help a lot in the development of the
     Samba browser code.
 
     Paul was responsible for Microsoft paying my flight to Seattle for the
-    first CIFS conference (see http://samba.org/cifs) and has been
+    first CIFS conference (see https://www.samba.org/cifs) and has been
     generally helpful and cooperative as the SMB community moves towards
     an Internet-ready specification. Isaac has regularly provided help on
     the behaviour of NT networks.
@@ -112,7 +112,7 @@ John Terpstra (jht@aquasoft.com.au)
         of Samba.
 
         The donation of the new PC will make it possible to more fully
-        diagnose and observe the behaviour of Samba in conjuction with
+        diagnose and observe the behaviour of Samba in conjunction with
         other SMB protocol utilising systems.
 
 

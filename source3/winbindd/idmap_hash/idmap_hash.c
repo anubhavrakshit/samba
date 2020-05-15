@@ -104,13 +104,24 @@ static void separate_hashes(uint32_t id,
 /*********************************************************************
  ********************************************************************/
 
-static NTSTATUS be_init(struct idmap_domain *dom)
+static NTSTATUS idmap_hash_initialize(struct idmap_domain *dom)
 {
 	struct sid_hash_table *hashed_domains;
 	NTSTATUS nt_status = NT_STATUS_UNSUCCESSFUL;
 	struct winbindd_tdc_domain *dom_list = NULL;
 	size_t num_domains = 0;
-	int i;
+	size_t i;
+
+	DBG_ERR("The idmap_hash module is deprecated and should not be used. "
+		"Please migrate to a different plugin. This module will be "
+		"removed in a future version of Samba\n");
+
+	if (!strequal(dom->name, "*")) {
+		DBG_ERR("Error: idmap_hash configured for domain '%s'. "
+			"But the hash module can only be used for the default "
+			"idmap configuration.\n", dom->name);
+		return NT_STATUS_INVALID_PARAMETER;
+	}
 
 	/* If the domain SID hash table has been initialized, assume
 	   that we completed this function previously */
@@ -133,17 +144,31 @@ static NTSTATUS be_init(struct idmap_domain *dom)
 	/* create the hash table of domain SIDs */
 
 	for (i=0; i<num_domains; i++) {
+		struct dom_sid_buf buf;
 		uint32_t hash;
 
 		if (is_null_sid(&dom_list[i].sid))
 			continue;
+
+		/*
+		 * Check if the domain from the list is not already configured
+		 * to use another idmap backend. Not checking this makes the
+		 * idmap_hash module map IDs for *all* domains implicitly.  This
+		 * is quite dangerous in setups that use multiple idmap
+		 * configurations.
+		 */
+
+		if (domain_has_idmap_config(dom_list[i].domain_name)) {
+			continue;
+		}
+
 		if ((hash = hash_domain_sid(&dom_list[i].sid)) == 0)
 			continue;
 
-		DEBUG(5,("hash:be_init() Adding %s (%s) -> %d\n",
+		DBG_INFO("Adding %s (%s) -> %d\n",
 			 dom_list[i].domain_name,
-			 sid_string_dbg(&dom_list[i].sid),
-			 hash));
+			 dom_sid_str_buf(&dom_list[i].sid, &buf),
+			 hash);
 
 		hashed_domains[hash].sid = talloc(hashed_domains, struct dom_sid);
 		sid_copy(hashed_domains[hash].sid, &dom_list[i].sid);
@@ -176,7 +201,7 @@ static NTSTATUS unixids_to_sids(struct idmap_domain *dom,
 		ids[i]->status = ID_UNKNOWN;
 	}
 
-	nt_status = be_init(dom);
+	nt_status = idmap_hash_initialize(dom);
 	BAIL_ON_NTSTATUS_ERROR(nt_status);
 
 	for (i=0; ids[i]; i++) {
@@ -226,7 +251,7 @@ static NTSTATUS sids_to_unixids(struct idmap_domain *dom,
 		ids[i]->status = ID_UNKNOWN;
 	}
 
-	nt_status = be_init(dom);
+	nt_status = idmap_hash_initialize(dom);
 	BAIL_ON_NTSTATUS_ERROR(nt_status);
 
 	for (i=0; ids[i]; i++) {
@@ -260,46 +285,6 @@ done:
 static NTSTATUS nss_hash_init(struct nss_domain_entry *e )
 {
 	return NT_STATUS_OK;
-}
-
-/**********************************************************************
- *********************************************************************/
-
-static NTSTATUS nss_hash_get_info(struct nss_domain_entry *e,
-				    const struct dom_sid *sid,
-				    TALLOC_CTX *ctx,
-				    const char **homedir,
-				    const char **shell,
-				    const char **gecos,
-				    gid_t *p_gid )
-{
-	NTSTATUS nt_status = NT_STATUS_UNSUCCESSFUL;
-
-	nt_status = nss_hash_init(e);
-	BAIL_ON_NTSTATUS_ERROR(nt_status);
-
-	if (!homedir || !shell || !gecos) {
-		nt_status = NT_STATUS_INVALID_PARAMETER;
-		BAIL_ON_NTSTATUS_ERROR(nt_status);
-	}
-
-	*homedir = talloc_strdup(ctx, lp_template_homedir());
-	BAIL_ON_PTR_NT_ERROR(*homedir, nt_status);
-
-	*shell   = talloc_strdup(ctx, lp_template_shell());
-	BAIL_ON_PTR_NT_ERROR(*shell, nt_status);
-
-	*gecos   = NULL;
-
-	/* Initialize the gid so that the upper layer fills
-	   in the proper Windows primary group */
-
-	if (*p_gid) {
-		*p_gid = (gid_t)-1;
-	}
-
-done:
-	return nt_status;
 }
 
 /**********************************************************************
@@ -347,14 +332,13 @@ static NTSTATUS nss_hash_close(void)
 ********************************************************************/
 
 static struct idmap_methods hash_idmap_methods = {
-	.init            = be_init,
+	.init            = idmap_hash_initialize,
 	.unixids_to_sids = unixids_to_sids,
 	.sids_to_unixids = sids_to_unixids,
 };
 
 static struct nss_info_methods hash_nss_methods = {
 	.init           = nss_hash_init,
-	.get_nss_info   = nss_hash_get_info,
 	.map_to_alias   = nss_hash_map_to_alias,
 	.map_from_alias = nss_hash_map_from_alias,
 	.close_fn       = nss_hash_close
@@ -367,7 +351,7 @@ static struct nss_info_methods hash_nss_methods = {
  **********************************************************************/
 
 static_decl_idmap;
-NTSTATUS idmap_hash_init(void)
+NTSTATUS idmap_hash_init(TALLOC_CTX *ctx)
 {
 	static NTSTATUS idmap_status = NT_STATUS_UNSUCCESSFUL;
 	static NTSTATUS nss_status = NT_STATUS_UNSUCCESSFUL;

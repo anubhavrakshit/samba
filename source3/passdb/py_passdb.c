@@ -20,19 +20,13 @@
 #include <Python.h>
 #include <pytalloc.h>
 #include "includes.h"
+#include "python/py3compat.h"
 #include "lib/util/talloc_stack.h"
 #include "libcli/security/security.h"
 #include "librpc/gen_ndr/idmap.h"
 #include "passdb.h"
 #include "secrets.h"
 #include "idmap.h"
-
-/* There's no Py_ssize_t in 2.4, apparently */
-#if PY_MAJOR_VERSION == 2 && PY_MINOR_VERSION < 5
-typedef int Py_ssize_t;
-typedef inquiry lenfunc;
-typedef intargfunc ssizeargfunc;
-#endif
 
 #ifndef Py_TYPE /* Py_TYPE is only available on Python > 2.6 */
 #define Py_TYPE(ob)             (((PyObject*)(ob))->ob_type)
@@ -68,7 +62,7 @@ static PyObject *py_samu_get_logon_time(PyObject *obj, void *closure)
 	struct samu *sam_acct = (struct samu *)pytalloc_get_ptr(obj);
 	PyObject *py_logon_time;
 
-	py_logon_time = PyInt_FromLong(pdb_get_logon_time(sam_acct));
+	py_logon_time = PyLong_FromLong(pdb_get_logon_time(sam_acct));
 	talloc_free(frame);
 	return py_logon_time;
 }
@@ -78,8 +72,8 @@ static int py_samu_set_logon_time(PyObject *obj, PyObject *value, void *closure)
 	TALLOC_CTX *frame = talloc_stackframe();
 	struct samu *sam_acct = (struct samu *)pytalloc_get_ptr(obj);
 
-	PY_CHECK_TYPE(&PyInt_Type, value, return -1;);
-	if (!pdb_set_logon_time(sam_acct, PyInt_AsLong(value), PDB_CHANGED)) {
+	PY_CHECK_TYPE(&PyLong_Type, value, return -1;);
+	if (!pdb_set_logon_time(sam_acct, PyLong_AsLong(value), PDB_CHANGED)) {
 		talloc_free(frame);
 		return -1;
 	}
@@ -93,7 +87,7 @@ static PyObject *py_samu_get_logoff_time(PyObject *obj, void *closure)
 	struct samu *sam_acct = (struct samu *)pytalloc_get_ptr(obj);
 	PyObject *py_logoff_time;
 
-	py_logoff_time = PyInt_FromLong(pdb_get_logoff_time(sam_acct));
+	py_logoff_time = PyLong_FromLong(pdb_get_logoff_time(sam_acct));
 	talloc_free(frame);
 	return py_logoff_time;
 }
@@ -103,8 +97,8 @@ static int py_samu_set_logoff_time(PyObject *obj, PyObject *value, void *closure
 	TALLOC_CTX *frame = talloc_stackframe();
 	struct samu *sam_acct = (struct samu *)pytalloc_get_ptr(obj);
 
-	PY_CHECK_TYPE(&PyInt_Type, value, return -1;);
-	if (!pdb_set_logoff_time(sam_acct, PyInt_AsLong(value), PDB_CHANGED)) {
+	PY_CHECK_TYPE(&PyLong_Type, value, return -1;);
+	if (!pdb_set_logoff_time(sam_acct, PyLong_AsLong(value), PDB_CHANGED)) {
 		talloc_free(frame);
 		return -1;
 	}
@@ -118,7 +112,7 @@ static PyObject *py_samu_get_kickoff_time(PyObject *obj, void *closure)
 	struct samu *sam_acct = (struct samu *)pytalloc_get_ptr(obj);
 	PyObject *py_kickoff_time;
 
-	py_kickoff_time = PyInt_FromLong(pdb_get_kickoff_time(sam_acct));
+	py_kickoff_time = PyLong_FromLong(pdb_get_kickoff_time(sam_acct));
 	talloc_free(frame);
 	return py_kickoff_time;
 }
@@ -128,8 +122,8 @@ static int py_samu_set_kickoff_time(PyObject *obj, PyObject *value, void *closur
 	TALLOC_CTX *frame = talloc_stackframe();
 	struct samu *sam_acct = (struct samu *)pytalloc_get_ptr(obj);
 
-	PY_CHECK_TYPE(&PyInt_Type, value, return -1;);
-	if (!pdb_set_kickoff_time(sam_acct, PyInt_AsLong(value), PDB_CHANGED)) {
+	PY_CHECK_TYPE(&PyLong_Type, value, return -1;);
+	if (!pdb_set_kickoff_time(sam_acct, PyLong_AsLong(value), PDB_CHANGED)) {
 		talloc_free(frame);
 		return -1;
 	}
@@ -143,7 +137,7 @@ static PyObject *py_samu_get_bad_password_time(PyObject *obj, void *closure)
 	struct samu *sam_acct = (struct samu *)pytalloc_get_ptr(obj);
 	PyObject *py_bad_password_time;
 
-	py_bad_password_time = PyInt_FromLong(pdb_get_bad_password_time(sam_acct));
+	py_bad_password_time = PyLong_FromLong(pdb_get_bad_password_time(sam_acct));
 	talloc_free(frame);
 	return py_bad_password_time;
 }
@@ -153,8 +147,8 @@ static int py_samu_set_bad_password_time(PyObject *obj, PyObject *value, void *c
 	TALLOC_CTX *frame = talloc_stackframe();
 	struct samu *sam_acct = (struct samu *)pytalloc_get_ptr(obj);
 
-	PY_CHECK_TYPE(&PyInt_Type, value, return -1;);
-	if (!pdb_set_bad_password_time(sam_acct, PyInt_AsLong(value), PDB_CHANGED)) {
+	PY_CHECK_TYPE(&PyLong_Type, value, return -1;);
+	if (!pdb_set_bad_password_time(sam_acct, PyLong_AsLong(value), PDB_CHANGED)) {
 		talloc_free(frame);
 		return -1;
 	}
@@ -168,7 +162,7 @@ static PyObject *py_samu_get_pass_last_set_time(PyObject *obj, void *closure)
 	struct samu *sam_acct = (struct samu *)pytalloc_get_ptr(obj);
 	PyObject *py_pass_last_set_time;
 
-	py_pass_last_set_time = PyInt_FromLong(pdb_get_pass_last_set_time(sam_acct));
+	py_pass_last_set_time = PyLong_FromLong(pdb_get_pass_last_set_time(sam_acct));
 	talloc_free(frame);
 	return py_pass_last_set_time;
 }
@@ -178,8 +172,8 @@ static int py_samu_set_pass_last_set_time(PyObject *obj, PyObject *value, void *
 	TALLOC_CTX *frame = talloc_stackframe();
 	struct samu *sam_acct = (struct samu *)pytalloc_get_ptr(obj);
 
-	PY_CHECK_TYPE(&PyInt_Type, value, return -1;);
-	if (!pdb_set_pass_last_set_time(sam_acct, PyInt_AsLong(value), PDB_CHANGED)) {
+	PY_CHECK_TYPE(&PyLong_Type, value, return -1;);
+	if (!pdb_set_pass_last_set_time(sam_acct, PyLong_AsLong(value), PDB_CHANGED)) {
 		talloc_free(frame);
 		return -1;
 	}
@@ -193,7 +187,7 @@ static PyObject *py_samu_get_pass_can_change_time(PyObject *obj, void *closure)
 	struct samu *sam_acct = (struct samu *)pytalloc_get_ptr(obj);
 	PyObject *py_pass_can_change_time;
 
-	py_pass_can_change_time = PyInt_FromLong(pdb_get_pass_can_change_time(sam_acct));
+	py_pass_can_change_time = PyLong_FromLong(pdb_get_pass_can_change_time(sam_acct));
 	talloc_free(frame);
 	return py_pass_can_change_time;
 }
@@ -203,8 +197,8 @@ static int py_samu_set_pass_can_change_time(PyObject *obj, PyObject *value, void
 	TALLOC_CTX *frame = talloc_stackframe();
 	struct samu *sam_acct = (struct samu *)pytalloc_get_ptr(obj);
 
-	PY_CHECK_TYPE(&PyInt_Type, value, return -1;);
-	if (!pdb_set_pass_can_change_time(sam_acct, PyInt_AsLong(value), PDB_CHANGED)) {
+	PY_CHECK_TYPE(&PyLong_Type, value, return -1;);
+	if (!pdb_set_pass_can_change_time(sam_acct, PyLong_AsLong(value), PDB_CHANGED)) {
 		talloc_free(frame);
 		return -1;
 	}
@@ -218,7 +212,7 @@ static PyObject *py_samu_get_pass_must_change_time(PyObject *obj, void *closure)
 	struct samu *sam_acct = (struct samu *)pytalloc_get_ptr(obj);
 	PyObject *py_pass_must_change_time;
 
-	py_pass_must_change_time = PyInt_FromLong(pdb_get_pass_must_change_time(sam_acct));
+	py_pass_must_change_time = PyLong_FromLong(pdb_get_pass_must_change_time(sam_acct));
 	talloc_free(frame);
 	return py_pass_must_change_time;
 }
@@ -226,7 +220,7 @@ static PyObject *py_samu_get_pass_must_change_time(PyObject *obj, void *closure)
 static int py_samu_set_pass_must_change_time(PyObject *obj, PyObject *value, void *closure)
 {
 	TALLOC_CTX *frame = talloc_stackframe();
-	PY_CHECK_TYPE(&PyInt_Type, value, return -1;);
+	PY_CHECK_TYPE(&PyLong_Type, value, return -1;);
 
 	/* TODO: make this not a get/set or give a better exception */
 	talloc_free(frame);
@@ -245,7 +239,7 @@ static PyObject *py_samu_get_username(PyObject *obj, void *closure)
 		Py_RETURN_NONE;
 	}
 
-	py_username = PyString_FromString(username);
+	py_username = PyUnicode_FromString(username);
 	talloc_free(frame);
 	return py_username;
 }
@@ -255,8 +249,8 @@ static int py_samu_set_username(PyObject *obj, PyObject *value, void *closure)
 	TALLOC_CTX *frame = talloc_stackframe();
 	struct samu *sam_acct = (struct samu *)pytalloc_get_ptr(obj);
 
-	PY_CHECK_TYPE(&PyString_Type, value, return -1;);
-	if (!pdb_set_username(sam_acct, PyString_AsString(value), PDB_CHANGED)) {
+	PY_CHECK_TYPE(&PyUnicode_Type, value, return -1;);
+	if (!pdb_set_username(sam_acct, PyUnicode_AsUTF8(value), PDB_CHANGED)) {
 		talloc_free(frame);
 		return -1;
 	}
@@ -276,7 +270,7 @@ static PyObject *py_samu_get_domain(PyObject *obj, void *closure)
 		Py_RETURN_NONE;
 	}
 
-	py_domain = PyString_FromString(domain);
+	py_domain = PyUnicode_FromString(domain);
 	talloc_free(frame);
 	return py_domain;
 }
@@ -286,8 +280,8 @@ static int py_samu_set_domain(PyObject *obj, PyObject *value, void *closure)
 	TALLOC_CTX *frame = talloc_stackframe();
 	struct samu *sam_acct = (struct samu *)pytalloc_get_ptr(obj);
 
-	PY_CHECK_TYPE(&PyString_Type, value, return -1;);
-	if (!pdb_set_domain(sam_acct, PyString_AsString(value), PDB_CHANGED)) {
+	PY_CHECK_TYPE(&PyUnicode_Type, value, return -1;);
+	if (!pdb_set_domain(sam_acct, PyUnicode_AsUTF8(value), PDB_CHANGED)) {
 		talloc_free(frame);
 		return -1;
 	}
@@ -307,7 +301,7 @@ static PyObject *py_samu_get_nt_username(PyObject *obj, void *closure)
 		Py_RETURN_NONE;
 	}
 
-	py_nt_username = PyString_FromString(nt_username);
+	py_nt_username = PyUnicode_FromString(nt_username);
 	talloc_free(frame);
 	return py_nt_username;
 }
@@ -317,8 +311,8 @@ static int py_samu_set_nt_username(PyObject *obj, PyObject *value, void *closure
 	TALLOC_CTX *frame = talloc_stackframe();
 	struct samu *sam_acct = (struct samu *)pytalloc_get_ptr(obj);
 
-	PY_CHECK_TYPE(&PyString_Type, value, return -1;);
-	if (!pdb_set_nt_username(sam_acct, PyString_AsString(value), PDB_CHANGED)) {
+	PY_CHECK_TYPE(&PyUnicode_Type, value, return -1;);
+	if (!pdb_set_nt_username(sam_acct, PyUnicode_AsUTF8(value), PDB_CHANGED)) {
 		talloc_free(frame);
 		return -1;
 	}
@@ -338,7 +332,7 @@ static PyObject *py_samu_get_full_name(PyObject *obj, void *closure)
 		Py_RETURN_NONE;
 	}
 
-	py_full_name = PyString_FromString(full_name);
+	py_full_name = PyUnicode_FromString(full_name);
 	talloc_free(frame);
 	return py_full_name;
 }
@@ -348,8 +342,8 @@ static int py_samu_set_full_name(PyObject *obj, PyObject *value, void *closure)
 	TALLOC_CTX *frame = talloc_stackframe();
 	struct samu *sam_acct = (struct samu *)pytalloc_get_ptr(obj);
 
-	PY_CHECK_TYPE(&PyString_Type, value, return -1;);
-	if (!pdb_set_fullname(sam_acct, PyString_AsString(value), PDB_CHANGED)) {
+	PY_CHECK_TYPE(&PyUnicode_Type, value, return -1;);
+	if (!pdb_set_fullname(sam_acct, PyUnicode_AsUTF8(value), PDB_CHANGED)) {
 		talloc_free(frame);
 		return -1;
 	}
@@ -369,7 +363,7 @@ static PyObject *py_samu_get_home_dir(PyObject *obj, void *closure)
 		Py_RETURN_NONE;
 	}
 
-	py_home_dir = PyString_FromString(home_dir);
+	py_home_dir = PyUnicode_FromString(home_dir);
 	talloc_free(frame);
 	return py_home_dir;
 }
@@ -379,8 +373,8 @@ static int py_samu_set_home_dir(PyObject *obj, PyObject *value, void *closure)
 	TALLOC_CTX *frame = talloc_stackframe();
 	struct samu *sam_acct = (struct samu *)pytalloc_get_ptr(obj);
 
-	PY_CHECK_TYPE(&PyString_Type, value, return -1;);
-	if (!pdb_set_homedir(sam_acct, PyString_AsString(value), PDB_CHANGED)) {
+	PY_CHECK_TYPE(&PyUnicode_Type, value, return -1;);
+	if (!pdb_set_homedir(sam_acct, PyUnicode_AsUTF8(value), PDB_CHANGED)) {
 		talloc_free(frame);
 		return -1;
 	}
@@ -400,7 +394,7 @@ static PyObject *py_samu_get_dir_drive(PyObject *obj, void *closure)
 		Py_RETURN_NONE;
 	}
 
-	py_dir_drive = PyString_FromString(dir_drive);
+	py_dir_drive = PyUnicode_FromString(dir_drive);
 	talloc_free(frame);
 	return py_dir_drive;
 }
@@ -410,8 +404,8 @@ static int py_samu_set_dir_drive(PyObject *obj, PyObject *value, void *closure)
 	TALLOC_CTX *frame = talloc_stackframe();
 	struct samu *sam_acct = (struct samu *)pytalloc_get_ptr(obj);
 
-	PY_CHECK_TYPE(&PyString_Type, value, return -1;);
-	if (!pdb_set_dir_drive(sam_acct, PyString_AsString(value), PDB_CHANGED)) {
+	PY_CHECK_TYPE(&PyUnicode_Type, value, return -1;);
+	if (!pdb_set_dir_drive(sam_acct, PyUnicode_AsUTF8(value), PDB_CHANGED)) {
 		talloc_free(frame);
 		return -1;
 	}
@@ -431,7 +425,7 @@ static PyObject *py_samu_get_logon_script(PyObject *obj, void *closure)
 		Py_RETURN_NONE;
 	}
 
-	py_logon_script = PyString_FromString(logon_script);
+	py_logon_script = PyUnicode_FromString(logon_script);
 	talloc_free(frame);
 	return py_logon_script;
 }
@@ -441,8 +435,8 @@ static int py_samu_set_logon_script(PyObject *obj, PyObject *value, void *closur
 	TALLOC_CTX *frame = talloc_stackframe();
 	struct samu *sam_acct = (struct samu *)pytalloc_get_ptr(obj);
 
-	PY_CHECK_TYPE(&PyString_Type, value, return -1;);
-	if (!pdb_set_logon_script(sam_acct, PyString_AsString(value), PDB_CHANGED)) {
+	PY_CHECK_TYPE(&PyUnicode_Type, value, return -1;);
+	if (!pdb_set_logon_script(sam_acct, PyUnicode_AsUTF8(value), PDB_CHANGED)) {
 		talloc_free(frame);
 		return -1;
 	}
@@ -462,7 +456,7 @@ static PyObject *py_samu_get_profile_path(PyObject *obj, void *closure)
 		Py_RETURN_NONE;
 	}
 
-	py_profile_path = PyString_FromString(profile_path);
+	py_profile_path = PyUnicode_FromString(profile_path);
 	talloc_free(frame);
 	return py_profile_path;
 }
@@ -472,8 +466,8 @@ static int py_samu_set_profile_path(PyObject *obj, PyObject *value, void *closur
 	TALLOC_CTX *frame = talloc_stackframe();
 	struct samu *sam_acct = (struct samu *)pytalloc_get_ptr(obj);
 
-	PY_CHECK_TYPE(&PyString_Type, value, return -1;);
-	if (!pdb_set_profile_path(sam_acct, PyString_AsString(value), PDB_CHANGED)) {
+	PY_CHECK_TYPE(&PyUnicode_Type, value, return -1;);
+	if (!pdb_set_profile_path(sam_acct, PyUnicode_AsUTF8(value), PDB_CHANGED)) {
 		talloc_free(frame);
 		return -1;
 	}
@@ -493,7 +487,7 @@ static PyObject *py_samu_get_acct_desc(PyObject *obj, void *closure)
 		Py_RETURN_NONE;
 	}
 
-	py_acct_desc = PyString_FromString(acct_desc);
+	py_acct_desc = PyUnicode_FromString(acct_desc);
 	talloc_free(frame);
 	return py_acct_desc;
 }
@@ -503,8 +497,8 @@ static int py_samu_set_acct_desc(PyObject *obj, PyObject *value, void *closure)
 	TALLOC_CTX *frame = talloc_stackframe();
 	struct samu *sam_acct = (struct samu *)pytalloc_get_ptr(obj);
 
-	PY_CHECK_TYPE(&PyString_Type, value, return -1;);
-	if (!pdb_set_acct_desc(sam_acct, PyString_AsString(value), PDB_CHANGED)) {
+	PY_CHECK_TYPE(&PyUnicode_Type, value, return -1;);
+	if (!pdb_set_acct_desc(sam_acct, PyUnicode_AsUTF8(value), PDB_CHANGED)) {
 		talloc_free(frame);
 		return -1;
 	}
@@ -524,7 +518,7 @@ static PyObject *py_samu_get_workstations(PyObject *obj, void *closure)
 		Py_RETURN_NONE;
 	}
 
-	py_workstations = PyString_FromString(workstations);
+	py_workstations = PyUnicode_FromString(workstations);
 	talloc_free(frame);
 	return py_workstations;
 }
@@ -534,8 +528,8 @@ static int py_samu_set_workstations(PyObject *obj, PyObject *value, void *closur
 	TALLOC_CTX *frame = talloc_stackframe();
 	struct samu *sam_acct = (struct samu *)pytalloc_get_ptr(obj);
 
-	PY_CHECK_TYPE(&PyString_Type, value, return -1;);
-	if (!pdb_set_workstations(sam_acct, PyString_AsString(value), PDB_CHANGED)) {
+	PY_CHECK_TYPE(&PyUnicode_Type, value, return -1;);
+	if (!pdb_set_workstations(sam_acct, PyUnicode_AsUTF8(value), PDB_CHANGED)) {
 		talloc_free(frame);
 		return -1;
 	}
@@ -555,7 +549,7 @@ static PyObject *py_samu_get_comment(PyObject *obj, void *closure)
 		Py_RETURN_NONE;
 	}
 
-	py_comment = PyString_FromString(comment);
+	py_comment = PyUnicode_FromString(comment);
 	talloc_free(frame);
 	return py_comment;
 }
@@ -565,8 +559,8 @@ static int py_samu_set_comment(PyObject *obj, PyObject *value, void *closure)
 	TALLOC_CTX *frame = talloc_stackframe();
 	struct samu *sam_acct = (struct samu *)pytalloc_get_ptr(obj);
 
-	PY_CHECK_TYPE(&PyString_Type, value, return -1;);
-	if (!pdb_set_comment(sam_acct, PyString_AsString(value), PDB_CHANGED)) {
+	PY_CHECK_TYPE(&PyUnicode_Type, value, return -1;);
+	if (!pdb_set_comment(sam_acct, PyUnicode_AsUTF8(value), PDB_CHANGED)) {
 		talloc_free(frame);
 		return -1;
 	}
@@ -586,7 +580,7 @@ static PyObject *py_samu_get_munged_dial(PyObject *obj, void *closure)
 		Py_RETURN_NONE;
 	}
 
-	py_munged_dial = PyString_FromString(munged_dial);
+	py_munged_dial = PyUnicode_FromString(munged_dial);
 	talloc_free(frame);
 	return py_munged_dial;
 }
@@ -596,8 +590,8 @@ static int py_samu_set_munged_dial(PyObject *obj, PyObject *value, void *closure
 	TALLOC_CTX *frame = talloc_stackframe();
 	struct samu *sam_acct = (struct samu *)pytalloc_get_ptr(obj);
 
-	PY_CHECK_TYPE(&PyString_Type, value, return -1;);
-	if (!pdb_set_munged_dial(sam_acct, PyString_AsString(value), PDB_CHANGED)) {
+	PY_CHECK_TYPE(&PyUnicode_Type, value, return -1;);
+	if (!pdb_set_munged_dial(sam_acct, PyUnicode_AsUTF8(value), PDB_CHANGED)) {
 		talloc_free(frame);
 		return -1;
 	}
@@ -704,7 +698,7 @@ static PyObject *py_samu_get_lanman_passwd(PyObject *obj, void *closure)
 		Py_RETURN_NONE;
 	}
 
-	py_lm_pw = PyString_FromStringAndSize(lm_pw, LM_HASH_LEN);
+	py_lm_pw = PyBytes_FromStringAndSize(lm_pw, LM_HASH_LEN);
 	talloc_free(frame);
 	return py_lm_pw;
 }
@@ -714,8 +708,8 @@ static int py_samu_set_lanman_passwd(PyObject *obj, PyObject *value, void *closu
 	TALLOC_CTX *frame = talloc_stackframe();
 	struct samu *sam_acct = (struct samu *)pytalloc_get_ptr(obj);
 
-	PY_CHECK_TYPE(&PyString_Type, value, return -1;);
-	if (!pdb_set_lanman_passwd(sam_acct, (uint8_t *)PyString_AsString(value), PDB_CHANGED)) {
+	PY_CHECK_TYPE(&PyBytes_Type, value, return -1;);
+	if (!pdb_set_lanman_passwd(sam_acct, (uint8_t *)PyBytes_AsString(value), PDB_CHANGED)) {
 		talloc_free(frame);
 		return -1;
 	}
@@ -735,7 +729,7 @@ static PyObject *py_samu_get_nt_passwd(PyObject *obj, void *closure)
 		Py_RETURN_NONE;
 	}
 
-	py_nt_pw = PyString_FromStringAndSize(nt_pw, NT_HASH_LEN);
+	py_nt_pw = PyBytes_FromStringAndSize(nt_pw, NT_HASH_LEN);
 	talloc_free(frame);
 	return py_nt_pw;
 }
@@ -745,7 +739,7 @@ static int py_samu_set_nt_passwd(PyObject *obj, PyObject *value, void *closure)
 	TALLOC_CTX *frame = talloc_stackframe();
 	struct samu *sam_acct = (struct samu *)pytalloc_get_ptr(obj);
 
-	if (!pdb_set_nt_passwd(sam_acct, (uint8_t *)PyString_AsString(value), PDB_CHANGED)) {
+	if (!pdb_set_nt_passwd(sam_acct, (uint8_t *)PyBytes_AsString(value), PDB_CHANGED)) {
 		talloc_free(frame);
 		return -1;
 	}
@@ -766,7 +760,7 @@ static PyObject *py_samu_get_pw_history(PyObject *obj, void *closure)
 		Py_RETURN_NONE;
 	}
 
-	py_nt_pw_his = PyString_FromStringAndSize(nt_pw_his, hist_len*PW_HISTORY_ENTRY_LEN);
+	py_nt_pw_his = PyBytes_FromStringAndSize(nt_pw_his, hist_len*PW_HISTORY_ENTRY_LEN);
 	talloc_free(frame);
 	return py_nt_pw_his;
 }
@@ -779,7 +773,7 @@ static int py_samu_set_pw_history(PyObject *obj, PyObject *value, void *closure)
 	Py_ssize_t len;
 	uint32_t hist_len;
 
-	PyString_AsStringAndSize(value, &nt_pw_his, &len);
+	PyBytes_AsStringAndSize(value, &nt_pw_his, &len);
 	hist_len = len / PW_HISTORY_ENTRY_LEN;
 	if (!pdb_set_pw_history(sam_acct, (uint8_t *)nt_pw_his, hist_len, PDB_CHANGED)) {
 		talloc_free(frame);
@@ -801,7 +795,7 @@ static PyObject *py_samu_get_plaintext_passwd(PyObject *obj, void *closure)
 		Py_RETURN_NONE;
 	}
 
-	py_plaintext_pw = PyString_FromString(plaintext_pw);
+	py_plaintext_pw = PyUnicode_FromString(plaintext_pw);
 	talloc_free(frame);
 	return py_plaintext_pw;
 }
@@ -811,7 +805,7 @@ static int py_samu_set_plaintext_passwd(PyObject *obj, PyObject *value, void *cl
 	TALLOC_CTX *frame = talloc_stackframe();
 	struct samu *sam_acct = (struct samu *)pytalloc_get_ptr(obj);
 
-	if (!pdb_set_plaintext_passwd(sam_acct, PyString_AsString(value))) {
+	if (!pdb_set_plaintext_passwd(sam_acct, PyUnicode_AsUTF8(value))) {
 		talloc_free(frame);
 		return -1;
 	}
@@ -825,7 +819,7 @@ static PyObject *py_samu_get_acct_ctrl(PyObject *obj, void *closure)
 	struct samu *sam_acct = (struct samu *)pytalloc_get_ptr(obj);
 	PyObject *py_acct_ctrl;
 
-	py_acct_ctrl = PyInt_FromLong(pdb_get_acct_ctrl(sam_acct));
+	py_acct_ctrl = PyLong_FromLong(pdb_get_acct_ctrl(sam_acct));
 	talloc_free(frame);
 	return py_acct_ctrl;
 }
@@ -835,8 +829,8 @@ static int py_samu_set_acct_ctrl(PyObject *obj, PyObject *value, void *closure)
 	TALLOC_CTX *frame = talloc_stackframe();
 	struct samu *sam_acct = (struct samu *)pytalloc_get_ptr(obj);
 
-	PY_CHECK_TYPE(&PyInt_Type, value, return -1;);
-	if (!pdb_set_acct_ctrl(sam_acct, PyInt_AsLong(value), PDB_CHANGED)) {
+	PY_CHECK_TYPE(&PyLong_Type, value, return -1;);
+	if (!pdb_set_acct_ctrl(sam_acct, PyLong_AsLong(value), PDB_CHANGED)) {
 		talloc_free(frame);
 		return -1;
 	}
@@ -850,7 +844,7 @@ static PyObject *py_samu_get_logon_divs(PyObject *obj, void *closure)
 	struct samu *sam_acct = (struct samu *)pytalloc_get_ptr(obj);
 	PyObject *py_logon_divs;
 
-	py_logon_divs = PyInt_FromLong(pdb_get_logon_divs(sam_acct));
+	py_logon_divs = PyLong_FromLong(pdb_get_logon_divs(sam_acct));
 	talloc_free(frame);
 	return py_logon_divs;
 }
@@ -860,8 +854,8 @@ static int py_samu_set_logon_divs(PyObject *obj, PyObject *value, void *closure)
 	TALLOC_CTX *frame = talloc_stackframe();
 	struct samu *sam_acct = (struct samu *)pytalloc_get_ptr(obj);
 
-	PY_CHECK_TYPE(&PyInt_Type, value, return -1;);
-	if (!pdb_set_logon_divs(sam_acct, PyInt_AsLong(value), PDB_CHANGED)) {
+	PY_CHECK_TYPE(&PyLong_Type, value, return -1;);
+	if (!pdb_set_logon_divs(sam_acct, PyLong_AsLong(value), PDB_CHANGED)) {
 		talloc_free(frame);
 		return -1;
 	}
@@ -875,7 +869,7 @@ static PyObject *py_samu_get_hours_len(PyObject *obj, void *closure)
 	struct samu *sam_acct = (struct samu *)pytalloc_get_ptr(obj);
 	PyObject *py_hours_len;
 
-	py_hours_len = PyInt_FromLong(pdb_get_hours_len(sam_acct));
+	py_hours_len = PyLong_FromLong(pdb_get_hours_len(sam_acct));
 	talloc_free(frame);
 	return py_hours_len;
 }
@@ -885,8 +879,8 @@ static int py_samu_set_hours_len(PyObject *obj, PyObject *value, void *closure)
 	TALLOC_CTX *frame = talloc_stackframe();
 	struct samu *sam_acct = (struct samu *)pytalloc_get_ptr(obj);
 
-	PY_CHECK_TYPE(&PyInt_Type, value, return -1;);
-	if (!pdb_set_hours_len(sam_acct, PyInt_AsLong(value), PDB_CHANGED)) {
+	PY_CHECK_TYPE(&PyLong_Type, value, return -1;);
+	if (!pdb_set_hours_len(sam_acct, PyLong_AsLong(value), PDB_CHANGED)) {
 		talloc_free(frame);
 		return -1;
 	}
@@ -915,7 +909,7 @@ static PyObject *py_samu_get_hours(PyObject *obj, void *closure)
 	}
 
 	for (i=0; i<hours_len; i++) {
-		PyList_SetItem(py_hours, i, PyInt_FromLong(hours[i]));
+		PyList_SetItem(py_hours, i, PyLong_FromLong(hours[i]));
 	}
 	talloc_free(frame);
 	return py_hours;
@@ -942,8 +936,8 @@ static int py_samu_set_hours(PyObject *obj, PyObject *value, void *closure)
 	}
 
 	for (i=0; i < hours_len; i++) {
-		PY_CHECK_TYPE(&PyInt_Type, PyList_GET_ITEM(value,i), return -1;);
-		hours[i] = PyInt_AsLong(PyList_GET_ITEM(value, i));
+		PY_CHECK_TYPE(&PyLong_Type, PyList_GET_ITEM(value,i), return -1;);
+		hours[i] = PyLong_AsLong(PyList_GET_ITEM(value, i));
 	}
 
 	status = pdb_set_hours(sam_acct, hours, hours_len, PDB_CHANGED);
@@ -963,7 +957,7 @@ static PyObject *py_samu_get_bad_password_count(PyObject *obj, void *closure)
 	struct samu *sam_acct = (struct samu *)pytalloc_get_ptr(obj);
 	PyObject *py_bad_password_count;
 
-	py_bad_password_count = PyInt_FromLong(pdb_get_bad_password_count(sam_acct));
+	py_bad_password_count = PyLong_FromLong(pdb_get_bad_password_count(sam_acct));
 	talloc_free(frame);
 	return py_bad_password_count;
 }
@@ -973,8 +967,8 @@ static int py_samu_set_bad_password_count(PyObject *obj, PyObject *value, void *
 	TALLOC_CTX *frame = talloc_stackframe();
 	struct samu *sam_acct = (struct samu *)pytalloc_get_ptr(obj);
 
-	PY_CHECK_TYPE(&PyInt_Type, value, return -1;);
-	if (!pdb_set_bad_password_count(sam_acct, PyInt_AsLong(value), PDB_CHANGED)) {
+	PY_CHECK_TYPE(&PyLong_Type, value, return -1;);
+	if (!pdb_set_bad_password_count(sam_acct, PyLong_AsLong(value), PDB_CHANGED)) {
 		talloc_free(frame);
 		return -1;
 	}
@@ -988,7 +982,7 @@ static PyObject *py_samu_get_logon_count(PyObject *obj, void *closure)
 	struct samu *sam_acct = (struct samu *)pytalloc_get_ptr(obj);
 	PyObject *py_logon_count;
 
-	py_logon_count = PyInt_FromLong(pdb_get_logon_count(sam_acct));
+	py_logon_count = PyLong_FromLong(pdb_get_logon_count(sam_acct));
 	talloc_free(frame);
 	return py_logon_count;
 }
@@ -998,8 +992,8 @@ static int py_samu_set_logon_count(PyObject *obj, PyObject *value, void *closure
 	TALLOC_CTX *frame = talloc_stackframe();
 	struct samu *sam_acct = (struct samu *)pytalloc_get_ptr(obj);
 
-	PY_CHECK_TYPE(&PyInt_Type, value, return -1;);
-	if (!pdb_set_logon_count(sam_acct, PyInt_AsLong(value), PDB_CHANGED)) {
+	PY_CHECK_TYPE(&PyLong_Type, value, return -1;);
+	if (!pdb_set_logon_count(sam_acct, PyLong_AsLong(value), PDB_CHANGED)) {
 		talloc_free(frame);
 		return -1;
 	}
@@ -1013,7 +1007,7 @@ static PyObject *py_samu_get_country_code(PyObject *obj, void *closure)
 	struct samu *sam_acct = (struct samu *)pytalloc_get_ptr(obj);
 	PyObject *py_country_code;
 
-	py_country_code = PyInt_FromLong(pdb_get_country_code(sam_acct));
+	py_country_code = PyLong_FromLong(pdb_get_country_code(sam_acct));
 	talloc_free(frame);
 	return py_country_code;
 }
@@ -1023,8 +1017,8 @@ static int py_samu_set_country_code(PyObject *obj, PyObject *value, void *closur
 	TALLOC_CTX *frame = talloc_stackframe();
 	struct samu *sam_acct = (struct samu *)pytalloc_get_ptr(obj);
 
-	PY_CHECK_TYPE(&PyInt_Type, value, return -1;);
-	if (!pdb_set_country_code(sam_acct, PyInt_AsLong(value), PDB_CHANGED)) {
+	PY_CHECK_TYPE(&PyLong_Type, value, return -1;);
+	if (!pdb_set_country_code(sam_acct, PyLong_AsLong(value), PDB_CHANGED)) {
 		talloc_free(frame);
 		return -1;
 	}
@@ -1038,7 +1032,7 @@ static PyObject *py_samu_get_code_page(PyObject *obj, void *closure)
 	struct samu *sam_acct = (struct samu *)pytalloc_get_ptr(obj);
 	PyObject *py_code_page;
 
-	py_code_page = PyInt_FromLong(pdb_get_code_page(sam_acct));
+	py_code_page = PyLong_FromLong(pdb_get_code_page(sam_acct));
 	talloc_free(frame);
 	return py_code_page;
 }
@@ -1048,8 +1042,8 @@ static int py_samu_set_code_page(PyObject *obj, PyObject *value, void *closure)
 	TALLOC_CTX *frame = talloc_stackframe();
 	struct samu *sam_acct = (struct samu *)pytalloc_get_ptr(obj);
 
-	PY_CHECK_TYPE(&PyInt_Type, value, return -1;);
-	if (!pdb_set_code_page(sam_acct, PyInt_AsLong(value), PDB_CHANGED)) {
+	PY_CHECK_TYPE(&PyLong_Type, value, return -1;);
+	if (!pdb_set_code_page(sam_acct, PyLong_AsLong(value), PDB_CHANGED)) {
 		talloc_free(frame);
 		return -1;
 	}
@@ -1058,40 +1052,174 @@ static int py_samu_set_code_page(PyObject *obj, PyObject *value, void *closure)
 }
 
 static PyGetSetDef py_samu_getsetters[] = {
-	{ discard_const_p(char, "logon_time"), py_samu_get_logon_time, py_samu_set_logon_time },
-	{ discard_const_p(char, "logoff_time"), py_samu_get_logoff_time, py_samu_set_logoff_time },
-	{ discard_const_p(char, "kickoff_time"), py_samu_get_kickoff_time, py_samu_set_kickoff_time },
-	{ discard_const_p(char, "bad_password_time"), py_samu_get_bad_password_time, py_samu_set_bad_password_time },
-	{ discard_const_p(char, "pass_last_set_time"), py_samu_get_pass_last_set_time, py_samu_set_pass_last_set_time },
-	{ discard_const_p(char, "pass_can_change_time"), py_samu_get_pass_can_change_time, py_samu_set_pass_can_change_time },
-	{ discard_const_p(char, "pass_must_change_time"), py_samu_get_pass_must_change_time, py_samu_set_pass_must_change_time },
-	{ discard_const_p(char, "username"), py_samu_get_username, py_samu_set_username },
-	{ discard_const_p(char, "domain"), py_samu_get_domain, py_samu_set_domain },
-	{ discard_const_p(char, "nt_username"), py_samu_get_nt_username, py_samu_set_nt_username },
-	{ discard_const_p(char, "full_name"), py_samu_get_full_name, py_samu_set_full_name },
-	{ discard_const_p(char, "home_dir"), py_samu_get_home_dir, py_samu_set_home_dir },
-	{ discard_const_p(char, "dir_drive"), py_samu_get_dir_drive, py_samu_set_dir_drive },
-	{ discard_const_p(char, "logon_script"), py_samu_get_logon_script, py_samu_set_logon_script },
-	{ discard_const_p(char, "profile_path"), py_samu_get_profile_path, py_samu_set_profile_path },
-	{ discard_const_p(char, "acct_desc"), py_samu_get_acct_desc, py_samu_set_acct_desc },
-	{ discard_const_p(char, "workstations"), py_samu_get_workstations, py_samu_set_workstations },
-	{ discard_const_p(char, "comment"), py_samu_get_comment, py_samu_set_comment },
-	{ discard_const_p(char, "munged_dial"), py_samu_get_munged_dial, py_samu_set_munged_dial },
-	{ discard_const_p(char, "user_sid"), py_samu_get_user_sid, py_samu_set_user_sid },
-	{ discard_const_p(char, "group_sid"), py_samu_get_group_sid, py_samu_set_group_sid },
-	{ discard_const_p(char, "lanman_passwd"), py_samu_get_lanman_passwd, py_samu_set_lanman_passwd },
-	{ discard_const_p(char, "nt_passwd"), py_samu_get_nt_passwd, py_samu_set_nt_passwd },
-	{ discard_const_p(char, "pw_history"), py_samu_get_pw_history, py_samu_set_pw_history },
-	{ discard_const_p(char, "plaintext_passwd"), py_samu_get_plaintext_passwd, py_samu_set_plaintext_passwd },
-	{ discard_const_p(char, "acct_ctrl"), py_samu_get_acct_ctrl, py_samu_set_acct_ctrl },
-	{ discard_const_p(char, "logon_divs"), py_samu_get_logon_divs, py_samu_set_logon_divs },
-	{ discard_const_p(char, "hours_len"), py_samu_get_hours_len, py_samu_set_hours_len },
-	{ discard_const_p(char, "hours"), py_samu_get_hours, py_samu_set_hours },
-	{ discard_const_p(char, "bad_password_count"), py_samu_get_bad_password_count, py_samu_set_bad_password_count },
-	{ discard_const_p(char, "logon_count"), py_samu_get_logon_count, py_samu_set_logon_count },
-	{ discard_const_p(char, "country_code"), py_samu_get_country_code, py_samu_set_country_code },
-	{ discard_const_p(char, "code_page"), py_samu_get_code_page, py_samu_set_code_page },
-	{ NULL }
+	{
+		.name = discard_const_p(char, "logon_time"),
+		.get  = py_samu_get_logon_time,
+		.set  = py_samu_set_logon_time,
+	},
+	{
+		.name = discard_const_p(char, "logoff_time"),
+		.get  = py_samu_get_logoff_time,
+		.set  = py_samu_set_logoff_time,
+	},
+	{
+		.name = discard_const_p(char, "kickoff_time"),
+		.get  = py_samu_get_kickoff_time,
+		.set  = py_samu_set_kickoff_time,
+	},
+	{
+		.name = discard_const_p(char, "bad_password_time"),
+		.get  = py_samu_get_bad_password_time,
+		.set  = py_samu_set_bad_password_time,
+	},
+	{
+		.name = discard_const_p(char, "pass_last_set_time"),
+		.get  = py_samu_get_pass_last_set_time,
+		.set  = py_samu_set_pass_last_set_time,
+	},
+	{
+		.name = discard_const_p(char, "pass_can_change_time"),
+		.get  = py_samu_get_pass_can_change_time,
+		.set  = py_samu_set_pass_can_change_time,
+	},
+	{
+		.name = discard_const_p(char, "pass_must_change_time"),
+		.get  = py_samu_get_pass_must_change_time,
+		.set  = py_samu_set_pass_must_change_time,
+	},
+	{
+		.name = discard_const_p(char, "username"),
+		.get  = py_samu_get_username,
+		.set  = py_samu_set_username,
+	},
+	{
+		.name = discard_const_p(char, "domain"),
+		.get  = py_samu_get_domain,
+		.set  = py_samu_set_domain,
+	},
+	{
+		.name = discard_const_p(char, "nt_username"),
+		.get  = py_samu_get_nt_username,
+		.set  = py_samu_set_nt_username,
+	},
+	{
+		.name = discard_const_p(char, "full_name"),
+		.get  = py_samu_get_full_name,
+		.set  = py_samu_set_full_name,
+	},
+	{
+		.name = discard_const_p(char, "home_dir"),
+		.get  = py_samu_get_home_dir,
+		.set  = py_samu_set_home_dir,
+	},
+	{
+		.name = discard_const_p(char, "dir_drive"),
+		.get  = py_samu_get_dir_drive,
+		.set  = py_samu_set_dir_drive,
+	},
+	{
+		.name = discard_const_p(char, "logon_script"),
+		.get  = py_samu_get_logon_script,
+		.set  = py_samu_set_logon_script,
+	},
+	{
+		.name = discard_const_p(char, "profile_path"),
+		.get  = py_samu_get_profile_path,
+		.set  = py_samu_set_profile_path,
+	},
+	{
+		.name = discard_const_p(char, "acct_desc"),
+		.get  = py_samu_get_acct_desc,
+		.set  = py_samu_set_acct_desc,
+	},
+	{
+		.name = discard_const_p(char, "workstations"),
+		.get  = py_samu_get_workstations,
+		.set  = py_samu_set_workstations,
+	},
+	{
+		.name = discard_const_p(char, "comment"),
+		.get  = py_samu_get_comment,
+		.set  = py_samu_set_comment,
+	},
+	{
+		.name = discard_const_p(char, "munged_dial"),
+		.get  = py_samu_get_munged_dial,
+		.set  = py_samu_set_munged_dial,
+	},
+	{
+		.name = discard_const_p(char, "user_sid"),
+		.get  = py_samu_get_user_sid,
+		.set  = py_samu_set_user_sid,
+	},
+	{
+		.name = discard_const_p(char, "group_sid"),
+		.get  = py_samu_get_group_sid,
+		.set  = py_samu_set_group_sid,
+	},
+	{
+		.name = discard_const_p(char, "lanman_passwd"),
+		.get  = py_samu_get_lanman_passwd,
+		.set  = py_samu_set_lanman_passwd,
+	},
+	{
+		.name = discard_const_p(char, "nt_passwd"),
+		.get  = py_samu_get_nt_passwd,
+		.set  = py_samu_set_nt_passwd,
+	},
+	{
+		.name = discard_const_p(char, "pw_history"),
+		.get  = py_samu_get_pw_history,
+		.set  = py_samu_set_pw_history,
+	},
+	{
+		.name = discard_const_p(char, "plaintext_passwd"),
+		.get  = py_samu_get_plaintext_passwd,
+		.set  = py_samu_set_plaintext_passwd,
+	},
+	{
+		.name = discard_const_p(char, "acct_ctrl"),
+		.get  = py_samu_get_acct_ctrl,
+		.set  = py_samu_set_acct_ctrl,
+	},
+	{
+		.name = discard_const_p(char, "logon_divs"),
+		.get  = py_samu_get_logon_divs,
+		.set  = py_samu_set_logon_divs,
+	},
+	{
+		.name = discard_const_p(char, "hours_len"),
+		.get  = py_samu_get_hours_len,
+		.set  = py_samu_set_hours_len,
+	},
+	{
+		.name = discard_const_p(char, "hours"),
+		.get  = py_samu_get_hours,
+		.set  = py_samu_set_hours,
+	},
+	{
+		.name = discard_const_p(char, "bad_password_count"),
+		.get  = py_samu_get_bad_password_count,
+		.set  = py_samu_set_bad_password_count,
+	},
+	{
+		.name = discard_const_p(char, "logon_count"),
+		.get  = py_samu_get_logon_count,
+		.set  = py_samu_set_logon_count,
+	},
+	{
+		.name = discard_const_p(char, "country_code"),
+		.get  = py_samu_get_country_code,
+		.set  = py_samu_set_country_code,
+	},
+	{
+		.name = discard_const_p(char, "code_page"),
+		.get  = py_samu_get_code_page,
+		.set  = py_samu_set_code_page,
+	},
+	{
+		.name = NULL,
+	}
 };
 
 
@@ -1115,7 +1243,6 @@ static PyObject *py_samu_new(PyTypeObject *type, PyObject *args, PyObject *kwarg
 
 static PyTypeObject PySamu = {
 	.tp_name = "passdb.Samu",
-	.tp_basicsize = sizeof(pytalloc_Object),
 	.tp_getset = py_samu_getsetters,
 	.tp_methods = NULL,
 	.tp_new = py_samu_new,
@@ -1140,8 +1267,8 @@ static int py_groupmap_set_gid(PyObject *obj, PyObject *value, void *closure)
 	TALLOC_CTX *frame = talloc_stackframe();
 	GROUP_MAP *group_map = (GROUP_MAP *)pytalloc_get_ptr(obj);
 
-	PY_CHECK_TYPE(&PyInt_Type, value, return -1;);
-	group_map->gid = PyInt_AsLong(value);
+	PY_CHECK_TYPE(&PyLong_Type, value, return -1;);
+	group_map->gid = PyLong_AsLong(value);
 	talloc_free(frame);
 	return 0;
 }
@@ -1194,7 +1321,7 @@ static PyObject *py_groupmap_get_sid_name_use(PyObject *obj, void *closure)
 	GROUP_MAP *group_map = (GROUP_MAP *)pytalloc_get_ptr(obj);
 	PyObject *py_sid_name_use;
 
-	py_sid_name_use = PyInt_FromLong(group_map->sid_name_use);
+	py_sid_name_use = PyLong_FromLong(group_map->sid_name_use);
 	talloc_free(frame);
 	return py_sid_name_use;
 }
@@ -1204,8 +1331,8 @@ static int py_groupmap_set_sid_name_use(PyObject *obj, PyObject *value, void *cl
 	TALLOC_CTX *frame = talloc_stackframe();
 	GROUP_MAP *group_map = (GROUP_MAP *)pytalloc_get_ptr(obj);
 
-	PY_CHECK_TYPE(&PyInt_Type, value, return -1;);
-	group_map->sid_name_use = PyInt_AsLong(value);
+	PY_CHECK_TYPE(&PyLong_Type, value, return -1;);
+	group_map->sid_name_use = PyLong_AsLong(value);
 	talloc_free(frame);
 	return 0;
 }
@@ -1219,7 +1346,7 @@ static PyObject *py_groupmap_get_nt_name(PyObject *obj, void *closure)
 		py_nt_name = Py_None;
 		Py_INCREF(py_nt_name);
 	} else {
-		py_nt_name = PyString_FromString(group_map->nt_name);
+		py_nt_name = PyUnicode_FromString(group_map->nt_name);
 	}
 	talloc_free(frame);
 	return py_nt_name;
@@ -1230,11 +1357,11 @@ static int py_groupmap_set_nt_name(PyObject *obj, PyObject *value, void *closure
 	TALLOC_CTX *frame = talloc_stackframe();
 	GROUP_MAP *group_map = (GROUP_MAP *)pytalloc_get_ptr(obj);
 
-	PY_CHECK_TYPE(&PyString_Type, value, return -1;);
+	PY_CHECK_TYPE(&PyUnicode_Type, value, return -1;);
 	if (value == Py_None) {
 		fstrcpy(group_map->nt_name, NULL);
 	} else {
-		fstrcpy(group_map->nt_name, PyString_AsString(value));
+		fstrcpy(group_map->nt_name, PyUnicode_AsUTF8(value));
 	}
 	talloc_free(frame);
 	return 0;
@@ -1249,7 +1376,7 @@ static PyObject *py_groupmap_get_comment(PyObject *obj, void *closure)
 		py_comment = Py_None;
 		Py_INCREF(py_comment);
 	} else {
-		py_comment = PyString_FromString(group_map->comment);
+		py_comment = PyUnicode_FromString(group_map->comment);
 	}
 	talloc_free(frame);
 	return py_comment;
@@ -1260,23 +1387,45 @@ static int py_groupmap_set_comment(PyObject *obj, PyObject *value, void *closure
 	TALLOC_CTX *frame = talloc_stackframe();
 	GROUP_MAP *group_map = (GROUP_MAP *)pytalloc_get_ptr(obj);
 
-	PY_CHECK_TYPE(&PyString_Type, value, return -1;);
+	PY_CHECK_TYPE(&PyUnicode_Type, value, return -1;);
 	if (value == Py_None) {
 		fstrcpy(group_map->comment, NULL);
 	} else {
-		fstrcpy(group_map->comment, PyString_AsString(value));
+		fstrcpy(group_map->comment, PyUnicode_AsUTF8(value));
 	}
 	talloc_free(frame);
 	return 0;
 }
 
 static PyGetSetDef py_groupmap_getsetters[] = {
-	{ discard_const_p(char, "gid"), py_groupmap_get_gid, py_groupmap_set_gid },
-	{ discard_const_p(char, "sid"), py_groupmap_get_sid, py_groupmap_set_sid },
-	{ discard_const_p(char, "sid_name_use"), py_groupmap_get_sid_name_use, py_groupmap_set_sid_name_use },
-	{ discard_const_p(char, "nt_name"), py_groupmap_get_nt_name, py_groupmap_set_nt_name },
-	{ discard_const_p(char, "comment"), py_groupmap_get_comment, py_groupmap_set_comment },
-	{ NULL }
+	{
+		.name = discard_const_p(char, "gid"),
+		.get  = py_groupmap_get_gid,
+		.set  = py_groupmap_set_gid,
+	},
+	{
+		.name = discard_const_p(char, "sid"),
+		.get  = py_groupmap_get_sid,
+		.set  = py_groupmap_set_sid,
+	},
+	{
+		.name = discard_const_p(char, "sid_name_use"),
+		.get  = py_groupmap_get_sid_name_use,
+		.set  = py_groupmap_set_sid_name_use,
+	},
+	{
+		.name = discard_const_p(char, "nt_name"),
+		.get  = py_groupmap_get_nt_name,
+		.set  = py_groupmap_set_nt_name,
+	},
+	{
+		.name = discard_const_p(char, "comment"),
+		.get  = py_groupmap_get_comment,
+		.set  = py_groupmap_set_comment,
+	},
+	{
+		.name = NULL,
+	},
 };
 
 static PyObject *py_groupmap_new(PyTypeObject *type, PyObject *args, PyObject *kwargs)
@@ -1318,7 +1467,6 @@ static PyObject *py_groupmap_new(PyTypeObject *type, PyObject *args, PyObject *k
 
 static PyTypeObject PyGroupmap = {
 	.tp_name = "passdb.Groupmap",
-	.tp_basicsize = sizeof(pytalloc_Object),
 	.tp_getset = py_groupmap_getsetters,
 	.tp_methods = NULL,
 	.tp_new = py_groupmap_new,
@@ -1327,7 +1475,7 @@ static PyTypeObject PyGroupmap = {
 };
 
 
-static PyObject *py_pdb_domain_info(pytalloc_Object *self, PyObject *args)
+static PyObject *py_pdb_domain_info(PyObject *self, PyObject *args)
 {
 	TALLOC_CTX *frame = talloc_stackframe();
 	struct pdb_methods *methods;
@@ -1335,6 +1483,8 @@ static PyObject *py_pdb_domain_info(pytalloc_Object *self, PyObject *args)
 	PyObject *py_domain_info;
 	struct dom_sid *sid;
 	struct GUID *guid;
+	PyObject *py_dom_sid = NULL;
+	PyObject *py_guid = NULL;
 
 	methods = pytalloc_get_ptr(self);
 
@@ -1358,24 +1508,26 @@ static PyObject *py_pdb_domain_info(pytalloc_Object *self, PyObject *args)
 	}
 	*guid = domain_info->guid;
 
-	if ((py_domain_info = PyDict_New()) == NULL) {
-		PyErr_NoMemory();
-		talloc_free(frame);
-		return NULL;
-	}
+	py_dom_sid = pytalloc_steal(dom_sid_Type, sid);
+	py_guid = pytalloc_steal(guid_Type, guid);
 
-	PyDict_SetItemString(py_domain_info, "name", PyString_FromString(domain_info->name));
-	PyDict_SetItemString(py_domain_info, "dns_domain", PyString_FromString(domain_info->dns_domain));
-	PyDict_SetItemString(py_domain_info, "dns_forest", PyString_FromString(domain_info->dns_forest));
-	PyDict_SetItemString(py_domain_info, "dom_sid", pytalloc_steal(dom_sid_Type, sid));
-	PyDict_SetItemString(py_domain_info, "guid", pytalloc_steal(guid_Type, guid));
+	py_domain_info = Py_BuildValue(
+		"{s:s, s:s, s:s, s:O, s:O}",
+		"name", domain_info->name,
+		"dns_domain", domain_info->dns_domain,
+		"dns_forest", domain_info->dns_forest,
+		"dom_sid", py_dom_sid,
+		"guid", py_guid);
 
+
+	Py_CLEAR(py_dom_sid);
+	Py_CLEAR(py_guid);
 	talloc_free(frame);
 	return py_domain_info;
 }
 
 
-static PyObject *py_pdb_getsampwnam(pytalloc_Object *self, PyObject *args)
+static PyObject *py_pdb_getsampwnam(PyObject *self, PyObject *args)
 {
 	TALLOC_CTX *frame = talloc_stackframe();
 	NTSTATUS status;
@@ -1414,7 +1566,7 @@ static PyObject *py_pdb_getsampwnam(pytalloc_Object *self, PyObject *args)
 	return py_sam_acct;
 }
 
-static PyObject *py_pdb_getsampwsid(pytalloc_Object *self, PyObject *args)
+static PyObject *py_pdb_getsampwsid(PyObject *self, PyObject *args)
 {
 	TALLOC_CTX *frame = talloc_stackframe();
 	NTSTATUS status;
@@ -1452,7 +1604,7 @@ static PyObject *py_pdb_getsampwsid(pytalloc_Object *self, PyObject *args)
 	return py_sam_acct;
 }
 
-static PyObject *py_pdb_create_user(pytalloc_Object *self, PyObject *args)
+static PyObject *py_pdb_create_user(PyObject *self, PyObject *args)
 {
 	TALLOC_CTX *frame = talloc_stackframe();
 	NTSTATUS status;
@@ -1479,10 +1631,10 @@ static PyObject *py_pdb_create_user(pytalloc_Object *self, PyObject *args)
 	}
 
 	talloc_free(frame);
-	return PyInt_FromLong(rid);
+	return PyLong_FromLong(rid);
 }
 
-static PyObject *py_pdb_delete_user(pytalloc_Object *self, PyObject *args)
+static PyObject *py_pdb_delete_user(PyObject *self, PyObject *args)
 {
 	TALLOC_CTX *frame = talloc_stackframe();
 	NTSTATUS status;
@@ -1508,11 +1660,11 @@ static PyObject *py_pdb_delete_user(pytalloc_Object *self, PyObject *args)
 		return NULL;
 	}
 
-	Py_RETURN_NONE;
 	talloc_free(frame);
+	Py_RETURN_NONE;
 }
 
-static PyObject *py_pdb_add_sam_account(pytalloc_Object *self, PyObject *args)
+static PyObject *py_pdb_add_sam_account(PyObject *self, PyObject *args)
 {
 	TALLOC_CTX *frame = talloc_stackframe();
 	NTSTATUS status;
@@ -1539,11 +1691,11 @@ static PyObject *py_pdb_add_sam_account(pytalloc_Object *self, PyObject *args)
 		return NULL;
 	}
 
-	Py_RETURN_NONE;
 	talloc_free(frame);
+	Py_RETURN_NONE;
 }
 
-static PyObject *py_pdb_update_sam_account(pytalloc_Object *self, PyObject *args)
+static PyObject *py_pdb_update_sam_account(PyObject *self, PyObject *args)
 {
 	TALLOC_CTX *frame = talloc_stackframe();
 	NTSTATUS status;
@@ -1569,11 +1721,11 @@ static PyObject *py_pdb_update_sam_account(pytalloc_Object *self, PyObject *args
 		return NULL;
 	}
 
-	Py_RETURN_NONE;
 	talloc_free(frame);
+	Py_RETURN_NONE;
 }
 
-static PyObject *py_pdb_delete_sam_account(pytalloc_Object *self, PyObject *args)
+static PyObject *py_pdb_delete_sam_account(PyObject *self, PyObject *args)
 {
 	TALLOC_CTX *frame = talloc_stackframe();
 	NTSTATUS status;
@@ -1599,11 +1751,11 @@ static PyObject *py_pdb_delete_sam_account(pytalloc_Object *self, PyObject *args
 		return NULL;
 	}
 
-	Py_RETURN_NONE;
 	talloc_free(frame);
+	Py_RETURN_NONE;
 }
 
-static PyObject *py_pdb_rename_sam_account(pytalloc_Object *self, PyObject *args)
+static PyObject *py_pdb_rename_sam_account(PyObject *self, PyObject *args)
 {
 	TALLOC_CTX *frame = talloc_stackframe();
 	NTSTATUS status;
@@ -1631,12 +1783,12 @@ static PyObject *py_pdb_rename_sam_account(pytalloc_Object *self, PyObject *args
 		return NULL;
 	}
 
-	Py_RETURN_NONE;
 	talloc_free(frame);
+	Py_RETURN_NONE;
 }
 
 
-static PyObject *py_pdb_getgrsid(pytalloc_Object *self, PyObject *args)
+static PyObject *py_pdb_getgrsid(PyObject *self, PyObject *args)
 {
 	TALLOC_CTX *frame = talloc_stackframe();
 	NTSTATUS status;
@@ -1677,7 +1829,7 @@ static PyObject *py_pdb_getgrsid(pytalloc_Object *self, PyObject *args)
 }
 
 
-static PyObject *py_pdb_getgrgid(pytalloc_Object *self, PyObject *args)
+static PyObject *py_pdb_getgrgid(PyObject *self, PyObject *args)
 {
 	TALLOC_CTX *frame = talloc_stackframe();
 	NTSTATUS status;
@@ -1716,7 +1868,7 @@ static PyObject *py_pdb_getgrgid(pytalloc_Object *self, PyObject *args)
 }
 
 
-static PyObject *py_pdb_getgrnam(pytalloc_Object *self, PyObject *args)
+static PyObject *py_pdb_getgrnam(PyObject *self, PyObject *args)
 {
 	TALLOC_CTX *frame = talloc_stackframe();
 	NTSTATUS status;
@@ -1755,7 +1907,7 @@ static PyObject *py_pdb_getgrnam(pytalloc_Object *self, PyObject *args)
 }
 
 
-static PyObject *py_pdb_create_dom_group(pytalloc_Object *self, PyObject *args)
+static PyObject *py_pdb_create_dom_group(PyObject *self, PyObject *args)
 {
 	TALLOC_CTX *frame = talloc_stackframe();
 	NTSTATUS status;
@@ -1781,11 +1933,11 @@ static PyObject *py_pdb_create_dom_group(pytalloc_Object *self, PyObject *args)
 	}
 
 	talloc_free(frame);
-	return PyInt_FromLong(group_rid);
+	return PyLong_FromLong(group_rid);
 }
 
 
-static PyObject *py_pdb_delete_dom_group(pytalloc_Object *self, PyObject *args)
+static PyObject *py_pdb_delete_dom_group(PyObject *self, PyObject *args)
 {
 	TALLOC_CTX *frame = talloc_stackframe();
 	NTSTATUS status;
@@ -1809,12 +1961,12 @@ static PyObject *py_pdb_delete_dom_group(pytalloc_Object *self, PyObject *args)
 		return NULL;
 	}
 
-	Py_RETURN_NONE;
 	talloc_free(frame);
+	Py_RETURN_NONE;
 }
 
 
-static PyObject *py_pdb_add_group_mapping_entry(pytalloc_Object *self, PyObject *args)
+static PyObject *py_pdb_add_group_mapping_entry(PyObject *self, PyObject *args)
 {
 	TALLOC_CTX *frame = talloc_stackframe();
 	NTSTATUS status;
@@ -1840,12 +1992,12 @@ static PyObject *py_pdb_add_group_mapping_entry(pytalloc_Object *self, PyObject 
 		return NULL;
 	}
 
-	Py_RETURN_NONE;
 	talloc_free(frame);
+	Py_RETURN_NONE;
 }
 
 
-static PyObject *py_pdb_update_group_mapping_entry(pytalloc_Object *self, PyObject *args)
+static PyObject *py_pdb_update_group_mapping_entry(PyObject *self, PyObject *args)
 {
 	TALLOC_CTX *frame = talloc_stackframe();
 	NTSTATUS status;
@@ -1871,12 +2023,12 @@ static PyObject *py_pdb_update_group_mapping_entry(pytalloc_Object *self, PyObje
 		return NULL;
 	}
 
-	Py_RETURN_NONE;
 	talloc_free(frame);
+	Py_RETURN_NONE;
 }
 
 
-static PyObject *py_pdb_delete_group_mapping_entry(pytalloc_Object *self, PyObject *args)
+static PyObject *py_pdb_delete_group_mapping_entry(PyObject *self, PyObject *args)
 {
 	TALLOC_CTX *frame = talloc_stackframe();
 	NTSTATUS status;
@@ -1902,12 +2054,12 @@ static PyObject *py_pdb_delete_group_mapping_entry(pytalloc_Object *self, PyObje
 		return NULL;
 	}
 
-	Py_RETURN_NONE;
 	talloc_free(frame);
+	Py_RETURN_NONE;
 }
 
 
-static PyObject *py_pdb_enum_group_mapping(pytalloc_Object *self, PyObject *args)
+static PyObject *py_pdb_enum_group_mapping(PyObject *self, PyObject *args)
 {
 	TALLOC_CTX *frame = talloc_stackframe();
 	NTSTATUS status;
@@ -1915,7 +2067,7 @@ static PyObject *py_pdb_enum_group_mapping(pytalloc_Object *self, PyObject *args
 	enum lsa_SidType sid_name_use;
 	int lsa_sidtype_value = SID_NAME_UNKNOWN;
 	int unix_only = 0;
-	PyObject *py_domain_sid;
+	PyObject *py_domain_sid = Py_None;
 	struct dom_sid *domain_sid = NULL;
 	GROUP_MAP **gmap = NULL;
 	GROUP_MAP *group_map;
@@ -1923,7 +2075,6 @@ static PyObject *py_pdb_enum_group_mapping(pytalloc_Object *self, PyObject *args
 	PyObject *py_gmap_list, *py_group_map;
 	int i;
 
-	py_domain_sid = Py_None;
 	Py_INCREF(Py_None);
 
 	if (!PyArg_ParseTuple(args, "|O!ii:enum_group_mapping", dom_sid_Type, &py_domain_sid,
@@ -1960,12 +2111,19 @@ static PyObject *py_pdb_enum_group_mapping(pytalloc_Object *self, PyObject *args
 	for(i=0; i<num_entries; i++) {
 		py_group_map = py_groupmap_new(&PyGroupmap, NULL, NULL);
 		if (py_group_map) {
+			int res = 0;
 			group_map = pytalloc_get_ptr(py_group_map);
 			*group_map = *gmap[i];
 			talloc_steal(group_map, gmap[i]->nt_name);
 			talloc_steal(group_map, gmap[i]->comment);
 
-			PyList_Append(py_gmap_list, py_group_map);
+			res = PyList_Append(py_gmap_list, py_group_map);
+			Py_CLEAR(py_group_map);
+			if (res == -1) {
+				Py_CLEAR(py_gmap_list);
+				talloc_free(frame);
+				return NULL;
+			}
 		}
 	}
 
@@ -1976,7 +2134,7 @@ static PyObject *py_pdb_enum_group_mapping(pytalloc_Object *self, PyObject *args
 }
 
 
-static PyObject *py_pdb_enum_group_members(pytalloc_Object *self, PyObject *args)
+static PyObject *py_pdb_enum_group_members(PyObject *self, PyObject *args)
 {
 	TALLOC_CTX *frame = talloc_stackframe();
 	NTSTATUS status;
@@ -2018,8 +2176,18 @@ static PyObject *py_pdb_enum_group_members(pytalloc_Object *self, PyObject *args
 	domain_sid = get_global_sam_sid();
 
 	for(i=0; i<num_members; i++) {
+		int res = 0;
+		PyObject *py_member_sid = NULL;
 		member_sid = dom_sid_add_rid(frame, domain_sid, member_rids[i]);
-		PyList_Append(py_sid_list, pytalloc_steal(dom_sid_Type, member_sid));
+		py_member_sid = pytalloc_steal(dom_sid_Type, member_sid);
+		res = PyList_Append(py_sid_list,
+				    py_member_sid);
+		Py_CLEAR(py_member_sid);
+		if (res == -1) {
+			talloc_free(frame);
+			Py_CLEAR(py_sid_list);
+			return NULL;
+		}
 	}
 
 	talloc_free(frame);
@@ -2027,7 +2195,7 @@ static PyObject *py_pdb_enum_group_members(pytalloc_Object *self, PyObject *args
 }
 
 
-static PyObject *py_pdb_enum_group_memberships(pytalloc_Object *self, PyObject *args)
+static PyObject *py_pdb_enum_group_memberships(PyObject *self, PyObject *args)
 {
 	TALLOC_CTX *frame = talloc_stackframe();
 	NTSTATUS status;
@@ -2068,7 +2236,11 @@ static PyObject *py_pdb_enum_group_memberships(pytalloc_Object *self, PyObject *
 	}
 
 	for(i=0; i<num_groups; i++) {
-		PyList_Append(py_sid_list, pytalloc_steal(dom_sid_Type, dom_sid_dup(NULL, &user_group_sids[i])));
+		PyObject *py_sid =
+			pytalloc_steal(dom_sid_Type,
+				       dom_sid_dup(NULL, &user_group_sids[i]));
+		PyList_Append(py_sid_list, py_sid);
+		Py_CLEAR(py_sid);
 	}
 
 	talloc_free(frame);
@@ -2076,7 +2248,7 @@ static PyObject *py_pdb_enum_group_memberships(pytalloc_Object *self, PyObject *
 }
 
 
-static PyObject *py_pdb_add_groupmem(pytalloc_Object *self, PyObject *args)
+static PyObject *py_pdb_add_groupmem(PyObject *self, PyObject *args)
 {
 	TALLOC_CTX *frame = talloc_stackframe();
 	NTSTATUS status;
@@ -2099,12 +2271,12 @@ static PyObject *py_pdb_add_groupmem(pytalloc_Object *self, PyObject *args)
 		return NULL;
 	}
 
-	Py_RETURN_NONE;
 	talloc_free(frame);
+	Py_RETURN_NONE;
 }
 
 
-static PyObject *py_pdb_del_groupmem(pytalloc_Object *self, PyObject *args)
+static PyObject *py_pdb_del_groupmem(PyObject *self, PyObject *args)
 {
 	TALLOC_CTX *frame = talloc_stackframe();
 	NTSTATUS status;
@@ -2127,12 +2299,12 @@ static PyObject *py_pdb_del_groupmem(pytalloc_Object *self, PyObject *args)
 		return NULL;
 	}
 
-	Py_RETURN_NONE;
 	talloc_free(frame);
+	Py_RETURN_NONE;
 }
 
 
-static PyObject *py_pdb_create_alias(pytalloc_Object *self, PyObject *args)
+static PyObject *py_pdb_create_alias(PyObject *self, PyObject *args)
 {
 	TALLOC_CTX *frame = talloc_stackframe();
 	NTSTATUS status;
@@ -2158,11 +2330,11 @@ static PyObject *py_pdb_create_alias(pytalloc_Object *self, PyObject *args)
 	}
 
 	talloc_free(frame);
-	return PyInt_FromLong(rid);
+	return PyLong_FromLong(rid);
 }
 
 
-static PyObject *py_pdb_delete_alias(pytalloc_Object *self, PyObject *args)
+static PyObject *py_pdb_delete_alias(PyObject *self, PyObject *args)
 {
 	TALLOC_CTX *frame = talloc_stackframe();
 	NTSTATUS status;
@@ -2188,12 +2360,12 @@ static PyObject *py_pdb_delete_alias(pytalloc_Object *self, PyObject *args)
 		return NULL;
 	}
 
-	Py_RETURN_NONE;
 	talloc_free(frame);
+	Py_RETURN_NONE;
 }
 
 
-static PyObject *py_pdb_get_aliasinfo(pytalloc_Object *self, PyObject *args)
+static PyObject *py_pdb_get_aliasinfo(PyObject *self, PyObject *args)
 {
 	TALLOC_CTX *frame = talloc_stackframe();
 	NTSTATUS status;
@@ -2228,26 +2400,18 @@ static PyObject *py_pdb_get_aliasinfo(pytalloc_Object *self, PyObject *args)
 		return NULL;
 	}
 
-	py_alias_info = PyDict_New();
-	if (py_alias_info == NULL) {
-		PyErr_NoMemory();
-		talloc_free(frame);
-		return NULL;
-	}
-
-	PyDict_SetItemString(py_alias_info, "acct_name",
-			     PyString_FromString(alias_info->acct_name));
-	PyDict_SetItemString(py_alias_info, "acct_desc",
-			     PyString_FromString(alias_info->acct_desc));
-	PyDict_SetItemString(py_alias_info, "rid",
-			     PyInt_FromLong(alias_info->rid));
+	py_alias_info = Py_BuildValue(
+		"{s:s, s:s, s:l}",
+		"acct_name", alias_info->acct_name,
+		"acct_desc", alias_info->acct_desc,
+		"rid", alias_info->rid);
 
 	talloc_free(frame);
 	return py_alias_info;
 }
 
 
-static PyObject *py_pdb_set_aliasinfo(pytalloc_Object *self, PyObject *args)
+static PyObject *py_pdb_set_aliasinfo(PyObject *self, PyObject *args)
 {
 	TALLOC_CTX *frame = talloc_stackframe();
 	NTSTATUS status;
@@ -2266,13 +2430,13 @@ static PyObject *py_pdb_set_aliasinfo(pytalloc_Object *self, PyObject *args)
 
 	alias_sid = pytalloc_get_ptr(py_alias_sid);
 
-	alias_info.acct_name = talloc_strdup(frame, PyString_AsString(PyDict_GetItemString(py_alias_info, "acct_name")));
+	alias_info.acct_name = talloc_strdup(frame, PyUnicode_AsUTF8(PyDict_GetItemString(py_alias_info, "acct_name")));
 	if (alias_info.acct_name == NULL) {
 		PyErr_Format(py_pdb_error, "Unable to allocate memory");
 		talloc_free(frame);
 		return NULL;
 	}
-	alias_info.acct_desc = talloc_strdup(frame, PyString_AsString(PyDict_GetItemString(py_alias_info, "acct_desc")));
+	alias_info.acct_desc = talloc_strdup(frame, PyUnicode_AsUTF8(PyDict_GetItemString(py_alias_info, "acct_desc")));
 	if (alias_info.acct_desc == NULL) {
 		PyErr_Format(py_pdb_error, "Unable to allocate memory");
 		talloc_free(frame);
@@ -2288,12 +2452,12 @@ static PyObject *py_pdb_set_aliasinfo(pytalloc_Object *self, PyObject *args)
 		return NULL;
 	}
 
-	Py_RETURN_NONE;
 	talloc_free(frame);
+	Py_RETURN_NONE;
 }
 
 
-static PyObject *py_pdb_add_aliasmem(pytalloc_Object *self, PyObject *args)
+static PyObject *py_pdb_add_aliasmem(PyObject *self, PyObject *args)
 {
 	TALLOC_CTX *frame = talloc_stackframe();
 	NTSTATUS status;
@@ -2321,12 +2485,12 @@ static PyObject *py_pdb_add_aliasmem(pytalloc_Object *self, PyObject *args)
 		return NULL;
 	}
 
-	Py_RETURN_NONE;
 	talloc_free(frame);
+	Py_RETURN_NONE;
 }
 
 
-static PyObject *py_pdb_del_aliasmem(pytalloc_Object *self, PyObject *args)
+static PyObject *py_pdb_del_aliasmem(PyObject *self, PyObject *args)
 {
 	TALLOC_CTX *frame = talloc_stackframe();
 	NTSTATUS status;
@@ -2354,12 +2518,12 @@ static PyObject *py_pdb_del_aliasmem(pytalloc_Object *self, PyObject *args)
 		return NULL;
 	}
 
-	Py_RETURN_NONE;
 	talloc_free(frame);
+	Py_RETURN_NONE;
 }
 
 
-static PyObject *py_pdb_enum_aliasmem(pytalloc_Object *self, PyObject *args)
+static PyObject *py_pdb_enum_aliasmem(PyObject *self, PyObject *args)
 {
 	TALLOC_CTX *frame = talloc_stackframe();
 	NTSTATUS status;
@@ -2396,15 +2560,23 @@ static PyObject *py_pdb_enum_aliasmem(pytalloc_Object *self, PyObject *args)
 	}
 
 	for(i=0; i<num_members; i++) {
+		int res = 0;
 		py_member_sid = pytalloc_new(struct dom_sid, dom_sid_Type);
 		if (py_member_sid == NULL) {
 			PyErr_NoMemory();
+			Py_CLEAR(py_member_list);
 			talloc_free(frame);
 			return NULL;
 		}
 		tmp_sid = pytalloc_get_ptr(py_member_sid);
 		*tmp_sid = member_sid[i];
-		PyList_Append(py_member_list, py_member_sid);
+		res = PyList_Append(py_member_list, py_member_sid);
+		Py_CLEAR(py_member_sid);
+		if (res == -1) {
+			Py_CLEAR(py_member_list);
+			talloc_free(frame);
+			return NULL;
+		}
 	}
 
 	talloc_free(frame);
@@ -2412,7 +2584,7 @@ static PyObject *py_pdb_enum_aliasmem(pytalloc_Object *self, PyObject *args)
 }
 
 
-static PyObject *py_pdb_get_account_policy(pytalloc_Object *self)
+static PyObject *py_pdb_get_account_policy(PyObject *self, PyObject *unused)
 {
 	TALLOC_CTX *frame = talloc_stackframe();
 	NTSTATUS status;
@@ -2437,7 +2609,20 @@ static PyObject *py_pdb_get_account_policy(pytalloc_Object *self)
 		type = account_policy_name_to_typenum(names[i]);
 		status = methods->get_account_policy(methods, type, &value);
 		if (NT_STATUS_IS_OK(status)) {
-			PyDict_SetItemString(py_acct_policy, names[i], Py_BuildValue("i", value));
+			int res = 0;
+			PyObject *py_value = Py_BuildValue("i", value);
+			if (py_value == NULL) {
+				Py_CLEAR(py_acct_policy);
+				break;
+			}
+			res = PyDict_SetItemString(py_acct_policy,
+						   names[i],
+						   py_value);
+			Py_CLEAR(py_value);
+			if (res == -1) {
+				Py_CLEAR(py_acct_policy);
+				break;
+			}
 		}
 	}
 
@@ -2446,7 +2631,7 @@ static PyObject *py_pdb_get_account_policy(pytalloc_Object *self)
 }
 
 
-static PyObject *py_pdb_set_account_policy(pytalloc_Object *self, PyObject *args)
+static PyObject *py_pdb_set_account_policy(PyObject *self, PyObject *args)
 {
 	TALLOC_CTX *frame = talloc_stackframe();
 	NTSTATUS status;
@@ -2467,7 +2652,7 @@ static PyObject *py_pdb_set_account_policy(pytalloc_Object *self, PyObject *args
 	for (i=0; i<count; i++) {
 		if ((py_value = PyDict_GetItemString(py_acct_policy, names[i])) != NULL) {
 			type = account_policy_name_to_typenum(names[i]);
-			status = methods->set_account_policy(methods, type, PyInt_AsLong(py_value));
+			status = methods->set_account_policy(methods, type, PyLong_AsLong(py_value));
 			if (!NT_STATUS_IS_OK(status)) {
 				PyErr_Format(py_pdb_error, "Error setting account policy (%s), (%d,%s)",
 						names[i],
@@ -2477,11 +2662,11 @@ static PyObject *py_pdb_set_account_policy(pytalloc_Object *self, PyObject *args
 		}
 	}
 
-	Py_RETURN_NONE;
 	talloc_free(frame);
+	Py_RETURN_NONE;
 }
 
-static PyObject *py_pdb_search_users(pytalloc_Object *self, PyObject *args)
+static PyObject *py_pdb_search_users(PyObject *self, PyObject *args)
 {
 	TALLOC_CTX *frame = talloc_stackframe();
 	struct pdb_methods *methods;
@@ -2525,27 +2710,36 @@ static PyObject *py_pdb_search_users(pytalloc_Object *self, PyObject *args)
 	}
 
 	while (search->next_entry(search, entry)) {
-		py_dict = PyDict_New();
+		int res = 1;
+		py_dict = Py_BuildValue(
+			"{s:l, s:l, s:l, s:s, s:s, s:s}",
+			"idx", entry->idx,
+			"rid", entry->rid,
+			"acct_flags", entry->acct_flags,
+			"account_name", entry->account_name,
+			"fullname", entry->fullname,
+			"description", entry->description);
 		if (py_dict == NULL) {
-			PyErr_NoMemory();
-		} else {
-			PyDict_SetItemString(py_dict, "idx", PyInt_FromLong(entry->idx));
-			PyDict_SetItemString(py_dict, "rid", PyInt_FromLong(entry->rid));
-			PyDict_SetItemString(py_dict, "acct_flags", PyInt_FromLong(entry->acct_flags));
-			PyDict_SetItemString(py_dict, "account_name", PyString_FromString(entry->account_name));
-			PyDict_SetItemString(py_dict, "fullname", PyString_FromString(entry->fullname));
-			PyDict_SetItemString(py_dict, "description", PyString_FromString(entry->description));
-			PyList_Append(py_userlist, py_dict);
+			Py_CLEAR(py_userlist);
+			goto out;
+		}
+
+		res = PyList_Append(py_userlist, py_dict);
+		Py_CLEAR(py_dict);
+		if (res == -1) {
+			Py_CLEAR(py_userlist);
+			goto out;
 		}
 	}
 	search->search_end(search);
 
+out:
 	talloc_free(frame);
 	return py_userlist;
 }
 
 
-static PyObject *py_pdb_search_groups(pytalloc_Object *self)
+static PyObject *py_pdb_search_groups(PyObject *self, PyObject *unused)
 {
 	TALLOC_CTX *frame = talloc_stackframe();
 	struct pdb_methods *methods;
@@ -2583,37 +2777,45 @@ static PyObject *py_pdb_search_groups(pytalloc_Object *self)
 	}
 
 	while (search->next_entry(search, entry)) {
-		py_dict = PyDict_New();
+		int res = 0;
+		py_dict = Py_BuildValue(
+			"{s:l, s:l, s:l, s:s, s:s, s:s}",
+			"idx", entry->idx,
+			"rid", entry->rid,
+			"acct_flags", entry->acct_flags,
+			"account_name", entry->account_name,
+			"fullname", entry->fullname,
+			"description", entry->description);
+
 		if (py_dict == NULL) {
-			PyErr_NoMemory();
-		} else {
-			PyDict_SetItemString(py_dict, "idx", PyInt_FromLong(entry->idx));
-			PyDict_SetItemString(py_dict, "rid", PyInt_FromLong(entry->rid));
-			PyDict_SetItemString(py_dict, "acct_flags", PyInt_FromLong(entry->acct_flags));
-			PyDict_SetItemString(py_dict, "account_name", PyString_FromString(entry->account_name));
-			PyDict_SetItemString(py_dict, "fullname", PyString_FromString(entry->fullname));
-			PyDict_SetItemString(py_dict, "description", PyString_FromString(entry->description));
-			PyList_Append(py_grouplist, py_dict);
+			Py_CLEAR(py_grouplist);
+			goto out;
+		}
+
+		res = PyList_Append(py_grouplist, py_dict);
+		Py_CLEAR(py_dict);
+		if (res == -1) {
+			Py_CLEAR(py_grouplist);
+			goto out;
 		}
 	}
 	search->search_end(search);
-
+out:
 	talloc_free(frame);
 	return py_grouplist;
 }
 
 
-static PyObject *py_pdb_search_aliases(pytalloc_Object *self, PyObject *args)
+static PyObject *py_pdb_search_aliases(PyObject *self, PyObject *args)
 {
 	TALLOC_CTX *frame = talloc_stackframe();
 	struct pdb_methods *methods;
 	struct pdb_search *search;
 	struct samr_displayentry *entry;
 	PyObject *py_aliaslist, *py_dict;
-	PyObject *py_domain_sid;
+	PyObject *py_domain_sid = Py_None;
 	struct dom_sid *domain_sid = NULL;
 
-	py_domain_sid = Py_None;
 	Py_INCREF(Py_None);
 
 	if (!PyArg_ParseTuple(args, "|O!:search_aliases", dom_sid_Type, &py_domain_sid)) {
@@ -2655,27 +2857,36 @@ static PyObject *py_pdb_search_aliases(pytalloc_Object *self, PyObject *args)
 	}
 
 	while (search->next_entry(search, entry)) {
-		py_dict = PyDict_New();
+		int res = 0;
+
+		py_dict = Py_BuildValue(
+			"{s:l, s:l, s:l, s:s, s:s, s:s}",
+			"idx", entry->idx,
+			"rid", entry->rid,
+			"acct_flags", entry->acct_flags,
+			"account_name", entry->account_name,
+			"fullname", entry->fullname,
+			"description", entry->description);
+
 		if (py_dict == NULL) {
-			PyErr_NoMemory();
-		} else {
-			PyDict_SetItemString(py_dict, "idx", PyInt_FromLong(entry->idx));
-			PyDict_SetItemString(py_dict, "rid", PyInt_FromLong(entry->rid));
-			PyDict_SetItemString(py_dict, "acct_flags", PyInt_FromLong(entry->acct_flags));
-			PyDict_SetItemString(py_dict, "account_name", PyString_FromString(entry->account_name));
-			PyDict_SetItemString(py_dict, "fullname", PyString_FromString(entry->fullname));
-			PyDict_SetItemString(py_dict, "description", PyString_FromString(entry->description));
-			PyList_Append(py_aliaslist, py_dict);
+			Py_CLEAR(py_aliaslist);
+			goto out;
+		}
+		res = PyList_Append(py_aliaslist, py_dict);
+		Py_CLEAR(py_dict);
+		if (res == -1) {
+			Py_CLEAR(py_aliaslist);
+			goto out;
 		}
 	}
 	search->search_end(search);
-
+out:
 	talloc_free(frame);
 	return py_aliaslist;
 }
 
 
-static PyObject *py_pdb_uid_to_sid(pytalloc_Object *self, PyObject *args)
+static PyObject *py_pdb_uid_to_sid(PyObject *self, PyObject *args)
 {
 	TALLOC_CTX *frame = talloc_stackframe();
 	struct pdb_methods *methods;
@@ -2714,7 +2925,7 @@ static PyObject *py_pdb_uid_to_sid(pytalloc_Object *self, PyObject *args)
 }
 
 
-static PyObject *py_pdb_gid_to_sid(pytalloc_Object *self, PyObject *args)
+static PyObject *py_pdb_gid_to_sid(PyObject *self, PyObject *args)
 {
 	TALLOC_CTX *frame = talloc_stackframe();
 	struct pdb_methods *methods;
@@ -2753,7 +2964,7 @@ static PyObject *py_pdb_gid_to_sid(pytalloc_Object *self, PyObject *args)
 }
 
 
-static PyObject *py_pdb_sid_to_id(pytalloc_Object *self, PyObject *args)
+static PyObject *py_pdb_sid_to_id(PyObject *self, PyObject *args)
 {
 	TALLOC_CTX *frame = talloc_stackframe();
 	struct pdb_methods *methods;
@@ -2781,7 +2992,7 @@ static PyObject *py_pdb_sid_to_id(pytalloc_Object *self, PyObject *args)
 }
 
 
-static PyObject *py_pdb_new_rid(pytalloc_Object *self)
+static PyObject *py_pdb_new_rid(PyObject *self, PyObject *unused)
 {
 	TALLOC_CTX *frame = talloc_stackframe();
 	struct pdb_methods *methods;
@@ -2796,11 +3007,11 @@ static PyObject *py_pdb_new_rid(pytalloc_Object *self)
 	}
 
 	talloc_free(frame);
-	return PyInt_FromLong(rid);
+	return PyLong_FromLong(rid);
 }
 
 
-static PyObject *py_pdb_get_trusteddom_pw(pytalloc_Object *self, PyObject *args)
+static PyObject *py_pdb_get_trusteddom_pw(PyObject *self, PyObject *args)
 {
 	TALLOC_CTX *frame = talloc_stackframe();
 	struct pdb_methods *methods;
@@ -2838,23 +3049,19 @@ static PyObject *py_pdb_get_trusteddom_pw(pytalloc_Object *self, PyObject *args)
 		return NULL;
 	}
 
-	py_value = PyDict_New();
-	if (py_value == NULL) {
-		PyErr_NoMemory();
-		talloc_free(frame);
-		return NULL;
-	}
+	py_value = Py_BuildValue(
+		"{s:s, s:O, s:l}",
+		"pwd", pwd,
+		"sid", py_sid,
+		"last_set_tim", last_set_time);
 
-	PyDict_SetItemString(py_value, "pwd", PyString_FromString(pwd));
-	PyDict_SetItemString(py_value, "sid", py_sid);
-	PyDict_SetItemString(py_value, "last_set_tim", PyInt_FromLong(last_set_time));
-
+	Py_CLEAR(py_sid);
 	talloc_free(frame);
 	return py_value;
 }
 
 
-static PyObject *py_pdb_set_trusteddom_pw(pytalloc_Object *self, PyObject *args)
+static PyObject *py_pdb_set_trusteddom_pw(PyObject *self, PyObject *args)
 {
 	TALLOC_CTX *frame = talloc_stackframe();
 	struct pdb_methods *methods;
@@ -2879,12 +3086,12 @@ static PyObject *py_pdb_set_trusteddom_pw(pytalloc_Object *self, PyObject *args)
 		return NULL;
 	}
 
-	Py_RETURN_NONE;
 	talloc_free(frame);
+	Py_RETURN_NONE;
 }
 
 
-static PyObject *py_pdb_del_trusteddom_pw(pytalloc_Object *self, PyObject *args)
+static PyObject *py_pdb_del_trusteddom_pw(PyObject *self, PyObject *args)
 {
 	TALLOC_CTX *frame = talloc_stackframe();
 	struct pdb_methods *methods;
@@ -2903,12 +3110,12 @@ static PyObject *py_pdb_del_trusteddom_pw(pytalloc_Object *self, PyObject *args)
 		return NULL;
 	}
 
-	Py_RETURN_NONE;
 	talloc_free(frame);
+	Py_RETURN_NONE;
 }
 
 
-static PyObject *py_pdb_enum_trusteddoms(pytalloc_Object *self)
+static PyObject *py_pdb_enum_trusteddoms(PyObject *self, PyObject *unused)
 {
 	TALLOC_CTX *frame = talloc_stackframe();
 	NTSTATUS status;
@@ -2937,15 +3144,26 @@ static PyObject *py_pdb_enum_trusteddoms(pytalloc_Object *self)
 	}
 
 	for(i=0; i<num_domains; i++) {
-		py_dict = PyDict_New();
-		if (py_dict) {
-			PyDict_SetItemString(py_dict, "name",
-					PyString_FromString(domains[i]->name));
-			PyDict_SetItemString(py_dict, "sid",
-					pytalloc_steal(dom_sid_Type, &domains[i]->sid));
+		int res = 0;
+		PyObject *py_sid =
+			pytalloc_steal(dom_sid_Type, &domains[i]->sid);
+		py_dict = Py_BuildValue(
+			"{s:s, s:O}",
+			"name", domains[i]->name,
+			"sid", py_sid);
+		Py_CLEAR(py_sid);
+		if (py_dict == NULL) {
+			DBG_ERR("Failed to insert entry to dict\n");
+				Py_CLEAR(py_domain_list);
+				break;
 		}
 
-		PyList_Append(py_domain_list, py_dict);
+		res = PyList_Append(py_domain_list, py_dict);
+		Py_CLEAR(py_dict);
+		if (res == -1) {
+			Py_CLEAR(py_domain_list);
+			break;
+		}
 	}
 
 	talloc_free(frame);
@@ -2953,7 +3171,7 @@ static PyObject *py_pdb_enum_trusteddoms(pytalloc_Object *self)
 }
 
 
-static PyObject *py_pdb_get_trusted_domain(pytalloc_Object *self, PyObject *args)
+static PyObject *py_pdb_get_trusted_domain(PyObject *self, PyObject *args)
 {
 	TALLOC_CTX *frame = talloc_stackframe();
 	NTSTATUS status;
@@ -2961,6 +3179,7 @@ static PyObject *py_pdb_get_trusted_domain(pytalloc_Object *self, PyObject *args
 	const char *domain;
 	struct pdb_trusted_domain *td;
 	PyObject *py_domain_info;
+	PyObject *py_sid = NULL;
 
 	if (!PyArg_ParseTuple(args, "s:get_trusted_domain", &domain)) {
 		talloc_free(frame);
@@ -2978,41 +3197,37 @@ static PyObject *py_pdb_get_trusted_domain(pytalloc_Object *self, PyObject *args
 		return NULL;
 	}
 
-	py_domain_info = PyDict_New();
-	if (py_domain_info == NULL) {
-		PyErr_NoMemory();
-		talloc_free(frame);
-		return NULL;
-	}
+	py_sid = pytalloc_steal(dom_sid_Type, &td->security_identifier);
 
-	PyDict_SetItemString(py_domain_info, "domain_name",
-			PyString_FromString(td->domain_name));
-	PyDict_SetItemString(py_domain_info, "netbios_name",
-			PyString_FromString(td->netbios_name));
-	PyDict_SetItemString(py_domain_info, "security_identifier",
-			pytalloc_steal(dom_sid_Type, &td->security_identifier));
-	PyDict_SetItemString(py_domain_info, "trust_auth_incoming",
-			PyString_FromStringAndSize((char *)td->trust_auth_incoming.data,
-						td->trust_auth_incoming.length));
-	PyDict_SetItemString(py_domain_info, "trust_auth_outgoing",
-			PyString_FromStringAndSize((char *)td->trust_auth_outgoing.data,
-						td->trust_auth_outgoing.length));
-	PyDict_SetItemString(py_domain_info, "trust_direction",
-			PyInt_FromLong(td->trust_direction));
-	PyDict_SetItemString(py_domain_info, "trust_type",
-			PyInt_FromLong(td->trust_type));
-	PyDict_SetItemString(py_domain_info, "trust_attributes",
-			PyInt_FromLong(td->trust_attributes));
-	PyDict_SetItemString(py_domain_info, "trust_forest_trust_info",
-			PyString_FromStringAndSize((char *)td->trust_forest_trust_info.data,
-						td->trust_forest_trust_info.length));
+	py_domain_info = Py_BuildValue(
+		"{s:s, s:s, s:O,"
+			" s:"PYARG_BYTES_LEN","
+			" s:"PYARG_BYTES_LEN","
+			" s:l, s:l, s:l,"
+			" s:"PYARG_BYTES_LEN"}",
+		"domain_name", td->domain_name,
+		"netbios_name", td->netbios_name,
+		"security_identifier", py_sid,
+		"trust_auth_incoming",
+			(const char *)td->trust_auth_incoming.data,
+			td->trust_auth_incoming.length,
+		"trust_auth_outgoing",
+			(const char *)td->trust_auth_outgoing.data,
+			td->trust_auth_outgoing.length,
+		"trust_direction", td->trust_direction,
+		"trust_type", td->trust_type,
+		"trust_attributes", td->trust_attributes,
+		"trust_forest_trust_info",
+			(const char *)td->trust_forest_trust_info.data,
+			td->trust_forest_trust_info.length);
+	Py_CLEAR(py_sid);
 
 	talloc_free(frame);
 	return py_domain_info;
 }
 
 
-static PyObject *py_pdb_get_trusted_domain_by_sid(pytalloc_Object *self, PyObject *args)
+static PyObject *py_pdb_get_trusted_domain_by_sid(PyObject *self, PyObject *args)
 {
 	TALLOC_CTX *frame = talloc_stackframe();
 	NTSTATUS status;
@@ -3021,6 +3236,7 @@ static PyObject *py_pdb_get_trusted_domain_by_sid(pytalloc_Object *self, PyObjec
 	struct dom_sid *domain_sid;
 	struct pdb_trusted_domain *td;
 	PyObject *py_domain_info;
+	PyObject *py_sid = NULL;
 
 	if (!PyArg_ParseTuple(args, "O!:get_trusted_domain_by_sid", dom_sid_Type, &py_domain_sid)) {
 		talloc_free(frame);
@@ -3040,41 +3256,37 @@ static PyObject *py_pdb_get_trusted_domain_by_sid(pytalloc_Object *self, PyObjec
 		return NULL;
 	}
 
-	py_domain_info = PyDict_New();
-	if (py_domain_info == NULL) {
-		PyErr_NoMemory();
-		talloc_free(frame);
-		return NULL;
-	}
+	py_sid = pytalloc_steal(dom_sid_Type, &td->security_identifier);
 
-	PyDict_SetItemString(py_domain_info, "domain_name",
-			PyString_FromString(td->domain_name));
-	PyDict_SetItemString(py_domain_info, "netbios_name",
-			PyString_FromString(td->netbios_name));
-	PyDict_SetItemString(py_domain_info, "security_identifier",
-			pytalloc_steal(dom_sid_Type, &td->security_identifier));
-	PyDict_SetItemString(py_domain_info, "trust_auth_incoming",
-			PyString_FromStringAndSize((char *)td->trust_auth_incoming.data,
-						td->trust_auth_incoming.length));
-	PyDict_SetItemString(py_domain_info, "trust_auth_outgoing",
-			PyString_FromStringAndSize((char *)td->trust_auth_outgoing.data,
-						td->trust_auth_outgoing.length));
-	PyDict_SetItemString(py_domain_info, "trust_direction",
-			PyInt_FromLong(td->trust_direction));
-	PyDict_SetItemString(py_domain_info, "trust_type",
-			PyInt_FromLong(td->trust_type));
-	PyDict_SetItemString(py_domain_info, "trust_attributes",
-			PyInt_FromLong(td->trust_attributes));
-	PyDict_SetItemString(py_domain_info, "trust_forest_trust_info",
-			PyString_FromStringAndSize((char *)td->trust_forest_trust_info.data,
-						td->trust_forest_trust_info.length));
+	py_domain_info = Py_BuildValue(
+		"{s:s, s:s, s:O,"
+			" s:"PYARG_BYTES_LEN","
+			" s:"PYARG_BYTES_LEN","
+			" s:l, s:l, s:l,"
+			" s:"PYARG_BYTES_LEN"}",
+		"domain_name", td->domain_name,
+		"netbios_name", td->netbios_name,
+		"security_identifier", py_sid,
+		"trust_auth_incoming",
+			(const char *)td->trust_auth_incoming.data,
+			td->trust_auth_incoming.length,
+		"trust_auth_outgoing",
+			(const char *)td->trust_auth_outgoing.data,
+			td->trust_auth_outgoing.length,
+		"trust_direction", td->trust_direction,
+		"trust_type", td->trust_type,
+		"trust_attributes", td->trust_attributes,
+		"trust_forest_trust_info",
+			(const char *)td->trust_forest_trust_info.data,
+			td->trust_forest_trust_info.length);
+	Py_CLEAR(py_sid);
 
 	talloc_free(frame);
 	return py_domain_info;
 }
 
 
-static PyObject *py_pdb_set_trusted_domain(pytalloc_Object *self, PyObject *args)
+static PyObject *py_pdb_set_trusted_domain(PyObject *self, PyObject *args)
 {
 	TALLOC_CTX *frame = talloc_stackframe();
 	NTSTATUS status;
@@ -3091,33 +3303,33 @@ static PyObject *py_pdb_set_trusted_domain(pytalloc_Object *self, PyObject *args
 	}
 
 	py_tmp = PyDict_GetItemString(py_td_info, "domain_name");
-	td_info.domain_name = PyString_AsString(py_tmp);
+	td_info.domain_name = discard_const_p(char, PyUnicode_AsUTF8(py_tmp));
 
 	py_tmp = PyDict_GetItemString(py_td_info, "netbios_name");
-	td_info.netbios_name = PyString_AsString(py_tmp);
+	td_info.netbios_name = discard_const_p(char, PyUnicode_AsUTF8(py_tmp));
 
 	py_tmp = PyDict_GetItemString(py_td_info, "security_identifier");
 	td_info.security_identifier = *pytalloc_get_type(py_tmp, struct dom_sid);
 
 	py_tmp = PyDict_GetItemString(py_td_info, "trust_auth_incoming");
-	PyString_AsStringAndSize(py_tmp, (char **)&td_info.trust_auth_incoming.data, &len);
+	PyBytes_AsStringAndSize(py_tmp, (char **)&td_info.trust_auth_incoming.data, &len);
 	td_info.trust_auth_incoming.length = len;
 
 	py_tmp = PyDict_GetItemString(py_td_info, "trust_auth_outgoing");
-	PyString_AsStringAndSize(py_tmp, (char **)&td_info.trust_auth_outgoing.data, &len);
+	PyBytes_AsStringAndSize(py_tmp, (char **)&td_info.trust_auth_outgoing.data, &len);
 	td_info.trust_auth_outgoing.length = len;
 
 	py_tmp = PyDict_GetItemString(py_td_info, "trust_direction");
-	td_info.trust_direction = PyInt_AsLong(py_tmp);
+	td_info.trust_direction = PyLong_AsLong(py_tmp);
 
 	py_tmp = PyDict_GetItemString(py_td_info, "trust_type");
-	td_info.trust_type = PyInt_AsLong(py_tmp);
+	td_info.trust_type = PyLong_AsLong(py_tmp);
 
 	py_tmp = PyDict_GetItemString(py_td_info, "trust_attributes");
-	td_info.trust_attributes = PyInt_AsLong(py_tmp);
+	td_info.trust_attributes = PyLong_AsLong(py_tmp);
 
 	py_tmp = PyDict_GetItemString(py_td_info, "trust_forest_trust_info");
-	PyString_AsStringAndSize(py_tmp, (char **)&td_info.trust_forest_trust_info.data, &len);
+	PyBytes_AsStringAndSize(py_tmp, (char **)&td_info.trust_forest_trust_info.data, &len);
 	td_info.trust_forest_trust_info.length = len;
 
 	methods = pytalloc_get_ptr(self);
@@ -3131,12 +3343,12 @@ static PyObject *py_pdb_set_trusted_domain(pytalloc_Object *self, PyObject *args
 		return NULL;
 	}
 
-	Py_RETURN_NONE;
 	talloc_free(frame);
+	Py_RETURN_NONE;
 }
 
 
-static PyObject *py_pdb_del_trusted_domain(pytalloc_Object *self, PyObject *args)
+static PyObject *py_pdb_del_trusted_domain(PyObject *self, PyObject *args)
 {
 	TALLOC_CTX *frame = talloc_stackframe();
 	NTSTATUS status;
@@ -3159,18 +3371,18 @@ static PyObject *py_pdb_del_trusted_domain(pytalloc_Object *self, PyObject *args
 		return NULL;
 	}
 
-	Py_RETURN_NONE;
 	talloc_free(frame);
+	Py_RETURN_NONE;
 }
 
 
-static PyObject *py_pdb_enum_trusted_domains(pytalloc_Object *self)
+static PyObject *py_pdb_enum_trusted_domains(PyObject *self, PyObject *args)
 {
 	TALLOC_CTX *frame = talloc_stackframe();
 	NTSTATUS status;
 	struct pdb_methods *methods;
 	uint32_t num_domains;
-	struct pdb_trusted_domain **td_info, *td;
+	struct pdb_trusted_domain **td_info;
 	PyObject *py_td_info, *py_domain_info;
 	int i;
 
@@ -3193,39 +3405,44 @@ static PyObject *py_pdb_enum_trusted_domains(pytalloc_Object *self)
 	}
 
 	for (i=0; i<num_domains; i++) {
+		int res = 0;
+		struct pdb_trusted_domain *td = td_info[i];
+		PyObject *py_sid =
+			pytalloc_steal(dom_sid_Type, &td->security_identifier);
 
-		py_domain_info = PyDict_New();
+		py_domain_info = Py_BuildValue(
+			"{s:s, s:s, s:O,"
+				" s:"PYARG_BYTES_LEN","
+				" s:"PYARG_BYTES_LEN","
+				" s:l, s:l, s:l,"
+				" s:"PYARG_BYTES_LEN"}",
+			"domain_name", td->domain_name,
+			"netbios_name", td->netbios_name,
+			"security_identifier", py_sid,
+			"trust_auth_incoming",
+				(const char *)td->trust_auth_incoming.data,
+				td->trust_auth_incoming.length,
+			"trust_auth_outgoing",
+				(const char *)td->trust_auth_outgoing.data,
+				td->trust_auth_outgoing.length,
+			"trust_direction", td->trust_direction,
+			"trust_type", td->trust_type,
+			"trust_attributes", td->trust_attributes,
+			"trust_forest_trust_info",
+				(const char *)td->trust_forest_trust_info.data,
+				td->trust_forest_trust_info.length);
+		Py_CLEAR(py_sid);
+
 		if (py_domain_info == NULL) {
-			PyErr_NoMemory();
-			Py_DECREF(py_td_info);
-			talloc_free(frame);
-			return NULL;
+			Py_CLEAR(py_td_info);
+			break;
 		}
-
-		td = td_info[i];
-
-		PyDict_SetItemString(py_domain_info, "domain_name",
-				PyString_FromString(td->domain_name));
-		PyDict_SetItemString(py_domain_info, "netbios_name",
-				PyString_FromString(td->netbios_name));
-		PyDict_SetItemString(py_domain_info, "security_identifier",
-				pytalloc_steal(dom_sid_Type, &td->security_identifier));
-		PyDict_SetItemString(py_domain_info, "trust_auth_incoming",
-				PyString_FromStringAndSize((char *)td->trust_auth_incoming.data,
-							td->trust_auth_incoming.length));
-		PyDict_SetItemString(py_domain_info, "trust_auth_outgoing",
-				PyString_FromStringAndSize((char *)td->trust_auth_outgoing.data,
-							td->trust_auth_outgoing.length));
-		PyDict_SetItemString(py_domain_info, "trust_direction",
-				PyInt_FromLong(td->trust_direction));
-		PyDict_SetItemString(py_domain_info, "trust_type",
-				PyInt_FromLong(td->trust_type));
-		PyDict_SetItemString(py_domain_info, "trust_attributes",
-				PyInt_FromLong(td->trust_attributes));
-		PyDict_SetItemString(py_domain_info, "trust_forest_trust_info",
-				PyString_FromStringAndSize((char *)td->trust_forest_trust_info.data,
-							td->trust_forest_trust_info.length));
-		PyList_Append(py_td_info, py_domain_info);
+		res = PyList_Append(py_td_info, py_domain_info);
+		Py_CLEAR(py_domain_info);
+		if (res == -1) {
+			Py_CLEAR(py_td_info);
+			break;
+		}
 	}
 
 	talloc_free(frame);
@@ -3233,7 +3450,7 @@ static PyObject *py_pdb_enum_trusted_domains(pytalloc_Object *self)
 }
 
 
-static PyObject *py_pdb_get_secret(pytalloc_Object *self, PyObject *args)
+static PyObject *py_pdb_get_secret(PyObject *self, PyObject *args)
 {
 	TALLOC_CTX *frame = talloc_stackframe();
 	NTSTATUS status;
@@ -3275,30 +3492,31 @@ static PyObject *py_pdb_get_secret(pytalloc_Object *self, PyObject *args)
 		return NULL;
 	}
 
-	py_secret = PyDict_New();
+	py_secret = Py_BuildValue(
+		"{s:"PYARG_BYTES_LEN","
+			" s:K"
+			" s:"PYARG_BYTES_LEN","
+			" s:K, s:O}",
+		"secret_current", (const char*)secret_current.data,
+				secret_current.length,
+		"secret_current_lastchange", secret_current_lastchange,
+		"secret_old", (const char*)secret_old.data,
+				secret_old.length,
+		"secret_old_lastchange", secret_old_lastchange,
+		"sd", py_sd);
+
+	Py_CLEAR(py_sd);
 	if (py_secret == NULL) {
-		PyErr_NoMemory();
-		Py_DECREF(py_sd);
 		talloc_free(frame);
 		return NULL;
 	}
-
-	PyDict_SetItemString(py_secret, "secret_current",
-			PyString_FromStringAndSize((char *)secret_current.data, secret_current.length));
-	PyDict_SetItemString(py_secret, "secret_current_lastchange",
-			PyLong_FromUnsignedLongLong(secret_current_lastchange));
-	PyDict_SetItemString(py_secret, "secret_old",
-			PyString_FromStringAndSize((char *)secret_old.data, secret_old.length));
-	PyDict_SetItemString(py_secret, "secret_old_lastchange",
-			PyLong_FromUnsignedLongLong(secret_old_lastchange));
-	PyDict_SetItemString(py_secret, "sd", py_sd);
 
 	talloc_free(frame);
 	return py_secret;
 }
 
 
-static PyObject *py_pdb_set_secret(pytalloc_Object *self, PyObject *args)
+static PyObject *py_pdb_set_secret(PyObject *self, PyObject *args)
 {
 	TALLOC_CTX *frame = talloc_stackframe();
 	NTSTATUS status;
@@ -3319,15 +3537,15 @@ static PyObject *py_pdb_set_secret(pytalloc_Object *self, PyObject *args)
 	py_secret_old = PyDict_GetItemString(py_secret, "secret_old");
 	py_sd = PyDict_GetItemString(py_secret, "sd");
 
-	PY_CHECK_TYPE(&PyString_Type, py_secret_cur, return NULL;);
-	PY_CHECK_TYPE(&PyString_Type, py_secret_old, return NULL;);
+	PY_CHECK_TYPE(&PyBytes_Type, py_secret_cur, return NULL;);
+	PY_CHECK_TYPE(&PyBytes_Type, py_secret_old, return NULL;);
 	PY_CHECK_TYPE(security_Type, py_sd, return NULL;);
 
 	methods = pytalloc_get_ptr(self);
 
-	PyString_AsStringAndSize(py_secret_cur, (char **)&secret_current.data, &len);
+	PyBytes_AsStringAndSize(py_secret_cur, (char **)&secret_current.data, &len);
 	secret_current.length = len;
-	PyString_AsStringAndSize(py_secret_old, (char **)&secret_old.data, &len);
+	PyBytes_AsStringAndSize(py_secret_old, (char **)&secret_old.data, &len);
 	secret_current.length = len;
 	sd = pytalloc_get_ptr(py_sd);
 
@@ -3341,12 +3559,12 @@ static PyObject *py_pdb_set_secret(pytalloc_Object *self, PyObject *args)
 		return NULL;
 	}
 
-	Py_RETURN_NONE;
 	talloc_free(frame);
+	Py_RETURN_NONE;
 }
 
 
-static PyObject *py_pdb_delete_secret(pytalloc_Object *self, PyObject *args)
+static PyObject *py_pdb_delete_secret(PyObject *self, PyObject *args)
 {
 	TALLOC_CTX *frame = talloc_stackframe();
 	NTSTATUS status;
@@ -3370,172 +3588,172 @@ static PyObject *py_pdb_delete_secret(pytalloc_Object *self, PyObject *args)
 		return NULL;
 	}
 
-	Py_RETURN_NONE;
 	talloc_free(frame);
+	Py_RETURN_NONE;
 }
 
 static PyMethodDef py_pdb_methods[] = {
-	{ "domain_info", (PyCFunction)py_pdb_domain_info, METH_NOARGS,
+	{ "domain_info", py_pdb_domain_info, METH_NOARGS,
 		"domain_info() -> str\n\n \
 		Get domain information for the database." },
-	{ "getsampwnam", (PyCFunction)py_pdb_getsampwnam, METH_VARARGS,
+	{ "getsampwnam", py_pdb_getsampwnam, METH_VARARGS,
 		"getsampwnam(username) -> samu object\n\n \
 		Get user information by name." },
-	{ "getsampwsid", (PyCFunction)py_pdb_getsampwsid, METH_VARARGS,
+	{ "getsampwsid", py_pdb_getsampwsid, METH_VARARGS,
 		"getsampwsid(user_sid) -> samu object\n\n \
 		Get user information by sid (dcerpc.security.dom_sid object)." },
-	{ "create_user", (PyCFunction)py_pdb_create_user, METH_VARARGS,
+	{ "create_user", py_pdb_create_user, METH_VARARGS,
 		"create_user(username, acct_flags) -> rid\n\n \
 		Create user. acct_flags are samr account control flags." },
-	{ "delete_user", (PyCFunction)py_pdb_delete_user, METH_VARARGS,
+	{ "delete_user", py_pdb_delete_user, METH_VARARGS,
 		"delete_user(samu object) -> None\n\n \
 		Delete user." },
-	{ "add_sam_account", (PyCFunction)py_pdb_add_sam_account, METH_VARARGS,
+	{ "add_sam_account", py_pdb_add_sam_account, METH_VARARGS,
 		"add_sam_account(samu object) -> None\n\n \
 		Add SAM account." },
-	{ "update_sam_account", (PyCFunction)py_pdb_update_sam_account, METH_VARARGS,
+	{ "update_sam_account", py_pdb_update_sam_account, METH_VARARGS,
 		"update_sam_account(samu object) -> None\n\n \
 		Update SAM account." },
-	{ "delete_sam_account", (PyCFunction)py_pdb_delete_sam_account, METH_VARARGS,
+	{ "delete_sam_account", py_pdb_delete_sam_account, METH_VARARGS,
 		"delete_sam_account(samu object) -> None\n\n \
 		Delete SAM account." },
-	{ "rename_sam_account", (PyCFunction)py_pdb_rename_sam_account, METH_VARARGS,
+	{ "rename_sam_account", py_pdb_rename_sam_account, METH_VARARGS,
 		"rename_sam_account(samu object1, new_username) -> None\n\n \
 		Rename SAM account." },
 	/* update_login_attempts */
-	{ "getgrsid", (PyCFunction)py_pdb_getgrsid, METH_VARARGS,
+	{ "getgrsid", py_pdb_getgrsid, METH_VARARGS,
 		"getgrsid(group_sid) -> groupmap object\n\n \
 		Get group information by sid (dcerpc.security.dom_sid object)." },
-	{ "getgrgid", (PyCFunction)py_pdb_getgrgid, METH_VARARGS,
+	{ "getgrgid", py_pdb_getgrgid, METH_VARARGS,
 		"getgrsid(gid) -> groupmap object\n\n \
 		Get group information by gid." },
-	{ "getgrnam", (PyCFunction)py_pdb_getgrnam, METH_VARARGS,
+	{ "getgrnam", py_pdb_getgrnam, METH_VARARGS,
 		"getgrsid(groupname) -> groupmap object\n\n \
 		Get group information by name." },
-	{ "create_dom_group", (PyCFunction)py_pdb_create_dom_group, METH_VARARGS,
+	{ "create_dom_group", py_pdb_create_dom_group, METH_VARARGS,
 		"create_dom_group(groupname) -> group_rid\n\n \
 		Create new domain group by name." },
-	{ "delete_dom_group", (PyCFunction)py_pdb_delete_dom_group, METH_VARARGS,
+	{ "delete_dom_group", py_pdb_delete_dom_group, METH_VARARGS,
 		"delete_dom_group(group_rid) -> None\n\n \
 		Delete domain group identified by rid" },
-	{ "add_group_mapping_entry", (PyCFunction)py_pdb_add_group_mapping_entry, METH_VARARGS,
+	{ "add_group_mapping_entry", py_pdb_add_group_mapping_entry, METH_VARARGS,
 		"add_group_mapping_entry(groupmap) -> None\n \
 		Add group mapping entry for groupmap object." },
-	{ "update_group_mapping_entry", (PyCFunction)py_pdb_update_group_mapping_entry, METH_VARARGS,
+	{ "update_group_mapping_entry", py_pdb_update_group_mapping_entry, METH_VARARGS,
 		"update_group_mapping_entry(groupmap) -> None\n\n \
 		Update group mapping entry for groupmap object." },
-	{ "delete_group_mapping_entry", (PyCFunction)py_pdb_delete_group_mapping_entry, METH_VARARGS,
+	{ "delete_group_mapping_entry", py_pdb_delete_group_mapping_entry, METH_VARARGS,
 		"delete_group_mapping_entry(groupmap) -> None\n\n \
 		Delete group mapping entry for groupmap object." },
-	{ "enum_group_mapping", (PyCFunction)py_pdb_enum_group_mapping, METH_VARARGS,
+	{ "enum_group_mapping", py_pdb_enum_group_mapping, METH_VARARGS,
 		"enum_group_mapping([domain_sid, [type, [unix_only]]]) -> List\n\n \
 		Return list of group mappings as groupmap objects. Optional arguments are domain_sid object, type of group, unix only flag." },
-	{ "enum_group_members", (PyCFunction)py_pdb_enum_group_members, METH_VARARGS,
+	{ "enum_group_members", py_pdb_enum_group_members, METH_VARARGS,
 		"enum_group_members(group_sid) -> List\n\n \
 		Return list of users (dom_sid object) in group." },
-	{ "enum_group_memberships", (PyCFunction)py_pdb_enum_group_memberships, METH_VARARGS,
+	{ "enum_group_memberships", py_pdb_enum_group_memberships, METH_VARARGS,
 		"enum_group_memberships(samu object) -> List\n\n \
 		Return list of groups (dom_sid object) this user is part of." },
 	/* set_unix_primary_group */
-	{ "add_groupmem", (PyCFunction)py_pdb_add_groupmem, METH_VARARGS,
+	{ "add_groupmem", py_pdb_add_groupmem, METH_VARARGS,
 		"add_groupmem(group_rid, member_rid) -> None\n\n \
 		Add user to group." },
-	{ "del_groupmem", (PyCFunction)py_pdb_del_groupmem, METH_VARARGS,
+	{ "del_groupmem", py_pdb_del_groupmem, METH_VARARGS,
 		"del_groupmem(group_rid, member_rid) -> None\n\n \
 		Remove user from from group." },
-	{ "create_alias", (PyCFunction)py_pdb_create_alias, METH_VARARGS,
+	{ "create_alias", py_pdb_create_alias, METH_VARARGS,
 		"create_alias(alias_name) -> alias_rid\n\n \
 		Create alias entry." },
-	{ "delete_alias", (PyCFunction)py_pdb_delete_alias, METH_VARARGS,
+	{ "delete_alias", py_pdb_delete_alias, METH_VARARGS,
 		"delete_alias(alias_sid) -> None\n\n \
 		Delete alias entry." },
-	{ "get_aliasinfo", (PyCFunction)py_pdb_get_aliasinfo, METH_VARARGS,
+	{ "get_aliasinfo", py_pdb_get_aliasinfo, METH_VARARGS,
 		"get_aliasinfo(alias_sid) -> Mapping\n\n \
 		Get alias information as a dictionary with keys - acct_name, acct_desc, rid." },
-	{ "set_aliasinfo", (PyCFunction)py_pdb_set_aliasinfo, METH_VARARGS,
+	{ "set_aliasinfo", py_pdb_set_aliasinfo, METH_VARARGS,
 		"set_alias_info(alias_sid, Mapping) -> None\n\n \
 		Set alias information from a dictionary with keys - acct_name, acct_desc." },
-	{ "add_aliasmem", (PyCFunction)py_pdb_add_aliasmem, METH_VARARGS,
+	{ "add_aliasmem", py_pdb_add_aliasmem, METH_VARARGS,
 		"add_aliasmem(alias_sid, member_sid) -> None\n\n \
 		Add user to alias entry." },
-	{ "del_aliasmem", (PyCFunction)py_pdb_del_aliasmem, METH_VARARGS,
+	{ "del_aliasmem", py_pdb_del_aliasmem, METH_VARARGS,
 		"del_aliasmem(alias_sid, member_sid) -> None\n\n \
 		Remove a user from alias entry." },
-	{ "enum_aliasmem", (PyCFunction)py_pdb_enum_aliasmem, METH_VARARGS,
+	{ "enum_aliasmem", py_pdb_enum_aliasmem, METH_VARARGS,
 		"enum_aliasmem(alias_sid) -> List\n\n \
 		Return a list of members (dom_sid object) for alias entry." },
 	/* enum_alias_memberships */
 	/* lookup_rids */
 	/* lookup_names */
-	{ "get_account_policy", (PyCFunction)py_pdb_get_account_policy, METH_NOARGS,
+	{ "get_account_policy", py_pdb_get_account_policy, METH_NOARGS,
 		"get_account_policy() -> Mapping\n\n \
 		Get account policy information as a dictionary." },
-	{ "set_account_policy", (PyCFunction)py_pdb_set_account_policy, METH_VARARGS,
+	{ "set_account_policy", py_pdb_set_account_policy, METH_VARARGS,
 		"get_account_policy(Mapping) -> None\n\n \
 		Set account policy settings from a dicionary." },
 	/* get_seq_num */
-	{ "search_users", (PyCFunction)py_pdb_search_users, METH_VARARGS,
+	{ "search_users", py_pdb_search_users, METH_VARARGS,
 		"search_users(acct_flags) -> List\n\n \
 		Search users. acct_flags are samr account control flags.\n \
 		Each list entry is dictionary with keys - idx, rid, acct_flags, account_name, fullname, description." },
-	{ "search_groups", (PyCFunction)py_pdb_search_groups, METH_NOARGS,
+	{ "search_groups", py_pdb_search_groups, METH_NOARGS,
 		"search_groups() -> List\n\n \
 		Search unix only groups. \n \
 		Each list entry is dictionary with keys - idx, rid, acct_flags, account_name, fullname, description." },
-	{ "search_aliases", (PyCFunction)py_pdb_search_aliases, METH_VARARGS,
+	{ "search_aliases", py_pdb_search_aliases, METH_VARARGS,
 		"search_aliases([domain_sid]) -> List\n\n \
 		Search aliases. domain_sid is dcerpc.security.dom_sid object.\n \
 		Each list entry is dictionary with keys - idx, rid, acct_flags, account_name, fullname, description." },
-	{ "uid_to_sid", (PyCFunction)py_pdb_uid_to_sid, METH_VARARGS,
+	{ "uid_to_sid", py_pdb_uid_to_sid, METH_VARARGS,
 		"uid_to_sid(uid) -> sid\n\n \
 		Return sid for given user id." },
-	{ "gid_to_sid", (PyCFunction)py_pdb_gid_to_sid, METH_VARARGS,
+	{ "gid_to_sid", py_pdb_gid_to_sid, METH_VARARGS,
 		"gid_to_sid(gid) -> sid\n\n \
 		Return sid for given group id." },
-	{ "sid_to_id", (PyCFunction)py_pdb_sid_to_id, METH_VARARGS,
+	{ "sid_to_id", py_pdb_sid_to_id, METH_VARARGS,
 		"sid_to_id(sid) -> Tuple\n\n \
 		Return id and type for given sid." },
 	/* capabilities */
-	{ "new_rid", (PyCFunction)py_pdb_new_rid, METH_NOARGS,
+	{ "new_rid", py_pdb_new_rid, METH_NOARGS,
 		"new_rid() -> rid\n\n \
 		Get a new rid." },
-	{ "get_trusteddom_pw", (PyCFunction)py_pdb_get_trusteddom_pw, METH_VARARGS,
+	{ "get_trusteddom_pw", py_pdb_get_trusteddom_pw, METH_VARARGS,
 		"get_trusteddom_pw(domain) -> Mapping\n\n \
 		Get trusted domain password, sid and last set time in a dictionary." },
-	{ "set_trusteddom_pw", (PyCFunction)py_pdb_set_trusteddom_pw, METH_VARARGS,
+	{ "set_trusteddom_pw", py_pdb_set_trusteddom_pw, METH_VARARGS,
 		"set_trusteddom_pw(domain, pwd, sid) -> None\n\n \
 		Set trusted domain password." },
-	{ "del_trusteddom_pw", (PyCFunction)py_pdb_del_trusteddom_pw, METH_VARARGS,
+	{ "del_trusteddom_pw", py_pdb_del_trusteddom_pw, METH_VARARGS,
 		"del_trusteddom_pw(domain) -> None\n\n \
 		Delete trusted domain password." },
-	{ "enum_trusteddoms", (PyCFunction)py_pdb_enum_trusteddoms, METH_NOARGS,
+	{ "enum_trusteddoms", py_pdb_enum_trusteddoms, METH_NOARGS,
 		"enum_trusteddoms() -> List\n\n \
 		Get list of trusted domains. Each item is a dictionary with name and sid keys" },
-	{ "get_trusted_domain", (PyCFunction)py_pdb_get_trusted_domain, METH_VARARGS,
+	{ "get_trusted_domain", py_pdb_get_trusted_domain, METH_VARARGS,
 		"get_trusted_domain(domain) -> Mapping\n\n \
 		Get trusted domain information by name. Information is a dictionary with keys - domain_name, netbios_name, security_identifier, trust_auth_incoming, trust_auth_outgoing, trust_direction, trust_type, trust_attributes, trust_forest_trust_info." },
-	{ "get_trusted_domain_by_sid", (PyCFunction)py_pdb_get_trusted_domain_by_sid, METH_VARARGS,
+	{ "get_trusted_domain_by_sid", py_pdb_get_trusted_domain_by_sid, METH_VARARGS,
 		"get_trusted_domain_by_sid(domain_sid) -> Mapping\n\n \
 		Get trusted domain information by sid. Information is a dictionary with keys - domain_name, netbios_name, security_identifier, trust_auth_incoming, trust_auth_outgoing, trust_direction, trust_type, trust_attributes, trust_forest_trust_info" },
-	{ "set_trusted_domain", (PyCFunction)py_pdb_set_trusted_domain, METH_VARARGS,
+	{ "set_trusted_domain", py_pdb_set_trusted_domain, METH_VARARGS,
 		"set_trusted_domain(domain, Mapping) -> None\n\n \
 		Set trusted domain information for domain. Mapping is a dictionary with keys - domain_name, netbios_name, security_identifier, trust_auth_incoming, trust_auth_outgoing, trust_direction, trust_type, trust_attributes, trust_forest_trust_info." },
-	{ "del_trusted_domain", (PyCFunction)py_pdb_del_trusted_domain, METH_VARARGS,
+	{ "del_trusted_domain", py_pdb_del_trusted_domain, METH_VARARGS,
 		"del_trusted_domain(domain) -> None\n\n \
 		Delete trusted domain." },
-	{ "enum_trusted_domains", (PyCFunction)py_pdb_enum_trusted_domains, METH_VARARGS,
+	{ "enum_trusted_domains", py_pdb_enum_trusted_domains, METH_VARARGS,
 		"enum_trusted_domains() -> List\n\n \
 		Get list of trusted domains. Each entry is a dictionary with keys - domain_name, netbios_name, security_identifier, trust_auth_incoming, trust_auth_outgoing, trust_direction, trust_type, trust_attributes, trust_forest_trust_info." },
-	{ "get_secret", (PyCFunction)py_pdb_get_secret, METH_VARARGS,
+	{ "get_secret", py_pdb_get_secret, METH_VARARGS,
 		"get_secret(secret_name) -> Mapping\n\n \
 		Get secret information for secret_name. Information is a dictionary with keys - secret_current, secret_current_lastchange, secret_old, secret_old_lastchange, sd." },
-	{ "set_secret", (PyCFunction)py_pdb_set_secret, METH_VARARGS,
+	{ "set_secret", py_pdb_set_secret, METH_VARARGS,
 		"set_secret(secret_name, Mapping) -> None\n\n \
 		Set secret information for secret_name using dictionary with keys - secret_current, sd." },
-	{ "delete_secret", (PyCFunction)py_pdb_delete_secret, METH_VARARGS,
+	{ "delete_secret", py_pdb_delete_secret, METH_VARARGS,
 		"delete_secret(secret_name) -> None\n\n \
 		Delete secret information for secret_name." },
-	{ NULL },
+	{0},
 };
 
 
@@ -3552,7 +3770,7 @@ static PyObject *py_pdb_new(PyTypeObject *type, PyObject *args, PyObject *kwargs
 		return NULL;
 	}
 
-	/* Initalize list of methods */
+	/* Initialize list of methods */
 	status = make_pdb_method_name(&methods, url);
 	if (!NT_STATUS_IS_OK(status)) {
 		PyErr_Format(py_pdb_error, "Cannot load backend methods for '%s' backend (%d,%s)",
@@ -3576,7 +3794,6 @@ static PyObject *py_pdb_new(PyTypeObject *type, PyObject *args, PyObject *kwargs
 
 static PyTypeObject PyPDB = {
 	.tp_name = "passdb.PDB",
-	.tp_basicsize = sizeof(pytalloc_Object),
 	.tp_new = py_pdb_new,
 	.tp_flags = Py_TPFLAGS_DEFAULT,
 	.tp_methods = py_pdb_methods,
@@ -3587,7 +3804,7 @@ static PyTypeObject PyPDB = {
 /*
  * Return a list of passdb backends
  */
-static PyObject *py_passdb_backends(PyObject *self)
+static PyObject *py_passdb_backends(PyObject *self, PyObject *unused)
 {
 	TALLOC_CTX *frame = talloc_stackframe();
 	PyObject *py_blist;
@@ -3605,7 +3822,20 @@ static PyObject *py_passdb_backends(PyObject *self)
 	}
 
 	while(entry) {
-		PyList_Append(py_blist, PyString_FromString(entry->name));
+		int res = 0;
+		PyObject *entry_name = PyUnicode_FromString(entry->name);
+		if (entry_name) {
+			res = PyList_Append(py_blist, entry_name);
+		} else {
+			Py_CLEAR(entry_name);
+			Py_CLEAR(py_blist);
+			break;
+		}
+		Py_CLEAR(entry_name);
+		if (res == -1) {
+			Py_CLEAR(py_blist);
+			break;
+		}
 		entry = entry->next;
 	}
 
@@ -3631,8 +3861,8 @@ static PyObject *py_set_smb_config(PyObject *self, PyObject *args)
 		return NULL;
 	}
 
-	Py_RETURN_NONE;
 	talloc_free(frame);
+	Py_RETURN_NONE;
 }
 
 
@@ -3673,7 +3903,32 @@ static PyObject *py_reload_static_pdb(PyObject *self, PyObject *args)
 	Py_RETURN_NONE;
 }
 
-static PyObject *py_get_global_sam_sid(PyObject *self)
+static PyObject *py_get_domain_sid(PyObject *self, PyObject *unused)
+{
+	TALLOC_CTX *frame = talloc_stackframe();
+	struct dom_sid domain_sid, *domain_sid_copy;
+	PyObject *py_dom_sid = Py_None;
+	bool ret = false;
+
+	ret = secrets_fetch_domain_sid(lp_workgroup(), &domain_sid);
+	if (!ret) {
+		talloc_free(frame);
+		return PyErr_NoMemory();
+	}
+
+	domain_sid_copy = dom_sid_dup(frame, &domain_sid);
+	if (domain_sid_copy == NULL) {
+		talloc_free(frame);
+		return PyErr_NoMemory();
+	}
+
+	py_dom_sid = pytalloc_steal(dom_sid_Type, domain_sid_copy);
+
+	talloc_free(frame);
+	return py_dom_sid;
+}
+
+static PyObject *py_get_global_sam_sid(PyObject *self, PyObject *unused)
 {
 	TALLOC_CTX *frame = talloc_stackframe();
 	struct dom_sid *domain_sid, *domain_sid_copy;
@@ -3696,58 +3951,60 @@ static PyObject *py_get_global_sam_sid(PyObject *self)
 
 
 static PyMethodDef py_passdb_methods[] = {
-	{ "get_backends", (PyCFunction)py_passdb_backends, METH_NOARGS,
+	{ "get_backends", py_passdb_backends, METH_NOARGS,
 		"get_backends() -> list\n\n \
 		Get a list of password database backends supported." },
-	{ "set_smb_config", (PyCFunction)py_set_smb_config, METH_VARARGS,
+	{ "set_smb_config", py_set_smb_config, METH_VARARGS,
 		"set_smb_config(path) -> None\n\n \
 		Set path to smb.conf file to load configuration parameters." },
-	{ "set_secrets_dir", (PyCFunction)py_set_secrets_dir, METH_VARARGS,
+	{ "set_secrets_dir", py_set_secrets_dir, METH_VARARGS,
 		"set_secrets_dir(private_dir) -> None\n\n \
 		Set path to private directory to load secrets database from non-default location." },
-	{ "get_global_sam_sid", (PyCFunction)py_get_global_sam_sid, METH_NOARGS,
+	{ "get_global_sam_sid", py_get_global_sam_sid, METH_NOARGS,
 		"get_global_sam_sid() -> dom_sid\n\n \
 		Return domain SID." },
-	{ "reload_static_pdb", (PyCFunction)py_reload_static_pdb, METH_NOARGS,
+	{ "get_domain_sid", py_get_domain_sid, METH_NOARGS,
+		"get_domain_sid() -> dom_sid\n\n \
+		Return domain SID from secrets database." },
+	{ "reload_static_pdb", py_reload_static_pdb, METH_NOARGS,
 		"reload_static_pdb() -> None\n\n \
-		Re-initalise the static pdb used internally.  Needed if 'passdb backend' is changed." },
-	{ NULL },
+		Re-initialise the static pdb used internally.  Needed if 'passdb backend' is changed." },
+	{0},
 };
 
-void initpassdb(void)
+static struct PyModuleDef moduledef = {
+    PyModuleDef_HEAD_INIT,
+    .m_name = "passdb",
+    .m_doc = "SAMBA Password Database",
+    .m_size = -1,
+    .m_methods = py_passdb_methods,
+};
+
+MODULE_INIT_FUNC(passdb)
 {
 	TALLOC_CTX *frame = talloc_stackframe();
-	PyObject *m, *mod;
+	PyObject *m = NULL, *mod = NULL;
 	char exception_name[] = "passdb.error";
 
-	PyTypeObject *talloc_type = pytalloc_GetObjectType();
-	if (talloc_type == NULL) {
+	if (pytalloc_BaseObject_PyType_Ready(&PyPDB) < 0) {
 		talloc_free(frame);
-		return;
+		return NULL;
 	}
 
-	PyPDB.tp_base = talloc_type;
-	if (PyType_Ready(&PyPDB) < 0) {
+	if (pytalloc_BaseObject_PyType_Ready(&PySamu) < 0) {
 		talloc_free(frame);
-		return;
+		return NULL;
 	}
 
-	PySamu.tp_base = talloc_type;
-	if (PyType_Ready(&PySamu) < 0) {
+	if (pytalloc_BaseObject_PyType_Ready(&PyGroupmap) < 0) {
 		talloc_free(frame);
-		return;
+		return NULL;
 	}
 
-	PyGroupmap.tp_base = talloc_type;
-	if (PyType_Ready(&PyGroupmap) < 0) {
-		talloc_free(frame);
-		return;
-	}
-
-	m = Py_InitModule3("passdb", py_passdb_methods, "SAMBA Password Database");
+	m = PyModule_Create(&moduledef);
 	if (m == NULL) {
 	    talloc_free(frame);
-	    return;
+	    return NULL;
 	}
 
 	/* Create new exception for passdb module */
@@ -3768,35 +4025,42 @@ void initpassdb(void)
 	mod = PyImport_ImportModule("samba.dcerpc.security");
 	if (mod == NULL) {
 		talloc_free(frame);
-		return;
+		return NULL;
 	}
 
 	dom_sid_Type = (PyTypeObject *)PyObject_GetAttrString(mod, "dom_sid");
 	if (dom_sid_Type == NULL) {
+		Py_DECREF(mod);
 		talloc_free(frame);
-		return;
+		return NULL;
 	}
 
 	/* Import security_descriptor type from dcerpc.security */
 	security_Type = (PyTypeObject *)PyObject_GetAttrString(mod, "descriptor");
 	Py_DECREF(mod);
 	if (security_Type == NULL) {
+		Py_DECREF(dom_sid_Type);
 		talloc_free(frame);
-		return;
+		return NULL;
 	}
 
 	/* Import GUID type from dcerpc.misc */
 	mod = PyImport_ImportModule("samba.dcerpc.misc");
 	if (mod == NULL) {
+		Py_DECREF(security_Type);
+		Py_DECREF(dom_sid_Type);
 		talloc_free(frame);
-		return;
+		return NULL;
 	}
 
 	guid_Type = (PyTypeObject *)PyObject_GetAttrString(mod, "GUID");
 	Py_DECREF(mod);
 	if (guid_Type == NULL) {
+		Py_DECREF(security_Type);
+		Py_DECREF(dom_sid_Type);
 		talloc_free(frame);
-		return;
+		return NULL;
 	}
 	talloc_free(frame);
+	return m;
 }

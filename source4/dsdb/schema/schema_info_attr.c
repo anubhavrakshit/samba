@@ -125,7 +125,7 @@ WERROR dsdb_schema_info_from_blob(const DATA_BLOB *blob,
 	schema_info = talloc(mem_ctx, struct dsdb_schema_info);
 	if (!schema_info) {
 		talloc_free(temp_ctx);
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	/* note that we accept revision numbers of zero now - w2k8r2
@@ -175,10 +175,11 @@ WERROR dsdb_blob_from_schema_info(const struct dsdb_schema_info *schema_info,
 WERROR dsdb_schema_info_cmp(const struct dsdb_schema *schema,
 			    const struct drsuapi_DsReplicaOIDMapping_Ctr *ctr)
 {
-	bool bres;
-	DATA_BLOB blob;
-	char *schema_info_str;
-	struct drsuapi_DsReplicaOIDMapping *mapping;
+	TALLOC_CTX *frame = NULL;
+	DATA_BLOB blob = data_blob_null;
+	struct dsdb_schema_info *schema_info = NULL;
+	const struct drsuapi_DsReplicaOIDMapping *mapping = NULL;
+	WERROR werr;
 
 	/* we should have at least schemaInfo element */
 	if (ctr->num_mappings < 1) {
@@ -196,13 +197,39 @@ WERROR dsdb_schema_info_cmp(const struct dsdb_schema *schema,
 		return WERR_INVALID_PARAMETER;
 	}
 
-	schema_info_str = hex_encode_talloc(NULL, blob.data, blob.length);
-	W_ERROR_HAVE_NO_MEMORY(schema_info_str);
+	frame = talloc_stackframe();
+	werr = dsdb_schema_info_from_blob(&blob, frame, &schema_info);
+	if (!W_ERROR_IS_OK(werr)) {
+		TALLOC_FREE(frame);
+		return werr;
+	}
 
-	bres = strequal(schema->schema_info, schema_info_str);
-	talloc_free(schema_info_str);
+	/*
+	 * shouldn't really be possible is dsdb_schema_info_from_blob
+	 * succeeded, this check is just to satisfy static checker
+	 */
+	if (schema_info == NULL) {
+		TALLOC_FREE(frame);
+		return WERR_INVALID_PARAMETER;
+	}
 
-	return bres ? WERR_OK : WERR_DS_DRA_SCHEMA_MISMATCH;
+	if (schema->schema_info->revision > schema_info->revision) {
+		/*
+		 * It's ok if our schema is newer than the remote one
+		 */
+		werr = WERR_OK;
+	} else if (schema->schema_info->revision < schema_info->revision) {
+		werr = WERR_DS_DRA_SCHEMA_MISMATCH;
+	} else if (!GUID_equal(&schema->schema_info->invocation_id,
+		   &schema_info->invocation_id))
+	{
+		werr = WERR_DS_DRA_SCHEMA_CONFLICT;
+	} else {
+		werr = WERR_OK;
+	}
+
+	TALLOC_FREE(frame);
+	return werr;
 }
 
 

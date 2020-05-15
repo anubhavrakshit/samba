@@ -75,8 +75,20 @@ static void reg_ldb_unpack_value(TALLOC_CTX *mem_ctx,
 	case REG_DWORD:
 	case REG_DWORD_BIG_ENDIAN:
 		if (val != NULL) {
+			int error = 0;
 			/* The data is a plain DWORD */
-			uint32_t tmp = strtoul((char *)val->data, NULL, 0);
+			uint32_t tmp;
+
+			tmp = smb_strtoul((char *)val->data,
+					  NULL,
+					  0,
+					  &error,
+					  SMB_STR_STANDARD);
+			if (error != 0) {
+				data->data = NULL;
+				data->length = 0;
+				break;
+			}
 			data->data = talloc_size(mem_ctx, sizeof(uint32_t));
 			if (data->data != NULL) {
 				SIVAL(data->data, 0, tmp);
@@ -90,8 +102,20 @@ static void reg_ldb_unpack_value(TALLOC_CTX *mem_ctx,
 
 	case REG_QWORD:
 		if (val != NULL) {
+			int error = 0;
 			/* The data is a plain QWORD */
-			uint64_t tmp = strtoull((char *)val->data, NULL, 0);
+			uint64_t tmp;
+
+			tmp = smb_strtoull((char *)val->data,
+					   NULL,
+					   0,
+					   &error,
+					   SMB_STR_STANDARD);
+			if (error != 0) {
+				data->data = NULL;
+				data->length = 0;
+				break;
+			}
 			data->data = talloc_size(mem_ctx, sizeof(uint64_t));
 			if (data->data != NULL) {
 				SBVAL(data->data, 0, tmp);
@@ -126,7 +150,7 @@ static struct ldb_message *reg_ldb_pack_value(struct ldb_context *ctx,
 	char *name_dup, *type_str;
 	int ret;
 
-	msg = talloc_zero(mem_ctx, struct ldb_message);
+	msg = ldb_msg_new(mem_ctx);
 	if (msg == NULL) {
 		return NULL;
 	}
@@ -419,7 +443,7 @@ static WERROR ldb_get_default_value(TALLOC_CTX *mem_ctx,
 
 	if (res->count == 0 || res->msgs[0]->num_elements == 0) {
 		talloc_free(res);
-		return WERR_BADFILE;
+		return WERR_FILE_NOT_FOUND;
 	}
 
 	if ((data_type != NULL) && (data != NULL)) {
@@ -488,7 +512,7 @@ static WERROR ldb_get_value(TALLOC_CTX *mem_ctx, struct hive_key *k,
 		}
 	}
 
-	return WERR_BADFILE;
+	return WERR_FILE_NOT_FOUND;
 }
 
 static WERROR ldb_open_key(TALLOC_CTX *mem_ctx, const struct hive_key *h,
@@ -515,7 +539,7 @@ static WERROR ldb_open_key(TALLOC_CTX *mem_ctx, const struct hive_key *h,
 		DEBUG(3, ("Key '%s' not found\n",
 			ldb_dn_get_linearized(ldb_path)));
 		talloc_free(res);
-		return WERR_BADFILE;
+		return WERR_FILE_NOT_FOUND;
 	}
 
 	newkd = talloc_zero(mem_ctx, struct ldb_key_data);
@@ -545,7 +569,7 @@ WERROR reg_open_ldb_file(TALLOC_CTX *parent_ctx, const char *location,
 	struct ldb_message *attrs_msg;
 
 	if (location == NULL)
-		return WERR_INVALID_PARAM;
+		return WERR_INVALID_PARAMETER;
 
 	wrap = ldb_wrap_connect(parent_ctx, ev_ctx, lp_ctx,
 				location, session_info, credentials, 0);
@@ -642,7 +666,7 @@ static WERROR ldb_del_value(TALLOC_CTX *mem_ctx, struct hive_key *key,
 
 	if (child[0] == '\0') {
 		/* default value */
-		msg = talloc_zero(mem_ctx, struct ldb_message);
+		msg = ldb_msg_new(mem_ctx);
 		W_ERROR_HAVE_NO_MEMORY(msg);
 		msg->dn = ldb_dn_copy(msg, kd->dn);
 		W_ERROR_HAVE_NO_MEMORY(msg->dn);
@@ -661,7 +685,7 @@ static WERROR ldb_del_value(TALLOC_CTX *mem_ctx, struct hive_key *key,
 		talloc_free(msg);
 
 		if (ret == LDB_ERR_NO_SUCH_ATTRIBUTE) {
-			return WERR_BADFILE;
+			return WERR_FILE_NOT_FOUND;
 		} else if (ret != LDB_SUCCESS) {
 			DEBUG(1, ("ldb_del_value: %s\n", ldb_errstring(kd->ldb)));
 			return WERR_FOOBAR;
@@ -681,7 +705,7 @@ static WERROR ldb_del_value(TALLOC_CTX *mem_ctx, struct hive_key *key,
 		talloc_free(childdn);
 
 		if (ret == LDB_ERR_NO_SUCH_OBJECT) {
-			return WERR_BADFILE;
+			return WERR_FILE_NOT_FOUND;
 		} else if (ret != LDB_SUCCESS) {
 			DEBUG(1, ("ldb_del_value: %s\n", ldb_errstring(kd->ldb)));
 			return WERR_FOOBAR;
@@ -906,7 +930,7 @@ static WERROR ldb_get_key_info(TALLOC_CTX *mem_ctx,
 	 * remain { NULL, 0 }. */
 	werr = ldb_get_default_value(mem_ctx, key, NULL, &default_value_type,
 				     &default_value);
-	if ((!W_ERROR_IS_OK(werr)) && (!W_ERROR_EQUAL(werr, WERR_BADFILE))) {
+	if ((!W_ERROR_IS_OK(werr)) && (!W_ERROR_EQUAL(werr, WERR_FILE_NOT_FOUND))) {
 		return werr;
 	}
 

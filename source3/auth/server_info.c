@@ -19,7 +19,7 @@
 
 #include "includes.h"
 #include "auth.h"
-#include "../lib/crypto/arcfour.h"
+#include "lib/util_unixsids.h"
 #include "../librpc/gen_ndr/netlogon.h"
 #include "../libcli/security/security.h"
 #include "rpc_client/util_netlogon.h"
@@ -62,11 +62,14 @@ struct auth_serversupplied_info *make_server_info(TALLOC_CTX *mem_ctx)
 NTSTATUS serverinfo_to_SamInfo2(struct auth_serversupplied_info *server_info,
 				struct netr_SamInfo2 *sam2)
 {
-	struct netr_SamInfo3 *info3;
+	struct netr_SamInfo3 *info3 = NULL;
+	NTSTATUS status;
 
-	info3 = copy_netr_SamInfo3(sam2, server_info->info3);
-	if (!info3) {
-		return NT_STATUS_NO_MEMORY;
+	status = copy_netr_SamInfo3(sam2,
+				    server_info->info3,
+				    &info3);
+	if (!NT_STATUS_IS_OK(status)) {
+		return status;
 	}
 
 	if (server_info->session_key.length) {
@@ -95,11 +98,14 @@ NTSTATUS serverinfo_to_SamInfo2(struct auth_serversupplied_info *server_info,
 NTSTATUS serverinfo_to_SamInfo3(const struct auth_serversupplied_info *server_info,
 				struct netr_SamInfo3 *sam3)
 {
-	struct netr_SamInfo3 *info3;
+	struct netr_SamInfo3 *info3 = NULL;
+	NTSTATUS status;
 
-	info3 = copy_netr_SamInfo3(sam3, server_info->info3);
-	if (!info3) {
-		return NT_STATUS_NO_MEMORY;
+	status = copy_netr_SamInfo3(sam3,
+				    server_info->info3,
+				    &info3);
+	if (!NT_STATUS_IS_OK(status)) {
+		return status;
 	}
 
 	if (server_info->session_key.length) {
@@ -132,7 +138,8 @@ NTSTATUS serverinfo_to_SamInfo6(struct auth_serversupplied_info *server_info,
 				struct netr_SamInfo6 *sam6)
 {
 	struct pdb_domain_info *dominfo;
-	struct netr_SamInfo3 *info3;
+	struct netr_SamInfo3 *info3 = NULL;
+	NTSTATUS status;
 
 	if ((pdb_capabilities() & PDB_CAP_ADS) == 0) {
 		DEBUG(10,("Not adding validation info level 6 "
@@ -145,9 +152,11 @@ NTSTATUS serverinfo_to_SamInfo6(struct auth_serversupplied_info *server_info,
 		return NT_STATUS_NO_MEMORY;
 	}
 
-	info3 = copy_netr_SamInfo3(sam6, server_info->info3);
-	if (!info3) {
-		return NT_STATUS_NO_MEMORY;
+	status = copy_netr_SamInfo3(sam6,
+				    server_info->info3,
+				    &info3);
+	if (!NT_STATUS_IS_OK(status)) {
+		return status;
 	}
 
 	if (server_info->session_key.length) {
@@ -173,10 +182,10 @@ NTSTATUS serverinfo_to_SamInfo6(struct auth_serversupplied_info *server_info,
 		return NT_STATUS_NO_MEMORY;
 	}
 
-	sam6->principle.string	= talloc_asprintf(sam6, "%s@%s",
-						  sam6->base.account_name.string,
-						  sam6->dns_domainname.string);
-	if (sam6->principle.string == NULL) {
+	sam6->principal_name.string = talloc_asprintf(
+		sam6, "%s@%s", sam6->base.account_name.string,
+		sam6->dns_domainname.string);
+	if (sam6->principal_name.string == NULL) {
 		return NT_STATUS_NO_MEMORY;
 	}
 
@@ -261,9 +270,27 @@ static NTSTATUS merge_resource_sids(const struct PAC_LOGON_INFO *logon_info,
 				struct netr_SamInfo3 *info3)
 {
 	uint32_t i = 0;
+	const struct PAC_DOMAIN_GROUP_MEMBERSHIP *rg = NULL;
 
-	if (!(logon_info->info3.base.user_flags & NETLOGON_RESOURCE_GROUPS)) {
+	if (logon_info->info3.base.user_flags & NETLOGON_RESOURCE_GROUPS) {
+		rg = &logon_info->resource_groups;
+	}
+
+	if (rg == NULL) {
 		return NT_STATUS_OK;
+	}
+
+	if (rg->domain_sid == NULL) {
+		DEBUG(10, ("Missing Resource Group Domain SID\n"));
+		return NT_STATUS_INVALID_PARAMETER;
+	}
+
+	/* The IDL layer would be a better place to check this, but to
+	 * guard the integer addition below, we double-check */
+	if (rg->groups.count > 65535) {
+		DEBUG(10, ("Too much Resource Group RIDs %u\n",
+			  (unsigned)rg->groups.count));
+		return NT_STATUS_INVALID_PARAMETER;
 	}
 
 	/*
@@ -278,17 +305,18 @@ static NTSTATUS merge_resource_sids(const struct PAC_LOGON_INFO *logon_info,
 	 * Construct a SID for each RID in the list and then append it
 	 * to the info3.
 	 */
-	for (i = 0; i < logon_info->res_groups.count; i++) {
+	for (i = 0; i < rg->groups.count; i++) {
 		NTSTATUS status;
 		struct dom_sid new_sid;
-		uint32_t attributes = logon_info->res_groups.rids[i].attributes;
+		uint32_t attributes = rg->groups.rids[i].attributes;
+		struct dom_sid_buf buf;
 
 		sid_compose(&new_sid,
-			logon_info->res_group_dom_sid,
-			logon_info->res_groups.rids[i].rid);
+			    rg->domain_sid,
+			    rg->groups.rids[i].rid);
 
 		DEBUG(10, ("Adding SID %s to extra SIDS\n",
-			sid_string_dbg(&new_sid)));
+			   dom_sid_str_buf(&new_sid, &buf)));
 
 		status = append_netr_SidAttr(info3, &info3->sids,
 					&info3->sidcount,
@@ -296,7 +324,7 @@ static NTSTATUS merge_resource_sids(const struct PAC_LOGON_INFO *logon_info,
 					attributes);
 		if (!NT_STATUS_IS_OK(status)) {
 			DEBUG(1, ("failed to append SID %s to extra SIDS: %s\n",
-				sid_string_dbg(&new_sid),
+				dom_sid_str_buf(&new_sid, &buf),
 				nt_errstr(status)));
 			return status;
 		}
@@ -316,17 +344,77 @@ NTSTATUS create_info3_from_pac_logon_info(TALLOC_CTX *mem_ctx,
 					struct netr_SamInfo3 **pp_info3)
 {
 	NTSTATUS status;
-	struct netr_SamInfo3 *info3 = copy_netr_SamInfo3(mem_ctx,
-					&logon_info->info3);
-	if (info3 == NULL) {
-		return NT_STATUS_NO_MEMORY;
+	struct netr_SamInfo3 *info3 = NULL;
+
+	status = copy_netr_SamInfo3(mem_ctx,
+				    &logon_info->info3,
+				    &info3);
+	if (!NT_STATUS_IS_OK(status)) {
+		return status;
 	}
+
 	status = merge_resource_sids(logon_info, info3);
 	if (!NT_STATUS_IS_OK(status)) {
 		TALLOC_FREE(info3);
 		return status;
 	}
 	*pp_info3 = info3;
+	return NT_STATUS_OK;
+}
+
+/*
+ * Create a copy of an info6 struct from the PAC_UPN_DNS_INFO and PAC_LOGON_INFO
+ * then merge resource SIDs, if any, into it. If successful return the created
+ * info6 struct.
+ */
+NTSTATUS create_info6_from_pac(TALLOC_CTX *mem_ctx,
+			       const struct PAC_LOGON_INFO *logon_info,
+			       const struct PAC_UPN_DNS_INFO *upn_dns_info,
+			       struct netr_SamInfo6 **pp_info6)
+{
+	NTSTATUS status;
+	struct netr_SamInfo6 *info6 = NULL;
+	struct netr_SamInfo3 *info3 = NULL;
+
+	info6 = talloc_zero(mem_ctx, struct netr_SamInfo6);
+	if (info6 == NULL) {
+		return NT_STATUS_NO_MEMORY;
+	}
+
+	status = copy_netr_SamInfo3(info6,
+				    &logon_info->info3,
+				    &info3);
+	if (!NT_STATUS_IS_OK(status)) {
+		TALLOC_FREE(info6);
+		return status;
+	}
+
+	status = merge_resource_sids(logon_info, info3);
+	if (!NT_STATUS_IS_OK(status)) {
+		TALLOC_FREE(info6);
+		return status;
+	}
+
+	info6->base = info3->base;
+	info6->sids = info3->sids;
+	info6->sidcount = info3->sidcount;
+
+	if (upn_dns_info != NULL) {
+		info6->dns_domainname.string = talloc_strdup(info6,
+				upn_dns_info->dns_domain_name);
+		if (info6->dns_domainname.string == NULL) {
+			TALLOC_FREE(info6);
+			return NT_STATUS_NO_MEMORY;
+		}
+		info6->principal_name.string = talloc_strdup(info6,
+				upn_dns_info->upn_name);
+		if (info6->principal_name.string == NULL) {
+			TALLOC_FREE(info6);
+			return NT_STATUS_NO_MEMORY;
+		}
+	}
+
+	*pp_info6 = info6;
 	return NT_STATUS_OK;
 }
 
@@ -343,6 +431,8 @@ static NTSTATUS SamInfo3_handle_sids(const char *username,
 			struct dom_sid *domain_sid,
 			struct extra_auth_info *extra)
 {
+	struct dom_sid_buf buf;
+
 	if (sid_check_is_in_unix_users(user_sid)) {
 		/* in info3 you can only set rids for the user and the
 		 * primary group, and the domain sid must be that of
@@ -357,7 +447,7 @@ static NTSTATUS SamInfo3_handle_sids(const char *username,
 
 		DEBUG(10, ("Unix User found. Rid marked as "
 			"special and sid (%s) saved as extra sid\n",
-			sid_string_dbg(user_sid)));
+			dom_sid_str_buf(user_sid, &buf)));
 	} else {
 		sid_copy(domain_sid, user_sid);
 		sid_split_rid(domain_sid, &info3->base.rid);
@@ -383,17 +473,18 @@ static NTSTATUS SamInfo3_handle_sids(const char *username,
 
 		DEBUG(10, ("Unix Group found. Rid marked as "
 			"special and sid (%s) saved as extra sid\n",
-			sid_string_dbg(group_sid)));
+			dom_sid_str_buf(group_sid, &buf)));
 	} else {
 		bool ok = sid_peek_check_rid(domain_sid, group_sid,
 					&info3->base.primary_gid);
 		if (!ok) {
+			struct dom_sid_buf buf2, buf3;
 			DEBUG(1, ("The primary group domain sid(%s) does not "
 				"match the domain sid(%s) for %s(%s)\n",
-				sid_string_dbg(group_sid),
-				sid_string_dbg(domain_sid),
+				dom_sid_str_buf(group_sid, &buf),
+				dom_sid_str_buf(domain_sid, &buf2),
 				username,
-				sid_string_dbg(user_sid)));
+				dom_sid_str_buf(user_sid, &buf3)));
 			return NT_STATUS_INVALID_SID;
 		}
 	}
@@ -415,7 +506,7 @@ NTSTATUS samu_to_SamInfo3(TALLOC_CTX *mem_ctx,
 	struct netr_SamInfo3 *info3;
 	const struct dom_sid *user_sid;
 	const struct dom_sid *group_sid;
-	struct dom_sid domain_sid;
+	struct dom_sid domain_sid = {0};
 	struct dom_sid *group_sids;
 	uint32_t num_group_sids = 0;
 	const char *tmp;
@@ -434,8 +525,6 @@ NTSTATUS samu_to_SamInfo3(TALLOC_CTX *mem_ctx,
 	if (!info3) {
 		return NT_STATUS_NO_MEMORY;
 	}
-
-	ZERO_STRUCT(domain_sid);
 
 	status = SamInfo3_handle_sids(pdb_get_username(samu),
 				user_sid,
@@ -599,17 +688,26 @@ NTSTATUS passwd_to_SamInfo3(TALLOC_CTX *mem_ctx,
 		 * will be rejected by other Samba code.
 		 */
 		gid_to_sid(&group_sid, pwd->pw_gid);
+	}
 
-		ZERO_STRUCT(domain_sid);
-
-		/*
-		 * If we are a unix group, set the group_sid to the
-		 * 'Domain Users' RID of 513 which will always resolve to a
-		 * name.
-		 */
-		if (sid_check_is_in_unix_groups(&group_sid)) {
+	/*
+	 * If we are a unix group, or a wellknown/builtin alias,
+	 * set the group_sid to the
+	 * 'Domain Users' RID of 513 which will always resolve to a
+	 * name.
+	 */
+	if (sid_check_is_in_unix_groups(&group_sid) ||
+	    sid_check_is_in_builtin(&group_sid) ||
+	    sid_check_is_in_wellknown_domain(&group_sid)) {
+		if (sid_check_is_in_unix_users(&user_sid)) {
 			sid_compose(&group_sid,
 				    get_global_sam_sid(),
+				    DOMAIN_RID_USERS);
+		} else {
+			sid_copy(&domain_sid, &user_sid);
+			sid_split_rid(&domain_sid, NULL);
+			sid_compose(&group_sid,
+				    &domain_sid,
 				    DOMAIN_RID_USERS);
 		}
 	}
@@ -656,12 +754,14 @@ NTSTATUS passwd_to_SamInfo3(TALLOC_CTX *mem_ctx,
 	ok = sid_peek_check_rid(&domain_sid, &group_sid,
 				&info3->base.primary_gid);
 	if (!ok) {
+		struct dom_sid_buf buf1, buf2, buf3;
+
 		DEBUG(1, ("The primary group domain sid(%s) does not "
 			  "match the domain sid(%s) for %s(%s)\n",
-			  sid_string_dbg(&group_sid),
-			  sid_string_dbg(&domain_sid),
+			  dom_sid_str_buf(&group_sid, &buf1),
+			  dom_sid_str_buf(&domain_sid, &buf2),
 			  unix_username,
-			  sid_string_dbg(&user_sid)));
+			  dom_sid_str_buf(&user_sid, &buf3)));
 		status = NT_STATUS_INVALID_SID;
 		goto done;
 	}
@@ -683,45 +783,3 @@ done:
 
 	return status;
 }
-
-#undef RET_NOMEM
-
-#define RET_NOMEM(ptr) do { \
-	if (!ptr) { \
-		TALLOC_FREE(info3); \
-		return NULL; \
-	} } while(0)
-
-struct netr_SamInfo3 *copy_netr_SamInfo3(TALLOC_CTX *mem_ctx,
-					 const struct netr_SamInfo3 *orig)
-{
-	struct netr_SamInfo3 *info3;
-	unsigned int i;
-	NTSTATUS status;
-
-	info3 = talloc_zero(mem_ctx, struct netr_SamInfo3);
-	if (!info3) return NULL;
-
-	status = copy_netr_SamBaseInfo(info3, &orig->base, &info3->base);
-	if (!NT_STATUS_IS_OK(status)) {
-		TALLOC_FREE(info3);
-		return NULL;
-	}
-
-	if (orig->sidcount) {
-		info3->sidcount = orig->sidcount;
-		info3->sids = talloc_array(info3, struct netr_SidAttr,
-					   orig->sidcount);
-		RET_NOMEM(info3->sids);
-		for (i = 0; i < orig->sidcount; i++) {
-			info3->sids[i].sid = dom_sid_dup(info3->sids,
-							    orig->sids[i].sid);
-			RET_NOMEM(info3->sids[i].sid);
-			info3->sids[i].attributes =
-				orig->sids[i].attributes;
-		}
-	}
-
-	return info3;
-}
-

@@ -43,6 +43,7 @@ int net_ads_printer_usage(struct net_context *c, int argc, const char **argv);
 int net_ads_changetrustpw(struct net_context *c, int argc, const char **argv);
 int net_ads_keytab(struct net_context *c, int argc, const char **argv);
 int net_ads_kerberos(struct net_context *c, int argc, const char **argv);
+int net_ads_setspn(struct net_context *c, int argc, const char **argv);
 int net_ads(struct net_context *c, int argc, const char **argv);
 
 /* The following definitions come from utils/net_ads_gpo.c  */
@@ -317,17 +318,8 @@ struct rpc_sh_cmd *net_rpc_rights_cmds(struct net_context *c, TALLOC_CTX *mem_ct
 
 /* The following definitions come from utils/net_rpc_samsync.c  */
 
-NTSTATUS rpc_samdump_internals(struct net_context *c,
-				const struct dom_sid *domain_sid,
-				const char *domain_name,
-				struct cli_state *cli,
-				struct rpc_pipe_client *pipe_hnd,
-				TALLOC_CTX *mem_ctx,
-				int argc,
-				const char **argv);
 int rpc_vampire_usage(struct net_context *c, int argc, const char **argv);
 int rpc_vampire_passdb(struct net_context *c, int argc, const char **argv);
-int rpc_vampire_ldif(struct net_context *c, int argc, const char **argv);
 int rpc_vampire_keytab(struct net_context *c, int argc, const char **argv);
 
 /* The following definitions come from utils/net_rpc_service.c  */
@@ -447,11 +439,6 @@ NTSTATUS net_lookup_name_from_sid(struct net_context *c,
 NTSTATUS net_lookup_sid_from_name(struct net_context *c, TALLOC_CTX *ctx,
 				  const char *full_name, struct dom_sid *pret_sid);
 
-/* The following definitions come from utils/passwd_util.c  */
-
-char *stdin_new_passwd( void);
-char *get_pass( const char *prompt, bool stdin_get);
-
 /* The following definitions come from utils/net_g_lock.c  */
 int net_g_lock(struct net_context *c, int argc, const char **argv);
 
@@ -462,4 +449,9 @@ int net_rpc_trust(struct net_context *c, int argc, const char **argv);
 int net_rpc_conf(struct net_context *c, int argc, const char **argv);
 
 int net_notify(struct net_context *c, int argc, const char **argv);
+
+int net_tdb(struct net_context *c, int argc, const char **argv);
+
+int net_vfs(struct net_context *c, int argc, const char **argv);
+
 #endif /*  _NET_PROTO_H_  */

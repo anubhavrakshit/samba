@@ -105,6 +105,8 @@ void process_host_announce(struct subnet_record *subrec, struct packet_struct *p
 	struct server_record *servrec;
 	unstring work_name;
 	unstring source_name;
+	ZERO_STRUCT(source_name);
+	ZERO_STRUCT(announce_name);
 
 	pull_ascii_fstring(comment, buf+31);
   
@@ -605,7 +607,7 @@ static void send_backup_list_response(struct subnet_record *subrec,
     if(!(servrec->serv.type & SV_TYPE_BACKUP_BROWSER))
       continue;
 
-    StrnCpy(p, servrec->serv.name, 15);
+    strlcpy(p, servrec->serv.name, 16);
     strupper_m(p);
     count++;
 

@@ -98,12 +98,47 @@
     </para>
 
     <para>
-      The recovery lock is implemented using a file residing in shared
+      By default, the recovery lock is implemented using a file
+      (specified by <parameter>recovery lock</parameter> in the
+      <literal>[cluster]</literal> section of
+      <citerefentry><refentrytitle>ctdb.conf</refentrytitle>
+      <manvolnum>5</manvolnum></citerefentry>) residing in shared
       storage (usually) on a cluster filesystem.  To support a
       recovery lock the cluster filesystem must support lock
       coherence.  See
       <citerefentry><refentrytitle>ping_pong</refentrytitle>
       <manvolnum>1</manvolnum></citerefentry> for more details.
+    </para>
+
+    <para>
+      The recovery lock can also be implemented using an arbitrary
+      cluster mutex helper (or call-out).  This is indicated by using
+      an exclamation point ('!') as the first character of the
+      <parameter>recovery lock</parameter> parameter.  For example, a
+      value of <command>!/usr/local/bin/myhelper recovery</command>
+      would run the given helper with the specified arguments.  The
+      helper will continue to run as long as it holds its mutex.  See
+      <filename>ctdb/doc/cluster_mutex_helper.txt</filename> in the
+      source tree, and related code, for clues about writing helpers.
+    </para>
+
+    <para>
+      When a file is specified for the <parameter>recovery
+      lock</parameter> parameter (i.e. no leading '!') the file lock
+      is implemented by a default helper
+      (<command>/usr/local/libexec/ctdb/ctdb_mutex_fcntl_helper</command>).
+      This helper has arguments as follows:
+
+      <!-- cmdsynopsis would not require long line but does not work :-( -->
+      <synopsis>
+<command>ctdb_mutex_fcntl_helper</command> <parameter>FILE</parameter> <optional><parameter>RECHECK-INTERVAL</parameter></optional>
+      </synopsis>
+
+      <command>ctdb_mutex_fcntl_helper</command> will take a lock on
+      FILE and then check every RECHECK-INTERVAL seconds to ensure
+      that FILE still exists and that its inode number is unchanged
+      from when the lock was taken.  The default value for
+      RECHECK-INTERVAL is 5.
     </para>
 
     <para>
@@ -162,16 +197,21 @@
         the cluster and is the address that CTDB daemons will use to
         communicate with the CTDB daemons on other nodes.
       </para>
+
       <para>
-        Private addresses are listed in the file specified by the
-        <varname>CTDB_NODES</varname> configuration variable (see
-        <citerefentry><refentrytitle>ctdbd.conf</refentrytitle>
-        <manvolnum>5</manvolnum></citerefentry>, default
-        <filename>/etc/ctdb/nodes</filename>).  This file contains the
-        list of private addresses for all nodes in the cluster, one
-        per line. This file must be the same on all nodes in the
-        cluster.
+	Private addresses are listed in the file
+	<filename>/usr/local/etc/ctdb/nodes</filename>).  This file
+	contains the list of private addresses for all nodes in the
+	cluster, one per line. This file must be the same on all nodes
+	in the cluster.
       </para>
+
+      <para>
+	Some users like to put this configuration file in their
+	cluster filesystem.  A symbolic link should be used in this
+	case.
+      </para>
+
       <para>
 	Private addresses should not be used by clients to connect to
 	services provided by the cluster.
@@ -179,11 +219,16 @@
       <para>
         It is strongly recommended that the private addresses are
         configured on a private network that is separate from client
-        networks.
+        networks.  This is because the CTDB protocol is both
+        unauthenticated and unencrypted.  If clients share the private
+        network then steps need to be taken to stop injection of
+        packets to relevant ports on the private addresses.  It is
+        also likely that CTDB protocol traffic between nodes could
+        leak sensitive information if it can be intercepted.
       </para>
 
       <para>
-	Example <filename>/etc/ctdb/nodes</filename> for a four node
+	Example <filename>/usr/local/etc/ctdb/nodes</filename> for a four node
 	cluster:
       </para>
       <screen format="linespecific">
@@ -213,21 +258,25 @@
         clients, as long as there are nodes available capable of
         hosting this address.
       </para>
+
       <para>
-	The public address configuration is stored in a file on each
-	node specified by the <varname>CTDB_PUBLIC_ADDRESSES</varname>
-	configuration variable (see
-	<citerefentry><refentrytitle>ctdbd.conf</refentrytitle>
-	<manvolnum>5</manvolnum></citerefentry>, recommended
-	<filename>/etc/ctdb/public_addresses</filename>).  This file
-	contains a list of the public addresses that the node is
-	capable of hosting, one per line.  Each entry also contains
-	the netmask and the interface to which the address should be
-	assigned.
+	The public address configuration is stored in
+	<filename>/usr/local/etc/ctdb/public_addresses</filename> on
+	each node.  This file contains a list of the public addresses
+	that the node is capable of hosting, one per line.  Each entry
+	also contains the netmask and the interface to which the
+	address should be assigned.  If this file is missing then no
+	public addresses are configured.
       </para>
 
       <para>
-	Example <filename>/etc/ctdb/public_addresses</filename> for a
+	Some users who have the same public addresses on all nodes
+	like to put this configuration file in their cluster
+	filesystem.  A symbolic link should be used in this case.
+      </para>
+
+      <para>
+	Example <filename>/usr/local/etc/ctdb/public_addresses</filename> for a
 	node that can host 4 public addresses, on 2 different
 	interfaces:
       </para>
@@ -248,19 +297,19 @@
 	Example: 4 nodes partitioned into two subgroups:
       </para>
       <screen format="linespecific">
-Node 0:/etc/ctdb/public_addresses
+Node 0:/usr/local/etc/ctdb/public_addresses
 	10.1.1.1/24 eth1
 	10.1.1.2/24 eth1
 
-Node 1:/etc/ctdb/public_addresses
+Node 1:/usr/local/etc/ctdb/public_addresses
 	10.1.1.1/24 eth1
 	10.1.1.2/24 eth1
 
-Node 2:/etc/ctdb/public_addresses
+Node 2:/usr/local/etc/ctdb/public_addresses
 	10.1.2.1/24 eth2
 	10.1.2.2/24 eth2
 
-Node 3:/etc/ctdb/public_addresses
+Node 3:/usr/local/etc/ctdb/public_addresses
 	10.1.2.1/24 eth2
 	10.1.2.2/24 eth2
       </screen>
@@ -431,33 +480,6 @@ Node 3:/etc/ctdb/public_addresses
 	</listitem>
       </varlistentry>
 
-      <varlistentry>
-	<term>LVS</term>
-	<listitem>
-	  <para>
-	    Indicates that a node is configued in Linux Virtual Server
-	    (LVS) mode.  In this mode the entire CTDB cluster uses one
-	    single public address for the entire cluster instead of
-	    using multiple public addresses in failover mode.  This is
-	    an alternative to using a load-balancing layer-4 switch.
-	    See the <citetitle>LVS</citetitle> section for more
-	    details.
-	  </para>
-	</listitem>
-      </varlistentry>
-
-      <varlistentry>
-	<term>NATGW</term>
-	<listitem>
-	  <para>
-	    Indicates that this node is configured to become the NAT
-	    gateway master in a NAT gateway group.  See the
-	    <citetitle>NAT GATEWAY</citetitle> section for more
-	    details.
-	  </para>
-	</listitem>
-      </varlistentry>
-
     </variablelist>
 
     <para>
@@ -484,25 +506,35 @@ Node 3:/etc/ctdb/public_addresses
     </para>
 
     <para>
-      In this mode the cluster selects a set of nodes in the cluster
-      and loadbalance all client access to the LVS address across this
-      set of nodes. This set of nodes are all LVS capable nodes that
-      are HEALTHY, or if no HEALTHY nodes exists all LVS capable nodes
-      regardless of health status.  LVS will however never loadbalance
-      traffic to nodes that are BANNED, STOPPED, DISABLED or
-      DISCONNECTED. The <command>ctdb lvs</command> command is used to
-      show which nodes are currently load-balanced across.
+      One extra LVS public address is assigned on the public network
+      to each LVS group.  Each LVS group is a set of nodes in the
+      cluster that presents the same LVS address public address to the
+      outside world.  Normally there would only be one LVS group
+      spanning an entire cluster, but in situations where one CTDB
+      cluster spans multiple physical sites it might be useful to have
+      one LVS group for each site.  There can be multiple LVS groups
+      in a cluster but each node can only be member of one LVS group.
     </para>
 
     <para>
-      One of the these nodes are elected as the LVSMASTER. This node
-      receives all traffic from clients coming in to the LVS address
-      and multiplexes it across the internal network to one of the
-      nodes that LVS is using.  When responding to the client, that
-      node will send the data back directly to the client, bypassing
-      the LVSMASTER node.  The command <command>ctdb
-      lvsmaster</command> will show which node is the current
-      LVSMASTER.
+      Client access to the cluster is load-balanced across the HEALTHY
+      nodes in an LVS group.  If no HEALTHY nodes exists then all
+      nodes in the group are used, regardless of health status.  CTDB
+      will, however never load-balance LVS traffic to nodes that are
+      BANNED, STOPPED, DISABLED or DISCONNECTED.  The <command>ctdb
+      lvs</command> command is used to show which nodes are currently
+      load-balanced across.
+    </para>
+
+    <para>
+      In each LVS group, one of the nodes is selected by CTDB to be
+      the LVS master.  This node receives all traffic from clients
+      coming in to the LVS public address and multiplexes it across
+      the internal network to one of the nodes that LVS is using.
+      When responding to the client, that node will send the data back
+      directly to the client, bypassing the LVS master node.  The
+      command <command>ctdb lvs master</command> will show which node
+      is the current LVS master.
     </para>
 
     <para>
@@ -532,18 +564,18 @@ Node 3:/etc/ctdb/public_addresses
       </orderedlist>
     </para>
 
-    <para> 
+    <para>
       This means that all incoming traffic to the cluster will pass
       through one physical node, which limits scalability. You can
       send more data to the LVS address that one physical node can
       multiplex. This means that you should not use LVS if your I/O
       pattern is write-intensive since you will be limited in the
       available network bandwidth that node can handle.  LVS does work
-      wery well for read-intensive workloads where only smallish READ
+      very well for read-intensive workloads where only smallish READ
       requests are going through the LVSMASTER bottleneck and the
       majority of the traffic volume (the data in the read replies)
       goes straight from the processing node back to the clients. For
-      read-intensive i/o patterns you can acheive very high throughput
+      read-intensive i/o patterns you can achieve very high throughput
       rates in this mode.
     </para>
 
@@ -572,23 +604,75 @@ Node 3:/etc/ctdb/public_addresses
 
       <para>
 	To activate LVS on a CTDB node you must specify the
-	<varname>CTDB_PUBLIC_INTERFACE</varname> and
-	<varname>CTDB_LVS_PUBLIC_IP</varname> configuration variables.
-	Setting the latter variable also enables the LVS capability on
-	the node at startup.
+	<varname>CTDB_LVS_PUBLIC_IFACE</varname>,
+	<varname>CTDB_LVS_PUBLIC_IP</varname> and
+	<varname>CTDB_LVS_NODES</varname> configuration variables.
+	<varname>CTDB_LVS_NODES</varname> specifies a file containing
+	the private address of all nodes in the current node's LVS
+	group.
       </para>
-	
+
       <para>
 	Example:
 	<screen format="linespecific">
-CTDB_PUBLIC_INTERFACE=eth1
+CTDB_LVS_PUBLIC_IFACE=eth1
 CTDB_LVS_PUBLIC_IP=10.1.1.237
+CTDB_LVS_NODES=/usr/local/etc/ctdb/lvs_nodes
 	</screen>
       </para>
 
+      <para>
+	Example <filename>/usr/local/etc/ctdb/lvs_nodes</filename>:
+      </para>
+      <screen format="linespecific">
+192.168.1.2
+192.168.1.3
+192.168.1.4
+      </screen>
+
+      <para>
+	Normally any node in an LVS group can act as the LVS master.
+	Nodes that are highly loaded due to other demands maybe
+	flagged with the "slave-only" option in the
+	<varname>CTDB_LVS_NODES</varname> file to limit the LVS
+	functionality of those nodes.
+      </para>
+
+      <para>
+	LVS nodes file that excludes 192.168.1.4 from being
+	the LVS master node:
+      </para>
+      <screen format="linespecific">
+192.168.1.2
+192.168.1.3
+192.168.1.4 slave-only
+      </screen>
+
     </refsect2>
   </refsect1>
-    
+
+  <refsect1>
+    <title>TRACKING AND RESETTING TCP CONNECTIONS</title>
+
+    <para>
+      CTDB tracks TCP connections from clients to public IP addresses,
+      on known ports.  When an IP address moves from one node to
+      another, all existing TCP connections to that IP address are
+      reset.  The node taking over this IP address will also send
+      gratuitous ARPs (for IPv4, or neighbour advertisement, for
+      IPv6).  This allows clients to reconnect quickly, rather than
+      waiting for TCP timeouts, which can be very long.
+    </para>
+
+    <para>
+      It is important that established TCP connections do not survive
+      a release and take of a public IP address on the same node.
+      Such connections can get out of sync with sequence and ACK
+      numbers, potentially causing a disruptive ACK storm.
+    </para>
+
+  </refsect1>
+
   <refsect1>
     <title>NAT GATEWAY</title>
 
@@ -649,7 +733,7 @@ CTDB_LVS_PUBLIC_IP=10.1.1.237
 	NATGW is usually configured similar to the following example configuration:
       </para>
       <screen format="linespecific">
-CTDB_NATGW_NODES=/etc/ctdb/natgw_nodes
+CTDB_NATGW_NODES=/usr/local/etc/ctdb/natgw_nodes
 CTDB_NATGW_PRIVATE_NETWORK=192.168.1.0/24
 CTDB_NATGW_PUBLIC_IP=10.0.0.227/24
 CTDB_NATGW_PUBLIC_IFACE=eth0
@@ -659,14 +743,15 @@ CTDB_NATGW_DEFAULT_GATEWAY=10.0.0.1
       <para>
 	Normally any node in a NATGW group can act as the NATGW
 	master.  Some configurations may have special nodes that lack
-	connectivity to a public network.  In such cases,
-	<varname>CTDB_NATGW_SLAVE_ONLY</varname> can be used to limit the
-	NATGW functionality of thos nodes.
+	connectivity to a public network.  In such cases, those nodes
+	can be flagged with the "slave-only" option in the
+	<varname>CTDB_NATGW_NODES</varname> file to limit the NATGW
+	functionality of those nodes.
       </para>
 
       <para>
 	See the <citetitle>NAT GATEWAY</citetitle> section in
-	<citerefentry><refentrytitle>ctdb.conf</refentrytitle>
+	<citerefentry><refentrytitle>ctdb-script.options</refentrytitle>
 	<manvolnum>5</manvolnum></citerefentry> for more details of
 	NATGW configuration.
       </para>
@@ -718,7 +803,7 @@ CTDB_NATGW_DEFAULT_GATEWAY=10.0.0.1
 	This is implemented in the <filename>11.natgw</filename>
 	eventscript.  Please see the eventscript file and the
 	<citetitle>NAT GATEWAY</citetitle> section in
-	<citerefentry><refentrytitle>ctdbd.conf</refentrytitle>
+	<citerefentry><refentrytitle>ctdb-script.options</refentrytitle>
 	<manvolnum>5</manvolnum></citerefentry> for more details.
       </para>
 
@@ -750,7 +835,7 @@ CTDB_NATGW_DEFAULT_GATEWAY=10.0.0.1
 	<varname>CTDB_PER_IP_ROUTING_TABLE_ID_LOW</varname>,
 	<varname>CTDB_PER_IP_ROUTING_TABLE_ID_HIGH</varname>.  See the
 	<citetitle>POLICY ROUTING</citetitle> section in
-	<citerefentry><refentrytitle>ctdbd.conf</refentrytitle>
+	<citerefentry><refentrytitle>ctdb-script.options</refentrytitle>
 	<manvolnum>5</manvolnum></citerefentry> for more details.
       </para>
     </refsect2>
@@ -871,12 +956,12 @@ CTDB_NATGW_DEFAULT_GATEWAY=10.0.0.1
       </para>
 
       <screen>
-/etc/ctdb/public_addresses:
+/usr/local/etc/ctdb/public_addresses:
 
   192.168.1.98	eth2,eth3
   192.168.1.99	eth2,eth3
 
-/etc/ctdb/policy_routing:
+/usr/local/etc/ctdb/policy_routing:
 
   192.168.1.98 192.168.1.0/24
   192.168.1.98 192.168.200.0/24	192.168.1.254
@@ -896,24 +981,22 @@ CTDB_NATGW_DEFAULT_GATEWAY=10.0.0.1
   </refsect1>
 
   <refsect1>
-    <title>NOTIFICATION SCRIPT</title>
+    <title>NOTIFICATIONS</title>
 
     <para>
       When certain state changes occur in CTDB, it can be configured
-      to perform arbitrary actions via a notification script.  For
-      example, sending SNMP traps or emails when a node becomes
-      unhealthy or similar.
+      to perform arbitrary actions via notifications.  For example,
+      sending SNMP traps or emails when a node becomes unhealthy or
+      similar.
     </para>
+
     <para>
-      This is activated by setting the
-      <varname>CTDB_NOTIFY_SCRIPT</varname> configuration variable.
-      The specified script must be executable.  
+      The notification mechanism runs all executable files ending in
+      ".script" in
+      <filename>/usr/local/etc/ctdb/events/notification/</filename>,
+      ignoring any failures and continuing to run all files.
     </para>
-    <para>
-      Use of the provided <filename>/etc/ctdb/notify.sh</filename>
-      script is recommended.  It executes files in
-      <filename>/etc/ctdb/notify.d/</filename>.
-    </para>
+
     <para>
       CTDB currently generates notifications after CTDB changes to
       these states:
@@ -930,18 +1013,18 @@ CTDB_NATGW_DEFAULT_GATEWAY=10.0.0.1
   </refsect1>
 
   <refsect1>
-    <title>DEBUG LEVELS</title>
+    <title>LOG LEVELS</title>
 
     <para>
-      Valid values for DEBUGLEVEL are:
+      Valid log levels, in increasing order of verbosity, are:
     </para>
 
     <simplelist>
-      <member>ERR (0)</member>
-      <member>WARNING (1)</member>
-      <member>NOTICE (2)</member>
-      <member>INFO (3)</member>
-      <member>DEBUG (4)</member>
+      <member>ERROR</member>
+      <member>WARNING</member>
+      <member>NOTICE</member>
+      <member>INFO</member>
+      <member>DEBUG</member>
     </simplelist>
   </refsect1>
 
@@ -974,11 +1057,13 @@ correct CIFS semantics to clients.
     </para>
 
     <para>
-	To activate a node as being a remote cluster node you need to set
-	the following two parameters in /etc/sysconfig/ctdb  for the remote node:
+	To activate a node as being a remote cluster node you need to
+	set the following two parameters in
+	/usr/local/etc/ctdb/ctdb.conf for the remote node:
         <screen format="linespecific">
-CTDB_CAPABILITY_LMASTER=no
-CTDB_CAPABILITY_RECMASTER=no
+[legacy]
+  lmaster capability = false
+  recmaster capability = false
 	</screen>
     </para>
 
@@ -1003,6 +1088,9 @@ CTDB_CAPABILITY_RECMASTER=no
       <citerefentry><refentrytitle>ctdbd_wrapper</refentrytitle>
       <manvolnum>1</manvolnum></citerefentry>,
 
+      <citerefentry><refentrytitle>ctdb_diagnostics</refentrytitle>
+      <manvolnum>1</manvolnum></citerefentry>,
+
       <citerefentry><refentrytitle>ltdbtool</refentrytitle>
       <manvolnum>1</manvolnum></citerefentry>,
 
@@ -1012,7 +1100,13 @@ CTDB_CAPABILITY_RECMASTER=no
       <citerefentry><refentrytitle>ping_pong</refentrytitle>
       <manvolnum>1</manvolnum></citerefentry>,
 
-      <citerefentry><refentrytitle>ctdbd.conf</refentrytitle>
+      <citerefentry><refentrytitle>ctdb.conf</refentrytitle>
+      <manvolnum>5</manvolnum></citerefentry>,
+
+      <citerefentry><refentrytitle>ctdb-script.options</refentrytitle>
+      <manvolnum>5</manvolnum></citerefentry>,
+
+      <citerefentry><refentrytitle>ctdb.sysconfig</refentrytitle>
       <manvolnum>5</manvolnum></citerefentry>,
 
       <citerefentry><refentrytitle>ctdb-statistics</refentrytitle>

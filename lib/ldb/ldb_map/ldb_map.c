@@ -523,7 +523,8 @@ struct ldb_dn *ldb_dn_map_local(struct ldb_module *module, void *mem_ctx, struct
 					  "used in DN!", ldb_dn_get_component_name(dn, i));
 				goto failed;
 			}
-			/* fall through */
+
+			FALL_THROUGH;
 		case LDB_MAP_KEEP:
 		case LDB_MAP_RENAME:
 		case LDB_MAP_RENDROP:
@@ -599,7 +600,8 @@ struct ldb_dn *ldb_dn_map_remote(struct ldb_module *module, void *mem_ctx, struc
 					  "used in DN!", ldb_dn_get_component_name(dn, i));
 				goto failed;
 			}
-			/* fall through */
+
+			FALL_THROUGH;
 		case LDB_MAP_KEEP:
 		case LDB_MAP_RENAME:
 		case LDB_MAP_RENDROP:
@@ -727,6 +729,7 @@ static void map_objectclass_generate_remote(struct ldb_module *module, const cha
 	struct ldb_val val;
 	bool found_extensibleObject = false;
 	unsigned int i;
+	int ret;
 
 	ldb = ldb_module_get_ctx(module);
 
@@ -774,7 +777,11 @@ static void map_objectclass_generate_remote(struct ldb_module *module, const cha
 	}
 
 	/* Add new objectClass to remote message */
-	ldb_msg_add(remote, el, 0);
+	ret = ldb_msg_add(remote, el, 0);
+	if (ret != LDB_SUCCESS) {
+		ldb_oom(ldb);
+		return;
+	}
 }
 
 /* Map an objectClass into the local partition. */

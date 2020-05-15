@@ -231,7 +231,7 @@ static NTSTATUS rpc_conf_del_value(TALLOC_CTX *mem_ctx,
 	}
 
 	if (!(W_ERROR_IS_OK(result))) {
-		if (W_ERROR_EQUAL(result, WERR_BADFILE)){
+		if (W_ERROR_EQUAL(result, WERR_FILE_NOT_FOUND)){
 			result = WERR_OK;
 			goto error;
 		}
@@ -342,7 +342,7 @@ static NTSTATUS rpc_conf_set_share(TALLOC_CTX *mem_ctx,
 						     const char *,
 						     service->num_params + 1);
 			if (includes == NULL) {
-				result = WERR_NOMEM;
+				result = WERR_NOT_ENOUGH_MEMORY;
 				d_fprintf(stderr, "ERROR: out of memory\n");
 				goto error;
 			}
@@ -354,7 +354,7 @@ static NTSTATUS rpc_conf_set_share(TALLOC_CTX *mem_ctx,
 							service->param_values[j]);
 
 				if (includes[j-i] == NULL) {
-					result = WERR_NOMEM;
+					result = WERR_NOT_ENOUGH_MEMORY;
 					d_fprintf(stderr, "ERROR: out of memory\n");
 					goto error;
 				}
@@ -418,8 +418,9 @@ static NTSTATUS rpc_conf_get_share(TALLOC_CTX *mem_ctx,
 	WERROR _werr;
 	struct policy_handle child_hnd;
 	int32_t includes_cnt, includes_idx = -1;
-	uint32_t num_vals, i, param_cnt = 0;
+	uint32_t num_vals, num_subkeys, i, param_cnt = 0;
 	const char **val_names;
+	const char **subkeys = NULL;
 	enum winreg_Type *types;
 	DATA_BLOB *data;
 	struct winreg_String key = { 0, };
@@ -429,7 +430,39 @@ static NTSTATUS rpc_conf_get_share(TALLOC_CTX *mem_ctx,
 
 	ZERO_STRUCT(tmp_share);
 
-	key.name = share_name;
+	/*
+	 * Determine correct upper/lowercase.
+	 */
+	status = dcerpc_winreg_enum_keys(frame,
+					 b,
+					 parent_hnd,
+					 &num_subkeys,
+					 &subkeys,
+					 &result);
+	if (!(NT_STATUS_IS_OK(status))) {
+		d_fprintf(stderr, _("Failed to enumerate shares: %s\n"),
+				nt_errstr(status));
+		goto error;
+	}
+	if (!(W_ERROR_IS_OK(result))) {
+		d_fprintf(stderr, _("Failed to enumerate shares: %s\n"),
+				win_errstr(result));
+		goto error;
+	}
+
+	for (i = 0; i < num_subkeys; i++) {
+		if (!strequal(share_name, subkeys[i])) {
+			continue;
+		}
+
+		key.name = subkeys[i];
+	}
+
+	if (key.name == NULL) {
+		d_fprintf(stderr, _("Could not find share.\n"));
+		goto error;
+	}
+
 	status = dcerpc_winreg_OpenKey(b, frame, parent_hnd, key, 0,
 			       REG_KEY_READ, &child_hnd, &result);
 
@@ -470,7 +503,7 @@ static NTSTATUS rpc_conf_get_share(TALLOC_CTX *mem_ctx,
 					       &data[i],
 					       &multi_s))
 			{
-				result = WERR_NOMEM;
+				result = WERR_NOT_ENOUGH_MEMORY;
 				d_fprintf(stderr,
 					  _("Failed to enumerate values: %s\n"),
 					  win_errstr(result));
@@ -487,9 +520,9 @@ static NTSTATUS rpc_conf_get_share(TALLOC_CTX *mem_ctx,
 		     includes_cnt ++);
 	}
 	/* place the name of the share in the smbconf_service struct */
-	tmp_share.name = talloc_strdup(frame, share_name);
+	tmp_share.name = talloc_strdup(frame, key.name);
 	if (tmp_share.name == NULL) {
-		result = WERR_NOMEM;
+		result = WERR_NOT_ENOUGH_MEMORY;
 		d_fprintf(stderr, _("Failed to create share: %s\n"),
 				win_errstr(result));
 		goto error;
@@ -502,14 +535,14 @@ static NTSTATUS rpc_conf_get_share(TALLOC_CTX *mem_ctx,
 	/* allocate memory for the param_names and param_values lists */
 	tmp_share.param_names = talloc_zero_array(frame, char *, tmp_share.num_params);
 	if (tmp_share.param_names == NULL) {
-		result = WERR_NOMEM;
+		result = WERR_NOT_ENOUGH_MEMORY;
 		d_fprintf(stderr, _("Failed to create share: %s\n"),
 				win_errstr(result));
 		goto error;
 	}
 	tmp_share.param_values = talloc_zero_array(frame, char *, tmp_share.num_params);
 	if (tmp_share.param_values == NULL) {
-		result = WERR_NOMEM;
+		result = WERR_NOT_ENOUGH_MEMORY;
 		d_fprintf(stderr, _("Failed to create share: %s\n"),
 				win_errstr(result));
 		goto error;
@@ -518,7 +551,7 @@ static NTSTATUS rpc_conf_get_share(TALLOC_CTX *mem_ctx,
 	for (i = 0; i < num_vals; i++) {
 		if (strcmp(val_names[i], "includes") != 0) {
 			if (!pull_reg_sz(frame, &data[i], &s)) {
-				result = WERR_NOMEM;
+				result = WERR_NOT_ENOUGH_MEMORY;
 				d_fprintf(stderr,
 					  _("Failed to enumerate values: %s\n"),
 					  win_errstr(result));
@@ -527,7 +560,7 @@ static NTSTATUS rpc_conf_get_share(TALLOC_CTX *mem_ctx,
 			/* place param_names */
 			tmp_share.param_names[param_cnt] = talloc_strdup(frame, val_names[i]);
 			if (tmp_share.param_names[param_cnt] == NULL) {
-				result = WERR_NOMEM;
+				result = WERR_NOT_ENOUGH_MEMORY;
 				d_fprintf(stderr, _("Failed to create share: %s\n"),
 						win_errstr(result));
 				goto error;
@@ -536,7 +569,7 @@ static NTSTATUS rpc_conf_get_share(TALLOC_CTX *mem_ctx,
 			/* place param_values */
 			tmp_share.param_values[param_cnt++] = talloc_strdup(frame, s);
 			if (tmp_share.param_values[param_cnt - 1] == NULL) {
-				result = WERR_NOMEM;
+				result = WERR_NOT_ENOUGH_MEMORY;
 				d_fprintf(stderr, _("Failed to create share: %s\n"),
 						win_errstr(result));
 				goto error;
@@ -547,7 +580,7 @@ static NTSTATUS rpc_conf_get_share(TALLOC_CTX *mem_ctx,
 	for (i = 0; i < includes_cnt; i++) {
 		tmp_share.param_names[param_cnt] = talloc_strdup(frame, "include");
 		if (tmp_share.param_names[param_cnt] == NULL) {
-				result = WERR_NOMEM;
+				result = WERR_NOT_ENOUGH_MEMORY;
 				d_fprintf(stderr, _("Failed to create share: %s\n"),
 						win_errstr(result));
 				goto error;
@@ -555,7 +588,7 @@ static NTSTATUS rpc_conf_get_share(TALLOC_CTX *mem_ctx,
 
 		tmp_share.param_values[param_cnt++] = talloc_strdup(frame, multi_s[i]);
 		if (tmp_share.param_values[param_cnt - 1] == NULL) {
-				result = WERR_NOMEM;
+				result = WERR_NOT_ENOUGH_MEMORY;
 				d_fprintf(stderr, _("Failed to create share: %s\n"),
 						win_errstr(result));
 				goto error;
@@ -648,7 +681,7 @@ static NTSTATUS rpc_conf_open_conf(TALLOC_CTX *mem_ctx,
 	 */
 
 	if (access_mask == REG_KEY_READ &&
-	    W_ERROR_EQUAL(result, WERR_BADFILE))
+	    W_ERROR_EQUAL(result, WERR_FILE_NOT_FOUND))
 	{
 		goto error;
 	}
@@ -675,7 +708,7 @@ static NTSTATUS rpc_conf_open_conf(TALLOC_CTX *mem_ctx,
 	 */
 
 	if (access_mask == REG_KEY_READ &&
-	    W_ERROR_EQUAL(result, WERR_BADFILE))
+	    W_ERROR_EQUAL(result, WERR_FILE_NOT_FOUND))
 	{
 		goto error;
 	}
@@ -854,7 +887,7 @@ static NTSTATUS rpc_conf_delshare_internal(struct net_context *c,
 		goto error;
 	}
 
-	if (W_ERROR_EQUAL(werr, WERR_BADFILE)){
+	if (W_ERROR_EQUAL(werr, WERR_FILE_NOT_FOUND)){
 		d_fprintf(stderr, _("ERROR: Key does not exist\n"));
 	}
 
@@ -958,7 +991,7 @@ static NTSTATUS rpc_conf_list_internal(struct net_context *c,
 	/* get info from each subkey */
 	shares = talloc_zero_array(frame, struct smbconf_service, num_subkeys);
 	if (shares == NULL) {
-		werr = WERR_NOMEM;
+		werr = WERR_NOT_ENOUGH_MEMORY;
 		d_fprintf(stderr, _("Failed to create shares: %s\n"),
 				win_errstr(werr));
 		goto error;
@@ -1155,6 +1188,8 @@ static NTSTATUS rpc_conf_import_internal(struct net_context *c,
 				d_printf(_("error: out of memory!\n"));
 				goto error;
 			}
+
+			FALL_THROUGH;
 		case 1:
 			filename = argv[0];
 			break;
@@ -1335,7 +1370,7 @@ static NTSTATUS rpc_conf_showshare_internal(struct net_context *c,
 
 	sharename = talloc_strdup(frame, argv[0]);
 	if (sharename == NULL) {
-		werr = WERR_NOMEM;
+		werr = WERR_NOT_ENOUGH_MEMORY;
 		d_fprintf(stderr, _("Failed to create share: %s\n"),
 				win_errstr(werr));
 		goto error;
@@ -1343,7 +1378,7 @@ static NTSTATUS rpc_conf_showshare_internal(struct net_context *c,
 
 	service = talloc(frame, struct smbconf_service);
 	if (service == NULL) {
-		werr = WERR_NOMEM;
+		werr = WERR_NOT_ENOUGH_MEMORY;
 		d_fprintf(stderr, _("Failed to create share: %s\n"),
 				win_errstr(werr));
 		goto error;
@@ -1426,6 +1461,8 @@ static NTSTATUS rpc_conf_addshare_internal(struct net_context *c,
 			goto error;
 		case 5:
 			comment = argv[4];
+
+			FALL_THROUGH;
 		case 4:
 			if (!strnequal(argv[3], "guest_ok=", 9)) {
 				rpc_conf_addshare_usage(c, argc, argv);
@@ -1446,6 +1483,8 @@ static NTSTATUS rpc_conf_addshare_internal(struct net_context *c,
 					status = NT_STATUS_INVALID_PARAMETER;
 					goto error;
 			}
+
+			FALL_THROUGH;
 		case 3:
 			if (!strnequal(argv[2], "writeable=", 10)) {
 				rpc_conf_addshare_usage(c, argc, argv);
@@ -1466,6 +1505,8 @@ static NTSTATUS rpc_conf_addshare_internal(struct net_context *c,
 					status = NT_STATUS_INVALID_PARAMETER;
 					goto error;
 			}
+
+			FALL_THROUGH;
 		case 2:
 			path = argv[1];
 			sharename = talloc_strdup(frame, argv[0]);
@@ -1675,7 +1716,7 @@ static NTSTATUS rpc_conf_getparm_internal(struct net_context *c,
 			goto error;
 	}
 
-	if (W_ERROR_EQUAL(werr, WERR_BADFILE)) {
+	if (W_ERROR_EQUAL(werr, WERR_FILE_NOT_FOUND)) {
 		d_fprintf(stderr, _("ERROR: Share %s does not exist\n"),
 				argv[0]);
 		goto error;
@@ -1700,7 +1741,7 @@ static NTSTATUS rpc_conf_getparm_internal(struct net_context *c,
 	if (!param_is_set) {
 		d_fprintf(stderr, _("ERROR: Given parameter '%s' has not been set\n"),
 				argv[1]);
-		werr = WERR_BADFILE;
+		werr = WERR_FILE_NOT_FOUND;
 		goto error;
 	}
 
@@ -1832,7 +1873,7 @@ static NTSTATUS rpc_conf_setparm_internal(struct net_context *c,
 	 */
 
 	if (!net_conf_param_valid(service_name, param_name, valstr)) {
-		werr = WERR_INVALID_PARAM;
+		werr = WERR_INVALID_PARAMETER;
 		goto error;
 	}
 

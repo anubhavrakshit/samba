@@ -19,55 +19,14 @@
 
 #include "includes.h"
 #include "utils/net.h"
+#include "lib/util/server_id.h"
 #include "dbwrap/dbwrap.h"
 #include "dbwrap/dbwrap_rbt.h"
 #include "serverid.h"
 #include "session.h"
-#include "lib/conn_tdb.h"
 #include "smbd/globals.h"
 #include "util_tdb.h"
-
-static int net_serverid_list_fn(const struct server_id *id,
-				uint32_t msg_flags, void *priv)
-{
-	struct server_id_buf idbuf;
-	d_printf("%s %llu 0x%x\n", server_id_str_buf(*id, &idbuf),
-		 (unsigned long long)id->unique_id,
-		 (unsigned int)msg_flags);
-	return 0;
-}
-
-static int net_serverid_list(struct net_context *c, int argc,
-			     const char **argv)
-{
-	d_printf("pid unique_id msg_flags\n");
-	return serverid_traverse_read(net_serverid_list_fn, NULL) ? 0 : -1;
-}
-
-static int net_serverid_wipe_fn(struct db_record *rec,
-				const struct server_id *id,
-				uint32_t msg_flags, void *private_data)
-{
-	NTSTATUS status;
-
-	if (id->vnn != get_my_vnn()) {
-		return 0;
-	}
-	status = dbwrap_record_delete(rec);
-	if (!NT_STATUS_IS_OK(status)) {
-		struct server_id_buf idbuf;
-		DEBUG(1, ("Could not delete serverid.tdb record %s: %s\n",
-			  server_id_str_buf(*id, &idbuf), nt_errstr(status)));
-	}
-	return 0;
-}
-
-static int net_serverid_wipe(struct net_context *c, int argc,
-			     const char **argv)
-{
-	return serverid_traverse(net_serverid_wipe_fn, NULL) ? 0 : -1;
-}
-
+#include "librpc/gen_ndr/ndr_open_files.h"
 
 struct wipedbs_record_marker {
 	struct wipedbs_record_marker *prev, *next;
@@ -303,9 +262,22 @@ static int wipedbs_traverse_open(struct smbXsrv_open_global0 *open,
 
 		if (state->verbose) {
 			TALLOC_CTX *mem_ctx = talloc_new(talloc_tos());
-			d_printf("open[global: %u] disconnected at "
+			enum ndr_err_code ndr_err;
+			struct vfs_default_durable_cookie cookie;
+
+			ndr_err = ndr_pull_struct_blob(
+				&open->backend_cookie, mem_ctx, &cookie,
+				(ndr_pull_flags_fn_t)ndr_pull_vfs_default_durable_cookie);
+			if (!NDR_ERR_CODE_IS_SUCCESS(ndr_err)) {
+				d_printf("ndr_pull_struct_blob failed\n");
+				ret = -1;
+				goto done;
+			}
+
+			d_printf("open[%s/%s id: 0x%" PRIx32 "] disconnected at "
 				 "[%s] %us ago with timeout of %us "
 				 "-%s reached\n",
+				 cookie.servicepath, cookie.base_name,
 				 open->open_global_id,
 				 nt_time_string(mem_ctx, open->disconnect_time),
 				 (unsigned)(tdiff/1000000),
@@ -400,6 +372,19 @@ static int wipedbs_traverse_set_exists(struct db_record *rec,
 	state->idx++;
 	return 0;
 }
+
+static bool serverids_exist(const struct server_id *ids, int num_ids,
+			    bool *results)
+{
+	int i;
+
+	for (i=0; i<num_ids; i++) {
+		results[i] = serverid_exists(&ids[i]);
+	}
+
+	return true;
+}
+
 
 static NTSTATUS wipedbs_check_server_exists(struct wipedbs_state *state)
 {
@@ -641,25 +626,33 @@ done:
 	return ret;
 }
 
+static int net_serverid_exists(struct net_context *c, int argc,
+			       const char **argv)
+{
+	struct server_id pid;
+	bool ok;
+
+	if ((argc != 1) || (c->display_usage)) {
+		d_printf("Usage:\n"
+			 "net serverid exists <serverid>\n");
+		return -1;
+	}
+
+	pid = server_id_from_string(get_my_vnn(), argv[0]);
+	ok = serverid_exists(&pid);
+
+	if (ok) {
+		d_printf("%s exists\n", argv[0]);
+	} else {
+		d_printf("%s does not exist\n", argv[0]);
+	}
+
+	return 0;
+}
+
 int net_serverid(struct net_context *c, int argc, const char **argv)
 {
 	struct functable func[] = {
-		{
-			"list",
-			net_serverid_list,
-			NET_TRANSPORT_LOCAL,
-			N_("List all entries from serverid.tdb"),
-			N_("net serverid list\n"
-			   "    List all entries from serverid.tdb")
-		},
-		{
-			"wipe",
-			net_serverid_wipe,
-			NET_TRANSPORT_LOCAL,
-			N_("Wipe the serverid.tdb for the current node"),
-			N_("net serverid wipe\n"
-			   "    Wipe the serverid.tdb for the current node")
-		},
 		{
 			"wipedbs",
 			net_serverid_wipedbs,
@@ -667,6 +660,13 @@ int net_serverid(struct net_context *c, int argc, const char **argv)
 			N_("Clean dead entries from temporary databases"),
 			N_("net serverid wipedbs\n"
 			   "    Clean dead entries from temporary databases")
+		},
+		{
+			"exists",
+			net_serverid_exists,
+			NET_TRANSPORT_LOCAL,
+			N_("Show existence of a serverid"),
+			N_("net serverid exists <id>")
 		},
 		{NULL, NULL, 0, NULL, NULL}
 	};

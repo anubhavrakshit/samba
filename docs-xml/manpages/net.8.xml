@@ -7,7 +7,7 @@
 	<manvolnum>8</manvolnum>
 	<refmiscinfo class="source">Samba</refmiscinfo>
 	<refmiscinfo class="manual">System Administration tools</refmiscinfo>
-	<refmiscinfo class="version">4.3</refmiscinfo>
+	<refmiscinfo class="version">&doc.version;</refmiscinfo>
 </refmeta>
 
 
@@ -26,6 +26,7 @@
 		<arg choice="opt">-w|--workgroup workgroup</arg>
 		<arg choice="opt">-W|--myworkgroup myworkgroup</arg>
 		<arg choice="opt">-U|--user user</arg>
+		<arg choice="opt">-A|--authentication-file authfile</arg>
 		<arg choice="opt">-I|--ipaddress ip-address</arg>
 		<arg choice="opt">-p|--port port</arg>
 		<arg choice="opt">-n myname</arg>
@@ -108,7 +109,6 @@
 		</varlistentry>
 
 		&stdarg.netbios.name;
-		&stdarg.configfile;
 
 		<varlistentry>
 		<term>-S|--server server</term>
@@ -239,7 +239,7 @@
 		<term>--single-obj-repl</term>
 		<listitem><para>
 				When calling "net rpc vampire keytab" this option
-				allows to replicate just a single object to the generated keytab file.
+				allows one to replicate just a single object to the generated keytab file.
 		</para></listitem>
 		</varlistentry>
 
@@ -247,7 +247,7 @@
 		<term>--clean-old-entries</term>
 		<listitem><para>
 				When calling "net rpc vampire keytab" this option
-				allows to cleanup old entries from the generated keytab file.
+				allows one to cleanup old entries from the generated keytab file.
 		</para></listitem>
 		</varlistentry>
 
@@ -299,7 +299,7 @@
 
 		<varlistentry>
 		<term>-X|--exclude DIRECTORY</term>
-		<listitem><para>Allows to exclude directories when copying with "net rpc share migrate".
+		<listitem><para>Allows one to exclude directories when copying with "net rpc share migrate".
 		</para></listitem>
 		</varlistentry>
 
@@ -376,6 +376,40 @@
 		<listitem><para>Do not perform DNS updates as part of
 		"net ads join".
 		</para></listitem>
+		</varlistentry>
+
+		<varlistentry>
+		<term>--keep-account</term>
+		<listitem><para>Prevent the machine account removal as
+		part of "net ads leave".
+		</para></listitem>
+		</varlistentry>
+
+		<varlistentry>
+		<term>--json</term>
+		<listitem><para>Report results in JSON format for
+		"net ads info" and "net ads lookup".
+		</para></listitem>
+		</varlistentry>
+
+		<!-- Options for net vfs stream2abouble -->
+
+		<varlistentry>
+		<term>--recursive</term>
+		<listitem><para>Traverse a directory
+		hierarchy.</para></listitem>
+		</varlistentry>
+
+		<varlistentry>
+		<term>--continue</term>
+		<listitem><para>Continue traversing a directory hierarchy in
+		case conversion of one file fails.</para></listitem>
+		</varlistentry>
+
+		<varlistentry>
+		<term>--follow-symlinks</term>
+		<listitem><para>Follow symlinks encountered while traversing a
+		directory.</para></listitem>
 		</varlistentry>
 
 		&stdarg.encrypt;
@@ -550,6 +584,12 @@ account in server manager first.</para>
 <title>[RPC|ADS] GROUP ADD <replaceable>name</replaceable> [-C comment]</title>
 
 <para>Create specified group.</para>
+
+</refsect3>
+<refsect3>
+<title>[ADS] LOOKUP</title>
+
+<para>Lookup the closest Domain Controller in our domain and retrieve server information about it.</para>
 
 </refsect3>
 </refsect2>
@@ -808,6 +848,30 @@ DOMAIN</replaceable>. Defaults to local domain.</para>
 
 <para>Give IP of master browser for specified <replaceable>DOMAIN</replaceable>
 or workgroup. Defaults to local domain.</para>
+
+</refsect3>
+
+<refsect3>
+<title>LOOKUP NAME [<replaceable>NAME</replaceable>]</title>
+
+<para>Lookup username's sid and type for specified <replaceable>NAME</replaceable>
+</para>
+
+</refsect3>
+
+<refsect3>
+<title>LOOKUP SID [<replaceable>SID</replaceable>]</title>
+
+<para>Give sid's name and type for specified <replaceable>SID</replaceable>
+</para>
+
+</refsect3>
+
+<refsect3>
+<title>LOOKUP DSGETDCNAME [<replaceable>NAME</replaceable>] [<replaceable>FLAGS</replaceable>] [<replaceable>SITENAME</replaceable>]</title>
+
+<para>Give Domain Controller information for specified domain <replaceable>NAME</replaceable>
+</para>
 
 </refsect3>
 
@@ -1271,7 +1335,68 @@ against an NT4 Domain Controller.
 </refsect2>
 
 <refsect2>
-<title>ADS LEAVE</title>
+
+<title>ADS GPO</title>
+<refsect3>
+<title>ADS GPO APPLY &lt;USERNAME|MACHINENAME&gt; </title>
+<para>Apply GPOs for a username or machine name. Either username or machine name should be provided to the command, not both. </para>
+</refsect3>
+
+<refsect3>
+<title>ADS GPO GETGPO [<replaceable>GPO</replaceable>]</title>
+<para>List specified GPO.</para>
+</refsect3>
+
+<refsect3>
+<title>ADS GPO LINKADD [<replaceable>LINKDN</replaceable>] [<replaceable>GPODN</replaceable>]</title>
+<para>Link a container to a GPO. <replaceable>LINKDN</replaceable> Container to link to a GPO. <replaceable>GPODN</replaceable> GPO to link container to. DNs must be provided properly escaped. See RFC 4514 for details.</para>
+</refsect3>
+
+<refsect3>
+<title>ADS GPO LINKGET [<replaceable>CONTAINER</replaceable>]</title>
+<para>Lists gPLink of a containter.</para>
+</refsect3>
+
+<refsect3>
+<title>ADS GPO LIST &lt;USERNAME|MACHINENAME&gt; </title>
+<para>Lists all GPOs for a username or machine name. Either username or machine name should be provided to the command, not both. </para>
+</refsect3>
+
+<refsect3>
+<title>ADS GPO LISTALL</title>
+<para>Lists all GPOs on a DC.</para>
+</refsect3>
+
+<refsect3>
+<title>ADS GPO REFRESH [<replaceable>USERNAME</replaceable>] [<replaceable>MACHINENAME</replaceable>]</title>
+<para>Lists all GPOs assigned to an account and download them. <replaceable>USERNAME</replaceable> User to refresh GPOs for. <replaceable>MACHINENAME</replaceable> Machine to refresh GPOs for.</para>
+</refsect3>
+
+</refsect2>
+
+<refsect2>
+
+<title>ADS DNS</title>
+
+<refsect3>
+<title>ADS DNS REGISTER [HOSTNAME [IP [IP.....]]]</title>
+<para>Add host dns entry to Active Directory.</para>
+</refsect3>
+
+<refsect3>
+<title>ADS DNS UNREGISTER &lt;HOSTNAME&gt;</title>
+<para>Remove host dns entry from Active Directory.</para>
+</refsect3>
+
+<refsect3>
+<title>ADS DNS GETHOSTBYNAME &lt;NAMESERVER|HOSTNAME&gt;</title>
+<para>Look up the hostname from Active Directory. You can either provide nameserver ie IPv4|IPv6 address or the hostname. Only one should be provided at a time.</para>
+</refsect3>
+
+</refsect2>
+
+<refsect2>
+<title>ADS LEAVE [--keep-account]</title>
 
 <para>Make the remote host leave the domain it is part of. </para>
 
@@ -1340,6 +1465,122 @@ to show in the result.
 </refsect2>
 
 <refsect2>
+<title>ADS KEYTAB <replaceable>CREATE</replaceable></title>
+
+<para>
+Creates a new keytab file if one doesn't exist with default entries. Default
+entries are kerberos principals created from the machinename of the
+client, the UPN (if it exists) and any Windows SPN(s) associated with the
+computer AD account for the client. If a keytab file already exists then only
+missing kerberos principals from the default entries are added. No changes
+are made to the computer AD account.
+</para>
+</refsect2>
+
+<refsect2>
+<title>ADS KEYTAB <replaceable>ADD</replaceable> <replaceable>(principal | machine | serviceclass | windows SPN</replaceable></title>
+
+<para>
+Adds a new keytab entry, the entry can be either;
+  <variablelist>
+    <varlistentry><term>kerberos principal</term>
+    <listitem><para>
+      A kerberos principal (identified by the presence of '@') is just
+      added to the keytab file.
+    </para></listitem>
+    </varlistentry>
+    <varlistentry><term>machinename</term>
+    <listitem><para>
+      A machinename (identified by the trailing '$') is used to create a
+      a kerberos principal 'machinename@realm' which is added to the
+      keytab file.
+    </para></listitem>
+    </varlistentry>
+    <varlistentry><term>serviceclass</term>
+    <listitem><para>
+    A serviceclass (such as 'cifs', 'html' etc.) is used to create a pair
+    of kerberos principals 'serviceclass/fully_qualified_dns_name@realm' &amp;
+    'serviceclass/netbios_name@realm' which are added to the keytab file.
+    </para></listitem>
+    </varlistentry>
+    <varlistentry><term>Windows SPN</term>
+    <listitem><para>
+    A Windows SPN is of the format 'serviceclass/host:port', it is used to
+    create a kerberos principal 'serviceclass/host@realm' which will
+    be written to the keytab file.
+    </para></listitem>
+    </varlistentry>
+  </variablelist>
+</para>
+<para>
+Unlike old versions no computer AD objects are modified by this command. To
+preserve the bevhaviour of older clients 'net ads keytab ad_update_ads' is
+available.
+</para>
+</refsect2>
+
+<refsect2>
+<title>ADS KEYTAB <replaceable>ADD_UPDATE_ADS</replaceable> <replaceable>(principal | machine | serviceclass | windows SPN</replaceable></title>
+
+<para>
+Adds a new keytab entry (see section for net ads keytab add). In addition to
+adding entries to the keytab file corrosponding Windows SPNs are created
+from the entry passed to this command. These SPN(s) added to the AD computer
+account object associated with the client machine running this command for
+the following entry types;
+  <variablelist>
+    <varlistentry><term>serviceclass</term>
+    <listitem><para>
+    A serviceclass (such as 'cifs', 'html' etc.) is used to create a
+    pair of Windows SPN(s) 'param/full_qualified_dns' &amp;
+    'param/netbios_name' which are added to the AD computer account object
+   for this client.
+    </para></listitem>
+    </varlistentry>
+    <varlistentry><term>Windows SPN</term>
+    <listitem><para>
+    A Windows SPN is of the format 'serviceclass/host:port', it is
+    added as passed to the AD computer account object for this client.
+    </para></listitem>
+    </varlistentry>
+  </variablelist>
+</para>
+</refsect2>
+
+<refsect2>
+<title>ADS setspn <replaceable>SETSPN LIST [machine]</replaceable></title>
+
+<para>
+   Lists the Windows SPNs stored in the 'machine' Windows AD Computer object.
+   If 'machine' is not specified then computer account for this client is used
+   instead.
+</para>
+</refsect2>
+
+<refsect2>
+<title>ADS setspn <replaceable>SETSPN ADD SPN [machine]</replaceable></title>
+
+<para>
+   Adds the specified Windows SPN to the 'machine' Windows AD Computer object.
+   If 'machine' is not specified then computer account for this client is used
+   instead.
+</para>
+</refsect2>
+
+
+<refsect2>
+<title>ADS setspn <replaceable>SETSPN DELETE SPN [machine]</replaceable></title>
+
+<para>
+   DELETE the specified Window SPN from the 'machine' Windows AD Computer
+   object. If 'machine' is not specified then computer account for this
+   client is used
+   instead.
+</para>
+
+</refsect2>
+
+<refsect2>
 <title>ADS WORKGROUP</title>
 
 <para>Print out workgroup name for specified kerberos realm.</para>
@@ -1354,7 +1595,7 @@ to show in the result.
 </para>
 
 <para>
-	This attribute allows to control which Kerberos encryption types are used for the generation of initial and service tickets. The value consists of an integer bitmask with the following values:
+	This attribute allows one to control which Kerberos encryption types are used for the generation of initial and service tickets. The value consists of an integer bitmask with the following values:
 </para>
 
 <para>0x00000001 DES-CBC-CRC</para>
@@ -1380,7 +1621,7 @@ to show in the result.
 	<title>ADS ENCTYPES SET <replaceable>&lt;ACCOUNTNAME&gt;</replaceable> <replaceable>[enctypes]</replaceable></title>
 
 <para>
-	Set the value of the "msDS-SupportedEncryptionTypes" attribute of the LDAP object of ACCOUNTNAME to a given value. If the value is ommitted, the value is set to 31 which enables all the currently supported encryption types.
+	Set the value of the "msDS-SupportedEncryptionTypes" attribute of the LDAP object of ACCOUNTNAME to a given value. If the value is omitted, the value is set to 31 which enables all the currently supported encryption types.
 </para>
 
 <para>Example: <userinput>net ads enctypes set Computername 24</userinput></para>
@@ -2458,7 +2699,7 @@ string.</member>
    <varlistentry><term>--reg-version={1,2,3}</term>
       <listitem><para>
 	Specify the format of the registry database. If not given it defaults to
-	the value of the binary or, if an registry.tdb is explizitly stated at
+	the value of the binary or, if an registry.tdb is explicitly stated at
 	the commandline, to the value found in the INFO/version record.
       </para></listitem>
     </varlistentry>
@@ -2704,6 +2945,94 @@ Print a list of all currently existing locknames.
 Dump the locking table of a certain global lock.
 </para>
 </refsect3>
+
+</refsect2>
+
+<refsect2>
+	<title>TDB</title>
+
+	<para>Print information from tdb records.</para>
+
+	<refsect3>
+		<title>TDB LOCKING <replaceable>key</replaceable> [DUMP]</title>
+
+		<para>List sharename, filename and number of share modes
+		for a record from locking.tdb. With the optional DUMP options,
+		dump the complete record.</para>
+
+		<itemizedlist>
+			<listitem>
+				<para><replaceable>KEY</replaceable>
+				Key of the tdb record as hex string.</para>
+			</listitem>
+		</itemizedlist>
+
+	</refsect3>
+</refsect2>
+
+<refsect2>
+  <title>vfs</title>
+  <para>Access shared filesystem through the VFS.</para>
+
+  <refsect3>
+    <title>vfs stream2abouble [--recursive] [--verbose] [--continue] [--follow-symlinks] <replaceable>share</replaceable> <replaceable>path</replaceable></title>
+
+    <para>Convert file streams to AppleDouble files.</para>
+    <itemizedlist>
+      <listitem>
+	<para><replaceable>share</replaceable>
+	A Samba share.</para>
+      </listitem>
+    </itemizedlist>
+    <itemizedlist>
+      <listitem>
+	<para><replaceable>path</replaceable> A relative path of something in
+	the Samba share. "." can be used for the root directory of the
+	share.</para>
+      </listitem>
+    </itemizedlist>
+
+    <para>Options:</para>
+    <variablelist>
+      <varlistentry>
+	<term>--recursive</term>
+	<listitem><para>Traverse a directory hierarchy.</para></listitem>
+      </varlistentry>
+      <varlistentry>
+	<term>--verbose</term>
+	<listitem><para>Verbose output.</para></listitem>
+      </varlistentry>
+      <varlistentry>
+	<term>--continue</term>
+	<listitem><para>Continue traversing a directory hierarchy if a single
+	conversion fails.</para></listitem>
+      </varlistentry>
+      <varlistentry>
+	<term>--follow-symlinks</term>
+	<listitem><para>Follow symlinks encountered while traversing a
+	directory.</para></listitem>
+      </varlistentry>
+    </variablelist>
+  </refsect3>
+
+  <refsect3>
+    <title>vfs getntacl <replaceable>share</replaceable> <replaceable>path</replaceable></title>
+
+    <para>Display the security descriptor of a file or directory.</para>
+    <itemizedlist>
+      <listitem>
+	<para><replaceable>share</replaceable>
+	A Samba share.</para>
+      </listitem>
+    </itemizedlist>
+    <itemizedlist>
+      <listitem>
+	<para><replaceable>path</replaceable> A relative path of something in
+	the Samba share. "." can be used for the root directory of the
+	share.</para>
+      </listitem>
+    </itemizedlist>
+  </refsect3>
 
 </refsect2>
 

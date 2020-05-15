@@ -134,6 +134,7 @@ static NTSTATUS nttrans_create(struct smbsrv_request *req,
 	io->ntcreatex.in.sec_desc         = NULL;
 	io->ntcreatex.in.ea_list          = NULL;
 	io->ntcreatex.in.query_maximal_access = false;
+	io->ntcreatex.in.query_on_disk_id = false;
 	io->ntcreatex.in.private_flags    = 0;
 
 	req_pull_string(&req->in.bufinfo, &io->ntcreatex.in.fname, 
@@ -569,8 +570,11 @@ static void reply_nttrans_send(struct ntvfs_request *ntvfs)
 		SIVAL(this_req->out.vwv, 31, PTR_DIFF(data, trans->out.data.data));
 
 		SCVAL(this_req->out.vwv, 35, trans->out.setup_count);
-		memcpy((char *)(this_req->out.vwv) + VWV(18), trans->out.setup,
-		       sizeof(uint16_t) * trans->out.setup_count);
+		if (trans->out.setup_count > 0) {
+			memcpy((char *)(this_req->out.vwv) + VWV(18),
+			       trans->out.setup,
+			       sizeof(uint16_t) * trans->out.setup_count);
+		}
 		memset(this_req->out.data, 0, align1);
 		if (this_param != 0) {
 			memcpy(this_req->out.data + align1, params, this_param);

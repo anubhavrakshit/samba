@@ -34,6 +34,9 @@
 #include "param/param.h"
 #include "dsdb/common/util.h"
 
+#undef DBGC_CLASS
+#define DBGC_CLASS            DBGC_DRS_REPL
+
 /*
   load the partitions list based on replicated NC attributes in our
   NTDSDSA object
@@ -345,7 +348,7 @@ WERROR dreplsrv_out_connection_attach(struct dreplsrv_service *s,
 			return ntstatus_to_werror(nt_status);
 		}
 
-		DLIST_ADD_END(s->connections, conn, struct dreplsrv_out_connection *);
+		DLIST_ADD_END(s->connections, conn);
 
 		DEBUG(4,("dreplsrv_out_connection_attach(%s): create\n", hostname));
 	} else {
@@ -425,7 +428,7 @@ static WERROR dreplsrv_partition_add_source_dsa(struct dreplsrv_service *s,
 		}
 	}
 
-	DLIST_ADD_END(*listp, source, struct dreplsrv_partition_source_dsa *);
+	DLIST_ADD_END(*listp, source);
 	return WERR_OK;
 }
 
@@ -442,12 +445,10 @@ WERROR dreplsrv_partition_find_for_nc(struct dreplsrv_service *s,
 {
 	struct dreplsrv_partition *p;
 	bool valid_sid, valid_guid;
-	struct dom_sid null_sid;
-	ZERO_STRUCT(null_sid);
 
 	SMB_ASSERT(_p);
 
-	valid_sid  = nc_sid && !dom_sid_equal(&null_sid, nc_sid);
+	valid_sid  = nc_sid && !is_null_sid(nc_sid);
 	valid_guid = nc_guid && !GUID_all_zero(nc_guid);
 
 	if (!valid_sid && !valid_guid && (!nc_dn_str)) {

@@ -70,10 +70,14 @@ def ldif_to_samdb(dburl, lp, ldif_file, forced_local_dsa=None):
 changetype: modify
 replace: dsServiceName
 dsServiceName: CN=NTDS Settings,%s
--
             """ % forced_local_dsa)
 
-    except Exception, estr:
+        tmpdb.add_ldif("""dn: @MODULES
+@LIST: rootdse,extended_dn_in,extended_dn_out_ldb,objectguid
+-
+""")
+
+    except Exception as estr:
         tmpdb.transaction_cancel()
         raise LdifError("Failed to import %s: %s" % (ldif_file, estr))
 
@@ -82,9 +86,7 @@ dsServiceName: CN=NTDS Settings,%s
     # We have an abbreviated list of options here because we have built
     # an abbreviated database.  We use the rootdse and extended-dn
     # modules only during this re-open
-    samdb = SamDB(url=dburl, session_info=system_session(), lp=lp,
-                  options=["modules:rootdse,extended_dn_in,"
-                           "extended_dn_out_ldb"])
+    samdb = SamDB(url=dburl, session_info=system_session(), lp=lp)
     return samdb
 
 
@@ -107,7 +109,8 @@ def samdb_to_ldif_file(samdb, dburl, lp, creds, ldif_file):
         samdb = SamDB(url=dburl,
                       session_info=system_session(),
                       credentials=creds, lp=lp)
-    except ldb.LdbError, (enum, estr):
+    except ldb.LdbError as e:
+        (enum, estr) = e.args
         raise LdifError("Unable to open sam database (%s) : %s" %
                         (dburl, estr))
 
@@ -230,7 +233,7 @@ def samdb_to_ldif_file(samdb, dburl, lp, creds, ldif_file):
                         for value in msg[k]:
                             # Some of these have binary DNs so
                             # use dsdb_Dn to split out relevent parts
-                            dsdn = dsdb_Dn(samdb, value)
+                            dsdn = dsdb_Dn(samdb, value.decode('utf8'))
                             dnstr = str(dsdn.dn)
                             if dnstr not in nclist:
                                 nclist.append(dnstr)
@@ -394,7 +397,8 @@ def samdb_to_ldif_file(samdb, dburl, lp, creds, ldif_file):
         # Write rootdse output
         write_search_result(samdb, f, res)
 
-    except ldb.LdbError, (enum, estr):
+    except ldb.LdbError as e1:
+        (enum, estr) = e1.args
         raise LdifError("Error processing (%s) : %s" % (sstr, estr))
 
     f.close()

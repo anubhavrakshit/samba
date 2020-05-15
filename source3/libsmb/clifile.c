@@ -26,135 +26,8 @@
 #include "libsmb/clirap.h"
 #include "trans2.h"
 #include "ntioctl.h"
-#include "libcli/security/secdesc.h"
+#include "libcli/security/security.h"
 #include "../libcli/smb/smbXcli_base.h"
-
-/***********************************************************
- Common function for pushing stings, used by smb_bytes_push_str()
- and trans_bytes_push_str(). Only difference is the align_odd
- parameter setting.
-***********************************************************/
-
-static uint8_t *internal_bytes_push_str(uint8_t *buf, bool ucs2,
-				const char *str, size_t str_len,
-				bool align_odd,
-				size_t *pconverted_size)
-{
-	size_t buflen;
-	char *converted;
-	size_t converted_size;
-
-	if (buf == NULL) {
-		return NULL;
-	}
-
-	buflen = talloc_get_size(buf);
-
-	if (ucs2 &&
-	    ((align_odd && (buflen % 2 == 0)) ||
-	     (!align_odd && (buflen % 2 == 1)))) {
-		/*
-		 * We're pushing into an SMB buffer, align odd
-		 */
-		buf = talloc_realloc(NULL, buf, uint8_t, buflen + 1);
-		if (buf == NULL) {
-			return NULL;
-		}
-		buf[buflen] = '\0';
-		buflen += 1;
-	}
-
-	if (!convert_string_talloc(talloc_tos(), CH_UNIX,
-				   ucs2 ? CH_UTF16LE : CH_DOS,
-				   str, str_len, &converted,
-				   &converted_size)) {
-		return NULL;
-	}
-
-	buf = talloc_realloc(NULL, buf, uint8_t,
-				   buflen + converted_size);
-	if (buf == NULL) {
-		TALLOC_FREE(converted);
-		return NULL;
-	}
-
-	memcpy(buf + buflen, converted, converted_size);
-
-	TALLOC_FREE(converted);
-
-	if (pconverted_size) {
-		*pconverted_size = converted_size;
-	}
-
-	return buf;
-}
-
-/***********************************************************
- Push a string into an SMB buffer, with odd byte alignment
- if it's a UCS2 string.
-***********************************************************/
-
-uint8_t *smb_bytes_push_str(uint8_t *buf, bool ucs2,
-			    const char *str, size_t str_len,
-			    size_t *pconverted_size)
-{
-	return internal_bytes_push_str(buf, ucs2, str, str_len,
-			true, pconverted_size);
-}
-
-uint8_t *smb_bytes_push_bytes(uint8_t *buf, uint8_t prefix,
-			      const uint8_t *bytes, size_t num_bytes)
-{
-	size_t buflen;
-
-	if (buf == NULL) {
-		return NULL;
-	}
-	buflen = talloc_get_size(buf);
-
-	buf = talloc_realloc(NULL, buf, uint8_t,
-				   buflen + 1 + num_bytes);
-	if (buf == NULL) {
-		return NULL;
-	}
-	buf[buflen] = prefix;
-	memcpy(&buf[buflen+1], bytes, num_bytes);
-	return buf;
-}
-
-/***********************************************************
- Same as smb_bytes_push_str(), but without the odd byte
- align for ucs2 (we're pushing into a param or data block).
- static for now, although this will probably change when
- other modules use async trans calls.
-***********************************************************/
-
-uint8_t *trans2_bytes_push_str(uint8_t *buf, bool ucs2,
-			       const char *str, size_t str_len,
-			       size_t *pconverted_size)
-{
-	return internal_bytes_push_str(buf, ucs2, str, str_len,
-			false, pconverted_size);
-}
-
-uint8_t *trans2_bytes_push_bytes(uint8_t *buf,
-				 const uint8_t *bytes, size_t num_bytes)
-{
-	size_t buflen;
-
-	if (buf == NULL) {
-		return NULL;
-	}
-	buflen = talloc_get_size(buf);
-
-	buf = talloc_realloc(NULL, buf, uint8_t,
-			     buflen + num_bytes);
-	if (buf == NULL) {
-		return NULL;
-	}
-	memcpy(&buf[buflen], bytes, num_bytes);
-	return buf;
-}
 
 struct cli_setpathinfo_state {
 	uint16_t setup;
@@ -173,6 +46,7 @@ struct tevent_req *cli_setpathinfo_send(TALLOC_CTX *mem_ctx,
 {
 	struct tevent_req *req, *subreq;
 	struct cli_setpathinfo_state *state;
+	uint16_t additional_flags2 = 0;
 
 	req = tevent_req_create(mem_ctx, &state,
 				struct cli_setpathinfo_state);
@@ -196,10 +70,16 @@ struct tevent_req *cli_setpathinfo_send(TALLOC_CTX *mem_ctx,
 		return tevent_req_post(req, ev);
 	}
 
+	if (clistr_is_previous_version_path(path, NULL, NULL, NULL) &&
+			!INFO_LEVEL_IS_UNIX(level)) {
+		additional_flags2 = FLAGS2_REPARSE_PATH;
+	}
+
 	subreq = cli_trans_send(
 		state,			/* mem ctx. */
 		ev,			/* event ctx. */
 		cli,			/* cli_state. */
+		additional_flags2,	/* additional_flags2 */
 		SMBtrans2,		/* cmd. */
 		NULL,			/* pipe name. */
 		-1,			/* fid. */
@@ -269,9 +149,86 @@ NTSTATUS cli_setpathinfo(struct cli_state *cli,
 	return status;
 }
 
+struct cli_setfileinfo_state {
+	uint16_t setup;
+	uint8_t param[6];
+};
+
+static void cli_setfileinfo_done(struct tevent_req *subreq);
+
+struct tevent_req *cli_setfileinfo_send(
+	TALLOC_CTX *mem_ctx,
+	struct tevent_context *ev,
+	struct cli_state *cli,
+	uint16_t fnum,
+	uint16_t level,
+	uint8_t *data,
+	size_t data_len)
+{
+	struct tevent_req *req = NULL, *subreq = NULL;
+	struct cli_setfileinfo_state *state = NULL;
+
+	req = tevent_req_create(mem_ctx, &state, struct cli_setfileinfo_state);
+	if (req == NULL) {
+		return NULL;
+	}
+	PUSH_LE_U16(&state->setup, 0, TRANSACT2_SETFILEINFO);
+
+	PUSH_LE_U16(state->param, 0, fnum);
+	PUSH_LE_U16(state->param, 2, level);
+
+	subreq = cli_trans_send(state,		/* mem ctx. */
+				ev,		/* event ctx. */
+				cli,		/* cli_state. */
+				0,		/* additional_flags2 */
+				SMBtrans2,	/* cmd. */
+				NULL,		/* pipe name. */
+				-1,		/* fid. */
+				0,		/* function. */
+				0,		/* flags. */
+				&state->setup,	/* setup. */
+				1,		/* num setup uint16_t words. */
+				0,		/* max returned setup. */
+				state->param,	/* param. */
+				6,		/* num param. */
+				2,		/* max returned param. */
+				data,		/* data. */
+				data_len,	/* num data. */
+				0);		/* max returned data. */
+
+	if (tevent_req_nomem(subreq, req)) {
+		return tevent_req_post(req, ev);
+	}
+	tevent_req_set_callback(subreq, cli_setfileinfo_done, req);
+	return req;
+}
+
+static void cli_setfileinfo_done(struct tevent_req *subreq)
+{
+	NTSTATUS status = cli_trans_recv(
+		subreq,		/* req */
+		NULL,		/* mem_ctx */
+		NULL,		/* recv_flags2 */
+		NULL,		/* setup */
+		0,		/* min_setup */
+		NULL,		/* num_setup */
+		NULL,		/* param */
+		0,		/* min_param */
+		NULL,		/* num_param */
+		NULL,		/* data */
+		0,		/* min_data */
+		NULL);		/* num_data */
+	tevent_req_simple_finish_ntstatus(subreq, status);
+}
+
+NTSTATUS cli_setfileinfo_recv(struct tevent_req *req)
+{
+	return tevent_req_simple_recv_ntstatus(req);
+}
+
 /****************************************************************************
  Hard/Symlink a file (UNIX extensions).
- Creates new name (sym)linked to oldname.
+ Creates new name (sym)linked to link_target.
 ****************************************************************************/
 
 struct cli_posix_link_internal_state {
@@ -284,7 +241,7 @@ static struct tevent_req *cli_posix_link_internal_send(TALLOC_CTX *mem_ctx,
 					struct tevent_context *ev,
 					struct cli_state *cli,
 					uint16_t level,
-					const char *oldname,
+					const char *link_target,
 					const char *newname)
 {
 	struct tevent_req *req = NULL, *subreq = NULL;
@@ -302,7 +259,8 @@ static struct tevent_req *cli_posix_link_internal_send(TALLOC_CTX *mem_ctx,
 		return tevent_req_post(req, ev);
 	}
 	state->data = trans2_bytes_push_str(
-		state->data, smbXcli_conn_use_unicode(cli->conn), oldname, strlen(oldname)+1, NULL);
+		state->data, smbXcli_conn_use_unicode(cli->conn),
+		link_target, strlen(link_target)+1, NULL);
 
 	subreq = cli_setpathinfo_send(
 		state, ev, cli, level, newname,
@@ -320,18 +278,49 @@ static void cli_posix_link_internal_done(struct tevent_req *subreq)
 	tevent_req_simple_finish_ntstatus(subreq, status);
 }
 
+static NTSTATUS cli_posix_link_internal_recv(struct tevent_req *req)
+{
+	return tevent_req_simple_recv_ntstatus(req);
+}
+
 /****************************************************************************
  Symlink a file (UNIX extensions).
 ****************************************************************************/
 
+struct cli_posix_symlink_state {
+	uint8_t dummy;
+};
+
+static void cli_posix_symlink_done(struct tevent_req *subreq);
+
 struct tevent_req *cli_posix_symlink_send(TALLOC_CTX *mem_ctx,
 					struct tevent_context *ev,
 					struct cli_state *cli,
-					const char *oldname,
+					const char *link_target,
 					const char *newname)
 {
-	return cli_posix_link_internal_send(
-		mem_ctx, ev, cli, SMB_SET_FILE_UNIX_LINK, oldname, newname);
+	struct tevent_req *req = NULL, *subreq = NULL;
+	struct cli_posix_symlink_state *state = NULL;
+
+	req = tevent_req_create(
+		mem_ctx, &state, struct cli_posix_symlink_state);
+	if (req == NULL) {
+		return NULL;
+	}
+
+	subreq = cli_posix_link_internal_send(
+		mem_ctx, ev, cli, SMB_SET_FILE_UNIX_LINK, link_target, newname);
+	if (tevent_req_nomem(subreq, req)) {
+		return tevent_req_post(req, ev);
+	}
+	tevent_req_set_callback(subreq, cli_posix_symlink_done, req);
+	return req;
+}
+
+static void cli_posix_symlink_done(struct tevent_req *subreq)
+{
+	NTSTATUS status = cli_posix_link_internal_recv(subreq);
+	tevent_req_simple_finish_ntstatus(subreq, status);
 }
 
 NTSTATUS cli_posix_symlink_recv(struct tevent_req *req)
@@ -340,7 +329,7 @@ NTSTATUS cli_posix_symlink_recv(struct tevent_req *req)
 }
 
 NTSTATUS cli_posix_symlink(struct cli_state *cli,
-			const char *oldname,
+			const char *link_target,
 			const char *newname)
 {
 	TALLOC_CTX *frame = talloc_stackframe();
@@ -365,7 +354,7 @@ NTSTATUS cli_posix_symlink(struct cli_state *cli,
 	req = cli_posix_symlink_send(frame,
 				ev,
 				cli,
-				oldname,
+				link_target,
 				newname);
 	if (req == NULL) {
 		status = NT_STATUS_NO_MEMORY;
@@ -387,9 +376,9 @@ NTSTATUS cli_posix_symlink(struct cli_state *cli,
  Read a POSIX symlink.
 ****************************************************************************/
 
-struct readlink_state {
-	uint8_t *data;
-	uint32_t num_data;
+struct cli_posix_readlink_state {
+	struct cli_state *cli;
+	char *converted;
 };
 
 static void cli_posix_readlink_done(struct tevent_req *subreq);
@@ -397,28 +386,26 @@ static void cli_posix_readlink_done(struct tevent_req *subreq);
 struct tevent_req *cli_posix_readlink_send(TALLOC_CTX *mem_ctx,
 					struct tevent_context *ev,
 					struct cli_state *cli,
-					const char *fname,
-					size_t len)
+					const char *fname)
 {
 	struct tevent_req *req = NULL, *subreq = NULL;
-	struct readlink_state *state = NULL;
-	uint32_t maxbytelen = (uint32_t)(smbXcli_conn_use_unicode(cli->conn) ? len*3 : len);
+	struct cli_posix_readlink_state *state = NULL;
 
-	req = tevent_req_create(mem_ctx, &state, struct readlink_state);
+	req = tevent_req_create(
+		mem_ctx, &state, struct cli_posix_readlink_state);
 	if (req == NULL) {
 		return NULL;
 	}
+	state->cli = cli;
 
-	/*
-	 * Len is in bytes, we need it in UCS2 units.
-	 */
-	if ((2*len < len) || (maxbytelen < len)) {
-		tevent_req_nterror(req, NT_STATUS_INVALID_PARAMETER);
-		return tevent_req_post(req, ev);
-	}
-
-	subreq = cli_qpathinfo_send(state, ev, cli, fname,
-				    SMB_QUERY_FILE_UNIX_LINK, 1, maxbytelen);
+	subreq = cli_qpathinfo_send(
+		state,
+		ev,
+		cli,
+		fname,
+		SMB_QUERY_FILE_UNIX_LINK,
+		1,
+		UINT16_MAX);
 	if (tevent_req_nomem(subreq, req)) {
 		return tevent_req_post(req, ev);
 	}
@@ -430,12 +417,16 @@ static void cli_posix_readlink_done(struct tevent_req *subreq)
 {
 	struct tevent_req *req = tevent_req_callback_data(
 		subreq, struct tevent_req);
-	struct readlink_state *state = tevent_req_data(
-		req, struct readlink_state);
+	struct cli_posix_readlink_state *state = tevent_req_data(
+		req, struct cli_posix_readlink_state);
 	NTSTATUS status;
+	uint8_t *data = NULL;
+	uint32_t num_data = 0;
+	charset_t charset;
+	size_t converted_size;
+	bool ok;
 
-	status = cli_qpathinfo_recv(subreq, state, &state->data,
-				    &state->num_data);
+	status = cli_qpathinfo_recv(subreq, state, &data, &num_data);
 	TALLOC_FREE(subreq);
 	if (tevent_req_nterror(req, status)) {
 		return;
@@ -443,45 +434,49 @@ static void cli_posix_readlink_done(struct tevent_req *subreq)
 	/*
 	 * num_data is > 1, we've given 1 as minimum to cli_qpathinfo_send
 	 */
-	if (state->data[state->num_data-1] != '\0') {
+	if (data == NULL || data[num_data-1] != '\0') {
 		tevent_req_nterror(req, NT_STATUS_DATA_ERROR);
+		return;
+	}
+
+	charset = smbXcli_conn_use_unicode(state->cli->conn) ?
+		CH_UTF16LE : CH_DOS;
+
+	/* The returned data is a pushed string, not raw data. */
+	ok = convert_string_talloc(
+		state,
+		charset,
+		CH_UNIX,
+		data,
+		num_data,
+		&state->converted,
+		&converted_size);
+	if (!ok) {
+		tevent_req_oom(req);
 		return;
 	}
 	tevent_req_done(req);
 }
 
-NTSTATUS cli_posix_readlink_recv(struct tevent_req *req, struct cli_state *cli,
-				char *retpath, size_t len)
+NTSTATUS cli_posix_readlink_recv(
+	struct tevent_req *req, TALLOC_CTX *mem_ctx, char **target)
 {
+	struct cli_posix_readlink_state *state = tevent_req_data(
+		req, struct cli_posix_readlink_state);
 	NTSTATUS status;
-	char *converted = NULL;
-	size_t converted_size = 0;
-	struct readlink_state *state = tevent_req_data(req, struct readlink_state);
 
 	if (tevent_req_is_nterror(req, &status)) {
 		return status;
 	}
-	/* The returned data is a pushed string, not raw data. */
-	if (!convert_string_talloc(state,
-				smbXcli_conn_use_unicode(cli->conn) ? CH_UTF16LE : CH_DOS, 
-				CH_UNIX,
-				state->data,
-				state->num_data,
-				&converted,
-				&converted_size)) {
-		return NT_STATUS_NO_MEMORY;
-	}
-
-	len = MIN(len,converted_size);
-	if (len == 0) {
-		return NT_STATUS_DATA_ERROR;
-	}
-	memcpy(retpath, converted, len);
+	*target = talloc_move(mem_ctx, &state->converted);
 	return NT_STATUS_OK;
 }
 
-NTSTATUS cli_posix_readlink(struct cli_state *cli, const char *fname,
-				char *linkpath, size_t len)
+NTSTATUS cli_posix_readlink(
+	struct cli_state *cli,
+	const char *fname,
+	TALLOC_CTX *mem_ctx,
+	char **target)
 {
 	TALLOC_CTX *frame = talloc_stackframe();
 	struct tevent_context *ev = NULL;
@@ -502,11 +497,7 @@ NTSTATUS cli_posix_readlink(struct cli_state *cli, const char *fname,
 		goto fail;
 	}
 
-	req = cli_posix_readlink_send(frame,
-				ev,
-				cli,
-				fname,
-				len);
+	req = cli_posix_readlink_send(frame, ev, cli, fname);
 	if (req == NULL) {
 		status = NT_STATUS_NO_MEMORY;
 		goto fail;
@@ -516,7 +507,7 @@ NTSTATUS cli_posix_readlink(struct cli_state *cli, const char *fname,
 		goto fail;
 	}
 
-	status = cli_posix_readlink_recv(req, cli, linkpath, len);
+	status = cli_posix_readlink_recv(req, mem_ctx, target);
 
  fail:
 	TALLOC_FREE(frame);
@@ -527,14 +518,40 @@ NTSTATUS cli_posix_readlink(struct cli_state *cli, const char *fname,
  Hard link a file (UNIX extensions).
 ****************************************************************************/
 
+struct cli_posix_hardlink_state {
+	uint8_t dummy;
+};
+
+static void cli_posix_hardlink_done(struct tevent_req *subreq);
+
 struct tevent_req *cli_posix_hardlink_send(TALLOC_CTX *mem_ctx,
 					struct tevent_context *ev,
 					struct cli_state *cli,
 					const char *oldname,
 					const char *newname)
 {
-	return cli_posix_link_internal_send(
-		mem_ctx, ev, cli, SMB_SET_FILE_UNIX_HLINK, oldname, newname);
+	struct tevent_req *req = NULL, *subreq = NULL;
+	struct cli_posix_hardlink_state *state = NULL;
+
+	req = tevent_req_create(
+		mem_ctx, &state, struct cli_posix_hardlink_state);
+	if (req == NULL) {
+		return NULL;
+	}
+
+	subreq = cli_posix_link_internal_send(
+		state, ev, cli, SMB_SET_FILE_UNIX_HLINK, oldname, newname);
+	if (tevent_req_nomem(subreq, req)) {
+		return tevent_req_post(req, ev);
+	}
+	tevent_req_set_callback(subreq, cli_posix_hardlink_done, req);
+	return req;
+}
+
+static void cli_posix_hardlink_done(struct tevent_req *subreq)
+{
+	NTSTATUS status = cli_posix_link_internal_recv(subreq);
+	tevent_req_simple_finish_ntstatus(subreq, status);
 }
 
 NTSTATUS cli_posix_hardlink_recv(struct tevent_req *req)
@@ -587,25 +604,25 @@ NTSTATUS cli_posix_hardlink(struct cli_state *cli,
 }
 
 /****************************************************************************
- Do a POSIX getfacl (UNIX extensions).
+ Do a POSIX getacl - pathname based ACL get (UNIX extensions).
 ****************************************************************************/
 
-struct getfacl_state {
+struct getacl_state {
 	uint32_t num_data;
 	uint8_t *data;
 };
 
-static void cli_posix_getfacl_done(struct tevent_req *subreq);
+static void cli_posix_getacl_done(struct tevent_req *subreq);
 
-struct tevent_req *cli_posix_getfacl_send(TALLOC_CTX *mem_ctx,
+struct tevent_req *cli_posix_getacl_send(TALLOC_CTX *mem_ctx,
 					struct tevent_context *ev,
 					struct cli_state *cli,
 					const char *fname)
 {
 	struct tevent_req *req = NULL, *subreq = NULL;
-	struct getfacl_state *state = NULL;
+	struct getacl_state *state = NULL;
 
-	req = tevent_req_create(mem_ctx, &state, struct getfacl_state);
+	req = tevent_req_create(mem_ctx, &state, struct getacl_state);
 	if (req == NULL) {
 		return NULL;
 	}
@@ -614,16 +631,16 @@ struct tevent_req *cli_posix_getfacl_send(TALLOC_CTX *mem_ctx,
 	if (tevent_req_nomem(subreq, req)) {
 		return tevent_req_post(req, ev);
 	}
-	tevent_req_set_callback(subreq, cli_posix_getfacl_done, req);
+	tevent_req_set_callback(subreq, cli_posix_getacl_done, req);
 	return req;
 }
 
-static void cli_posix_getfacl_done(struct tevent_req *subreq)
+static void cli_posix_getacl_done(struct tevent_req *subreq)
 {
 	struct tevent_req *req = tevent_req_callback_data(
 		subreq, struct tevent_req);
-	struct getfacl_state *state = tevent_req_data(
-		req, struct getfacl_state);
+	struct getacl_state *state = tevent_req_data(
+		req, struct getacl_state);
 	NTSTATUS status;
 
 	status = cli_qpathinfo_recv(subreq, state, &state->data,
@@ -635,12 +652,12 @@ static void cli_posix_getfacl_done(struct tevent_req *subreq)
 	tevent_req_done(req);
 }
 
-NTSTATUS cli_posix_getfacl_recv(struct tevent_req *req,
+NTSTATUS cli_posix_getacl_recv(struct tevent_req *req,
 				TALLOC_CTX *mem_ctx,
 				size_t *prb_size,
 				char **retbuf)
 {
-	struct getfacl_state *state = tevent_req_data(req, struct getfacl_state);
+	struct getacl_state *state = tevent_req_data(req, struct getacl_state);
 	NTSTATUS status;
 
 	if (tevent_req_is_nterror(req, &status)) {
@@ -651,7 +668,7 @@ NTSTATUS cli_posix_getfacl_recv(struct tevent_req *req,
 	return NT_STATUS_OK;
 }
 
-NTSTATUS cli_posix_getfacl(struct cli_state *cli,
+NTSTATUS cli_posix_getacl(struct cli_state *cli,
 			const char *fname,
 			TALLOC_CTX *mem_ctx,
 			size_t *prb_size,
@@ -676,7 +693,7 @@ NTSTATUS cli_posix_getfacl(struct cli_state *cli,
 		goto fail;
 	}
 
-	req = cli_posix_getfacl_send(frame,
+	req = cli_posix_getacl_send(frame,
 				ev,
 				cli,
 				fname);
@@ -689,7 +706,107 @@ NTSTATUS cli_posix_getfacl(struct cli_state *cli,
 		goto fail;
 	}
 
-	status = cli_posix_getfacl_recv(req, mem_ctx, prb_size, retbuf);
+	status = cli_posix_getacl_recv(req, mem_ctx, prb_size, retbuf);
+
+ fail:
+	TALLOC_FREE(frame);
+	return status;
+}
+
+/****************************************************************************
+ Do a POSIX setacl - pathname based ACL set (UNIX extensions).
+****************************************************************************/
+
+struct setacl_state {
+	uint8_t *data;
+};
+
+static void cli_posix_setacl_done(struct tevent_req *subreq);
+
+struct tevent_req *cli_posix_setacl_send(TALLOC_CTX *mem_ctx,
+					struct tevent_context *ev,
+					struct cli_state *cli,
+					const char *fname,
+					const void *data,
+					size_t num_data)
+{
+	struct tevent_req *req = NULL, *subreq = NULL;
+	struct setacl_state *state = NULL;
+
+	req = tevent_req_create(mem_ctx, &state, struct setacl_state);
+	if (req == NULL) {
+		return NULL;
+	}
+	state->data = talloc_memdup(state, data, num_data);
+	if (tevent_req_nomem(state->data, req)) {
+		return tevent_req_post(req, ev);
+	}
+
+	subreq = cli_setpathinfo_send(state,
+				ev,
+				cli,
+				SMB_SET_POSIX_ACL,
+				fname,
+				state->data,
+				num_data);
+	if (tevent_req_nomem(subreq, req)) {
+		return tevent_req_post(req, ev);
+	}
+	tevent_req_set_callback(subreq, cli_posix_setacl_done, req);
+	return req;
+}
+
+static void cli_posix_setacl_done(struct tevent_req *subreq)
+{
+	NTSTATUS status = cli_setpathinfo_recv(subreq);
+	tevent_req_simple_finish_ntstatus(subreq, status);
+}
+
+NTSTATUS cli_posix_setacl_recv(struct tevent_req *req)
+{
+	return tevent_req_simple_recv_ntstatus(req);
+}
+
+NTSTATUS cli_posix_setacl(struct cli_state *cli,
+			const char *fname,
+			const void *acl_buf,
+			size_t acl_buf_size)
+{
+	TALLOC_CTX *frame = talloc_stackframe();
+	struct tevent_context *ev = NULL;
+	struct tevent_req *req = NULL;
+	NTSTATUS status = NT_STATUS_OK;
+
+	if (smbXcli_conn_has_async_calls(cli->conn)) {
+		/*
+		 * Can't use sync call while an async call is in flight
+		 */
+		status = NT_STATUS_INVALID_PARAMETER;
+		goto fail;
+	}
+
+	ev = samba_tevent_context_init(frame);
+	if (ev == NULL) {
+		status = NT_STATUS_NO_MEMORY;
+		goto fail;
+	}
+
+	req = cli_posix_setacl_send(frame,
+				ev,
+				cli,
+				fname,
+				acl_buf,
+				acl_buf_size);
+	if (req == NULL) {
+		status = NT_STATUS_NO_MEMORY;
+		goto fail;
+	}
+
+	if (!tevent_req_poll_ntstatus(req, ev, &status)) {
+		goto fail;
+	}
+
+	status = cli_posix_setacl_recv(req);
 
  fail:
 	TALLOC_FREE(frame);
@@ -701,16 +818,16 @@ NTSTATUS cli_posix_getfacl(struct cli_state *cli,
 ****************************************************************************/
 
 struct stat_state {
-	uint32_t num_data;
-	uint8_t *data;
+	SMB_STRUCT_STAT *sbuf;
 };
 
 static void cli_posix_stat_done(struct tevent_req *subreq);
 
 struct tevent_req *cli_posix_stat_send(TALLOC_CTX *mem_ctx,
-					struct tevent_context *ev,
-					struct cli_state *cli,
-					const char *fname)
+				       struct tevent_context *ev,
+				       struct cli_state *cli,
+				       const char *fname,
+				       SMB_STRUCT_STAT *sbuf)
 {
 	struct tevent_req *req = NULL, *subreq = NULL;
 	struct stat_state *state = NULL;
@@ -719,6 +836,8 @@ struct tevent_req *cli_posix_stat_send(TALLOC_CTX *mem_ctx,
 	if (req == NULL) {
 		return NULL;
 	}
+	state->sbuf = sbuf;
+
 	subreq = cli_qpathinfo_send(state, ev, cli, fname,
 				    SMB_QUERY_FILE_UNIX_BASIC, 100, 100);
 	if (tevent_req_nomem(subreq, req)) {
@@ -733,54 +852,74 @@ static void cli_posix_stat_done(struct tevent_req *subreq)
 	struct tevent_req *req = tevent_req_callback_data(
 				subreq, struct tevent_req);
 	struct stat_state *state = tevent_req_data(req, struct stat_state);
+	SMB_STRUCT_STAT *sbuf = state->sbuf;
+	uint8_t *data;
+	uint32_t num_data = 0;
 	NTSTATUS status;
 
-	status = cli_qpathinfo_recv(subreq, state, &state->data,
-				    &state->num_data);
+	status = cli_qpathinfo_recv(subreq, state, &data, &num_data);
 	TALLOC_FREE(subreq);
 	if (tevent_req_nterror(req, status)) {
 		return;
 	}
-	tevent_req_done(req);
-}
 
-NTSTATUS cli_posix_stat_recv(struct tevent_req *req,
-				SMB_STRUCT_STAT *sbuf)
-{
-	struct stat_state *state = tevent_req_data(req, struct stat_state);
-	NTSTATUS status;
-
-	if (tevent_req_is_nterror(req, &status)) {
-		return status;
+	if (num_data != 100) {
+		/*
+		 * Paranoia, cli_qpathinfo should have guaranteed
+		 * this, but you never know...
+		 */
+		tevent_req_nterror(req, NT_STATUS_INVALID_NETWORK_RESPONSE);
+		return;
 	}
 
-	sbuf->st_ex_size = IVAL2_TO_SMB_BIG_UINT(state->data,0);     /* total size, in bytes */
-	sbuf->st_ex_blocks = IVAL2_TO_SMB_BIG_UINT(state->data,8);   /* number of blocks allocated */
+	*sbuf = (SMB_STRUCT_STAT) { 0 };
+
+	/* total size, in bytes */
+	sbuf->st_ex_size = IVAL2_TO_SMB_BIG_UINT(data, 0);
+
+	/* number of blocks allocated */
+	sbuf->st_ex_blocks = IVAL2_TO_SMB_BIG_UINT(data,8);
 #if defined (HAVE_STAT_ST_BLOCKS) && defined(STAT_ST_BLOCKSIZE)
 	sbuf->st_ex_blocks /= STAT_ST_BLOCKSIZE;
 #else
 	/* assume 512 byte blocks */
 	sbuf->st_ex_blocks /= 512;
 #endif
-	sbuf->st_ex_ctime = interpret_long_date((char *)(state->data + 16));    /* time of last change */
-	sbuf->st_ex_atime = interpret_long_date((char *)(state->data + 24));    /* time of last access */
-	sbuf->st_ex_mtime = interpret_long_date((char *)(state->data + 32));    /* time of last modification */
+	/* time of last change */
+	sbuf->st_ex_ctime = interpret_long_date((char *)(data + 16));
 
-	sbuf->st_ex_uid = (uid_t) IVAL(state->data,40);      /* user ID of owner */
-	sbuf->st_ex_gid = (gid_t) IVAL(state->data,48);      /* group ID of owner */
-	sbuf->st_ex_mode = unix_filetype_from_wire(IVAL(state->data, 56));
+	/* time of last access */
+	sbuf->st_ex_atime = interpret_long_date((char *)(data + 24));
+
+	/* time of last modification */
+	sbuf->st_ex_mtime = interpret_long_date((char *)(data + 32));
+
+	sbuf->st_ex_uid = (uid_t) IVAL(data, 40); /* user ID of owner */
+	sbuf->st_ex_gid = (gid_t) IVAL(data, 48); /* group ID of owner */
+	sbuf->st_ex_mode = unix_filetype_from_wire(IVAL(data, 56));
+
 #if defined(HAVE_MAKEDEV)
 	{
-		uint32_t dev_major = IVAL(state->data,60);
-		uint32_t dev_minor = IVAL(state->data,68);
+		uint32_t dev_major = IVAL(data,60);
+		uint32_t dev_minor = IVAL(data,68);
 		sbuf->st_ex_rdev = makedev(dev_major, dev_minor);
 	}
 #endif
-	sbuf->st_ex_ino = (SMB_INO_T)IVAL2_TO_SMB_BIG_UINT(state->data,76);      /* inode */
-	sbuf->st_ex_mode |= wire_perms_to_unix(IVAL(state->data,84));     /* protection */
-	sbuf->st_ex_nlink = BIG_UINT(state->data,92); /* number of hard links */
+	/* inode */
+	sbuf->st_ex_ino = (SMB_INO_T)IVAL2_TO_SMB_BIG_UINT(data, 76);
 
-	return NT_STATUS_OK;
+	/* protection */
+	sbuf->st_ex_mode |= wire_perms_to_unix(IVAL(data, 84));
+
+	/* number of hard links */
+	sbuf->st_ex_nlink = BIG_UINT(data, 92);
+
+	tevent_req_done(req);
+}
+
+NTSTATUS cli_posix_stat_recv(struct tevent_req *req)
+{
+	return tevent_req_simple_recv_ntstatus(req);
 }
 
 NTSTATUS cli_posix_stat(struct cli_state *cli,
@@ -806,10 +945,7 @@ NTSTATUS cli_posix_stat(struct cli_state *cli,
 		goto fail;
 	}
 
-	req = cli_posix_stat_send(frame,
-				ev,
-				cli,
-				fname);
+	req = cli_posix_stat_send(frame, ev, cli, fname, sbuf);
 	if (req == NULL) {
 		status = NT_STATUS_NO_MEMORY;
 		goto fail;
@@ -819,7 +955,7 @@ NTSTATUS cli_posix_stat(struct cli_state *cli,
 		goto fail;
 	}
 
-	status = cli_posix_stat_recv(req, sbuf);
+	status = cli_posix_stat_recv(req);
 
  fail:
 	TALLOC_FREE(frame);
@@ -875,9 +1011,20 @@ static void cli_posix_chown_chmod_internal_done(struct tevent_req *subreq)
 	tevent_req_simple_finish_ntstatus(subreq, status);
 }
 
+static NTSTATUS cli_posix_chown_chmod_internal_recv(struct tevent_req *req)
+{
+	return tevent_req_simple_recv_ntstatus(req);
+}
+
 /****************************************************************************
  chmod a file (UNIX extensions).
 ****************************************************************************/
+
+struct cli_posix_chmod_state {
+	uint8_t dummy;
+};
+
+static void cli_posix_chmod_done(struct tevent_req *subreq);
 
 struct tevent_req *cli_posix_chmod_send(TALLOC_CTX *mem_ctx,
 					struct tevent_context *ev,
@@ -885,11 +1032,33 @@ struct tevent_req *cli_posix_chmod_send(TALLOC_CTX *mem_ctx,
 					const char *fname,
 					mode_t mode)
 {
-	return cli_posix_chown_chmod_internal_send(mem_ctx, ev, cli,
-			fname,
-			unix_perms_to_wire(mode),
-			SMB_UID_NO_CHANGE,
-			SMB_GID_NO_CHANGE);
+	struct tevent_req *req = NULL, *subreq = NULL;
+	struct cli_posix_chmod_state *state = NULL;
+
+	req = tevent_req_create(mem_ctx, &state, struct cli_posix_chmod_state);
+	if (req == NULL) {
+		return NULL;
+	}
+
+	subreq = cli_posix_chown_chmod_internal_send(
+		state,
+		ev,
+		cli,
+		fname,
+		unix_perms_to_wire(mode),
+		SMB_UID_NO_CHANGE,
+		SMB_GID_NO_CHANGE);
+	if (tevent_req_nomem(subreq, req)) {
+		return tevent_req_post(req, ev);
+	}
+	tevent_req_set_callback(subreq, cli_posix_chmod_done, req);
+	return req;
+}
+
+static void cli_posix_chmod_done(struct tevent_req *subreq)
+{
+	NTSTATUS status = cli_posix_chown_chmod_internal_recv(subreq);
+	tevent_req_simple_finish_ntstatus(subreq, status);
 }
 
 NTSTATUS cli_posix_chmod_recv(struct tevent_req *req)
@@ -943,6 +1112,12 @@ NTSTATUS cli_posix_chmod(struct cli_state *cli, const char *fname, mode_t mode)
  chown a file (UNIX extensions).
 ****************************************************************************/
 
+struct cli_posix_chown_state {
+	uint8_t dummy;
+};
+
+static void cli_posix_chown_done(struct tevent_req *subreq);
+
 struct tevent_req *cli_posix_chown_send(TALLOC_CTX *mem_ctx,
 					struct tevent_context *ev,
 					struct cli_state *cli,
@@ -950,11 +1125,34 @@ struct tevent_req *cli_posix_chown_send(TALLOC_CTX *mem_ctx,
 					uid_t uid,
 					gid_t gid)
 {
-	return cli_posix_chown_chmod_internal_send(mem_ctx, ev, cli,
-			fname,
-			SMB_MODE_NO_CHANGE,
-			(uint32_t)uid,
-			(uint32_t)gid);
+	struct tevent_req *req = NULL, *subreq = NULL;
+	struct cli_posix_chown_state *state = NULL;
+
+	req = tevent_req_create(
+		mem_ctx, &state, struct cli_posix_chown_state);
+	if (req == NULL) {
+		return NULL;
+	}
+
+	subreq = cli_posix_chown_chmod_internal_send(
+		state,
+		ev,
+		cli,
+		fname,
+		SMB_MODE_NO_CHANGE,
+		(uint32_t)uid,
+		(uint32_t)gid);
+	if (tevent_req_nomem(subreq, req)) {
+		return tevent_req_post(req, ev);
+	}
+	tevent_req_set_callback(subreq, cli_posix_chown_done, req);
+	return req;
+}
+
+static void cli_posix_chown_done(struct tevent_req *subreq)
+{
+	NTSTATUS status = cli_posix_chown_chmod_internal_recv(subreq);
+	tevent_req_simple_finish_ntstatus(subreq, status);
 }
 
 NTSTATUS cli_posix_chown_recv(struct tevent_req *req)
@@ -1012,26 +1210,144 @@ NTSTATUS cli_posix_chown(struct cli_state *cli,
  Rename a file.
 ****************************************************************************/
 
-static void cli_rename_done(struct tevent_req *subreq);
+static struct tevent_req *cli_cifs_rename_send(TALLOC_CTX *mem_ctx,
+					       struct tevent_context *ev,
+					       struct cli_state *cli,
+					       const char *fname_src,
+					       const char *fname_dst,
+					       bool replace);
 
-struct cli_rename_state {
+static struct tevent_req *cli_smb1_rename_send(TALLOC_CTX *mem_ctx,
+					       struct tevent_context *ev,
+					       struct cli_state *cli,
+					       const char *fname_src,
+					       const char *fname_dst,
+					       bool replace);
+
+struct tevent_req *cli_rename_send(TALLOC_CTX *mem_ctx,
+				   struct tevent_context *ev,
+				   struct cli_state *cli,
+				   const char *fname_src,
+				   const char *fname_dst,
+				   bool replace)
+{
+	if (replace && smbXcli_conn_support_passthrough(cli->conn)) {
+		return cli_smb1_rename_send(mem_ctx, ev, cli, fname_src,
+					    fname_dst, replace);
+	} else {
+		return cli_cifs_rename_send(mem_ctx, ev, cli, fname_src,
+					    fname_dst, replace);
+	}
+}
+
+struct cli_smb1_rename_state {
+	uint8_t *data;
+};
+
+static void cli_smb1_rename_done(struct tevent_req *subreq);
+
+static struct tevent_req *cli_smb1_rename_send(TALLOC_CTX *mem_ctx,
+					       struct tevent_context *ev,
+					       struct cli_state *cli,
+					       const char *fname_src,
+					       const char *fname_dst,
+					       bool replace)
+{
+	NTSTATUS status;
+	struct tevent_req *req = NULL, *subreq = NULL;
+	struct cli_smb1_rename_state *state = NULL;
+	smb_ucs2_t *converted_str = NULL;
+	size_t converted_size_bytes = 0;
+
+	req = tevent_req_create(mem_ctx, &state, struct cli_smb1_rename_state);
+	if (req == NULL) {
+		return NULL;
+	}
+
+	if (!push_ucs2_talloc(talloc_tos(), &converted_str, fname_dst,
+			      &converted_size_bytes)) {
+		status = NT_STATUS_INVALID_PARAMETER;
+		goto fail;
+	}
+
+	/* W2K8 insists the dest name is not null
+	   terminated. Remove the last 2 zero bytes
+	   and reduce the name length. */
+
+	if (converted_size_bytes < 2) {
+		status = NT_STATUS_INVALID_PARAMETER;
+		goto fail;
+	}
+	converted_size_bytes -= 2;
+
+	state->data =
+	    talloc_zero_array(state, uint8_t, 12 + converted_size_bytes);
+	if (state->data == NULL) {
+		status = NT_STATUS_NO_MEMORY;
+		goto fail;
+	}
+
+	if (replace) {
+		SCVAL(state->data, 0, 1);
+	}
+
+	SIVAL(state->data, 8, converted_size_bytes);
+	memcpy(state->data + 12, converted_str, converted_size_bytes);
+
+	TALLOC_FREE(converted_str);
+
+	subreq = cli_setpathinfo_send(
+	    state, ev, cli, SMB_FILE_RENAME_INFORMATION, fname_src, state->data,
+	    talloc_get_size(state->data));
+	if (tevent_req_nomem(subreq, req)) {
+		status = NT_STATUS_NO_MEMORY;
+		goto fail;
+	}
+	tevent_req_set_callback(subreq, cli_smb1_rename_done, req);
+	return req;
+
+fail:
+	TALLOC_FREE(converted_str);
+	tevent_req_nterror(req, status);
+	return tevent_req_post(req, ev);
+}
+
+static void cli_smb1_rename_done(struct tevent_req *subreq)
+{
+	NTSTATUS status = cli_setpathinfo_recv(subreq);
+	tevent_req_simple_finish_ntstatus(subreq, status);
+}
+
+static void cli_cifs_rename_done(struct tevent_req *subreq);
+
+struct cli_cifs_rename_state {
 	uint16_t vwv[1];
 };
 
-struct tevent_req *cli_rename_send(TALLOC_CTX *mem_ctx,
-				struct tevent_context *ev,
-				struct cli_state *cli,
-				const char *fname_src,
-				const char *fname_dst)
+static struct tevent_req *cli_cifs_rename_send(TALLOC_CTX *mem_ctx,
+					       struct tevent_context *ev,
+					       struct cli_state *cli,
+					       const char *fname_src,
+					       const char *fname_dst,
+					       bool replace)
 {
 	struct tevent_req *req = NULL, *subreq = NULL;
-	struct cli_rename_state *state = NULL;
+	struct cli_cifs_rename_state *state = NULL;
 	uint8_t additional_flags = 0;
+	uint16_t additional_flags2 = 0;
 	uint8_t *bytes = NULL;
 
-	req = tevent_req_create(mem_ctx, &state, struct cli_rename_state);
+	req = tevent_req_create(mem_ctx, &state, struct cli_cifs_rename_state);
 	if (req == NULL) {
 		return NULL;
+	}
+
+	if (replace) {
+		/*
+		 * CIFS doesn't support replace
+		 */
+		tevent_req_nterror(req, NT_STATUS_INVALID_PARAMETER);
+		return tevent_req_post(req, ev);
 	}
 
 	SSVAL(state->vwv+0, 0, FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_DIRECTORY);
@@ -1045,6 +1361,10 @@ struct tevent_req *cli_rename_send(TALLOC_CTX *mem_ctx,
 				   strlen(fname_src)+1, NULL);
 	if (tevent_req_nomem(bytes, req)) {
 		return tevent_req_post(req, ev);
+	}
+
+	if (clistr_is_previous_version_path(fname_src, NULL, NULL, NULL)) {
+		additional_flags2 = FLAGS2_REPARSE_PATH;
 	}
 
 	bytes = talloc_realloc(state, bytes, uint8_t,
@@ -1061,15 +1381,16 @@ struct tevent_req *cli_rename_send(TALLOC_CTX *mem_ctx,
 	}
 
 	subreq = cli_smb_send(state, ev, cli, SMBmv, additional_flags,
-			      1, state->vwv, talloc_get_size(bytes), bytes);
+			additional_flags2,
+			1, state->vwv, talloc_get_size(bytes), bytes);
 	if (tevent_req_nomem(subreq, req)) {
 		return tevent_req_post(req, ev);
 	}
-	tevent_req_set_callback(subreq, cli_rename_done, req);
+	tevent_req_set_callback(subreq, cli_cifs_rename_done, req);
 	return req;
 }
 
-static void cli_rename_done(struct tevent_req *subreq)
+static void cli_cifs_rename_done(struct tevent_req *subreq)
 {
 	struct tevent_req *req = tevent_req_callback_data(
 				subreq, struct tevent_req);
@@ -1088,7 +1409,10 @@ NTSTATUS cli_rename_recv(struct tevent_req *req)
 	return tevent_req_simple_recv_ntstatus(req);
 }
 
-NTSTATUS cli_rename(struct cli_state *cli, const char *fname_src, const char *fname_dst)
+NTSTATUS cli_rename(struct cli_state *cli,
+		    const char *fname_src,
+		    const char *fname_dst,
+		    bool replace)
 {
 	TALLOC_CTX *frame = NULL;
 	struct tevent_context *ev;
@@ -1096,9 +1420,7 @@ NTSTATUS cli_rename(struct cli_state *cli, const char *fname_src, const char *fn
 	NTSTATUS status = NT_STATUS_OK;
 
 	if (smbXcli_conn_protocol(cli->conn) >= PROTOCOL_SMB2_02) {
-		return cli_smb2_rename(cli,
-					fname_src,
-					fname_dst);
+		return cli_smb2_rename(cli, fname_src, fname_dst, replace);
 	}
 
 	frame = talloc_stackframe();
@@ -1117,7 +1439,7 @@ NTSTATUS cli_rename(struct cli_state *cli, const char *fname_src, const char *fn
 		goto fail;
 	}
 
-	req = cli_rename_send(frame, ev, cli, fname_src, fname_dst);
+	req = cli_rename_send(frame, ev, cli, fname_src, fname_dst, replace);
 	if (req == NULL) {
 		status = NT_STATUS_NO_MEMORY;
 		goto fail;
@@ -1154,6 +1476,7 @@ static struct tevent_req *cli_ntrename_internal_send(TALLOC_CTX *mem_ctx,
 	struct tevent_req *req = NULL, *subreq = NULL;
 	struct cli_ntrename_internal_state *state = NULL;
 	uint8_t additional_flags = 0;
+	uint16_t additional_flags2 = 0;
 	uint8_t *bytes = NULL;
 
 	req = tevent_req_create(mem_ctx, &state,
@@ -1176,6 +1499,10 @@ static struct tevent_req *cli_ntrename_internal_send(TALLOC_CTX *mem_ctx,
 		return tevent_req_post(req, ev);
 	}
 
+	if (clistr_is_previous_version_path(fname_src, NULL, NULL, NULL)) {
+		additional_flags2 = FLAGS2_REPARSE_PATH;
+	}
+
 	bytes = talloc_realloc(state, bytes, uint8_t,
 			talloc_get_size(bytes)+1);
 	if (tevent_req_nomem(bytes, req)) {
@@ -1190,7 +1517,8 @@ static struct tevent_req *cli_ntrename_internal_send(TALLOC_CTX *mem_ctx,
 	}
 
 	subreq = cli_smb_send(state, ev, cli, SMBntrename, additional_flags,
-			      4, state->vwv, talloc_get_size(bytes), bytes);
+			additional_flags2,
+			4, state->vwv, talloc_get_size(bytes), bytes);
 	if (tevent_req_nomem(subreq, req)) {
 		return tevent_req_post(req, ev);
 	}
@@ -1200,16 +1528,9 @@ static struct tevent_req *cli_ntrename_internal_send(TALLOC_CTX *mem_ctx,
 
 static void cli_ntrename_internal_done(struct tevent_req *subreq)
 {
-	struct tevent_req *req = tevent_req_callback_data(
-				subreq, struct tevent_req);
-	NTSTATUS status;
-
-	status = cli_smb_recv(subreq, NULL, NULL, 0, NULL, NULL, NULL, NULL);
-	TALLOC_FREE(subreq);
-	if (tevent_req_nterror(req, status)) {
-		return;
-	}
-	tevent_req_done(req);
+	NTSTATUS status = cli_smb_recv(
+		subreq, NULL, NULL, 0, NULL, NULL, NULL, NULL);
+	tevent_req_simple_finish_ntstatus(subreq, status);
 }
 
 static NTSTATUS cli_ntrename_internal_recv(struct tevent_req *req)
@@ -1278,7 +1599,7 @@ NTSTATUS cli_ntrename(struct cli_state *cli, const char *fname_src, const char *
  NT hardlink a file.
 ****************************************************************************/
 
-struct tevent_req *cli_nt_hardlink_send(TALLOC_CTX *mem_ctx,
+static struct tevent_req *cli_nt_hardlink_send(TALLOC_CTX *mem_ctx,
 				struct tevent_context *ev,
 				struct cli_state *cli,
 				const char *fname_src,
@@ -1292,44 +1613,241 @@ struct tevent_req *cli_nt_hardlink_send(TALLOC_CTX *mem_ctx,
 					  RENAME_FLAG_HARD_LINK);
 }
 
-NTSTATUS cli_nt_hardlink_recv(struct tevent_req *req)
+static NTSTATUS cli_nt_hardlink_recv(struct tevent_req *req)
 {
 	return cli_ntrename_internal_recv(req);
 }
 
-NTSTATUS cli_nt_hardlink(struct cli_state *cli, const char *fname_src, const char *fname_dst)
+struct cli_smb2_hardlink_state {
+	struct tevent_context *ev;
+	struct cli_state *cli;
+	uint16_t fnum_src;
+	const char *fname_dst;
+	bool overwrite;
+	NTSTATUS status;
+};
+
+static void cli_smb2_hardlink_opened(struct tevent_req *subreq);
+static void cli_smb2_hardlink_info_set(struct tevent_req *subreq);
+static void cli_smb2_hardlink_closed(struct tevent_req *subreq);
+
+static struct tevent_req *cli_smb2_hardlink_send(
+	TALLOC_CTX *mem_ctx,
+	struct tevent_context *ev,
+	struct cli_state *cli,
+	const char *fname_src,
+	const char *fname_dst,
+	bool overwrite,
+	struct smb2_create_blobs *in_cblobs)
+{
+	struct tevent_req *req = NULL, *subreq = NULL;
+	struct cli_smb2_hardlink_state *state = NULL;
+
+	req = tevent_req_create(
+		mem_ctx, &state, struct cli_smb2_hardlink_state);
+	if (req == NULL) {
+		return NULL;
+	}
+	state->ev = ev;
+	state->cli = cli;
+	state->fname_dst = fname_dst;
+	state->overwrite = overwrite;
+
+	subreq = cli_smb2_create_fnum_send(
+		state,
+		ev,
+		cli,
+		fname_src,
+		0,			/* create_flags */
+		SMB2_IMPERSONATION_IMPERSONATION,
+		FILE_WRITE_ATTRIBUTES,
+		0,			/* file attributes */
+		FILE_SHARE_READ|
+		FILE_SHARE_WRITE|
+		FILE_SHARE_DELETE,	 /* share_access */
+		FILE_OPEN,		 /* create_disposition */
+		FILE_NON_DIRECTORY_FILE, /* no hardlinks on directories */
+		in_cblobs);
+	if (tevent_req_nomem(subreq, req)) {
+		return tevent_req_post(req, ev);
+	}
+	tevent_req_set_callback(subreq, cli_smb2_hardlink_opened, req);
+	return req;
+}
+
+static void cli_smb2_hardlink_opened(struct tevent_req *subreq)
+{
+	struct tevent_req *req = tevent_req_callback_data(
+		subreq, struct tevent_req);
+	struct cli_smb2_hardlink_state *state = tevent_req_data(
+		req, struct cli_smb2_hardlink_state);
+	NTSTATUS status;
+	smb_ucs2_t *ucs2_dst;
+	size_t ucs2_len;
+	DATA_BLOB inbuf;
+	bool ok;
+
+	status = cli_smb2_create_fnum_recv(
+		subreq, &state->fnum_src, NULL, NULL, NULL);
+	TALLOC_FREE(subreq);
+	if (tevent_req_nterror(req, status)) {
+		return;
+	}
+
+	ok = push_ucs2_talloc(state, &ucs2_dst, state->fname_dst, &ucs2_len);
+	if (!ok || (ucs2_len < 2)) {
+		tevent_req_nterror(req, NT_STATUS_INVALID_PARAMETER);
+		return;
+	}
+	/* Don't 0-terminate the name */
+	ucs2_len -= 2;
+
+	inbuf = data_blob_talloc_zero(state, ucs2_len + 20);
+	if (tevent_req_nomem(inbuf.data, req)) {
+		return;
+	}
+
+	if (state->overwrite) {
+		SCVAL(inbuf.data, 0, 1);
+	}
+	SIVAL(inbuf.data, 16, ucs2_len);
+	memcpy(inbuf.data + 20, ucs2_dst, ucs2_len);
+	TALLOC_FREE(ucs2_dst);
+
+	subreq = cli_smb2_set_info_fnum_send(
+		state,
+		state->ev,
+		state->cli,
+		state->fnum_src,
+		1,		/* in_info_type */
+		SMB_FILE_LINK_INFORMATION - 1000, /* in_file_info_class */
+		&inbuf,
+		0);		/* in_additional_info */
+	if (tevent_req_nomem(subreq, req)) {
+		return;
+	}
+	tevent_req_set_callback(subreq, cli_smb2_hardlink_info_set, req);
+}
+
+static void cli_smb2_hardlink_info_set(struct tevent_req *subreq)
+{
+	struct tevent_req *req = tevent_req_callback_data(
+		subreq, struct tevent_req);
+	struct cli_smb2_hardlink_state *state = tevent_req_data(
+		req, struct cli_smb2_hardlink_state);
+
+	state->status = cli_smb2_set_info_fnum_recv(subreq);
+	TALLOC_FREE(subreq);
+
+	/* ignore error here, we need to close the file */
+
+	subreq = cli_smb2_close_fnum_send(
+		state, state->ev, state->cli, state->fnum_src);
+	if (tevent_req_nomem(subreq, req)) {
+		return;
+	}
+	tevent_req_set_callback(subreq, cli_smb2_hardlink_closed, req);
+}
+
+static void cli_smb2_hardlink_closed(struct tevent_req *subreq)
+{
+	NTSTATUS status = cli_smb2_close_fnum_recv(subreq);
+	tevent_req_simple_finish_ntstatus(subreq, status);
+}
+
+static NTSTATUS cli_smb2_hardlink_recv(struct tevent_req *req)
+{
+	struct cli_smb2_hardlink_state *state = tevent_req_data(
+		req, struct cli_smb2_hardlink_state);
+	NTSTATUS status;
+
+	if (tevent_req_is_nterror(req, &status)) {
+		return status;
+	}
+	return state->status;
+}
+
+struct cli_hardlink_state {
+	uint8_t dummy;
+};
+
+static void cli_hardlink_done(struct tevent_req *subreq);
+static void cli_hardlink_done2(struct tevent_req *subreq);
+
+struct tevent_req *cli_hardlink_send(
+	TALLOC_CTX *mem_ctx,
+	struct tevent_context *ev,
+	struct cli_state *cli,
+	const char *fname_src,
+	const char *fname_dst)
+{
+	struct tevent_req *req = NULL, *subreq = NULL;
+	struct cli_hardlink_state *state;
+
+	req = tevent_req_create(mem_ctx, &state, struct cli_hardlink_state);
+	if (req == NULL) {
+		return NULL;
+	}
+
+	if (smbXcli_conn_protocol(cli->conn) >= PROTOCOL_SMB2_02) {
+		subreq = cli_smb2_hardlink_send(
+			state, ev, cli, fname_src, fname_dst, false, NULL);
+		if (tevent_req_nomem(subreq, req)) {
+			return tevent_req_post(req, ev);
+		}
+		tevent_req_set_callback(subreq, cli_hardlink_done2, req);
+		return req;
+	}
+
+	subreq = cli_nt_hardlink_send(state, ev, cli, fname_src, fname_dst);
+	if (tevent_req_nomem(subreq, req)) {
+		return tevent_req_post(req, ev);
+	}
+	tevent_req_set_callback(subreq, cli_hardlink_done, req);
+	return req;
+}
+
+static void cli_hardlink_done(struct tevent_req *subreq)
+{
+	NTSTATUS status = cli_nt_hardlink_recv(subreq);
+	tevent_req_simple_finish_ntstatus(subreq, status);
+}
+
+static void cli_hardlink_done2(struct tevent_req *subreq)
+{
+	NTSTATUS status = cli_smb2_hardlink_recv(subreq);
+	tevent_req_simple_finish_ntstatus(subreq, status);
+}
+
+NTSTATUS cli_hardlink_recv(struct tevent_req *req)
+{
+	return tevent_req_simple_recv_ntstatus(req);
+}
+
+NTSTATUS cli_hardlink(
+	struct cli_state *cli, const char *fname_src, const char *fname_dst)
 {
 	TALLOC_CTX *frame = talloc_stackframe();
-	struct tevent_context *ev;
-	struct tevent_req *req;
-	NTSTATUS status = NT_STATUS_OK;
+	struct tevent_context *ev = NULL;
+	struct tevent_req *req = NULL;
+	NTSTATUS status = NT_STATUS_NO_MEMORY;
 
 	if (smbXcli_conn_has_async_calls(cli->conn)) {
-		/*
-		 * Can't use sync call while an async call is in flight
-		 */
 		status = NT_STATUS_INVALID_PARAMETER;
 		goto fail;
 	}
-
 	ev = samba_tevent_context_init(frame);
 	if (ev == NULL) {
-		status = NT_STATUS_NO_MEMORY;
 		goto fail;
 	}
-
-	req = cli_nt_hardlink_send(frame, ev, cli, fname_src, fname_dst);
+	req = cli_hardlink_send(frame, ev, cli, fname_src, fname_dst);
 	if (req == NULL) {
-		status = NT_STATUS_NO_MEMORY;
 		goto fail;
 	}
-
 	if (!tevent_req_poll_ntstatus(req, ev, &status)) {
 		goto fail;
 	}
-
-	status = cli_nt_hardlink_recv(req);
-
+	status = cli_hardlink_recv(req);
  fail:
 	TALLOC_FREE(frame);
 	return status;
@@ -1354,6 +1872,7 @@ struct tevent_req *cli_unlink_send(TALLOC_CTX *mem_ctx,
 	struct tevent_req *req = NULL, *subreq = NULL;
 	struct cli_unlink_state *state = NULL;
 	uint8_t additional_flags = 0;
+	uint16_t additional_flags2 = 0;
 	uint8_t *bytes = NULL;
 
 	req = tevent_req_create(mem_ctx, &state, struct cli_unlink_state);
@@ -1375,7 +1894,12 @@ struct tevent_req *cli_unlink_send(TALLOC_CTX *mem_ctx,
 		return tevent_req_post(req, ev);
 	}
 
+	if (clistr_is_previous_version_path(fname, NULL, NULL, NULL)) {
+		additional_flags2 = FLAGS2_REPARSE_PATH;
+	}
+
 	subreq = cli_smb_send(state, ev, cli, SMBunlink, additional_flags,
+				additional_flags2,
 				1, state->vwv, talloc_get_size(bytes), bytes);
 	if (tevent_req_nomem(subreq, req)) {
 		return tevent_req_post(req, ev);
@@ -1411,7 +1935,7 @@ NTSTATUS cli_unlink(struct cli_state *cli, const char *fname, uint16_t mayhave_a
 	NTSTATUS status = NT_STATUS_OK;
 
 	if (smbXcli_conn_protocol(cli->conn) >= PROTOCOL_SMB2_02) {
-		return cli_smb2_unlink(cli, fname);
+		return cli_smb2_unlink(cli, fname, NULL);
 	}
 
 	frame = talloc_stackframe();
@@ -1465,6 +1989,7 @@ struct tevent_req *cli_mkdir_send(TALLOC_CTX *mem_ctx,
 	struct tevent_req *req = NULL, *subreq = NULL;
 	struct cli_mkdir_state *state = NULL;
 	uint8_t additional_flags = 0;
+	uint16_t additional_flags2 = 0;
 	uint8_t *bytes = NULL;
 
 	req = tevent_req_create(mem_ctx, &state, struct cli_mkdir_state);
@@ -1484,8 +2009,13 @@ struct tevent_req *cli_mkdir_send(TALLOC_CTX *mem_ctx,
 		return tevent_req_post(req, ev);
 	}
 
+	if (clistr_is_previous_version_path(dname, NULL, NULL, NULL)) {
+		additional_flags2 = FLAGS2_REPARSE_PATH;
+	}
+
 	subreq = cli_smb_send(state, ev, cli, SMBmkdir, additional_flags,
-			      0, NULL, talloc_get_size(bytes), bytes);
+			additional_flags2,
+			0, NULL, talloc_get_size(bytes), bytes);
 	if (tevent_req_nomem(subreq, req)) {
 		return tevent_req_post(req, ev);
 	}
@@ -1574,6 +2104,7 @@ struct tevent_req *cli_rmdir_send(TALLOC_CTX *mem_ctx,
 	struct tevent_req *req = NULL, *subreq = NULL;
 	struct cli_rmdir_state *state = NULL;
 	uint8_t additional_flags = 0;
+	uint16_t additional_flags2 = 0;
 	uint8_t *bytes = NULL;
 
 	req = tevent_req_create(mem_ctx, &state, struct cli_rmdir_state);
@@ -1593,8 +2124,13 @@ struct tevent_req *cli_rmdir_send(TALLOC_CTX *mem_ctx,
 		return tevent_req_post(req, ev);
 	}
 
+	if (clistr_is_previous_version_path(dname, NULL, NULL, NULL)) {
+		additional_flags2 = FLAGS2_REPARSE_PATH;
+	}
+
 	subreq = cli_smb_send(state, ev, cli, SMBrmdir, additional_flags,
-			      0, NULL, talloc_get_size(bytes), bytes);
+			additional_flags2,
+			0, NULL, talloc_get_size(bytes), bytes);
 	if (tevent_req_nomem(subreq, req)) {
 		return tevent_req_post(req, ev);
 	}
@@ -1629,7 +2165,7 @@ NTSTATUS cli_rmdir(struct cli_state *cli, const char *dname)
 	NTSTATUS status = NT_STATUS_OK;
 
 	if (smbXcli_conn_protocol(cli->conn) >= PROTOCOL_SMB2_02) {
-		return cli_smb2_rmdir(cli, dname);
+		return cli_smb2_rmdir(cli, dname, NULL);
 	}
 
 	frame = talloc_stackframe();
@@ -1670,17 +2206,11 @@ NTSTATUS cli_rmdir(struct cli_state *cli, const char *dname)
 ****************************************************************************/
 
 struct doc_state {
-	uint16_t setup;
-	uint8_t param[6];
 	uint8_t data[1];
 };
 
-static void cli_nt_delete_on_close_done(struct tevent_req *subreq)
-{
-	NTSTATUS status = cli_trans_recv(subreq, NULL, NULL, NULL, 0, NULL,
-					 NULL, 0, NULL, NULL, 0, NULL);
-	tevent_req_simple_finish_ntstatus(subreq, status);
-}
+static void cli_nt_delete_on_close_smb1_done(struct tevent_req *subreq);
+static void cli_nt_delete_on_close_smb2_done(struct tevent_req *subreq);
 
 struct tevent_req *cli_nt_delete_on_close_send(TALLOC_CTX *mem_ctx,
 					struct tevent_context *ev,
@@ -1696,39 +2226,49 @@ struct tevent_req *cli_nt_delete_on_close_send(TALLOC_CTX *mem_ctx,
 		return NULL;
 	}
 
-	/* Setup setup word. */
-	SSVAL(&state->setup, 0, TRANSACT2_SETFILEINFO);
-
-	/* Setup param array. */
-	SSVAL(state->param,0,fnum);
-	SSVAL(state->param,2,SMB_SET_FILE_DISPOSITION_INFO);
+	if (smbXcli_conn_protocol(cli->conn) >= PROTOCOL_SMB2_02) {
+		subreq = cli_smb2_delete_on_close_send(state, ev, cli,
+						       fnum, flag);
+		if (tevent_req_nomem(subreq, req)) {
+			return tevent_req_post(req, ev);
+		}
+		tevent_req_set_callback(subreq,
+					cli_nt_delete_on_close_smb2_done,
+					req);
+		return req;
+	}
 
 	/* Setup data array. */
 	SCVAL(&state->data[0], 0, flag ? 1 : 0);
 
-	subreq = cli_trans_send(state,			/* mem ctx. */
-				ev,			/* event ctx. */
-				cli,			/* cli_state. */
-				SMBtrans2,		/* cmd. */
-				NULL,			/* pipe name. */
-				-1,			/* fid. */
-				0,			/* function. */
-				0,			/* flags. */
-				&state->setup,		/* setup. */
-				1,			/* num setup uint16_t words. */
-				0,			/* max returned setup. */
-				state->param,		/* param. */
-				6,			/* num param. */
-				2,			/* max returned param. */
-				state->data,		/* data. */
-				1,			/* num data. */
-				0);			/* max returned data. */
+	subreq = cli_setfileinfo_send(
+		state,
+		ev,
+		cli,
+		fnum,
+		SMB_SET_FILE_DISPOSITION_INFO,
+		state->data,
+		sizeof(state->data));
 
 	if (tevent_req_nomem(subreq, req)) {
 		return tevent_req_post(req, ev);
 	}
-	tevent_req_set_callback(subreq, cli_nt_delete_on_close_done, req);
+	tevent_req_set_callback(subreq,
+				cli_nt_delete_on_close_smb1_done,
+				req);
 	return req;
+}
+
+static void cli_nt_delete_on_close_smb1_done(struct tevent_req *subreq)
+{
+	NTSTATUS status = cli_setfileinfo_recv(subreq);
+	tevent_req_simple_finish_ntstatus(subreq, status);
+}
+
+static void cli_nt_delete_on_close_smb2_done(struct tevent_req *subreq)
+{
+	NTSTATUS status = cli_smb2_delete_on_close_recv(subreq);
+	tevent_req_simple_finish_ntstatus(subreq, status);
 }
 
 NTSTATUS cli_nt_delete_on_close_recv(struct tevent_req *req)
@@ -1798,6 +2338,7 @@ static struct tevent_req *cli_ntcreate1_send(TALLOC_CTX *mem_ctx,
 					     uint32_t ShareAccess,
 					     uint32_t CreateDisposition,
 					     uint32_t CreateOptions,
+					     uint32_t ImpersonationLevel,
 					     uint8_t SecurityFlags)
 {
 	struct tevent_req *req, *subreq;
@@ -1805,6 +2346,7 @@ static struct tevent_req *cli_ntcreate1_send(TALLOC_CTX *mem_ctx,
 	uint16_t *vwv;
 	uint8_t *bytes;
 	size_t converted_len;
+	uint16_t additional_flags2 = 0;
 
 	req = tevent_req_create(mem_ctx, &state, struct cli_ntcreate1_state);
 	if (req == NULL) {
@@ -1831,13 +2373,17 @@ static struct tevent_req *cli_ntcreate1_send(TALLOC_CTX *mem_ctx,
 	SIVAL(vwv+17, 1, CreateDisposition);
 	SIVAL(vwv+19, 1, CreateOptions |
 		(cli->backup_intent ? FILE_OPEN_FOR_BACKUP_INTENT : 0));
-	SIVAL(vwv+21, 1, 0x02);	/* ImpersonationLevel */
+	SIVAL(vwv+21, 1, ImpersonationLevel);
 	SCVAL(vwv+23, 1, SecurityFlags);
 
 	bytes = talloc_array(state, uint8_t, 0);
 	bytes = smb_bytes_push_str(bytes, smbXcli_conn_use_unicode(cli->conn),
 				   fname, strlen(fname)+1,
 				   &converted_len);
+
+	if (clistr_is_previous_version_path(fname, NULL, NULL, NULL)) {
+		additional_flags2 = FLAGS2_REPARSE_PATH;
+	}
 
 	/* sigh. this copes with broken netapp filer behaviour */
 	bytes = smb_bytes_push_str(bytes, smbXcli_conn_use_unicode(cli->conn), "", 1, NULL);
@@ -1848,8 +2394,9 @@ static struct tevent_req *cli_ntcreate1_send(TALLOC_CTX *mem_ctx,
 
 	SSVAL(vwv+2, 1, converted_len);
 
-	subreq = cli_smb_send(state, ev, cli, SMBntcreateX, 0, 24, vwv,
-			      talloc_get_size(bytes), bytes);
+	subreq = cli_smb_send(state, ev, cli, SMBntcreateX, 0,
+			additional_flags2, 24, vwv,
+			talloc_get_size(bytes), bytes);
 	if (tevent_req_nomem(subreq, req)) {
 		return tevent_req_post(req, ev);
 	}
@@ -1919,14 +2466,13 @@ static NTSTATUS cli_ntcreate1_recv(struct tevent_req *req,
 }
 
 struct cli_ntcreate_state {
-	NTSTATUS (*recv)(struct tevent_req *req, uint16_t *fnum,
-			 struct smb_create_returns *cr);
 	struct smb_create_returns cr;
 	uint16_t fnum;
 	struct tevent_req *subreq;
 };
 
-static void cli_ntcreate_done(struct tevent_req *subreq);
+static void cli_ntcreate_done_nt1(struct tevent_req *subreq);
+static void cli_ntcreate_done_smb2(struct tevent_req *subreq);
 static bool cli_ntcreate_cancel(struct tevent_req *req);
 
 struct tevent_req *cli_ntcreate_send(TALLOC_CTX *mem_ctx,
@@ -1939,6 +2485,7 @@ struct tevent_req *cli_ntcreate_send(TALLOC_CTX *mem_ctx,
 				     uint32_t share_access,
 				     uint32_t create_disposition,
 				     uint32_t create_options,
+				     uint32_t impersonation_level,
 				     uint8_t security_flags)
 {
 	struct tevent_req *req, *subreq;
@@ -1950,27 +2497,37 @@ struct tevent_req *cli_ntcreate_send(TALLOC_CTX *mem_ctx,
 	}
 
 	if (smbXcli_conn_protocol(cli->conn) >= PROTOCOL_SMB2_02) {
-		state->recv = cli_smb2_create_fnum_recv;
-
 		if (cli->use_oplocks) {
 			create_flags |= REQUEST_OPLOCK|REQUEST_BATCH_OPLOCK;
 		}
 
 		subreq = cli_smb2_create_fnum_send(
-			state, ev, cli, fname, create_flags, desired_access,
-			file_attributes, share_access, create_disposition,
-			create_options);
+			state,
+			ev,
+			cli,
+			fname,
+			create_flags,
+			impersonation_level,
+			desired_access,
+			file_attributes,
+			share_access,
+			create_disposition,
+			create_options,
+			NULL);
+		if (tevent_req_nomem(subreq, req)) {
+			return tevent_req_post(req, ev);
+		}
+		tevent_req_set_callback(subreq, cli_ntcreate_done_smb2, req);
 	} else {
-		state->recv = cli_ntcreate1_recv;
 		subreq = cli_ntcreate1_send(
 			state, ev, cli, fname, create_flags, desired_access,
 			file_attributes, share_access, create_disposition,
-			create_options, security_flags);
+			create_options, impersonation_level, security_flags);
+		if (tevent_req_nomem(subreq, req)) {
+			return tevent_req_post(req, ev);
+		}
+		tevent_req_set_callback(subreq, cli_ntcreate_done_nt1, req);
 	}
-	if (tevent_req_nomem(subreq, req)) {
-		return tevent_req_post(req, ev);
-	}
-	tevent_req_set_callback(subreq, cli_ntcreate_done, req);
 
 	state->subreq = subreq;
 	tevent_req_set_cancel_fn(req, cli_ntcreate_cancel);
@@ -1978,7 +2535,7 @@ struct tevent_req *cli_ntcreate_send(TALLOC_CTX *mem_ctx,
 	return req;
 }
 
-static void cli_ntcreate_done(struct tevent_req *subreq)
+static void cli_ntcreate_done_nt1(struct tevent_req *subreq)
 {
 	struct tevent_req *req = tevent_req_callback_data(
 		subreq, struct tevent_req);
@@ -1986,7 +2543,28 @@ static void cli_ntcreate_done(struct tevent_req *subreq)
 		req, struct cli_ntcreate_state);
 	NTSTATUS status;
 
-	status = state->recv(subreq, &state->fnum, &state->cr);
+	status = cli_ntcreate1_recv(subreq, &state->fnum, &state->cr);
+	TALLOC_FREE(subreq);
+	if (tevent_req_nterror(req, status)) {
+		return;
+	}
+	tevent_req_done(req);
+}
+
+static void cli_ntcreate_done_smb2(struct tevent_req *subreq)
+{
+	struct tevent_req *req = tevent_req_callback_data(
+		subreq, struct tevent_req);
+	struct cli_ntcreate_state *state = tevent_req_data(
+		req, struct cli_ntcreate_state);
+	NTSTATUS status;
+
+	status = cli_smb2_create_fnum_recv(
+		subreq,
+		&state->fnum,
+		&state->cr,
+		NULL,
+		NULL);
 	TALLOC_FREE(subreq);
 	if (tevent_req_nterror(req, status)) {
 		return;
@@ -2035,6 +2613,7 @@ NTSTATUS cli_ntcreate(struct cli_state *cli,
 	TALLOC_CTX *frame = talloc_stackframe();
 	struct tevent_context *ev;
 	struct tevent_req *req;
+	uint32_t ImpersonationLevel = SMB2_IMPERSONATION_IMPERSONATION;
 	NTSTATUS status = NT_STATUS_NO_MEMORY;
 
 	if (smbXcli_conn_has_async_calls(cli->conn)) {
@@ -2053,7 +2632,7 @@ NTSTATUS cli_ntcreate(struct cli_state *cli,
 	req = cli_ntcreate_send(frame, ev, cli, fname, CreatFlags,
 				DesiredAccess, FileAttributes, ShareAccess,
 				CreateDisposition, CreateOptions,
-				SecurityFlags);
+				ImpersonationLevel, SecurityFlags);
 	if (req == NULL) {
 		goto fail;
 	}
@@ -2097,6 +2676,7 @@ struct tevent_req *cli_nttrans_create_send(TALLOC_CTX *mem_ctx,
 	size_t secdesc_len;
 	NTSTATUS status;
 	size_t converted_len;
+	uint16_t additional_flags2 = 0;
 
 	req = tevent_req_create(mem_ctx,
 				&state, struct cli_nttrans_create_state);
@@ -2137,6 +2717,10 @@ struct tevent_req *cli_nttrans_create_send(TALLOC_CTX *mem_ctx,
 		return tevent_req_post(req, ev);
 	}
 
+	if (clistr_is_previous_version_path(fname, NULL, NULL, NULL)) {
+		additional_flags2 = FLAGS2_REPARSE_PATH;
+	}
+
 	SIVAL(param, 0, CreatFlags);
 	SIVAL(param, 4, 0x0);	/* RootDirectoryFid */
 	SIVAL(param, 8, DesiredAccess);
@@ -2153,7 +2737,9 @@ struct tevent_req *cli_nttrans_create_send(TALLOC_CTX *mem_ctx,
 	SIVAL(param, 48, 0x02); /* ImpersonationLevel */
 	SCVAL(param, 52, SecurityFlags);
 
-	subreq = cli_trans_send(state, ev, cli, SMBnttrans,
+	subreq = cli_trans_send(state, ev, cli,
+				additional_flags2, /* additional_flags2 */
+				SMBnttrans,
 				NULL, -1, /* name, fid */
 				NT_TRANSACT_CREATE, 0,
 				NULL, 0, 0, /* setup */
@@ -2289,6 +2875,7 @@ struct tevent_req *cli_openx_create(TALLOC_CTX *mem_ctx,
 	unsigned openfn;
 	unsigned accessmode;
 	uint8_t additional_flags;
+	uint16_t additional_flags2 = 0;
 	uint8_t *bytes;
 
 	req = tevent_req_create(mem_ctx, &state, struct cli_openx_state);
@@ -2356,11 +2943,15 @@ struct tevent_req *cli_openx_create(TALLOC_CTX *mem_ctx,
 		return tevent_req_post(req, ev);
 	}
 
+	if (clistr_is_previous_version_path(fname, NULL, NULL, NULL)) {
+		additional_flags2 = FLAGS2_REPARSE_PATH;
+	}
+
 	state->bytes.iov_base = (void *)bytes;
 	state->bytes.iov_len = talloc_get_size(bytes);
 
 	subreq = cli_smb_req_create(state, ev, cli, SMBopenX, additional_flags,
-				    15, state->vwv, 1, &state->bytes);
+			additional_flags2, 15, state->vwv, 1, &state->bytes);
 	if (subreq == NULL) {
 		TALLOC_FREE(req);
 		return NULL;
@@ -2470,7 +3061,7 @@ NTSTATUS cli_open(struct cli_state *cli, const char *fname, int flags,
 	unsigned int openfn = 0;
 	unsigned int dos_deny = 0;
 	uint32_t access_mask, share_mode, create_disposition, create_options;
-	struct smb_create_returns cr;
+	struct smb_create_returns cr = {0};
 
 	/* Do the initial mapping into OpenX parameters. */
 	if (flags & O_CREAT) {
@@ -2599,22 +3190,22 @@ NTSTATUS cli_open(struct cli_state *cli, const char *fname, int flags,
  Close a file.
 ****************************************************************************/
 
-struct cli_close_state {
+struct cli_smb1_close_state {
 	uint16_t vwv[3];
 };
 
-static void cli_close_done(struct tevent_req *subreq);
+static void cli_smb1_close_done(struct tevent_req *subreq);
 
-struct tevent_req *cli_close_create(TALLOC_CTX *mem_ctx,
+struct tevent_req *cli_smb1_close_create(TALLOC_CTX *mem_ctx,
 				struct tevent_context *ev,
 				struct cli_state *cli,
 				uint16_t fnum,
 				struct tevent_req **psubreq)
 {
 	struct tevent_req *req, *subreq;
-	struct cli_close_state *state;
+	struct cli_smb1_close_state *state;
 
-	req = tevent_req_create(mem_ctx, &state, struct cli_close_state);
+	req = tevent_req_create(mem_ctx, &state, struct cli_smb1_close_state);
 	if (req == NULL) {
 		return NULL;
 	}
@@ -2622,38 +3213,18 @@ struct tevent_req *cli_close_create(TALLOC_CTX *mem_ctx,
 	SSVAL(state->vwv+0, 0, fnum);
 	SIVALS(state->vwv+1, 0, -1);
 
-	subreq = cli_smb_req_create(state, ev, cli, SMBclose, 0, 3, state->vwv,
-				    0, NULL);
+	subreq = cli_smb_req_create(state, ev, cli, SMBclose, 0, 0,
+				3, state->vwv, 0, NULL);
 	if (subreq == NULL) {
 		TALLOC_FREE(req);
 		return NULL;
 	}
-	tevent_req_set_callback(subreq, cli_close_done, req);
+	tevent_req_set_callback(subreq, cli_smb1_close_done, req);
 	*psubreq = subreq;
 	return req;
 }
 
-struct tevent_req *cli_close_send(TALLOC_CTX *mem_ctx,
-				struct tevent_context *ev,
-				struct cli_state *cli,
-				uint16_t fnum)
-{
-	struct tevent_req *req, *subreq;
-	NTSTATUS status;
-
-	req = cli_close_create(mem_ctx, ev, cli, fnum, &subreq);
-	if (req == NULL) {
-		return NULL;
-	}
-
-	status = smb1cli_req_chain_submit(&subreq, 1);
-	if (tevent_req_nterror(req, status)) {
-		return tevent_req_post(req, ev);
-	}
-	return req;
-}
-
-static void cli_close_done(struct tevent_req *subreq)
+static void cli_smb1_close_done(struct tevent_req *subreq)
 {
 	struct tevent_req *req = tevent_req_callback_data(
 		subreq, struct tevent_req);
@@ -2662,6 +3233,65 @@ static void cli_close_done(struct tevent_req *subreq)
 	status = cli_smb_recv(subreq, NULL, NULL, 0, NULL, NULL, NULL, NULL);
 	TALLOC_FREE(subreq);
 	if (tevent_req_nterror(req, status)) {
+		return;
+	}
+	tevent_req_done(req);
+}
+
+struct cli_close_state {
+	int dummy;
+};
+
+static void cli_close_done(struct tevent_req *subreq);
+
+struct tevent_req *cli_close_send(TALLOC_CTX *mem_ctx,
+				struct tevent_context *ev,
+				struct cli_state *cli,
+				uint16_t fnum)
+{
+	struct tevent_req *req, *subreq;
+	struct cli_close_state *state;
+	NTSTATUS status;
+
+	req = tevent_req_create(mem_ctx, &state, struct cli_close_state);
+	if (req == NULL) {
+		return NULL;
+	}
+
+	if (smbXcli_conn_protocol(cli->conn) >= PROTOCOL_SMB2_02) {
+		subreq = cli_smb2_close_fnum_send(state,
+						ev,
+						cli,
+						fnum);
+		if (tevent_req_nomem(subreq, req)) {
+			return tevent_req_post(req, ev);
+		}
+	} else {
+		struct tevent_req *ch_req = NULL;
+		subreq = cli_smb1_close_create(state, ev, cli, fnum, &ch_req);
+		if (tevent_req_nomem(subreq, req)) {
+			return tevent_req_post(req, ev);
+		}
+		status = smb1cli_req_chain_submit(&ch_req, 1);
+		if (tevent_req_nterror(req, status)) {
+			return tevent_req_post(req, ev);
+		}
+	}
+
+	tevent_req_set_callback(subreq, cli_close_done, req);
+	return req;
+}
+
+static void cli_close_done(struct tevent_req *subreq)
+{
+	struct tevent_req *req = tevent_req_callback_data(
+		subreq, struct tevent_req);
+	NTSTATUS status = NT_STATUS_OK;
+	bool err = tevent_req_is_nterror(subreq, &status);
+
+	TALLOC_FREE(subreq);
+	if (err) {
+		tevent_req_nterror(req, status);
 		return;
 	}
 	tevent_req_done(req);
@@ -2678,10 +3308,6 @@ NTSTATUS cli_close(struct cli_state *cli, uint16_t fnum)
 	struct tevent_context *ev;
 	struct tevent_req *req;
 	NTSTATUS status = NT_STATUS_OK;
-
-	if (smbXcli_conn_protocol(cli->conn) >= PROTOCOL_SMB2_02) {
-		return cli_smb2_close_fnum(cli, fnum);
-	}
 
 	frame = talloc_stackframe();
 
@@ -2720,15 +3346,12 @@ NTSTATUS cli_close(struct cli_state *cli, uint16_t fnum)
 ****************************************************************************/
 
 struct ftrunc_state {
-	uint16_t setup;
-	uint8_t param[6];
 	uint8_t data[8];
 };
 
 static void cli_ftruncate_done(struct tevent_req *subreq)
 {
-	NTSTATUS status = cli_trans_recv(subreq, NULL, NULL, NULL, 0, NULL,
-					 NULL, 0, NULL, NULL, 0, NULL);
+	NTSTATUS status = cli_setfileinfo_recv(subreq);
 	tevent_req_simple_finish_ntstatus(subreq, status);
 }
 
@@ -2746,34 +3369,17 @@ struct tevent_req *cli_ftruncate_send(TALLOC_CTX *mem_ctx,
 		return NULL;
 	}
 
-	/* Setup setup word. */
-	SSVAL(&state->setup, 0, TRANSACT2_SETFILEINFO);
-
-	/* Setup param array. */
-	SSVAL(state->param,0,fnum);
-	SSVAL(state->param,2,SMB_SET_FILE_END_OF_FILE_INFO);
-	SSVAL(state->param,4,0);
-
 	/* Setup data array. */
         SBVAL(state->data, 0, size);
 
-	subreq = cli_trans_send(state,			/* mem ctx. */
-				ev,			/* event ctx. */
-				cli,			/* cli_state. */
-				SMBtrans2,		/* cmd. */
-				NULL,			/* pipe name. */
-				-1,			/* fid. */
-				0,			/* function. */
-				0,			/* flags. */
-				&state->setup,		/* setup. */
-				1,			/* num setup uint16_t words. */
-				0,			/* max returned setup. */
-				state->param,		/* param. */
-				6,			/* num param. */
-				2,			/* max returned param. */
-				state->data,		/* data. */
-				8,			/* num data. */
-				0);			/* max returned data. */
+	subreq = cli_setfileinfo_send(
+		state,
+		ev,
+		cli,
+		fnum,
+		SMB_SET_FILE_END_OF_FILE_INFO,
+		state->data,
+		sizeof(state->data));
 
 	if (tevent_req_nomem(subreq, req)) {
 		return tevent_req_post(req, ev);
@@ -2789,10 +3395,16 @@ NTSTATUS cli_ftruncate_recv(struct tevent_req *req)
 
 NTSTATUS cli_ftruncate(struct cli_state *cli, uint16_t fnum, uint64_t size)
 {
-	TALLOC_CTX *frame = talloc_stackframe();
+	TALLOC_CTX *frame = NULL;
 	struct tevent_context *ev = NULL;
 	struct tevent_req *req = NULL;
 	NTSTATUS status = NT_STATUS_OK;
+
+	if (smbXcli_conn_protocol(cli->conn) >= PROTOCOL_SMB2_02) {
+		return cli_smb2_ftruncate(cli, fnum, size);
+	}
+
+	frame = talloc_stackframe();
 
 	if (smbXcli_conn_has_async_calls(cli->conn)) {
 		/*
@@ -2829,34 +3441,195 @@ NTSTATUS cli_ftruncate(struct cli_state *cli, uint16_t fnum, uint64_t size)
 	return status;
 }
 
-/****************************************************************************
- send a lock with a specified locktype
- this is used for testing LOCKING_ANDX_CANCEL_LOCK
-****************************************************************************/
-
-NTSTATUS cli_locktype(struct cli_state *cli, uint16_t fnum,
-		      uint32_t offset, uint32_t len,
-		      int timeout, unsigned char locktype)
+static uint8_t *cli_lockingx_put_locks(
+	uint8_t *buf,
+	bool large,
+	uint16_t num_locks,
+	const struct smb1_lock_element *locks)
 {
-	uint16_t vwv[8];
-	uint8_t bytes[10];
-	NTSTATUS status;
-	unsigned int set_timeout = 0;
-	unsigned int saved_timeout = 0;
+	uint16_t i;
 
-	SCVAL(vwv + 0, 0, 0xff);
+	for (i=0; i<num_locks; i++) {
+		const struct smb1_lock_element *e = &locks[i];
+		if (large) {
+			SSVAL(buf, 0, e->pid);
+			SSVAL(buf, 2, 0);
+			SOFF_T_R(buf, 4, e->offset);
+			SOFF_T_R(buf, 12, e->length);
+			buf += 20;
+		} else {
+			SSVAL(buf, 0, e->pid);
+			SIVAL(buf, 2, e->offset);
+			SIVAL(buf, 6, e->length);
+			buf += 10;
+		}
+	}
+	return buf;
+}
+
+struct cli_lockingx_state {
+	uint16_t vwv[8];
+	struct iovec bytes;
+	struct tevent_req *subreq;
+};
+
+static void cli_lockingx_done(struct tevent_req *subreq);
+static bool cli_lockingx_cancel(struct tevent_req *req);
+
+struct tevent_req *cli_lockingx_create(
+	TALLOC_CTX *mem_ctx,
+	struct tevent_context *ev,
+	struct cli_state *cli,
+	uint16_t fnum,
+	uint8_t typeoflock,
+	uint8_t newoplocklevel,
+	int32_t timeout,
+	uint16_t num_unlocks,
+	const struct smb1_lock_element *unlocks,
+	uint16_t num_locks,
+	const struct smb1_lock_element *locks,
+	struct tevent_req **psmbreq)
+{
+	struct tevent_req *req = NULL, *subreq = NULL;
+	struct cli_lockingx_state *state = NULL;
+	uint16_t *vwv;
+	uint8_t *p;
+	const bool large = (typeoflock & LOCKING_ANDX_LARGE_FILES);
+	const size_t element_len = large ? 20 : 10;
+
+	/* uint16->size_t, no overflow */
+	const size_t num_elements = (size_t)num_locks + (size_t)num_unlocks;
+
+	/* at most 20*2*65535 = 2621400, no overflow */
+	const size_t num_bytes = num_elements * element_len;
+
+	req = tevent_req_create(mem_ctx, &state, struct cli_lockingx_state);
+	if (req == NULL) {
+		return NULL;
+	}
+	vwv = state->vwv;
+
+	SCVAL(vwv + 0, 0, 0xFF);
 	SCVAL(vwv + 0, 1, 0);
 	SSVAL(vwv + 1, 0, 0);
 	SSVAL(vwv + 2, 0, fnum);
-	SCVAL(vwv + 3, 0, locktype);
-	SCVAL(vwv + 3, 1, 0);
+	SCVAL(vwv + 3, 0, typeoflock);
+	SCVAL(vwv + 3, 1, newoplocklevel);
 	SIVALS(vwv + 4, 0, timeout);
-	SSVAL(vwv + 6, 0, 0);
-	SSVAL(vwv + 7, 0, 1);
+	SSVAL(vwv + 6, 0, num_unlocks);
+	SSVAL(vwv + 7, 0, num_locks);
 
-	SSVAL(bytes, 0, cli_getpid(cli));
-	SIVAL(bytes, 2, offset);
-	SIVAL(bytes, 6, len);
+	state->bytes.iov_len = num_bytes;
+	state->bytes.iov_base = talloc_array(state, uint8_t, num_bytes);
+	if (tevent_req_nomem(state->bytes.iov_base, req)) {
+		return tevent_req_post(req, ev);
+	}
+
+	p = cli_lockingx_put_locks(
+		state->bytes.iov_base, large, num_unlocks, unlocks);
+	cli_lockingx_put_locks(p, large, num_locks, locks);
+
+	subreq = cli_smb_req_create(
+		state, ev, cli, SMBlockingX, 0, 0, 8, vwv, 1, &state->bytes);
+	if (tevent_req_nomem(subreq, req)) {
+		return tevent_req_post(req, ev);
+	}
+	tevent_req_set_callback(subreq, cli_lockingx_done, req);
+	*psmbreq = subreq;
+	return req;
+}
+
+struct tevent_req *cli_lockingx_send(
+	TALLOC_CTX *mem_ctx,
+	struct tevent_context *ev,
+	struct cli_state *cli,
+	uint16_t fnum,
+	uint8_t typeoflock,
+	uint8_t newoplocklevel,
+	int32_t timeout,
+	uint16_t num_unlocks,
+	const struct smb1_lock_element *unlocks,
+	uint16_t num_locks,
+	const struct smb1_lock_element *locks)
+{
+	struct tevent_req *req = NULL, *subreq = NULL;
+	struct cli_lockingx_state *state = NULL;
+	NTSTATUS status;
+
+	req = cli_lockingx_create(
+		mem_ctx,
+		ev,
+		cli,
+		fnum,
+		typeoflock,
+		newoplocklevel,
+		timeout,
+		num_unlocks,
+		unlocks,
+		num_locks,
+		locks,
+		&subreq);
+	if (req == NULL) {
+		return NULL;
+	}
+	state = tevent_req_data(req, struct cli_lockingx_state);
+	state->subreq = subreq;
+
+	status = smb1cli_req_chain_submit(&subreq, 1);
+	if (tevent_req_nterror(req, status)) {
+		return tevent_req_post(req, ev);
+	}
+	tevent_req_set_cancel_fn(req, cli_lockingx_cancel);
+	return req;
+}
+
+static void cli_lockingx_done(struct tevent_req *subreq)
+{
+	NTSTATUS status = cli_smb_recv(
+		subreq, NULL, NULL, 0, NULL, NULL, NULL, NULL);
+	tevent_req_simple_finish_ntstatus(subreq, status);
+}
+
+static bool cli_lockingx_cancel(struct tevent_req *req)
+{
+	struct cli_lockingx_state *state = tevent_req_data(
+		req, struct cli_lockingx_state);
+	if (state->subreq == NULL) {
+		return false;
+	}
+	return tevent_req_cancel(state->subreq);
+}
+
+NTSTATUS cli_lockingx_recv(struct tevent_req *req)
+{
+	return tevent_req_simple_recv_ntstatus(req);
+}
+
+NTSTATUS cli_lockingx(
+	struct cli_state *cli,
+	uint16_t fnum,
+	uint8_t typeoflock,
+	uint8_t newoplocklevel,
+	int32_t timeout,
+	uint16_t num_unlocks,
+	const struct smb1_lock_element *unlocks,
+	uint16_t num_locks,
+	const struct smb1_lock_element *locks)
+{
+	TALLOC_CTX *frame = talloc_stackframe();
+	struct tevent_context *ev = NULL;
+	struct tevent_req *req = NULL;
+	NTSTATUS status = NT_STATUS_NO_MEMORY;
+	unsigned int set_timeout = 0;
+	unsigned int saved_timeout = 0;
+
+	if (smbXcli_conn_has_async_calls(cli->conn)) {
+		return NT_STATUS_INVALID_PARAMETER;
+	}
+	ev = samba_tevent_context_init(frame);
+	if (ev == NULL) {
+		goto fail;
+	}
 
 	if (timeout != 0) {
 		if (timeout == -1) {
@@ -2867,13 +3640,60 @@ NTSTATUS cli_locktype(struct cli_state *cli, uint16_t fnum,
 		saved_timeout = cli_set_timeout(cli, set_timeout);
 	}
 
-	status = cli_smb(talloc_tos(), cli, SMBlockingX, 0, 8, vwv,
-			 10, bytes, NULL, 0, NULL, NULL, NULL, NULL);
+	req = cli_lockingx_send(
+		frame,
+		ev,
+		cli,
+		fnum,
+		typeoflock,
+		newoplocklevel,
+		timeout,
+		num_unlocks,
+		unlocks,
+		num_locks,
+		locks);
+	if (req == NULL) {
+		goto fail;
+	}
+	if (!tevent_req_poll_ntstatus(req, ev, &status)) {
+		goto fail;
+	}
+	status = cli_lockingx_recv(req);
 
 	if (saved_timeout != 0) {
 		cli_set_timeout(cli, saved_timeout);
 	}
+fail:
+	TALLOC_FREE(frame);
+	return status;
+}
 
+/****************************************************************************
+ send a lock with a specified locktype
+ this is used for testing LOCKING_ANDX_CANCEL_LOCK
+****************************************************************************/
+
+NTSTATUS cli_locktype(struct cli_state *cli, uint16_t fnum,
+		      uint32_t offset, uint32_t len,
+		      int timeout, unsigned char locktype)
+{
+	struct smb1_lock_element lck = {
+		.pid = cli_getpid(cli),
+		.offset = offset,
+		.length = len,
+	};
+	NTSTATUS status;
+
+	status = cli_lockingx(
+		cli,				/* cli */
+		fnum,				/* fnum */
+		locktype,			/* typeoflock */
+		0,				/* newoplocklevel */
+		timeout,			/* timeout */
+		0,				/* num_unlocks */
+		NULL,				/* unlocks */
+		1,				/* num_locks */
+		&lck);				/* locks */
 	return status;
 }
 
@@ -2898,8 +3718,7 @@ NTSTATUS cli_lock32(struct cli_state *cli, uint16_t fnum,
 ****************************************************************************/
 
 struct cli_unlock_state {
-	uint16_t vwv[8];
-	uint8_t data[10];
+	struct smb1_lock_element lck;
 };
 
 static void cli_unlock_done(struct tevent_req *subreq);
@@ -2914,26 +3733,29 @@ struct tevent_req *cli_unlock_send(TALLOC_CTX *mem_ctx,
 {
 	struct tevent_req *req = NULL, *subreq = NULL;
 	struct cli_unlock_state *state = NULL;
-	uint8_t additional_flags = 0;
 
 	req = tevent_req_create(mem_ctx, &state, struct cli_unlock_state);
 	if (req == NULL) {
 		return NULL;
 	}
+	state->lck = (struct smb1_lock_element) {
+		.pid = cli_getpid(cli),
+		.offset = offset,
+		.length = len,
+	};
 
-	SCVAL(state->vwv+0, 0, 0xFF);
-	SSVAL(state->vwv+2, 0, fnum);
-	SCVAL(state->vwv+3, 0, 0);
-	SIVALS(state->vwv+4, 0, 0);
-	SSVAL(state->vwv+6, 0, 1);
-	SSVAL(state->vwv+7, 0, 0);
-
-	SSVAL(state->data, 0, cli_getpid(cli));
-	SIVAL(state->data, 2, offset);
-	SIVAL(state->data, 6, len);
-
-	subreq = cli_smb_send(state, ev, cli, SMBlockingX, additional_flags,
-				8, state->vwv, 10, state->data);
+	subreq = cli_lockingx_send(
+		state,				/* mem_ctx */
+		ev,				/* tevent_context */
+		cli,				/* cli */
+		fnum,				/* fnum */
+		0,				/* typeoflock */
+		0,				/* newoplocklevel */
+		0,				/* timeout */
+		1,				/* num_unlocks */
+		&state->lck,			/* unlocks */
+		0,				/* num_locks */
+		NULL);				/* locks */
 	if (tevent_req_nomem(subreq, req)) {
 		return tevent_req_post(req, ev);
 	}
@@ -2943,16 +3765,8 @@ struct tevent_req *cli_unlock_send(TALLOC_CTX *mem_ctx,
 
 static void cli_unlock_done(struct tevent_req *subreq)
 {
-	struct tevent_req *req = tevent_req_callback_data(
-				subreq, struct tevent_req);
-	NTSTATUS status;
-
-	status = cli_smb_recv(subreq, NULL, NULL, 0, NULL, NULL, NULL, NULL);
-	TALLOC_FREE(subreq);
-	if (tevent_req_nterror(req, status)) {
-		return;
-	}
-	tevent_req_done(req);
+	NTSTATUS status = cli_lockingx_recv(subreq);
+	tevent_req_simple_finish_ntstatus(subreq, status);
 }
 
 NTSTATUS cli_unlock_recv(struct tevent_req *req)
@@ -2996,174 +3810,6 @@ NTSTATUS cli_unlock(struct cli_state *cli,
 	}
 
 	status = cli_unlock_recv(req);
-
- fail:
-	TALLOC_FREE(frame);
-	return status;
-}
-
-/****************************************************************************
- Lock a file with 64 bit offsets.
-****************************************************************************/
-
-NTSTATUS cli_lock64(struct cli_state *cli, uint16_t fnum,
-		    uint64_t offset, uint64_t len, int timeout,
-		    enum brl_type lock_type)
-{
-	uint16_t vwv[8];
-	uint8_t bytes[20];
-	unsigned int set_timeout = 0;
-	unsigned int saved_timeout = 0;
-	int ltype;
-	NTSTATUS status;
-
-	if (! (smb1cli_conn_capabilities(cli->conn) & CAP_LARGE_FILES)) {
-		return cli_lock32(cli, fnum, offset, len, timeout, lock_type);
-	}
-
-	ltype = (lock_type == READ_LOCK? 1 : 0);
-	ltype |= LOCKING_ANDX_LARGE_FILES;
-
-	SCVAL(vwv + 0, 0, 0xff);
-	SCVAL(vwv + 0, 1, 0);
-	SSVAL(vwv + 1, 0, 0);
-	SSVAL(vwv + 2, 0, fnum);
-	SCVAL(vwv + 3, 0, ltype);
-	SCVAL(vwv + 3, 1, 0);
-	SIVALS(vwv + 4, 0, timeout);
-	SSVAL(vwv + 6, 0, 0);
-	SSVAL(vwv + 7, 0, 1);
-
-	SIVAL(bytes, 0, cli_getpid(cli));
-	SOFF_T_R(bytes, 4, offset);
-	SOFF_T_R(bytes, 12, len);
-
-	if (timeout != 0) {
-		if (timeout == -1) {
-			set_timeout = 0x7FFFFFFF;
-		} else {
-			set_timeout = timeout + 2*1000;
-		}
-		saved_timeout = cli_set_timeout(cli, set_timeout);
-	}
-
-	status = cli_smb(talloc_tos(), cli, SMBlockingX, 0, 8, vwv,
-			 20, bytes, NULL, 0, NULL, NULL, NULL, NULL);
-
-	if (saved_timeout != 0) {
-		cli_set_timeout(cli, saved_timeout);
-	}
-
-	return status;
-}
-
-/****************************************************************************
- Unlock a file with 64 bit offsets.
-****************************************************************************/
-
-struct cli_unlock64_state {
-	uint16_t vwv[8];
-	uint8_t data[20];
-};
-
-static void cli_unlock64_done(struct tevent_req *subreq);
-
-struct tevent_req *cli_unlock64_send(TALLOC_CTX *mem_ctx,
-				struct tevent_context *ev,
-				struct cli_state *cli,
-				uint16_t fnum,
-				uint64_t offset,
-				uint64_t len)
-
-{
-	struct tevent_req *req = NULL, *subreq = NULL;
-	struct cli_unlock64_state *state = NULL;
-	uint8_t additional_flags = 0;
-
-	req = tevent_req_create(mem_ctx, &state, struct cli_unlock64_state);
-	if (req == NULL) {
-		return NULL;
-	}
-
-        SCVAL(state->vwv+0, 0, 0xff);
-	SSVAL(state->vwv+2, 0, fnum);
-	SCVAL(state->vwv+3, 0,LOCKING_ANDX_LARGE_FILES);
-	SIVALS(state->vwv+4, 0, 0);
-	SSVAL(state->vwv+6, 0, 1);
-	SSVAL(state->vwv+7, 0, 0);
-
-	SIVAL(state->data, 0, cli_getpid(cli));
-	SOFF_T_R(state->data, 4, offset);
-	SOFF_T_R(state->data, 12, len);
-
-	subreq = cli_smb_send(state, ev, cli, SMBlockingX, additional_flags,
-				8, state->vwv, 20, state->data);
-	if (tevent_req_nomem(subreq, req)) {
-		return tevent_req_post(req, ev);
-	}
-	tevent_req_set_callback(subreq, cli_unlock64_done, req);
-	return req;
-}
-
-static void cli_unlock64_done(struct tevent_req *subreq)
-{
-	struct tevent_req *req = tevent_req_callback_data(
-				subreq, struct tevent_req);
-	NTSTATUS status;
-
-	status = cli_smb_recv(subreq, NULL, NULL, 0, NULL, NULL, NULL, NULL);
-	TALLOC_FREE(subreq);
-	if (tevent_req_nterror(req, status)) {
-		return;
-	}
-	tevent_req_done(req);
-}
-
-NTSTATUS cli_unlock64_recv(struct tevent_req *req)
-{
-	return tevent_req_simple_recv_ntstatus(req);
-}
-
-NTSTATUS cli_unlock64(struct cli_state *cli,
-				uint16_t fnum,
-				uint64_t offset,
-				uint64_t len)
-{
-	TALLOC_CTX *frame = talloc_stackframe();
-	struct tevent_context *ev;
-	struct tevent_req *req;
-	NTSTATUS status = NT_STATUS_OK;
-
-	if (! (smb1cli_conn_capabilities(cli->conn) & CAP_LARGE_FILES)) {
-		return cli_unlock(cli, fnum, offset, len);
-	}
-
-	if (smbXcli_conn_has_async_calls(cli->conn)) {
-		/*
-		 * Can't use sync call while an async call is in flight
-		 */
-		status = NT_STATUS_INVALID_PARAMETER;
-		goto fail;
-	}
-
-	ev = samba_tevent_context_init(frame);
-	if (ev == NULL) {
-		status = NT_STATUS_NO_MEMORY;
-		goto fail;
-	}
-
-	req = cli_unlock64_send(frame, ev, cli,
-			fnum, offset, len);
-	if (req == NULL) {
-		status = NT_STATUS_NO_MEMORY;
-		goto fail;
-	}
-
-	if (!tevent_req_poll_ntstatus(req, ev, &status)) {
-		goto fail;
-	}
-
-	status = cli_unlock64_recv(req);
 
  fail:
 	TALLOC_FREE(frame);
@@ -3244,6 +3890,7 @@ static struct tevent_req *cli_posix_lock_internal_send(TALLOC_CTX *mem_ctx,
 	subreq = cli_trans_send(state,                  /* mem ctx. */
 				ev,                     /* event ctx. */
 				cli,                    /* cli_state. */
+				0,			/* additional_flags2 */
 				SMBtrans2,              /* cmd. */
 				NULL,                   /* pipe name. */
 				-1,                     /* fid. */
@@ -3436,7 +4083,7 @@ struct tevent_req *cli_getattrE_send(TALLOC_CTX *mem_ctx,
 	state->zone_offset = smb1cli_conn_server_time_zone(cli->conn);
 	SSVAL(state->vwv+0,0,fnum);
 
-	subreq = cli_smb_send(state, ev, cli, SMBgetattrE, additional_flags,
+	subreq = cli_smb_send(state, ev, cli, SMBgetattrE, additional_flags, 0,
 			      1, state->vwv, 0, NULL);
 	if (tevent_req_nomem(subreq, req)) {
 		return tevent_req_post(req, ev);
@@ -3585,6 +4232,7 @@ struct tevent_req *cli_getatr_send(TALLOC_CTX *mem_ctx,
 	struct tevent_req *req = NULL, *subreq = NULL;
 	struct cli_getatr_state *state = NULL;
 	uint8_t additional_flags = 0;
+	uint16_t additional_flags2 = 0;
 	uint8_t *bytes = NULL;
 
 	req = tevent_req_create(mem_ctx, &state, struct cli_getatr_state);
@@ -3606,8 +4254,13 @@ struct tevent_req *cli_getatr_send(TALLOC_CTX *mem_ctx,
 		return tevent_req_post(req, ev);
 	}
 
+	if (clistr_is_previous_version_path(fname, NULL, NULL, NULL)) {
+		additional_flags2 = FLAGS2_REPARSE_PATH;
+	}
+
 	subreq = cli_smb_send(state, ev, cli, SMBgetatr, additional_flags,
-			      0, NULL, talloc_get_size(bytes), bytes);
+			additional_flags2,
+			0, NULL, talloc_get_size(bytes), bytes);
 	if (tevent_req_nomem(subreq, req)) {
 		return tevent_req_post(req, ev);
 	}
@@ -3753,7 +4406,7 @@ struct tevent_req *cli_setattrE_send(TALLOC_CTX *mem_ctx,
 	push_dos_date2((uint8_t *)&state->vwv[5], 0, write_time,
 		       smb1cli_conn_server_time_zone(cli->conn));
 
-	subreq = cli_smb_send(state, ev, cli, SMBsetattrE, additional_flags,
+	subreq = cli_smb_send(state, ev, cli, SMBsetattrE, additional_flags, 0,
 			      7, state->vwv, 0, NULL);
 	if (tevent_req_nomem(subreq, req)) {
 		return tevent_req_post(req, ev);
@@ -3859,6 +4512,7 @@ struct tevent_req *cli_setatr_send(TALLOC_CTX *mem_ctx,
 	struct tevent_req *req = NULL, *subreq = NULL;
 	struct cli_setatr_state *state = NULL;
 	uint8_t additional_flags = 0;
+	uint16_t additional_flags2 = 0;
 	uint8_t *bytes = NULL;
 
 	req = tevent_req_create(mem_ctx, &state, struct cli_setatr_state);
@@ -3892,8 +4546,13 @@ struct tevent_req *cli_setatr_send(TALLOC_CTX *mem_ctx,
 		return tevent_req_post(req, ev);
 	}
 
+	if (clistr_is_previous_version_path(fname, NULL, NULL, NULL)) {
+		additional_flags2 = FLAGS2_REPARSE_PATH;
+	}
+
 	subreq = cli_smb_send(state, ev, cli, SMBsetatr, additional_flags,
-			      8, state->vwv, talloc_get_size(bytes), bytes);
+			additional_flags2,
+			8, state->vwv, talloc_get_size(bytes), bytes);
 	if (tevent_req_nomem(subreq, req)) {
 		return tevent_req_post(req, ev);
 	}
@@ -3971,7 +4630,7 @@ NTSTATUS cli_setatr(struct cli_state *cli,
 }
 
 /****************************************************************************
- Check for existance of a dir.
+ Check for existence of a dir.
 ****************************************************************************/
 
 static void cli_chkpath_done(struct tevent_req *subreq);
@@ -3988,6 +4647,7 @@ struct tevent_req *cli_chkpath_send(TALLOC_CTX *mem_ctx,
 	struct tevent_req *req = NULL, *subreq = NULL;
 	struct cli_chkpath_state *state = NULL;
 	uint8_t additional_flags = 0;
+	uint16_t additional_flags2 = 0;
 	uint8_t *bytes = NULL;
 
 	req = tevent_req_create(mem_ctx, &state, struct cli_chkpath_state);
@@ -4007,8 +4667,13 @@ struct tevent_req *cli_chkpath_send(TALLOC_CTX *mem_ctx,
 		return tevent_req_post(req, ev);
 	}
 
+	if (clistr_is_previous_version_path(fname, NULL, NULL, NULL)) {
+		additional_flags2 = FLAGS2_REPARSE_PATH;
+	}
+
 	subreq = cli_smb_send(state, ev, cli, SMBcheckpath, additional_flags,
-			      0, NULL, talloc_get_size(bytes), bytes);
+			additional_flags2,
+			0, NULL, talloc_get_size(bytes), bytes);
 	if (tevent_req_nomem(subreq, req)) {
 		return tevent_req_post(req, ev);
 	}
@@ -4037,11 +4702,17 @@ NTSTATUS cli_chkpath_recv(struct tevent_req *req)
 
 NTSTATUS cli_chkpath(struct cli_state *cli, const char *path)
 {
-	TALLOC_CTX *frame = talloc_stackframe();
+	TALLOC_CTX *frame = NULL;
 	struct tevent_context *ev = NULL;
 	struct tevent_req *req = NULL;
 	char *path2 = NULL;
 	NTSTATUS status = NT_STATUS_OK;
+
+	if (smbXcli_conn_protocol(cli->conn) >= PROTOCOL_SMB2_02) {
+		return cli_smb2_chkpath(cli, path);
+	}
+
+	frame = talloc_stackframe();
 
 	if (smbXcli_conn_has_async_calls(cli->conn)) {
 		/*
@@ -4113,7 +4784,7 @@ struct tevent_req *cli_dskattr_send(TALLOC_CTX *mem_ctx,
 		return NULL;
 	}
 
-	subreq = cli_smb_send(state, ev, cli, SMBdskattr, additional_flags,
+	subreq = cli_smb_send(state, ev, cli, SMBdskattr, additional_flags, 0,
 			      0, NULL, 0, NULL);
 	if (tevent_req_nomem(subreq, req)) {
 		return tevent_req_post(req, ev);
@@ -4199,15 +4870,16 @@ NTSTATUS cli_dskattr(struct cli_state *cli, int *bsize, int *total, int *avail)
 	return status;
 }
 
-NTSTATUS cli_disk_size(struct cli_state *cli, uint64_t *bsize, uint64_t *total, uint64_t *avail)
+NTSTATUS cli_disk_size(struct cli_state *cli, const char *path, uint64_t *bsize,
+		       uint64_t *total, uint64_t *avail)
 {
 	uint64_t sectors_per_block;
 	uint64_t bytes_per_sector;
-	int old_bsize, old_total, old_avail;
+	int old_bsize = 0, old_total = 0, old_avail = 0;
 	NTSTATUS status;
 
 	if (smbXcli_conn_protocol(cli->conn) >= PROTOCOL_SMB2_02) {
-		return cli_smb2_dskattr(cli, bsize, total, avail);
+		return cli_smb2_dskattr(cli, path, bsize, total, avail);
 	}
 
 	/*
@@ -4290,6 +4962,7 @@ struct tevent_req *cli_ctemp_send(TALLOC_CTX *mem_ctx,
 	struct tevent_req *req = NULL, *subreq = NULL;
 	struct ctemp_state *state = NULL;
 	uint8_t additional_flags = 0;
+	uint16_t additional_flags2 = 0;
 	uint8_t *bytes = NULL;
 
 	req = tevent_req_create(mem_ctx, &state, struct ctemp_state);
@@ -4311,8 +4984,13 @@ struct tevent_req *cli_ctemp_send(TALLOC_CTX *mem_ctx,
 		return tevent_req_post(req, ev);
 	}
 
+	if (clistr_is_previous_version_path(path, NULL, NULL, NULL)) {
+		additional_flags2 = FLAGS2_REPARSE_PATH;
+	}
+
 	subreq = cli_smb_send(state, ev, cli, SMBctemp, additional_flags,
-			      3, state->vwv, talloc_get_size(bytes), bytes);
+			additional_flags2,
+			3, state->vwv, talloc_get_size(bytes), bytes);
 	if (tevent_req_nomem(subreq, req)) {
 		return tevent_req_post(req, ev);
 	}
@@ -4489,10 +5167,19 @@ static NTSTATUS cli_set_ea(struct cli_state *cli, uint16_t setup_val,
 		memcpy(p+4+ea_namelen+1, ea_val, ea_len);
 	}
 
+	/*
+	 * FIXME - if we want to do previous version path
+	 * processing on an EA set call we need to turn this
+	 * into calls to cli_trans_send()/cli_trans_recv()
+	 * with a temporary event context, as cli_trans_send()
+	 * have access to the additional_flags2 needed to
+	 * send @GMT- paths. JRA.
+	 */
+
 	status = cli_trans(talloc_tos(), cli, SMBtrans2, NULL, -1, 0, 0,
 			   setup, 1, 0,
 			   param, param_len, 2,
-			   data,  data_len, CLI_BUFFER_SIZE,
+			   data,  data_len, 0,
 			   NULL,
 			   NULL, 0, NULL, /* rsetup */
 			   NULL, 0, NULL, /* rparam */
@@ -4636,7 +5323,6 @@ static bool parse_ea_blob(TALLOC_CTX *ctx, const uint8_t *rdata,
 		return false;
 	}
 
-	ea_size = (size_t)IVAL(rdata,0);
 	p = rdata + 4;
 
 	for (num_eas = 0; num_eas < *pnum_eas; num_eas++ ) {
@@ -4841,45 +5527,27 @@ static uint32_t open_flags_to_wire(int flags)
  Open a file - POSIX semantics. Returns fnum. Doesn't request oplock.
 ****************************************************************************/
 
-struct posix_open_state {
+struct cli_posix_open_internal_state {
 	uint16_t setup;
 	uint8_t *param;
 	uint8_t data[18];
 	uint16_t fnum; /* Out */
 };
 
-static void cli_posix_open_internal_done(struct tevent_req *subreq)
-{
-	struct tevent_req *req = tevent_req_callback_data(
-				subreq, struct tevent_req);
-	struct posix_open_state *state = tevent_req_data(req, struct posix_open_state);
-	NTSTATUS status;
-	uint8_t *data;
-	uint32_t num_data;
-
-	status = cli_trans_recv(subreq, state, NULL, NULL, 0, NULL,
-				NULL, 0, NULL, &data, 12, &num_data);
-	TALLOC_FREE(subreq);
-	if (tevent_req_nterror(req, status)) {
-		return;
-	}
-	state->fnum = SVAL(data,2);
-	tevent_req_done(req);
-}
+static void cli_posix_open_internal_done(struct tevent_req *subreq);
 
 static struct tevent_req *cli_posix_open_internal_send(TALLOC_CTX *mem_ctx,
 					struct tevent_context *ev,
 					struct cli_state *cli,
 					const char *fname,
-					int flags,
-					mode_t mode,
-					bool is_dir)
+					uint32_t wire_flags,
+					mode_t mode)
 {
 	struct tevent_req *req = NULL, *subreq = NULL;
-	struct posix_open_state *state = NULL;
-	uint32_t wire_flags = open_flags_to_wire(flags);
+	struct cli_posix_open_internal_state *state = NULL;
 
-	req = tevent_req_create(mem_ctx, &state, struct posix_open_state);
+	req = tevent_req_create(
+		mem_ctx, &state, struct cli_posix_open_internal_state);
 	if (req == NULL) {
 		return NULL;
 	}
@@ -4888,23 +5556,21 @@ static struct tevent_req *cli_posix_open_internal_send(TALLOC_CTX *mem_ctx,
 	SSVAL(&state->setup, 0, TRANSACT2_SETPATHINFO);
 
 	/* Setup param array. */
-	state->param = talloc_array(state, uint8_t, 6);
+	state->param = talloc_zero_array(state, uint8_t, 6);
 	if (tevent_req_nomem(state->param, req)) {
 		return tevent_req_post(req, ev);
 	}
-	memset(state->param, '\0', 6);
 	SSVAL(state->param, 0, SMB_POSIX_PATH_OPEN);
 
-	state->param = trans2_bytes_push_str(state->param, smbXcli_conn_use_unicode(cli->conn), fname,
-				   strlen(fname)+1, NULL);
+	state->param = trans2_bytes_push_str(
+		state->param,
+		smbXcli_conn_use_unicode(cli->conn),
+		fname,
+		strlen(fname)+1,
+		NULL);
 
 	if (tevent_req_nomem(state->param, req)) {
 		return tevent_req_post(req, ev);
-	}
-
-	/* Setup data words. */
-	if (is_dir) {
-		wire_flags |= SMB_O_DIRECTORY;
 	}
 
 	SIVAL(state->data,0,0); /* No oplock. */
@@ -4916,6 +5582,7 @@ static struct tevent_req *cli_posix_open_internal_send(TALLOC_CTX *mem_ctx,
 	subreq = cli_trans_send(state,			/* mem ctx. */
 				ev,			/* event ctx. */
 				cli,			/* cli_state. */
+				0,			/* additional_flags2 */
 				SMBtrans2,		/* cmd. */
 				NULL,			/* pipe name. */
 				-1,			/* fid. */
@@ -4938,6 +5605,57 @@ static struct tevent_req *cli_posix_open_internal_send(TALLOC_CTX *mem_ctx,
 	return req;
 }
 
+static void cli_posix_open_internal_done(struct tevent_req *subreq)
+{
+	struct tevent_req *req = tevent_req_callback_data(
+		subreq, struct tevent_req);
+	struct cli_posix_open_internal_state *state = tevent_req_data(
+		req, struct cli_posix_open_internal_state);
+	NTSTATUS status;
+	uint8_t *data;
+	uint32_t num_data;
+
+	status = cli_trans_recv(
+		subreq,
+		state,
+		NULL,
+		NULL,
+		0,
+		NULL,
+		NULL,
+		0,
+		NULL,
+		&data,
+		12,
+		&num_data);
+	TALLOC_FREE(subreq);
+	if (tevent_req_nterror(req, status)) {
+		return;
+	}
+	state->fnum = SVAL(data,2);
+	tevent_req_done(req);
+}
+
+static NTSTATUS cli_posix_open_internal_recv(struct tevent_req *req,
+					     uint16_t *pfnum)
+{
+	struct cli_posix_open_internal_state *state = tevent_req_data(
+		req, struct cli_posix_open_internal_state);
+	NTSTATUS status;
+
+	if (tevent_req_is_nterror(req, &status)) {
+		return status;
+	}
+	*pfnum = state->fnum;
+	return NT_STATUS_OK;
+}
+
+struct cli_posix_open_state {
+	uint16_t fnum;
+};
+
+static void cli_posix_open_done(struct tevent_req *subreq);
+
 struct tevent_req *cli_posix_open_send(TALLOC_CTX *mem_ctx,
 					struct tevent_context *ev,
 					struct cli_state *cli,
@@ -4945,13 +5663,43 @@ struct tevent_req *cli_posix_open_send(TALLOC_CTX *mem_ctx,
 					int flags,
 					mode_t mode)
 {
-	return cli_posix_open_internal_send(mem_ctx, ev,
-				cli, fname, flags, mode, false);
+	struct tevent_req *req = NULL, *subreq = NULL;
+	struct cli_posix_open_state *state = NULL;
+	uint32_t wire_flags;
+
+	req = tevent_req_create(mem_ctx, &state,
+				struct cli_posix_open_state);
+	if (req == NULL) {
+		return NULL;
+	}
+
+	wire_flags = open_flags_to_wire(flags);
+
+	subreq = cli_posix_open_internal_send(
+		mem_ctx, ev, cli, fname, wire_flags, mode);
+	if (tevent_req_nomem(subreq, req)) {
+		return tevent_req_post(req, ev);
+	}
+	tevent_req_set_callback(subreq, cli_posix_open_done, req);
+	return req;
+}
+
+static void cli_posix_open_done(struct tevent_req *subreq)
+{
+	struct tevent_req *req = tevent_req_callback_data(
+		subreq, struct tevent_req);
+	struct cli_posix_open_state *state = tevent_req_data(
+		req, struct cli_posix_open_state);
+	NTSTATUS status;
+
+	status = cli_posix_open_internal_recv(subreq, &state->fnum);
+	tevent_req_simple_finish_ntstatus(subreq, status);
 }
 
 NTSTATUS cli_posix_open_recv(struct tevent_req *req, uint16_t *pfnum)
 {
-	struct posix_open_state *state = tevent_req_data(req, struct posix_open_state);
+	struct cli_posix_open_state *state = tevent_req_data(
+		req, struct cli_posix_open_state);
 	NTSTATUS status;
 
 	if (tevent_req_is_nterror(req, &status)) {
@@ -4972,7 +5720,7 @@ NTSTATUS cli_posix_open(struct cli_state *cli, const char *fname,
 	TALLOC_CTX *frame = talloc_stackframe();
 	struct tevent_context *ev = NULL;
 	struct tevent_req *req = NULL;
-	NTSTATUS status = NT_STATUS_OK;
+	NTSTATUS status = NT_STATUS_NO_MEMORY;
 
 	if (smbXcli_conn_has_async_calls(cli->conn)) {
 		/*
@@ -4981,34 +5729,30 @@ NTSTATUS cli_posix_open(struct cli_state *cli, const char *fname,
 		status = NT_STATUS_INVALID_PARAMETER;
 		goto fail;
 	}
-
 	ev = samba_tevent_context_init(frame);
 	if (ev == NULL) {
-		status = NT_STATUS_NO_MEMORY;
 		goto fail;
 	}
-
-	req = cli_posix_open_send(frame,
-				ev,
-				cli,
-				fname,
-				flags,
-				mode);
+	req = cli_posix_open_send(
+		frame, ev, cli, fname, flags, mode);
 	if (req == NULL) {
-		status = NT_STATUS_NO_MEMORY;
 		goto fail;
 	}
-
 	if (!tevent_req_poll_ntstatus(req, ev, &status)) {
 		goto fail;
 	}
-
 	status = cli_posix_open_recv(req, pfnum);
-
  fail:
 	TALLOC_FREE(frame);
 	return status;
 }
+
+struct cli_posix_mkdir_state {
+	struct tevent_context *ev;
+	struct cli_state *cli;
+};
+
+static void cli_posix_mkdir_done(struct tevent_req *subreq);
 
 struct tevent_req *cli_posix_mkdir_send(TALLOC_CTX *mem_ctx,
 					struct tevent_context *ev,
@@ -5016,8 +5760,42 @@ struct tevent_req *cli_posix_mkdir_send(TALLOC_CTX *mem_ctx,
 					const char *fname,
 					mode_t mode)
 {
-	return cli_posix_open_internal_send(mem_ctx, ev,
-				cli, fname, O_CREAT, mode, true);
+	struct tevent_req *req = NULL, *subreq = NULL;
+	struct cli_posix_mkdir_state *state = NULL;
+	uint32_t wire_flags;
+
+	req = tevent_req_create(
+		mem_ctx, &state, struct cli_posix_mkdir_state);
+	if (req == NULL) {
+		return NULL;
+	}
+	state->ev = ev;
+	state->cli = cli;
+
+	wire_flags = SMB_O_CREAT | SMB_O_DIRECTORY;
+
+	subreq = cli_posix_open_internal_send(
+		mem_ctx, ev, cli, fname, wire_flags, mode);
+	if (tevent_req_nomem(subreq, req)) {
+		return tevent_req_post(req, ev);
+	}
+	tevent_req_set_callback(subreq, cli_posix_mkdir_done, req);
+	return req;
+}
+
+static void cli_posix_mkdir_done(struct tevent_req *subreq)
+{
+	struct tevent_req *req = tevent_req_callback_data(
+		subreq, struct tevent_req);
+	NTSTATUS status;
+	uint16_t fnum;
+
+	status = cli_posix_open_internal_recv(subreq, &fnum);
+	TALLOC_FREE(subreq);
+	if (tevent_req_nterror(req, status)) {
+		return;
+	}
+	tevent_req_done(req);
 }
 
 NTSTATUS cli_posix_mkdir_recv(struct tevent_req *req)
@@ -5030,7 +5808,7 @@ NTSTATUS cli_posix_mkdir(struct cli_state *cli, const char *fname, mode_t mode)
 	TALLOC_CTX *frame = talloc_stackframe();
 	struct tevent_context *ev = NULL;
 	struct tevent_req *req = NULL;
-	NTSTATUS status = NT_STATUS_OK;
+	NTSTATUS status = NT_STATUS_NO_MEMORY;
 
 	if (smbXcli_conn_has_async_calls(cli->conn)) {
 		/*
@@ -5042,26 +5820,17 @@ NTSTATUS cli_posix_mkdir(struct cli_state *cli, const char *fname, mode_t mode)
 
 	ev = samba_tevent_context_init(frame);
 	if (ev == NULL) {
-		status = NT_STATUS_NO_MEMORY;
 		goto fail;
 	}
-
-	req = cli_posix_mkdir_send(frame,
-				ev,
-				cli,
-				fname,
-				mode);
+	req = cli_posix_mkdir_send(
+		frame, ev, cli,	fname, mode);
 	if (req == NULL) {
-		status = NT_STATUS_NO_MEMORY;
 		goto fail;
 	}
-
 	if (!tevent_req_poll_ntstatus(req, ev, &status)) {
 		goto fail;
 	}
-
 	status = cli_posix_mkdir_recv(req);
-
  fail:
 	TALLOC_FREE(frame);
 	return status;
@@ -5112,13 +5881,43 @@ static void cli_posix_unlink_internal_done(struct tevent_req *subreq)
 	tevent_req_simple_finish_ntstatus(subreq, status);
 }
 
+static NTSTATUS cli_posix_unlink_internal_recv(struct tevent_req *req)
+{
+	return tevent_req_simple_recv_ntstatus(req);
+}
+
+struct cli_posix_unlink_state {
+	uint8_t dummy;
+};
+
+static void cli_posix_unlink_done(struct tevent_req *subreq);
+
 struct tevent_req *cli_posix_unlink_send(TALLOC_CTX *mem_ctx,
 					struct tevent_context *ev,
 					struct cli_state *cli,
 					const char *fname)
 {
-	return cli_posix_unlink_internal_send(mem_ctx, ev, cli, fname,
-					      SMB_POSIX_UNLINK_FILE_TARGET);
+	struct tevent_req *req = NULL, *subreq = NULL;
+	struct cli_posix_unlink_state *state;
+
+	req = tevent_req_create(
+		mem_ctx, &state, struct cli_posix_unlink_state);
+	if (req == NULL) {
+		return NULL;
+	}
+	subreq = cli_posix_unlink_internal_send(
+		mem_ctx, ev, cli, fname, SMB_POSIX_UNLINK_FILE_TARGET);
+	if (tevent_req_nomem(subreq, req)) {
+		return tevent_req_post(req, ev);
+	}
+	tevent_req_set_callback(subreq, cli_posix_unlink_done, req);
+	return req;
+}
+
+static void cli_posix_unlink_done(struct tevent_req *subreq)
+{
+	NTSTATUS status = cli_posix_unlink_internal_recv(subreq);
+	tevent_req_simple_finish_ntstatus(subreq, status);
 }
 
 NTSTATUS cli_posix_unlink_recv(struct tevent_req *req)
@@ -5175,14 +5974,37 @@ NTSTATUS cli_posix_unlink(struct cli_state *cli, const char *fname)
  rmdir - POSIX semantics.
 ****************************************************************************/
 
+struct cli_posix_rmdir_state {
+	uint8_t dummy;
+};
+
+static void cli_posix_rmdir_done(struct tevent_req *subreq);
+
 struct tevent_req *cli_posix_rmdir_send(TALLOC_CTX *mem_ctx,
 					struct tevent_context *ev,
 					struct cli_state *cli,
 					const char *fname)
 {
-	return cli_posix_unlink_internal_send(
-		mem_ctx, ev, cli, fname,
-		SMB_POSIX_UNLINK_DIRECTORY_TARGET);
+	struct tevent_req *req = NULL, *subreq = NULL;
+	struct cli_posix_rmdir_state *state;
+
+	req = tevent_req_create(mem_ctx, &state, struct cli_posix_rmdir_state);
+	if (req == NULL) {
+		return NULL;
+	}
+	subreq = cli_posix_unlink_internal_send(
+		mem_ctx, ev, cli, fname, SMB_POSIX_UNLINK_DIRECTORY_TARGET);
+	if (tevent_req_nomem(subreq, req)) {
+		return tevent_req_post(req, ev);
+	}
+	tevent_req_set_callback(subreq, cli_posix_rmdir_done, req);
+	return req;
+}
+
+static void cli_posix_rmdir_done(struct tevent_req *subreq)
+{
+	NTSTATUS status = cli_posix_unlink_internal_recv(subreq);
+	tevent_req_simple_finish_ntstatus(subreq, status);
 }
 
 NTSTATUS cli_posix_rmdir_recv(struct tevent_req *req, TALLOC_CTX *mem_ctx)
@@ -5236,12 +6058,15 @@ NTSTATUS cli_posix_rmdir(struct cli_state *cli, const char *fname)
 ****************************************************************************/
 
 struct cli_notify_state {
+	struct tevent_req *subreq;
 	uint8_t setup[8];
 	uint32_t num_changes;
 	struct notify_change *changes;
 };
 
 static void cli_notify_done(struct tevent_req *subreq);
+static void cli_notify_done_smb2(struct tevent_req *subreq);
+static bool cli_notify_cancel(struct tevent_req *req);
 
 struct tevent_req *cli_notify_send(TALLOC_CTX *mem_ctx,
 				   struct tevent_context *ev,
@@ -5249,13 +6074,38 @@ struct tevent_req *cli_notify_send(TALLOC_CTX *mem_ctx,
 				   uint32_t buffer_size,
 				   uint32_t completion_filter, bool recursive)
 {
-	struct tevent_req *req, *subreq;
+	struct tevent_req *req;
 	struct cli_notify_state *state;
 	unsigned old_timeout;
 
 	req = tevent_req_create(mem_ctx, &state, struct cli_notify_state);
 	if (req == NULL) {
 		return NULL;
+	}
+
+	if (smbXcli_conn_protocol(cli->conn) >= PROTOCOL_SMB2_02) {
+		/*
+		 * Notifies should not time out
+		 */
+		old_timeout = cli_set_timeout(cli, 0);
+
+		state->subreq = cli_smb2_notify_send(
+			state,
+			ev,
+			cli,
+			fnum,
+			buffer_size,
+			completion_filter,
+			recursive);
+
+		cli_set_timeout(cli, old_timeout);
+
+		if (tevent_req_nomem(state->subreq, req)) {
+			return tevent_req_post(req, ev);
+		}
+		tevent_req_set_callback(
+			state->subreq, cli_notify_done_smb2, req);
+		goto done;
 	}
 
 	SIVAL(state->setup, 0, completion_filter);
@@ -5267,10 +6117,11 @@ struct tevent_req *cli_notify_send(TALLOC_CTX *mem_ctx,
 	 */
 	old_timeout = cli_set_timeout(cli, 0);
 
-	subreq = cli_trans_send(
+	state->subreq = cli_trans_send(
 		state,			/* mem ctx. */
 		ev,			/* event ctx. */
 		cli,			/* cli_state. */
+		0,			/* additional_flags2 */
 		SMBnttrans,		/* cmd. */
 		NULL,			/* pipe name. */
 		-1,			/* fid. */
@@ -5288,11 +6139,23 @@ struct tevent_req *cli_notify_send(TALLOC_CTX *mem_ctx,
 
 	cli_set_timeout(cli, old_timeout);
 
-	if (tevent_req_nomem(subreq, req)) {
+	if (tevent_req_nomem(state->subreq, req)) {
 		return tevent_req_post(req, ev);
 	}
-	tevent_req_set_callback(subreq, cli_notify_done, req);
+	tevent_req_set_callback(state->subreq, cli_notify_done, req);
+done:
+	tevent_req_set_cancel_fn(req, cli_notify_cancel);
 	return req;
+}
+
+static bool cli_notify_cancel(struct tevent_req *req)
+{
+	struct cli_notify_state *state = tevent_req_data(
+		req, struct cli_notify_state);
+	bool ok;
+
+	ok = tevent_req_cancel(state->subreq);
+	return ok;
 }
 
 static void cli_notify_done(struct tevent_req *subreq)
@@ -5309,6 +6172,7 @@ static void cli_notify_done(struct tevent_req *subreq)
 	status = cli_trans_recv(subreq, talloc_tos(), &flags2, NULL, 0, NULL,
 				&params, 0, &num_params, NULL, 0, NULL);
 	TALLOC_FREE(subreq);
+	state->subreq = NULL;
 	if (tevent_req_nterror(req, status)) {
 		DEBUG(10, ("cli_trans_recv returned %s\n", nt_errstr(status)));
 		return;
@@ -5366,6 +6230,26 @@ static void cli_notify_done(struct tevent_req *subreq)
 	tevent_req_done(req);
 }
 
+static void cli_notify_done_smb2(struct tevent_req *subreq)
+{
+	struct tevent_req *req = tevent_req_callback_data(
+		subreq, struct tevent_req);
+	struct cli_notify_state *state = tevent_req_data(
+		req, struct cli_notify_state);
+	NTSTATUS status;
+
+	status = cli_smb2_notify_recv(
+		subreq,
+		state,
+		&state->changes,
+		&state->num_changes);
+	TALLOC_FREE(subreq);
+	if (tevent_req_nterror(req, status)) {
+		return;
+	}
+	tevent_req_done(req);
+}
+
 NTSTATUS cli_notify_recv(struct tevent_req *req, TALLOC_CTX *mem_ctx,
 			 uint32_t *pnum_changes,
 			 struct notify_change **pchanges)
@@ -5388,10 +6272,12 @@ NTSTATUS cli_notify(struct cli_state *cli, uint16_t fnum, uint32_t buffer_size,
 		    TALLOC_CTX *mem_ctx, uint32_t *pnum_changes,
 		    struct notify_change **pchanges)
 {
-	TALLOC_CTX *frame = talloc_stackframe();
+	TALLOC_CTX *frame;
 	struct tevent_context *ev;
 	struct tevent_req *req;
 	NTSTATUS status = NT_STATUS_NO_MEMORY;
+
+	frame = talloc_stackframe();
 
 	if (smbXcli_conn_has_async_calls(cli->conn)) {
 		/*
@@ -5437,6 +6323,7 @@ struct tevent_req *cli_qpathinfo_send(TALLOC_CTX *mem_ctx,
 {
 	struct tevent_req *req, *subreq;
 	struct cli_qpathinfo_state *state;
+	uint16_t additional_flags2 = 0;
 
 	req = tevent_req_create(mem_ctx, &state, struct cli_qpathinfo_state);
 	if (req == NULL) {
@@ -5456,10 +6343,16 @@ struct tevent_req *cli_qpathinfo_send(TALLOC_CTX *mem_ctx,
 		return tevent_req_post(req, ev);
 	}
 
+	if (clistr_is_previous_version_path(fname, NULL, NULL, NULL) &&
+			!INFO_LEVEL_IS_UNIX(level)) {
+		additional_flags2 = FLAGS2_REPARSE_PATH;
+	}
+
 	subreq = cli_trans_send(
 		state,			/* mem ctx. */
 		ev,			/* event ctx. */
 		cli,			/* cli_state. */
+		additional_flags2,	/* additional_flags2 */
 		SMBtrans2,		/* cmd. */
 		NULL,			/* pipe name. */
 		-1,			/* fid. */
@@ -5590,6 +6483,7 @@ struct tevent_req *cli_qfileinfo_send(TALLOC_CTX *mem_ctx,
 		state,			/* mem ctx. */
 		ev,			/* event ctx. */
 		cli,			/* cli_state. */
+		0,			/* additional_flags2 */
 		SMBtrans2,		/* cmd. */
 		NULL,			/* pipe name. */
 		-1,			/* fid. */
@@ -5713,7 +6607,7 @@ struct tevent_req *cli_flush_send(TALLOC_CTX *mem_ctx,
 	}
 	SSVAL(state->vwv + 0, 0, fnum);
 
-	subreq = cli_smb_send(state, ev, cli, SMBflush, 0, 1, state->vwv,
+	subreq = cli_smb_send(state, ev, cli, SMBflush, 0, 0, 1, state->vwv,
 			      0, NULL);
 	if (tevent_req_nomem(subreq, req)) {
 		return tevent_req_post(req, ev);
@@ -5805,8 +6699,9 @@ struct tevent_req *cli_shadow_copy_data_send(TALLOC_CTX *mem_ctx,
 	SCVAL(state->setup + 3, 1, 0); /* compfilter, isFlags (WSSP) */
 
 	subreq = cli_trans_send(
-		state, ev, cli, SMBnttrans, NULL, 0, NT_TRANSACT_IOCTL, 0,
-		state->setup, ARRAY_SIZE(state->setup), 0,
+		state, ev, cli, 0, SMBnttrans, NULL, 0, NT_TRANSACT_IOCTL, 0,
+		state->setup, ARRAY_SIZE(state->setup),
+		ARRAY_SIZE(state->setup),
 		NULL, 0, 0,
 		NULL, 0, ret_size);
 	if (tevent_req_nomem(subreq, req)) {
@@ -5840,29 +6735,49 @@ NTSTATUS cli_shadow_copy_data_recv(struct tevent_req *req, TALLOC_CTX *mem_ctx,
 {
 	struct cli_shadow_copy_data_state *state = tevent_req_data(
 		req, struct cli_shadow_copy_data_state);
-	char **names;
-	int i, num_names;
+	char **names = NULL;
+	uint32_t i, num_names;
 	uint32_t dlength;
+	uint8_t *endp = NULL;
 	NTSTATUS status;
 
 	if (tevent_req_is_nterror(req, &status)) {
 		return status;
 	}
+
+	if (state->num_data < 16) {
+		return NT_STATUS_INVALID_NETWORK_RESPONSE;
+	}
+
 	num_names = IVAL(state->data, 4);
 	dlength = IVAL(state->data, 8);
 
+	if (num_names > 0x7FFFFFFF) {
+		return NT_STATUS_INVALID_NETWORK_RESPONSE;
+	}
+
 	if (!state->get_names) {
-		*pnum_names = num_names;
+		*pnum_names = (int)num_names;
 		return NT_STATUS_OK;
 	}
 
-	if (dlength+12 > state->num_data) {
+	if (dlength + 12 < 12) {
 		return NT_STATUS_INVALID_NETWORK_RESPONSE;
 	}
+	if (dlength + 12 > state->num_data) {
+		return NT_STATUS_INVALID_NETWORK_RESPONSE;
+	}
+	if (state->num_data + (2 * sizeof(SHADOW_COPY_LABEL)) <
+			state->num_data) {
+		return NT_STATUS_INVALID_NETWORK_RESPONSE;
+	}
+
 	names = talloc_array(mem_ctx, char *, num_names);
 	if (names == NULL) {
 		return NT_STATUS_NO_MEMORY;
 	}
+
+	endp = state->data + state->num_data;
 
 	for (i=0; i<num_names; i++) {
 		bool ret;
@@ -5870,6 +6785,11 @@ NTSTATUS cli_shadow_copy_data_recv(struct tevent_req *req, TALLOC_CTX *mem_ctx,
 		size_t converted_size;
 
 		src = state->data + 12 + i * 2 * sizeof(SHADOW_COPY_LABEL);
+
+		if (src + (2 * sizeof(SHADOW_COPY_LABEL)) > endp) {
+			return NT_STATUS_INVALID_NETWORK_RESPONSE;
+		}
+
 		ret = convert_string_talloc(
 			names, CH_UTF16LE, CH_UNIX,
 			src, 2 * sizeof(SHADOW_COPY_LABEL),
@@ -5879,7 +6799,7 @@ NTSTATUS cli_shadow_copy_data_recv(struct tevent_req *req, TALLOC_CTX *mem_ctx,
 			return NT_STATUS_INVALID_NETWORK_RESPONSE;
 		}
 	}
-	*pnum_names = num_names;
+	*pnum_names = (int)num_names;
 	*pnames = names;
 	return NT_STATUS_OK;
 }
@@ -5888,10 +6808,21 @@ NTSTATUS cli_shadow_copy_data(TALLOC_CTX *mem_ctx, struct cli_state *cli,
 			      uint16_t fnum, bool get_names,
 			      char ***pnames, int *pnum_names)
 {
-	TALLOC_CTX *frame = talloc_stackframe();
+	TALLOC_CTX *frame = NULL;
 	struct tevent_context *ev;
 	struct tevent_req *req;
 	NTSTATUS status = NT_STATUS_NO_MEMORY;
+
+        if (smbXcli_conn_protocol(cli->conn) >= PROTOCOL_SMB2_02) {
+		return cli_smb2_shadow_copy_data(mem_ctx,
+					cli,
+					fnum,
+					get_names,
+					pnames,
+					pnum_names);
+	}
+
+	frame = talloc_stackframe();
 
 	if (smbXcli_conn_has_async_calls(cli->conn)) {
 		/*

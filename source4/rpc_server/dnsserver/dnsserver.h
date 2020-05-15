@@ -164,6 +164,8 @@ struct dnsserver_zone {
 	const char *name;
 	struct ldb_dn *zone_dn;
 	struct dnsserver_zoneinfo *zoneinfo;
+	struct dnsp_DnsProperty *tmp_props;
+	int32_t num_props;
 };
 
 
@@ -186,14 +188,15 @@ struct DNS_ADDR_ARRAY *dns_addr_array_copy(TALLOC_CTX *mem_ctx, struct DNS_ADDR_
 int dns_split_name_components(TALLOC_CTX *mem_ctx, const char *name, char ***components);
 char *dns_split_node_name(TALLOC_CTX *mem_ctx, const char *node_name, const char *zone_name);
 
-int dns_name_compare(const struct ldb_message **m1, const struct ldb_message **m2,
-			char *search_name);
-bool dns_name_equal(const char *name1, const char *name2);
+int dns_name_compare(struct ldb_message * const *m1, struct ldb_message * const *m2,
+		     const char *search_name);
 bool dns_record_match(struct dnsp_DnssrvRpcRecord *rec1, struct dnsp_DnssrvRpcRecord *rec2);
 
 void dnsp_to_dns_copy(TALLOC_CTX *mem_ctx, struct dnsp_DnssrvRpcRecord *dnsp,
 			struct DNS_RPC_RECORD *dns);
-struct dnsp_DnssrvRpcRecord *dns_to_dnsp_copy(TALLOC_CTX *mem_ctx, struct DNS_RPC_RECORD *dns);
+WERROR dns_to_dnsp_convert(TALLOC_CTX *mem_ctx, struct DNS_RPC_RECORD *dns,
+			   struct dnsp_DnssrvRpcRecord **out_dnsp,
+			   bool check_name);
 
 struct dns_tree *dns_build_tree(TALLOC_CTX *mem_ctx, const char *name, struct ldb_result *res);
 WERROR dns_fill_records_array(TALLOC_CTX *mem_ctx, struct dnsserver_zone *z,
@@ -211,8 +214,6 @@ struct dnsserver_serverinfo *dnsserver_init_serverinfo(TALLOC_CTX *mem_ctx,
 					struct ldb_context *samdb);
 struct dnsserver_zoneinfo *dnsserver_init_zoneinfo(struct dnsserver_zone *zone,
 					struct dnsserver_serverinfo *serverinfo);
-struct dnsserver_partition *dnsserver_find_partition(struct dnsserver_partition *partitions,
-					const char *dp_fqdn);
 struct dnsserver_zone *dnsserver_find_zone(struct dnsserver_zone *zones,
 					const char *zone_name);
 struct ldb_dn *dnsserver_name_to_dn(TALLOC_CTX *mem_ctx, struct dnsserver_zone *z,
@@ -245,11 +246,14 @@ WERROR dnsserver_db_update_record(TALLOC_CTX *mem_ctx,
 					const char *node_name,
 					struct DNS_RPC_RECORD *add_record,
 					struct DNS_RPC_RECORD *del_record);
-WERROR dnsserver_db_delete_record(TALLOC_CTX *mem_ctx,
-					struct ldb_context *samdb,
+WERROR dnsserver_db_do_reset_dword(struct ldb_context *samdb,
 					struct dnsserver_zone *z,
-					const char *node_name,
-					struct DNS_RPC_RECORD *del_record);
+					struct DNS_RPC_NAME_AND_PARAM *n_p);
+WERROR dnsserver_db_delete_record(TALLOC_CTX *mem_ctx,
+				  struct ldb_context *samdb,
+				  struct dnsserver_zone *z,
+				  const char *node_name,
+				  struct DNS_RPC_RECORD *del_record);
 WERROR dnsserver_db_create_zone(struct ldb_context *samdb,
 				struct dnsserver_partition *partitions,
 				struct dnsserver_zone *z,

@@ -177,8 +177,7 @@ int dsdb_module_search_tree(struct ldb_module *module,
 	if (dsdb_flags & DSDB_SEARCH_ONE_ONLY) {
 		if (res->count == 0) {
 			talloc_free(tmp_ctx);
-			ldb_reset_err_string(ldb_module_get_ctx(module));
-			return LDB_ERR_NO_SUCH_OBJECT;
+			return ldb_error(ldb_module_get_ctx(module), LDB_ERR_NO_SUCH_OBJECT, __func__);
 		}
 		if (res->count != 1) {
 			talloc_free(tmp_ctx);
@@ -279,7 +278,7 @@ int dsdb_module_dn_by_guid(struct ldb_module *module, TALLOC_CTX *mem_ctx,
 	}
 	if (res->count == 0) {
 		talloc_free(tmp_ctx);
-		return LDB_ERR_NO_SUCH_OBJECT;
+		return ldb_error(ldb_module_get_ctx(module), LDB_ERR_NO_SUCH_OBJECT, __func__);
 	}
 	if (res->count != 1) {
 		ldb_asprintf_errstring(ldb_module_get_ctx(module), "More than one object found matching objectGUID %s\n",
@@ -682,6 +681,53 @@ int dsdb_check_single_valued_link(const struct dsdb_attribute *attr,
 	return LDB_SUCCESS;
 }
 
+
+int dsdb_check_samba_compatible_feature(struct ldb_module *module,
+					const char *feature,
+					bool *found)
+{
+	struct ldb_context *ldb = ldb_module_get_ctx(module);
+	struct ldb_result *res;
+	static const char *samba_dsdb_attrs[] = {
+		SAMBA_COMPATIBLE_FEATURES_ATTR,
+		NULL
+	};
+	int ret;
+	struct ldb_dn *samba_dsdb_dn = NULL;
+	TALLOC_CTX *tmp_ctx = talloc_new(ldb);
+	if (tmp_ctx == NULL) {
+		*found = false;
+		return ldb_oom(ldb);
+	}
+	*found = false;
+
+	samba_dsdb_dn = ldb_dn_new(tmp_ctx, ldb, "@SAMBA_DSDB");
+	if (samba_dsdb_dn == NULL) {
+		TALLOC_FREE(tmp_ctx);
+		return ldb_oom(ldb);
+	}
+
+	ret = dsdb_module_search_dn(module,
+				    tmp_ctx,
+				    &res,
+				    samba_dsdb_dn,
+				    samba_dsdb_attrs,
+				    DSDB_FLAG_NEXT_MODULE,
+				    NULL);
+	if (ret == LDB_SUCCESS) {
+		*found = ldb_msg_check_string_attribute(
+			res->msgs[0],
+			SAMBA_COMPATIBLE_FEATURES_ATTR,
+			feature);
+	} else if (ret == LDB_ERR_NO_SUCH_OBJECT) {
+		/* it is not an error not to find it */
+		ret = LDB_SUCCESS;
+	}
+	TALLOC_FREE(tmp_ctx);
+	return ret;
+}
+
+
 /*
   check if an optional feature is enabled on our own NTDS DN
 
@@ -689,7 +735,7 @@ int dsdb_check_single_valued_link(const struct dsdb_attribute *attr,
   place. For example, the recyclebin feature is marked as enabled both
   on the CN=Partitions,CN=Configurration object and on the NTDS DN of
   each DC in the forest. It seems likely that it is the job of the KCC
-  to propogate between the two
+  to propagate between the two
  */
 int dsdb_check_optional_feature(struct ldb_module *module, struct GUID op_feature_guid, bool *feature_enabled)
 {
@@ -720,7 +766,7 @@ int dsdb_check_optional_feature(struct ldb_module *module, struct GUID op_featur
 				"Could not find the feature object - dn: %s\n",
 				ldb_dn_get_linearized(feature_dn));
 		talloc_free(tmp_ctx);
-		return LDB_ERR_OPERATIONS_ERROR;
+		return LDB_ERR_NO_SUCH_OBJECT;
 	}
 	if (res->msgs[0]->num_elements > 0) {
 		const char *attrs2[] = {"msDS-OptionalFeatureGUID", NULL};
@@ -833,8 +879,29 @@ int dsdb_next_callback(struct ldb_request *req, struct ldb_reply *ares)
 {
 	struct ldb_request *up_req = talloc_get_type(req->context, struct ldb_request);
 
-	talloc_steal(up_req, req);
-	return up_req->callback(up_req, ares);
+	if (!ares) {
+		return ldb_module_done(up_req, NULL, NULL,
+				       LDB_ERR_OPERATIONS_ERROR);
+	}
+
+	if (ares->error != LDB_SUCCESS || ares->type == LDB_REPLY_DONE) {
+		return ldb_module_done(up_req, ares->controls,
+				       ares->response, ares->error);
+	}
+
+	/* Otherwise pass on the callback */
+	switch (ares->type) {
+	case LDB_REPLY_ENTRY:
+		return ldb_module_send_entry(up_req, ares->message,
+					     ares->controls);
+
+	case LDB_REPLY_REFERRAL:
+		return ldb_module_send_referral(up_req,
+						ares->referral);
+	default:
+		/* Can't happen */
+		return LDB_ERR_OPERATIONS_ERROR;
+	}
 }
 
 /*
@@ -1030,7 +1097,9 @@ bool dsdb_module_am_system(struct ldb_module *module)
 {
 	struct ldb_context *ldb = ldb_module_get_ctx(module);
 	struct auth_session_info *session_info
-		= talloc_get_type(ldb_get_opaque(ldb, "sessionInfo"), struct auth_session_info);
+		= talloc_get_type(
+			ldb_get_opaque(ldb, DSDB_SESSION_INFO),
+			struct auth_session_info);
 	return security_session_user_level(session_info, NULL) == SECURITY_SYSTEM;
 }
 
@@ -1038,7 +1107,9 @@ bool dsdb_module_am_administrator(struct ldb_module *module)
 {
 	struct ldb_context *ldb = ldb_module_get_ctx(module);
 	struct auth_session_info *session_info
-		= talloc_get_type(ldb_get_opaque(ldb, "sessionInfo"), struct auth_session_info);
+		= talloc_get_type(
+			ldb_get_opaque(ldb, DSDB_SESSION_INFO),
+			struct auth_session_info);
 	return security_session_user_level(session_info, NULL) == SECURITY_ADMINISTRATOR;
 }
 
@@ -1056,7 +1127,7 @@ int dsdb_recyclebin_enabled(struct ldb_module *module, bool *enabled)
 	ret = dsdb_check_optional_feature(module, recyclebin_guid, enabled);
 	if (ret != LDB_SUCCESS) {
 		ldb_asprintf_errstring(ldb, "Could not verify if Recycle Bin is enabled \n");
-		return LDB_ERR_UNWILLING_TO_PERFORM;
+		return ret;
 	}
 
 	return LDB_SUCCESS;
@@ -1468,7 +1539,7 @@ int dsdb_fix_dn_rdncase(struct ldb_context *ldb, struct ldb_dn *dn)
  * @return LDB_SUCCESS or error including out of memory error
  */
 int dsdb_make_object_category(struct ldb_context *ldb, const struct dsdb_schema *schema,
-			      struct ldb_message *obj,
+			      const struct ldb_message *obj,
 			      TALLOC_CTX *mem_ctx, const char **pobjectcategory)
 {
 	const struct dsdb_class			*objectclass;

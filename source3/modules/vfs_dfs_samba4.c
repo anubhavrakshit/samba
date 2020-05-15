@@ -76,7 +76,9 @@ static int dfs_samba4_connect(struct vfs_handle_struct *handle,
 	data->sam_ctx = samdb_connect(data,
 				      data->ev,
 				      data->lp_ctx,
-				      system_session(data->lp_ctx), 0);
+				      system_session(data->lp_ctx),
+				      NULL,
+				      0);
 	if (!data->sam_ctx) {
 		DEBUG(0, ("samdb_connect failed\n"));
 		SMB_VFS_NEXT_DISCONNECT(handle);
@@ -95,8 +97,11 @@ static int dfs_samba4_connect(struct vfs_handle_struct *handle,
 
 static void dfs_samba4_disconnect(struct vfs_handle_struct *handle)
 {
+	const struct loadparm_substitution *lp_sub =
+		loadparm_s3_global_substitution();
+
 	DEBUG(10,("dfs_samba4_disconnect() connect to service[%s].\n",
-		  lp_servicename(talloc_tos(), SNUM(handle->conn))));
+		  lp_servicename(talloc_tos(), lp_sub, SNUM(handle->conn))));
 
 	SMB_VFS_NEXT_DISCONNECT(handle);
 }
@@ -135,8 +140,8 @@ static struct vfs_fn_pointers vfs_dfs_samba4_fns = {
 	.get_dfs_referrals_fn = dfs_samba4_get_referrals,
 };
 
-NTSTATUS vfs_dfs_samba4_init(void);
-NTSTATUS vfs_dfs_samba4_init(void)
+static_decl_vfs;
+NTSTATUS vfs_dfs_samba4_init(TALLOC_CTX *ctx)
 {
 	NTSTATUS ret;
 

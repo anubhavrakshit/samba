@@ -88,7 +88,7 @@ static NTSTATUS fetchfile_read(struct composite_context *c,
 static void fetchfile_state_handler(struct composite_context *c)
 {
 	struct fetchfile_state *state;
-	NTSTATUS status = NT_STATUS_UNSUCCESSFUL;
+	NTSTATUS status;
 	
 	state = talloc_get_type(c->private_data, struct fetchfile_state);
 
@@ -100,6 +100,9 @@ static void fetchfile_state_handler(struct composite_context *c)
 		break;
 	case FETCHFILE_READ:
 		status = fetchfile_read(c, state->io);
+		break;
+	default:
+		status = NT_STATUS_UNSUCCESSFUL;
 		break;
 	}
 
@@ -131,7 +134,7 @@ struct composite_context *smb_composite_fetchfile_send(struct smb_composite_fetc
 	state = talloc(c, struct fetchfile_state);
 	if (state == NULL) goto failed;
 
-	state->connect = talloc(state, struct smb_composite_connect);
+	state->connect = talloc_zero(state, struct smb_composite_connect);
 	if (state->connect == NULL) goto failed;
 
 	state->io = io;

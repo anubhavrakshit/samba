@@ -139,18 +139,18 @@ static int writefile(int f, const void *_b, int n, bool translation)
   read from a file with LF->CR/LF translation if appropriate. return the 
   number read. read approx n bytes.
 ****************************************************************************/
-static int readfile(void *_b, int n, XFILE *f, bool translation)
+static int readfile(void *_b, int n, FILE *f, bool translation)
 {
 	uint8_t *b = (uint8_t *)_b;
 	int i;
 	int c;
 
 	if (!translation)
-		return x_fread(b,1,n,f);
+		return fread(b,1,n,f);
   
 	i = 0;
 	while (i < (n - 1)) {
-		if ((c = x_getc(f)) == EOF) {
+		if ((c = getc(f)) == EOF) {
 			break;
 		}
       
@@ -174,7 +174,11 @@ static void send_message(struct smbcli_state *cli, const char *desthost)
 	int total_len = 0;
 	int grp_id;
 
-	if (!smbcli_message_start(cli->tree, desthost, cli_credentials_get_username(cmdline_credentials), &grp_id)) {
+	if (!smbcli_message_start(cli->tree,
+			desthost,
+			cli_credentials_get_username(
+				popt_get_cmdline_credentials()),
+			&grp_id)) {
 		d_printf("message start: %s\n", smbcli_errstr(cli->tree));
 		return;
 	}
@@ -302,25 +306,17 @@ static int cmd_cd(struct smbclient_context *ctx, const char **args)
 static bool mask_match(struct smbcli_state *c, const char *string, 
 		const char *pattern, bool is_case_sensitive)
 {
-	char *p2, *s2;
-	bool ret;
+	int ret;
 
 	if (ISDOTDOT(string))
 		string = ".";
 	if (ISDOT(pattern))
 		return false;
-	
-	if (is_case_sensitive)
-		return ms_fnmatch_protocol(pattern, string, 
-				  c->transport->negotiate.protocol) == 0;
 
-	p2 = strlower_talloc(NULL, pattern);
-	s2 = strlower_talloc(NULL, string);
-	ret = ms_fnmatch_protocol(p2, s2, c->transport->negotiate.protocol) == 0;
-	talloc_free(p2);
-	talloc_free(s2);
-
-	return ret;
+	ret = ms_fnmatch_protocol(pattern, string,
+				  c->transport->negotiate.protocol,
+				  is_case_sensitive);
+	return (ret == 0);
 }
 
 
@@ -874,6 +870,7 @@ static void do_mget(struct smbclient_context *ctx, struct clilist_file_info *fin
 	char *mget_mask;
 	char *saved_curdir;
 	char *l_fname;
+	int ret;
 
 	if (ISDOT(finfo->name) || ISDOTDOT(finfo->name))
 		return;
@@ -922,7 +919,11 @@ static void do_mget(struct smbclient_context *ctx, struct clilist_file_info *fin
 	mget_mask = talloc_asprintf(ctx, "%s*", ctx->remote_cur_dir);
 	
 	do_list(ctx, mget_mask, FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_DIRECTORY,do_mget,false, true);
-	chdir("..");
+	ret = chdir("..");
+	if (ret == -1) {
+		d_printf("failed to chdir to '..': %s\n", strerror(errno));
+		return;
+	}
 	talloc_free(ctx->remote_cur_dir);
 
 	ctx->remote_cur_dir = saved_curdir;
@@ -965,7 +966,11 @@ static int cmd_more(struct smbclient_context *ctx, const char **args)
 	pager=getenv("PAGER");
 
 	pager_cmd = talloc_asprintf(ctx, "%s %s",(pager? pager:DEFAULT_PAGER), lname);
-	system(pager_cmd);
+	rc = system(pager_cmd);
+	if (rc == -1) {
+		d_printf("failed to call pager command\n");
+		return 1;
+	}
 	unlink(lname);
 	
 	return rc;
@@ -1108,7 +1113,7 @@ static int cmd_altname(struct smbclient_context *ctx, const char **args)
 static int do_put(struct smbclient_context *ctx, char *rname, char *lname, bool reput)
 {
 	int fnum;
-	XFILE *f;
+	FILE *f;
 	size_t start = 0;
 	off_t nread = 0;
 	uint8_t *buf = NULL;
@@ -1143,14 +1148,14 @@ static int do_put(struct smbclient_context *ctx, char *rname, char *lname, bool 
 	   Note that in this case this function will exit(0) rather
 	   than returning. */
 	if (!strcmp(lname, "-")) {
-		f = x_stdin;
+		f = stdin;
 		/* size of file is not known */
 	} else {
-		f = x_fopen(lname,O_RDONLY, 0);
+		f = fopen(lname, "r");
 		if (f && reput) {
-			if (x_tseek(f, start, SEEK_SET) == -1) {
+			if (fseek(f, start, SEEK_SET) == -1) {
 				d_printf("Error seeking local file\n");
-				x_fclose(f);
+				fclose(f);
 				return 1;
 			}
 		}
@@ -1168,15 +1173,15 @@ static int do_put(struct smbclient_context *ctx, char *rname, char *lname, bool 
 	buf = (uint8_t *)malloc(maxwrite);
 	if (!buf) {
 		d_printf("ERROR: Not enough memory!\n");
-		x_fclose(f);
+		fclose(f);
 		return 1;
 	}
-	while (!x_feof(f)) {
+	while (!feof(f)) {
 		int n = maxwrite;
 		int ret;
 
 		if ((n = readfile(buf,n,f,ctx->translation)) < 1) {
-			if((n == 0) && x_feof(f))
+			if((n == 0) && feof(f))
 				break; /* Empty local file. */
 
 			d_printf("Error reading local file: %s\n", strerror(errno));
@@ -1197,14 +1202,14 @@ static int do_put(struct smbclient_context *ctx, char *rname, char *lname, bool 
 
 	if (NT_STATUS_IS_ERR(smbcli_close(ctx->cli->tree, fnum))) {
 		d_printf("%s closing remote file %s\n",smbcli_errstr(ctx->cli->tree),rname);
-		x_fclose(f);
+		fclose(f);
 		SAFE_FREE(buf);
 		return 1;
 	}
 
 	
-	if (f != x_stdin) {
-		x_fclose(f);
+	if (f != stdin) {
+		fclose(f);
 	}
 
 	SAFE_FREE(buf);
@@ -1225,7 +1230,7 @@ static int do_put(struct smbclient_context *ctx, char *rname, char *lname, bool 
 			 put_total_size / (1.024*put_total_time_ms)));
 	}
 
-	if (f == x_stdin) {
+	if (f == stdin) {
 		talloc_free(ctx);
 		exit(0);
 	}
@@ -1525,15 +1530,26 @@ static int cmd_print(struct smbclient_context *ctx, const char **args)
 	}
 
 	lname = talloc_strdup(ctx, args[1]);
-
-	rname = talloc_strdup(ctx, lname);
-	p = strrchr_m(rname,'/');
-	if (p) {
-		slprintf(rname, sizeof(rname)-1, "%s-%d", p+1, (int)getpid());
+	if (lname == NULL) {
+		d_printf("Out of memory in cmd_print\n");
+		return 1;
 	}
 
-	if (strequal(lname,"-")) {
-		slprintf(rname, sizeof(rname)-1, "stdin-%d", (int)getpid());
+	if (strequal(lname, "-")) {
+		rname = talloc_asprintf(ctx, "stdin-%d", (int)getpid());
+	} else {
+		p = strrchr_m(lname, '/');
+		if (p) {
+			rname = talloc_asprintf(ctx, "%s-%d", p + 1,
+						(int)getpid());
+		} else {
+			rname = talloc_strdup(ctx, lname);
+		}
+	}
+
+	if (rname == NULL) {
+		d_printf("Out of memory in cmd_print (stdin)\n");
+		return 1;
 	}
 
 	return do_put(ctx, rname, lname, false);
@@ -2540,8 +2556,17 @@ static int cmd_lcd(struct smbclient_context *ctx, const char **args)
 {
 	char d[PATH_MAX];
 	
-	if (args[1]) 
-		chdir(args[1]);
+	if (args[1]) {
+		int ret;
+
+		ret = chdir(args[1]);
+		if (ret == -1) {
+			d_printf("failed to chdir to dir '%s': %s\n",
+				 args[1], strerror(errno));
+			return 1;
+		}
+	}
+
 	DEBUG(2,("the local directory is now %s\n",getcwd(d, PATH_MAX)));
 
 	return 0;
@@ -2681,7 +2706,7 @@ static bool browse_host(struct loadparm_context *lp_ctx,
 
 	status = dcerpc_pipe_connect(mem_ctx, &p, binding, 
 					 &ndr_table_srvsvc,
-				     cmdline_credentials, ev_ctx,
+				     popt_get_cmdline_credentials(), ev_ctx,
 				     lp_ctx);
 	if (!NT_STATUS_IS_OK(status)) {
 		d_printf("Failed to connect to %s - %s\n", 
@@ -2824,10 +2849,10 @@ static struct
   ******************************************************************/
 static int process_tok(const char *tok)
 {
-	int i = 0, matches = 0;
-	int cmd=0;
-	int tok_len = strlen(tok);
-	
+	size_t i = 0, matches = 0;
+	size_t cmd=0;
+	size_t tok_len = strlen(tok);
+
 	while (commands[i].fn != NULL) {
 		if (strequal(commands[i].name,tok)) {
 			matches = 1;
@@ -3028,7 +3053,7 @@ static char **completion_fn(const char *text, int start, int end)
 			return NULL;
 	} else {
 		char **matches;
-		int i, len, samelen = 0, count=1;
+		size_t i, len, samelen = 0, count=1;
 
 		matches = malloc_array_p(char *, MAX_COMPLETIONS);
 		if (!matches) return NULL;
@@ -3067,10 +3092,8 @@ static char **completion_fn(const char *text, int start, int end)
 		return matches;
 
 cleanup:
-		count--;
-		while (count >= 0) {
-			free(matches[count]);
-			count--;
+		for (i = 0; i < count; i++) {
+			free(matches[i]);
 		}
 		free(matches);
 		return NULL;
@@ -3138,8 +3161,12 @@ static int process_stdin(struct smbclient_context *ctx)
 
 		/* special case - first char is ! */
 		if (*cline == '!') {
-			system(cline + 1);
+			int ret;
+			ret = system(cline + 1);
 			free(cline);
+			if (ret == -1) {
+				rc |= ret;
+			}
 			continue;
 		}
 
@@ -3298,19 +3325,81 @@ static int do_message_op(const char *netbios_name, const char *desthost,
 	struct poptOption long_options[] = {
 		POPT_AUTOHELP
 
-		{ "message", 'M', POPT_ARG_STRING, NULL, 'M', "Send message", "HOST" },
-		{ "ip-address", 'I', POPT_ARG_STRING, NULL, 'I', "Use this IP to connect to", "IP" },
-		{ "stderr", 'E', POPT_ARG_NONE, NULL, 'E', "Write messages to stderr instead of stdout" },
-		{ "list", 'L', POPT_ARG_STRING, NULL, 'L', "Get a list of shares available on a host", "HOST" },
-		{ "directory", 'D', POPT_ARG_STRING, NULL, 'D', "Start from directory", "DIR" },
-		{ "command", 'c', POPT_ARG_STRING, &cmdstr, 'c', "Execute semicolon separated commands" }, 
-		{ "send-buffer", 'b', POPT_ARG_INT, NULL, 'b', "Changes the transmit/send buffer", "BYTES" },
-		{ "port", 'p', POPT_ARG_INT, &port, 'p', "Port to connect to", "PORT" },
+		{
+			.longName   = "message",
+			.shortName  = 'M',
+			.argInfo    = POPT_ARG_STRING,
+			.arg        = NULL,
+			.val        = 'M',
+			.descrip    = "Send message",
+			.argDescrip = "HOST",
+		},
+		{
+			.longName   = "ip-address",
+			.shortName  = 'I',
+			.argInfo    = POPT_ARG_STRING,
+			.arg        = NULL,
+			.val        = 'I',
+			.descrip    = "Use this IP to connect to",
+			.argDescrip = "IP",
+		},
+		{
+			.longName   = "stderr",
+			.shortName  = 'E',
+			.argInfo    = POPT_ARG_NONE,
+			.arg        = NULL,
+			.val        = 'E',
+			.descrip    = "Write messages to stderr instead of stdout",
+		},
+		{
+			.longName   = "list",
+			.shortName  = 'L',
+			.argInfo    = POPT_ARG_STRING,
+			.arg        = NULL,
+			.val        = 'L',
+			.descrip    = "Get a list of shares available on a host",
+			.argDescrip = "HOST",
+		},
+		{
+			.longName   = "directory",
+			.shortName  = 'D',
+			.argInfo    = POPT_ARG_STRING,
+			.arg        = NULL,
+			.val        = 'D',
+			.descrip    = "Start from directory",
+			.argDescrip = "DIR",
+		},
+		{
+			.longName   = "command",
+			.shortName  = 'c',
+			.argInfo    = POPT_ARG_STRING,
+			.arg        = &cmdstr,
+			.val        = 'c',
+			.descrip    = "Execute semicolon separated commands",
+		},
+		{
+			.longName   = "send-buffer",
+			.shortName  = 'b',
+			.argInfo    = POPT_ARG_INT,
+			.arg        = NULL,
+			.val        = 'b',
+			.descrip    = "Changes the transmit/send buffer",
+			.argDescrip = "BYTES",
+		},
+		{
+			.longName   = "port",
+			.shortName  = 'p',
+			.argInfo    = POPT_ARG_INT,
+			.arg        = &port,
+			.val        = 'p',
+			.descrip    = "Port to connect to",
+			.argDescrip = "PORT",
+		},
 		POPT_COMMON_SAMBA
 		POPT_COMMON_CONNECTION
 		POPT_COMMON_CREDENTIALS
 		POPT_COMMON_VERSION
-		{ NULL }
+		POPT_TABLEEND
 	};
 	
 	mem_ctx = talloc_init("client.c/main");
@@ -3370,7 +3459,8 @@ static int do_message_op(const char *netbios_name, const char *desthost,
 	}
 
 	if (poptPeekArg(pc)) { 
-		cli_credentials_set_password(cmdline_credentials, poptGetArg(pc), CRED_SPECIFIED);
+		cli_credentials_set_password(popt_get_cmdline_credentials(),
+			poptGetArg(pc), CRED_SPECIFIED);
 	}
 
 	/*init_names(); */
@@ -3385,7 +3475,7 @@ static int do_message_op(const char *netbios_name, const char *desthost,
 	lpcfg_smbcli_options(cmdline_lp_ctx, &smb_options);
 	lpcfg_smbcli_session_options(cmdline_lp_ctx, &smb_session_options);
 
-	ev_ctx = s4_event_context_init(talloc_autofree_context());
+	ev_ctx = s4_event_context_init(ctx);
 
 	DEBUG( 3, ( "Client started (version %s).\n", SAMBA_VERSION_STRING ) );
 
@@ -3414,7 +3504,8 @@ static int do_message_op(const char *netbios_name, const char *desthost,
 	if (!do_connect(ctx, ev_ctx, lpcfg_resolve_context(cmdline_lp_ctx),
 			desthost, lpcfg_smb_ports(cmdline_lp_ctx), service,
 			lpcfg_socket_options(cmdline_lp_ctx),
-			cmdline_credentials, &smb_options, &smb_session_options,
+			popt_get_cmdline_credentials(),
+			&smb_options, &smb_session_options,
 			lpcfg_gensec_settings(ctx, cmdline_lp_ctx)))
 		return 1;
 

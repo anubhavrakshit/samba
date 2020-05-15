@@ -1,8 +1,9 @@
 # functions to support bundled libraries
 
-from Configure import conf
-import sys, Logs
-from samba_utils import *
+import sys
+from waflib import Build, Options, Logs
+from waflib.Configure import conf
+from wafsamba import samba_utils
 
 def PRIVATE_NAME(bld, name, private_extension, private_library):
     '''possibly rename a library to include a bundled extension'''
@@ -50,19 +51,19 @@ Build.BuildContext.BUILTIN_LIBRARY = BUILTIN_LIBRARY
 
 def BUILTIN_DEFAULT(opt, builtins):
     '''set a comma separated default list of builtin libraries for this package'''
-    if 'BUILTIN_LIBRARIES_DEFAULT' in Options.options:
+    if 'BUILTIN_LIBRARIES_DEFAULT' in Options.options.__dict__:
         return
-    Options.options['BUILTIN_LIBRARIES_DEFAULT'] = builtins
-Options.Handler.BUILTIN_DEFAULT = BUILTIN_DEFAULT
+    Options.options.__dict__['BUILTIN_LIBRARIES_DEFAULT'] = builtins
+Options.OptionsContext.BUILTIN_DEFAULT = BUILTIN_DEFAULT
 
 
 def PRIVATE_EXTENSION_DEFAULT(opt, extension, noextension=''):
     '''set a default private library extension'''
-    if 'PRIVATE_EXTENSION_DEFAULT' in Options.options:
+    if 'PRIVATE_EXTENSION_DEFAULT' in Options.options.__dict__:
         return
-    Options.options['PRIVATE_EXTENSION_DEFAULT'] = extension
-    Options.options['PRIVATE_EXTENSION_EXCEPTION'] = noextension
-Options.Handler.PRIVATE_EXTENSION_DEFAULT = PRIVATE_EXTENSION_DEFAULT
+    Options.options.__dict__['PRIVATE_EXTENSION_DEFAULT'] = extension
+    Options.options.__dict__['PRIVATE_EXTENSION_EXCEPTION'] = noextension
+Options.OptionsContext.PRIVATE_EXTENSION_DEFAULT = PRIVATE_EXTENSION_DEFAULT
 
 
 def minimum_library_version(conf, libname, default):
@@ -84,6 +85,8 @@ def minimum_library_version(conf, libname, default):
 
 @conf
 def LIB_MAY_BE_BUNDLED(conf, libname):
+    if libname in conf.env.SYSTEM_LIBS:
+        return False
     if libname in conf.env.BUNDLED_LIBS:
         return True
     if '!%s' % libname in conf.env.BUNDLED_LIBS:
@@ -108,18 +111,8 @@ def LIB_MUST_BE_PRIVATE(conf, libname):
             libname in conf.env.PRIVATE_LIBS)
 
 @conf
-def CHECK_PREREQUISITES(conf, prereqs):
-    missing = []
-    for syslib in TO_LIST(prereqs):
-        f = 'FOUND_SYSTEMLIB_%s' % syslib
-        if not f in conf.env:
-            missing.append(syslib)
-    return missing
-
-
-@runonce
-@conf
 def CHECK_BUNDLED_SYSTEM_PKG(conf, libname, minversion='0.0.0',
+        maxversion=None, version_blacklist=[],
         onlyif=None, implied_deps=None, pkg=None):
     '''check if a library is available as a system library.
 
@@ -127,13 +120,15 @@ def CHECK_BUNDLED_SYSTEM_PKG(conf, libname, minversion='0.0.0',
     '''
     return conf.CHECK_BUNDLED_SYSTEM(libname,
                                      minversion=minversion,
+                                     maxversion=maxversion,
+                                     version_blacklist=version_blacklist,
                                      onlyif=onlyif,
                                      implied_deps=implied_deps,
                                      pkg=pkg)
 
-@runonce
 @conf
 def CHECK_BUNDLED_SYSTEM(conf, libname, minversion='0.0.0',
+                         maxversion=None, version_blacklist=[],
                          checkfunctions=None, headers=None, checkcode=None,
                          onlyif=None, implied_deps=None,
                          require_headers=True, pkg=None, set_target=True):
@@ -141,11 +136,34 @@ def CHECK_BUNDLED_SYSTEM(conf, libname, minversion='0.0.0',
     this first tries via pkg-config, then if that fails
     tries by testing for a specified function in the specified lib
     '''
-    if conf.LIB_MUST_BE_BUNDLED(libname):
-        return False
+    # We always do a logic validation of 'onlyif' first
+    missing = []
+    if onlyif:
+        for l in samba_utils.TO_LIST(onlyif):
+            f = 'FOUND_SYSTEMLIB_%s' % l
+            if not f in conf.env:
+                Logs.error('ERROR: CHECK_BUNDLED_SYSTEM(%s) - ' % (libname) +
+                           'missing prerequisite check for ' +
+                           'system library %s, onlyif=%r' % (l, onlyif))
+                sys.exit(1)
+            if not conf.env[f]:
+                missing.append(l)
     found = 'FOUND_SYSTEMLIB_%s' % libname
     if found in conf.env:
         return conf.env[found]
+    if conf.LIB_MUST_BE_BUNDLED(libname):
+        conf.env[found] = False
+        return False
+
+    # see if the library should only use a system version if another dependent
+    # system version is found. That prevents possible use of mixed library
+    # versions
+    if missing:
+        if not conf.LIB_MAY_BE_BUNDLED(libname):
+            Logs.error('ERROR: Use of system library %s depends on missing system library/libraries %r' % (libname, missing))
+            sys.exit(1)
+        conf.env[found] = False
+        return False
 
     def check_functions_headers_code():
         '''helper function for CHECK_BUNDLED_SYSTEM'''
@@ -166,32 +184,32 @@ def CHECK_BUNDLED_SYSTEM(conf, libname, minversion='0.0.0',
                 return False
         return True
 
-
-    # see if the library should only use a system version if another dependent
-    # system version is found. That prevents possible use of mixed library
-    # versions
-    if onlyif:
-        missing = conf.CHECK_PREREQUISITES(onlyif)
-        if missing:
-            if not conf.LIB_MAY_BE_BUNDLED(libname):
-                Logs.error('ERROR: Use of system library %s depends on missing system library/libraries %r' % (libname, missing))
-                sys.exit(1)
-            conf.env[found] = False
-            return False
-
     minversion = minimum_library_version(conf, libname, minversion)
 
     msg = 'Checking for system %s' % libname
+    msg_ver = []
     if minversion != '0.0.0':
-        msg += ' >= %s' % minversion
+        msg_ver.append('>=%s' % minversion)
+    if maxversion is not None:
+        msg_ver.append('<=%s' % maxversion)
+    for v in version_blacklist:
+        msg_ver.append('!=%s' % v)
+    if msg_ver != []:
+        msg += " (%s)" % (" ".join(msg_ver))
 
     uselib_store=libname.upper()
     if pkg is None:
         pkg = libname
 
+    version_checks = '%s >= %s' % (pkg, minversion)
+    if maxversion is not None:
+        version_checks += ' %s <= %s' % (pkg, maxversion)
+
+    version_checks += "".join(' %s != %s' % (pkg, v) for v in version_blacklist)
+
     # try pkgconfig first
     if (conf.CHECK_CFG(package=pkg,
-                      args='"%s >= %s" --cflags --libs' % (pkg, minversion),
+                      args='"%s" --cflags --libs' % (version_checks),
                       msg=msg, uselib_store=uselib_store) and
         check_functions_headers_code()):
         if set_target:
@@ -218,7 +236,6 @@ def CHECK_BUNDLED_SYSTEM(conf, libname, minversion='0.0.0',
 def tuplize_version(version):
     return tuple([int(x) for x in version.split(".")])
 
-@runonce
 @conf
 def CHECK_BUNDLED_SYSTEM_PYTHON(conf, libname, modulename, minversion='0.0.0'):
     '''check if a python module is available on the system and

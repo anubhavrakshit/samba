@@ -24,19 +24,15 @@
 
 #include "includes.h"
 #include "../lib/tsocket/tsocket.h"
+#include "lib/util/server_id.h"
 #include "smbd/smbd.h"
 #include "smbd/globals.h"
-#include "../libcli/auth/spnego.h"
-#include "../auth/ntlmssp/ntlmssp.h"
-#include "../librpc/gen_ndr/krb5pac.h"
-#include "libads/kerberos_proto.h"
-#include "../lib/util/asn1.h"
 #include "auth.h"
 #include "messages.h"
 #include "smbprofile.h"
 #include "../libcli/security/security.h"
 #include "auth/gensec/gensec.h"
-#include "lib/conn_tdb.h"
+#include "../libcli/smb/smb_signing.h"
 
 /****************************************************************************
  Add the standard 'Samba' signature to the end of the session setup.
@@ -78,41 +74,6 @@ static int push_signature(uint8_t **outbuf)
 }
 
 /****************************************************************************
- Do a 'guest' logon, getting back the
-****************************************************************************/
-
-static NTSTATUS check_guest_password(const struct tsocket_address *remote_address,
-				     TALLOC_CTX *mem_ctx, 
-				     struct auth_session_info **session_info)
-{
-	struct auth4_context *auth_context;
-	struct auth_usersupplied_info *user_info = NULL;
-	uint8_t chal[8];
-	NTSTATUS nt_status;
-
-	DEBUG(3,("Got anonymous request\n"));
-
-	nt_status = make_auth4_context(talloc_tos(), &auth_context);
-	if (!NT_STATUS_IS_OK(nt_status)) {
-		return nt_status;
-	}
-
-	auth_context->get_ntlm_challenge(auth_context,
-					 chal);
-
-	if (!make_user_info_guest(talloc_tos(), remote_address, &user_info)) {
-		TALLOC_FREE(auth_context);
-		return NT_STATUS_NO_MEMORY;
-	}
-
-	nt_status = auth_check_password_session_info(auth_context, 
-						     mem_ctx, user_info, session_info);
-	TALLOC_FREE(user_info);
-	TALLOC_FREE(auth_context);
-	return nt_status;
-}
-
-/****************************************************************************
  Reply to a session setup command.
  conn POINTER CAN BE NULL HERE !
 ****************************************************************************/
@@ -134,6 +95,7 @@ static void reply_sesssetup_and_X_spnego(struct smb_request *req)
 	struct smbXsrv_connection *xconn = req->xconn;
 	struct smbd_server_connection *sconn = req->sconn;
 	uint16_t action = 0;
+	bool is_authenticated = false;
 	NTTIME now = timeval_to_nttime(&req->request_time);
 	struct smbXsrv_session *session = NULL;
 	uint16_t smb_bufsize = SVAL(req->vwv+2, 0);
@@ -248,7 +210,10 @@ static void reply_sesssetup_and_X_spnego(struct smb_request *req)
 	}
 
 	if (auth->gensec == NULL) {
-		status = auth_generic_prepare(session, xconn->remote_address,
+		status = auth_generic_prepare(session,
+					      xconn->remote_address,
+					      xconn->local_address,
+					      "SMB",
 					      &auth->gensec);
 		if (!NT_STATUS_IS_OK(status)) {
 			TALLOC_FREE(session);
@@ -258,6 +223,7 @@ static void reply_sesssetup_and_X_spnego(struct smb_request *req)
 
 		gensec_want_feature(auth->gensec, GENSEC_FEATURE_SESSION_KEY);
 		gensec_want_feature(auth->gensec, GENSEC_FEATURE_UNIX_TOKEN);
+		gensec_want_feature(auth->gensec, GENSEC_FEATURE_SMB_TRANSPORT);
 
 		status = gensec_start_mech_by_oid(auth->gensec,
 						  GENSEC_OID_SPNEGO);
@@ -297,8 +263,8 @@ static void reply_sesssetup_and_X_spnego(struct smb_request *req)
 			return;
 		}
 
-		if (security_session_user_level(session_info, NULL) < SECURITY_USER) {
-			action = 1;
+		if (security_session_user_level(session_info, NULL) == SECURITY_GUEST) {
+			action |= SMB_SETUP_GUEST;
 		}
 
 		if (session_info->session_key.length > 0) {
@@ -308,14 +274,26 @@ static void reply_sesssetup_and_X_spnego(struct smb_request *req)
 			 * Note: the SMB1 signing key is not truncated to 16 byte!
 			 */
 			x->global->signing_key =
-				data_blob_dup_talloc(x->global,
-						     session_info->session_key);
-			if (x->global->signing_key.data == NULL) {
+				talloc_zero(x->global, struct smb2_signing_key);
+			if (x->global->signing_key == NULL) {
 				data_blob_free(&out_blob);
 				TALLOC_FREE(session);
 				reply_nterror(req, NT_STATUS_NO_MEMORY);
 				return;
 			}
+			/* TODO: setup destructor once we cache the hmac handle */
+
+			x->global->signing_key->blob =
+				x->global->signing_key_blob =
+				data_blob_dup_talloc(x->global->signing_key,
+						     session_info->session_key);
+			if (!smb2_signing_key_valid(x->global->signing_key)) {
+				data_blob_free(&out_blob);
+				TALLOC_FREE(session);
+				reply_nterror(req, NT_STATUS_NO_MEMORY);
+				return;
+			}
+			talloc_keep_secret(x->global->signing_key->blob.data);
 
 			/*
 			 * clear the session key
@@ -324,36 +302,24 @@ static void reply_sesssetup_and_X_spnego(struct smb_request *req)
 			data_blob_clear_free(&session_info->session_key);
 		}
 
-		session->compat = talloc_zero(session, struct user_struct);
-		if (session->compat == NULL) {
-			data_blob_free(&out_blob);
-			TALLOC_FREE(session);
-			reply_nterror(req, NT_STATUS_NO_MEMORY);
-			return;
-		}
-		session->compat->session = session;
-		session->compat->homes_snum = -1;
-		session->compat->session_info = session_info;
-		session->compat->session_keystr = NULL;
-		session->compat->vuid = session->global->session_wire_id;
-		DLIST_ADD(sconn->users, session->compat);
 		sconn->num_users++;
 
 		if (security_session_user_level(session_info, NULL) >= SECURITY_USER) {
-			session->compat->homes_snum =
+			is_authenticated = true;
+			session->homes_snum =
 				register_homes_share(session_info->unix_info->unix_name);
 		}
 
 		if (srv_is_signing_negotiated(xconn) &&
-		    action == 0 &&
-		    session->global->signing_key.length > 0)
+		    is_authenticated &&
+		    smb2_signing_key_valid(session->global->signing_key))
 		{
 			/*
 			 * Try and turn on server signing on the first non-guest
 			 * sessionsetup.
 			 */
 			srv_set_signing(xconn,
-				session->global->signing_key,
+				session->global->signing_key->blob,
 				data_blob_null);
 		}
 
@@ -378,7 +344,7 @@ static void reply_sesssetup_and_X_spnego(struct smb_request *req)
 
 		if (!session_claim(session)) {
 			DEBUG(1, ("smb1: Failed to claim session for vuid=%llu\n",
-				  (unsigned long long)session->compat->vuid));
+				  (unsigned long long)session->global->session_wire_id));
 			data_blob_free(&out_blob);
 			TALLOC_FREE(session);
 			reply_nterror(req, NT_STATUS_LOGON_FAILURE);
@@ -388,7 +354,7 @@ static void reply_sesssetup_and_X_spnego(struct smb_request *req)
 		status = smbXsrv_session_update(session);
 		if (!NT_STATUS_IS_OK(status)) {
 			DEBUG(0, ("smb1: Failed to update session for vuid=%llu - %s\n",
-				  (unsigned long long)session->compat->vuid,
+				  (unsigned long long)session->global->session_wire_id,
 				  nt_errstr(status)));
 			data_blob_free(&out_blob);
 			TALLOC_FREE(session);
@@ -423,8 +389,8 @@ static void reply_sesssetup_and_X_spnego(struct smb_request *req)
 			return;
 		}
 
-		if (security_session_user_level(session_info, NULL) < SECURITY_USER) {
-			action = 1;
+		if (security_session_user_level(session_info, NULL) == SECURITY_GUEST) {
+			action |= SMB_SETUP_GUEST;
 		}
 
 		/*
@@ -436,12 +402,8 @@ static void reply_sesssetup_and_X_spnego(struct smb_request *req)
 		talloc_steal(session_info, session_info->session_key.data);
 		TALLOC_FREE(session->global->auth_session_info);
 
-		session->compat->session_info = session_info;
-
-		session->compat->vuid = session->global->session_wire_id;
-
 		if (security_session_user_level(session_info, NULL) >= SECURITY_USER) {
-			session->compat->homes_snum =
+			session->homes_snum =
 				register_homes_share(session_info->unix_info->unix_name);
 		}
 
@@ -467,7 +429,7 @@ static void reply_sesssetup_and_X_spnego(struct smb_request *req)
 		status = smbXsrv_session_update(session);
 		if (!NT_STATUS_IS_OK(status)) {
 			DEBUG(0, ("smb1: Failed to update session for vuid=%llu - %s\n",
-				  (unsigned long long)session->compat->vuid,
+				  (unsigned long long)session->global->session_wire_id,
 				  nt_errstr(status)));
 			data_blob_free(&out_blob);
 			TALLOC_FREE(session);
@@ -475,7 +437,7 @@ static void reply_sesssetup_and_X_spnego(struct smb_request *req)
 			return;
 		}
 
-		conn_clear_vuid_caches(sconn, session->compat->vuid);
+		conn_clear_vuid_caches(sconn, session->global->session_wire_id);
 
 		/* current_user_info is changed on new vuid */
 		reload_services(sconn, conn_snum_used, true);
@@ -514,6 +476,7 @@ static void reply_sesssetup_and_X_spnego(struct smb_request *req)
 
 struct shutdown_state {
 	const char *ip;
+	size_t ip_length;
 	struct messaging_context *msg_ctx;
 };
 
@@ -524,6 +487,8 @@ static int shutdown_other_smbds(struct smbXsrv_session_global0 *session,
 	struct server_id self_pid = messaging_server_id(state->msg_ctx);
 	struct server_id pid = session->channels[0].server_id;
 	const char *addr = session->channels[0].remote_address;
+	const char *port_colon;
+	size_t addr_len;
 	struct server_id_buf tmp;
 
 	DEBUG(10, ("shutdown_other_smbds: %s, %s\n",
@@ -534,19 +499,22 @@ static int shutdown_other_smbds(struct smbXsrv_session_global0 *session,
 		return 0;
 	}
 
-	if (serverid_equal(&pid, &self_pid)) {
+	if (server_id_equal(&pid, &self_pid)) {
 		DEBUG(10, ("It's me\n"));
 		return 0;
 	}
 
-	/*
-	 * here we use strstr() because 'addr'
-	 * (session->channels[0].remote_address)
-	 * contains a string like:
-	 * 'ipv4:127.0.0.1:48163'
-	 */
-	if (strstr(addr, state->ip)  == NULL) {
-		DEBUG(10, ("%s does not match %s\n", state->ip, addr));
+	port_colon = strrchr(addr, ':');
+	if (port_colon == NULL) {
+		DBG_DEBUG("addr %s in contains no port\n", addr);
+		return 0;
+	}
+	addr_len = port_colon - addr;
+
+	if ((addr_len != state->ip_length) ||
+	    (strncmp(addr, state->ip, state->ip_length) != 0)) {
+		DEBUG(10, ("%s (%zu) does not match %s (%zu)\n",
+			   state->ip, state->ip_length, addr, addr_len));
 		return 0;
 	}
 
@@ -563,20 +531,24 @@ static void setup_new_vc_session(struct smbd_server_connection *sconn)
 {
 	DEBUG(2,("setup_new_vc_session: New VC == 0, if NT4.x "
 		"compatible we would close all old resources.\n"));
-#if 0
-	conn_close_all();
-	invalidate_all_vuids();
-#endif
+
 	if (lp_reset_on_zero_vc()) {
 		char *addr;
+		const char *port_colon;
 		struct shutdown_state state;
 
-		addr = tsocket_address_inet_addr_string(
+		addr = tsocket_address_string(
 			sconn->remote_address, talloc_tos());
 		if (addr == NULL) {
 			return;
 		}
 		state.ip = addr;
+
+		port_colon = strrchr(addr, ':');
+		if (port_colon == NULL) {
+			return;
+		}
+		state.ip_length = port_colon - addr;
 		state.msg_ctx = sconn->msg_ctx;
 		smbXsrv_session_global_traverse(shutdown_other_smbds, &state);
 		TALLOC_FREE(addr);
@@ -587,24 +559,40 @@ static void setup_new_vc_session(struct smbd_server_connection *sconn)
  Reply to a session setup command.
 ****************************************************************************/
 
-void reply_sesssetup_and_X(struct smb_request *req)
-{
-	uint64_t sess_vuid;
-	uint16_t smb_bufsize;
+struct reply_sesssetup_and_X_state {
+	struct smb_request *req;
+	struct auth4_context *auth_context;
+	struct auth_usersupplied_info *user_info;
+	const char *user;
+	const char *domain;
 	DATA_BLOB lm_resp;
 	DATA_BLOB nt_resp;
 	DATA_BLOB plaintext_password;
+};
+
+static int reply_sesssetup_and_X_state_destructor(
+		struct reply_sesssetup_and_X_state *state)
+{
+	data_blob_clear_free(&state->nt_resp);
+	data_blob_clear_free(&state->lm_resp);
+	data_blob_clear_free(&state->plaintext_password);
+	return 0;
+}
+
+void reply_sesssetup_and_X(struct smb_request *req)
+{
+	struct reply_sesssetup_and_X_state *state = NULL;
+	uint64_t sess_vuid;
+	uint16_t smb_bufsize;
 	char *tmp;
-	const char *user;
 	fstring sub_user; /* Sanitised username for substituion */
-	const char *domain;
 	const char *native_os;
 	const char *native_lanman;
 	const char *primary_domain;
-	struct auth_usersupplied_info *user_info = NULL;
 	struct auth_session_info *session_info = NULL;
 	uint16_t smb_flag2 = req->flags2;
 	uint16_t action = 0;
+	bool is_authenticated = false;
 	NTTIME now = timeval_to_nttime(&req->request_time);
 	struct smbXsrv_session *session = NULL;
 	NTSTATUS nt_status;
@@ -612,15 +600,21 @@ void reply_sesssetup_and_X(struct smb_request *req)
 	struct smbd_server_connection *sconn = req->sconn;
 	bool doencrypt = xconn->smb1.negprot.encrypted_passwords;
 	bool signing_allowed = false;
-	bool signing_mandatory = false;
+	bool signing_mandatory = smb_signing_is_mandatory(
+		xconn->smb1.signing_state);
 
 	START_PROFILE(SMBsesssetupX);
 
-	ZERO_STRUCT(lm_resp);
-	ZERO_STRUCT(nt_resp);
-	ZERO_STRUCT(plaintext_password);
-
 	DEBUG(3,("wct=%d flg2=0x%x\n", req->wct, req->flags2));
+
+	state = talloc_zero(req, struct reply_sesssetup_and_X_state);
+	if (state == NULL) {
+		reply_nterror(req, NT_STATUS_NO_MEMORY);
+		END_PROFILE(SMBsesssetupX);
+		return;
+	}
+	state->req = req;
+	talloc_set_destructor(state, reply_sesssetup_and_X_state_destructor);
 
 	if (req->flags2 & FLAGS2_SMB_SECURITY_SIGNATURES) {
 		signing_allowed = true;
@@ -679,18 +673,22 @@ void reply_sesssetup_and_X(struct smb_request *req)
 		}
 
 		if (doencrypt) {
-			lm_resp = data_blob(req->buf, passlen1);
+			state->lm_resp = data_blob_talloc(state,
+							  req->buf,
+							  passlen1);
 		} else {
-			plaintext_password = data_blob(req->buf, passlen1+1);
+			state->plaintext_password = data_blob_talloc(state,
+								req->buf,
+								passlen1+1);
 			/* Ensure null termination */
-			plaintext_password.data[passlen1] = 0;
+			state->plaintext_password.data[passlen1] = 0;
 		}
 
-		srvstr_pull_req_talloc(talloc_tos(), req, &tmp,
+		srvstr_pull_req_talloc(state, req, &tmp,
 				       req->buf + passlen1, STR_TERMINATE);
-		user = tmp ? tmp : "";
+		state->user = tmp ? tmp : "";
 
-		domain = "";
+		state->domain = "";
 
 	} else {
 		uint16_t passlen1 = SVAL(req->vwv+7, 0);
@@ -765,15 +763,15 @@ void reply_sesssetup_and_X(struct smb_request *req)
 		}
 
 		if (doencrypt) {
-			lm_resp = data_blob(p, passlen1);
-			nt_resp = data_blob(p+passlen1, passlen2);
+			state->lm_resp = data_blob_talloc(state, p, passlen1);
+			state->nt_resp = data_blob_talloc(state, p+passlen1, passlen2);
 		} else {
 			char *pass = NULL;
 			bool unic= smb_flag2 & FLAGS2_UNICODE_STRINGS;
 
 			if (unic && (passlen2 == 0) && passlen1) {
 				/* Only a ascii plaintext password was sent. */
-				(void)srvstr_pull_talloc(talloc_tos(),
+				(void)srvstr_pull_talloc(state,
 							req->inbuf,
 							req->flags2,
 							&pass,
@@ -781,7 +779,7 @@ void reply_sesssetup_and_X(struct smb_request *req)
 							passlen1,
 							STR_TERMINATE|STR_ASCII);
 			} else {
-				(void)srvstr_pull_talloc(talloc_tos(),
+				(void)srvstr_pull_talloc(state,
 							req->inbuf,
 							req->flags2,
 							&pass,
@@ -795,18 +793,20 @@ void reply_sesssetup_and_X(struct smb_request *req)
 				END_PROFILE(SMBsesssetupX);
 				return;
 			}
-			plaintext_password = data_blob(pass, strlen(pass)+1);
+			state->plaintext_password = data_blob_talloc(state,
+								pass,
+								strlen(pass)+1);
 		}
 
 		p += passlen1 + passlen2;
 
-		p += srvstr_pull_req_talloc(talloc_tos(), req, &tmp, p,
+		p += srvstr_pull_req_talloc(state, req, &tmp, p,
 					    STR_TERMINATE);
-		user = tmp ? tmp : "";
+		state->user = tmp ? tmp : "";
 
-		p += srvstr_pull_req_talloc(talloc_tos(), req, &tmp, p,
+		p += srvstr_pull_req_talloc(state, req, &tmp, p,
 					    STR_TERMINATE);
-		domain = tmp ? tmp : "";
+		state->domain = tmp ? tmp : "";
 
 		p += srvstr_pull_req_talloc(talloc_tos(), req, &tmp, p,
 					    STR_TERMINATE);
@@ -834,7 +834,7 @@ void reply_sesssetup_and_X(struct smb_request *req)
 
 		DEBUG(3,("Domain=[%s]  NativeOS=[%s] NativeLanMan=[%s] "
 			"PrimaryDomain=[%s]\n",
-			domain, native_os, native_lanman, primary_domain));
+			state->domain, native_os, native_lanman, primary_domain));
 
 		if ( ra_type == RA_WIN2K ) {
 			if ( strlen(native_lanman) == 0 )
@@ -850,9 +850,9 @@ void reply_sesssetup_and_X(struct smb_request *req)
 	}
 
 	DEBUG(3,("sesssetupX:name=[%s]\\[%s]@[%s]\n",
-				domain, user, get_remote_machine_name()));
+		 state->domain, state->user, get_remote_machine_name()));
 
-	if (*user) {
+	if (*state->user) {
 		if (xconn->smb1.negprot.spnego) {
 
 			/* This has to be here, because this is a perfectly
@@ -866,23 +866,35 @@ void reply_sesssetup_and_X(struct smb_request *req)
 			END_PROFILE(SMBsesssetupX);
 			return;
 		}
-		fstrcpy(sub_user, user);
+		fstrcpy(sub_user, state->user);
 	} else {
 		fstrcpy(sub_user, "");
 	}
 
-	sub_set_smb_name(sub_user);
+	if (!*state->user) {
+		DEBUG(3,("Got anonymous request\n"));
 
-	reload_services(sconn, conn_snum_used, true);
+		nt_status = make_auth4_context(state, &state->auth_context);
+		if (NT_STATUS_IS_OK(nt_status)) {
+			uint8_t chal[8];
 
-	if (!*user) {
+			state->auth_context->get_ntlm_challenge(
+					state->auth_context, chal);
 
-		nt_status = check_guest_password(sconn->remote_address, req, &session_info);
+			if (!make_user_info_guest(state,
+						  sconn->remote_address,
+						  sconn->local_address,
+						  "SMB", &state->user_info)) {
+				nt_status =  NT_STATUS_NO_MEMORY;
+			}
 
+			if (NT_STATUS_IS_OK(nt_status)) {
+				state->user_info->auth_description = "guest";
+			}
+		}
 	} else if (doencrypt) {
-		struct auth4_context *negprot_auth_context = NULL;
-		negprot_auth_context = xconn->smb1.negprot.auth_context;
-		if (!negprot_auth_context) {
+		state->auth_context = xconn->smb1.negprot.auth_context;
+		if (state->auth_context == NULL) {
 			DEBUG(0, ("reply_sesssetup_and_X:  Attempted encrypted "
 				"session setup without negprot denied!\n"));
 			reply_nterror(req, nt_status_squash(
@@ -890,56 +902,60 @@ void reply_sesssetup_and_X(struct smb_request *req)
 			END_PROFILE(SMBsesssetupX);
 			return;
 		}
-		nt_status = make_user_info_for_reply_enc(talloc_tos(),
-							 &user_info, user,
-							 domain,
+		nt_status = make_user_info_for_reply_enc(state,
+							 &state->user_info,
+							 state->user,
+							 state->domain,
 							 sconn->remote_address,
-							 lm_resp, nt_resp);
+							 sconn->local_address,
+							 "SMB",
+							 state->lm_resp,
+							 state->nt_resp);
+
 		if (NT_STATUS_IS_OK(nt_status)) {
-			nt_status = auth_check_password_session_info(negprot_auth_context, 
-								     req, user_info, &session_info);
+			state->user_info->auth_description = "bare-NTLM";
 		}
 	} else {
-		struct auth4_context *plaintext_auth_context = NULL;
-
-		nt_status = make_auth4_context(
-			talloc_tos(), &plaintext_auth_context);
-
+		nt_status = make_auth4_context(state, &state->auth_context);
 		if (NT_STATUS_IS_OK(nt_status)) {
 			uint8_t chal[8];
 
-			plaintext_auth_context->get_ntlm_challenge(
-					plaintext_auth_context, chal);
+			state->auth_context->get_ntlm_challenge(
+					state->auth_context, chal);
 
-			if (!make_user_info_for_reply(talloc_tos(),
-						      &user_info,
-						      user, domain,
+			if (!make_user_info_for_reply(state,
+						      &state->user_info,
+						      state->user,
+						      state->domain,
 						      sconn->remote_address,
+						      sconn->local_address,
+						      "SMB",
 						      chal,
-						      plaintext_password)) {
+						      state->plaintext_password)) {
 				nt_status = NT_STATUS_NO_MEMORY;
 			}
 
 			if (NT_STATUS_IS_OK(nt_status)) {
-				nt_status = auth_check_password_session_info(plaintext_auth_context, 
-									     req, user_info, &session_info);
+				state->user_info->auth_description = "plaintext";
 			}
-			TALLOC_FREE(plaintext_auth_context);
 		}
 	}
 
-	TALLOC_FREE(user_info);
-
 	if (!NT_STATUS_IS_OK(nt_status)) {
-		data_blob_free(&nt_resp);
-		data_blob_free(&lm_resp);
-		data_blob_clear_free(&plaintext_password);
 		reply_nterror(req, nt_status_squash(nt_status));
 		END_PROFILE(SMBsesssetupX);
 		return;
 	}
 
-	data_blob_clear_free(&plaintext_password);
+	nt_status = auth_check_password_session_info(state->auth_context,
+						     req, state->user_info,
+						     &session_info);
+	TALLOC_FREE(state->user_info);
+	if (!NT_STATUS_IS_OK(nt_status)) {
+		reply_nterror(req, nt_status_squash(nt_status));
+		END_PROFILE(SMBsesssetupX);
+		return;
+	}
 
 	/* it's ok - setup a reply */
 	reply_outbuf(req, 3, 0);
@@ -951,8 +967,8 @@ void reply_sesssetup_and_X(struct smb_request *req)
 		/* perhaps grab OS version here?? */
 	}
 
-	if (security_session_user_level(session_info, NULL) < SECURITY_USER) {
-		action = 1;
+	if (security_session_user_level(session_info, NULL) == SECURITY_GUEST) {
+		action |= SMB_SETUP_GUEST;
 	}
 
 	/* register the name and uid as being validated, so further connections
@@ -961,8 +977,6 @@ void reply_sesssetup_and_X(struct smb_request *req)
 	nt_status = smbXsrv_session_create(xconn,
 					   now, &session);
 	if (!NT_STATUS_IS_OK(nt_status)) {
-		data_blob_free(&nt_resp);
-		data_blob_free(&lm_resp);
 		reply_nterror(req, nt_status_squash(nt_status));
 		END_PROFILE(SMBsesssetupX);
 		return;
@@ -975,23 +989,33 @@ void reply_sesssetup_and_X(struct smb_request *req)
 		 * Note: the SMB1 signing key is not truncated to 16 byte!
 		 */
 		session->global->signing_key =
-			data_blob_dup_talloc(session->global,
-					     session_info->session_key);
-		if (session->global->signing_key.data == NULL) {
-			data_blob_free(&nt_resp);
-			data_blob_free(&lm_resp);
+			talloc_zero(session->global, struct smb2_signing_key);
+		if (session->global->signing_key == NULL) {
 			TALLOC_FREE(session);
 			reply_nterror(req, NT_STATUS_NO_MEMORY);
 			END_PROFILE(SMBsesssetupX);
 			return;
 		}
+		/* TODO: setup destructor once we cache the hmac handle */
+
+		session->global->signing_key->blob =
+			session->global->signing_key_blob =
+			data_blob_dup_talloc(session->global->signing_key,
+					     session_info->session_key);
+		if (!smb2_signing_key_valid(session->global->signing_key)) {
+			TALLOC_FREE(session);
+			reply_nterror(req, NT_STATUS_NO_MEMORY);
+			END_PROFILE(SMBsesssetupX);
+			return;
+		}
+		talloc_keep_secret(session->global->signing_key->blob.data);
 
 		/*
 		 * The application key is truncated/padded to 16 bytes
 		 */
 		ZERO_STRUCT(session_key);
-		memcpy(session_key, session->global->signing_key.data,
-		       MIN(session->global->signing_key.length,
+		memcpy(session_key, session->global->signing_key->blob.data,
+		       MIN(session->global->signing_key->blob.length,
 			   sizeof(session_key)));
 		session->global->application_key =
 			data_blob_talloc(session->global,
@@ -999,8 +1023,6 @@ void reply_sesssetup_and_X(struct smb_request *req)
 					 sizeof(session_key));
 		ZERO_STRUCT(session_key);
 		if (session->global->application_key.data == NULL) {
-			data_blob_free(&nt_resp);
-			data_blob_free(&lm_resp);
 			TALLOC_FREE(session);
 			reply_nterror(req, NT_STATUS_NO_MEMORY);
 			END_PROFILE(SMBsesssetupX);
@@ -1014,8 +1036,6 @@ void reply_sesssetup_and_X(struct smb_request *req)
 		session_info->session_key = data_blob_dup_talloc(session_info,
 						session->global->application_key);
 		if (session_info->session_key.data == NULL) {
-			data_blob_free(&nt_resp);
-			data_blob_free(&lm_resp);
 			TALLOC_FREE(session);
 			reply_nterror(req, NT_STATUS_NO_MEMORY);
 			END_PROFILE(SMBsesssetupX);
@@ -1023,39 +1043,25 @@ void reply_sesssetup_and_X(struct smb_request *req)
 		}
 	}
 
-	session->compat = talloc_zero(session, struct user_struct);
-	if (session->compat == NULL) {
-		data_blob_free(&nt_resp);
-		data_blob_free(&lm_resp);
-		TALLOC_FREE(session);
-		reply_nterror(req, NT_STATUS_NO_MEMORY);
-		END_PROFILE(SMBsesssetupX);
-		return;
-	}
-	session->compat->session = session;
-	session->compat->homes_snum = -1;
-	session->compat->session_info = session_info;
-	session->compat->session_keystr = NULL;
-	session->compat->vuid = session->global->session_wire_id;
-	DLIST_ADD(sconn->users, session->compat);
 	sconn->num_users++;
 
 	if (security_session_user_level(session_info, NULL) >= SECURITY_USER) {
-		session->compat->homes_snum =
+		is_authenticated = true;
+		session->homes_snum =
 			register_homes_share(session_info->unix_info->unix_name);
 	}
 
 	if (srv_is_signing_negotiated(xconn) &&
-	    action == 0 &&
-	    session->global->signing_key.length > 0)
+	    is_authenticated &&
+	    smb2_signing_key_valid(session->global->signing_key))
 	{
 		/*
 		 * Try and turn on server signing on the first non-guest
 		 * sessionsetup.
 		 */
 		srv_set_signing(xconn,
-			session->global->signing_key,
-			nt_resp.data ? nt_resp : lm_resp);
+			session->global->signing_key->blob,
+			state->nt_resp.data ? state->nt_resp : state->lm_resp);
 	}
 
 	set_current_user_info(session_info->unix_info->sanitized_username,
@@ -1074,10 +1080,8 @@ void reply_sesssetup_and_X(struct smb_request *req)
 	nt_status = smbXsrv_session_update(session);
 	if (!NT_STATUS_IS_OK(nt_status)) {
 		DEBUG(0, ("smb1: Failed to update session for vuid=%llu - %s\n",
-			  (unsigned long long)session->compat->vuid,
+			  (unsigned long long)session->global->session_wire_id,
 			  nt_errstr(nt_status)));
-		data_blob_free(&nt_resp);
-		data_blob_free(&lm_resp);
 		TALLOC_FREE(session);
 		reply_nterror(req, nt_status_squash(nt_status));
 		END_PROFILE(SMBsesssetupX);
@@ -1086,9 +1090,7 @@ void reply_sesssetup_and_X(struct smb_request *req)
 
 	if (!session_claim(session)) {
 		DEBUG(1, ("smb1: Failed to claim session for vuid=%llu\n",
-			  (unsigned long long)session->compat->vuid));
-		data_blob_free(&nt_resp);
-		data_blob_free(&lm_resp);
+			  (unsigned long long)session->global->session_wire_id));
 		TALLOC_FREE(session);
 		reply_nterror(req, NT_STATUS_LOGON_FAILURE);
 		END_PROFILE(SMBsesssetupX);
@@ -1099,9 +1101,6 @@ void reply_sesssetup_and_X(struct smb_request *req)
 	reload_services(sconn, conn_snum_used, true);
 
 	sess_vuid = session->global->session_wire_id;
-
-	data_blob_free(&nt_resp);
-	data_blob_free(&lm_resp);
 
 	SSVAL(req->outbuf,smb_vwv2,action);
 	SSVAL(req->outbuf,smb_uid,sess_vuid);
@@ -1118,5 +1117,6 @@ void reply_sesssetup_and_X(struct smb_request *req)
 		xconn->smb1.sessions.done_sesssetup = true;
 	}
 
+	TALLOC_FREE(state);
 	END_PROFILE(SMBsesssetupX);
 }

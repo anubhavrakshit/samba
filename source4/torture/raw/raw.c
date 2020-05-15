@@ -23,10 +23,10 @@
 #include "torture/smbtorture.h"
 #include "torture/raw/proto.h"
 
-NTSTATUS torture_raw_init(void)
+NTSTATUS torture_raw_init(TALLOC_CTX *ctx)
 {
 	struct torture_suite *suite = torture_suite_create(
-		talloc_autofree_context(), "raw");
+		ctx, "raw");
 	/* RAW smb tests */
 	torture_suite_add_simple_test(suite, "bench-oplock", torture_bench_oplock);
 	torture_suite_add_simple_test(suite, "ping-pong", torture_ping_pong);
@@ -67,6 +67,8 @@ NTSTATUS torture_raw_init(void)
 	torture_suite_add_1smb_test(suite, "samba3closeerr", torture_samba3_closeerr);
 	torture_suite_add_1smb_test(suite, "samba3rootdirfid",
 				      torture_samba3_rootdirfid);
+	torture_suite_add_1smb_test(suite, "samba3rootdirfid2",
+				      torture_samba3_rootdirfid2);
 	torture_suite_add_1smb_test(suite, "samba3checkfsp", torture_samba3_checkfsp);
 	torture_suite_add_1smb_test(suite, "samba3oplocklogoff", torture_samba3_oplock_logoff);
 	torture_suite_add_1smb_test(suite, "samba3badnameblob", torture_samba3_check_openX_badname);
@@ -79,7 +81,7 @@ NTSTATUS torture_raw_init(void)
 
 	suite->description = talloc_strdup(suite, "Tests for the raw SMB interface");
 
-	torture_register_suite(suite);
+	torture_register_suite(ctx, suite);
 
 	return NT_STATUS_OK;
 }

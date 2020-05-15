@@ -53,7 +53,7 @@ struct dnsserver_partition *dnsserver_db_enumerate_partitions(TALLOC_CTX *mem_ct
 	p->dwDpFlags = DNS_DP_AUTOCREATED | DNS_DP_DOMAIN_DEFAULT | DNS_DP_ENLISTED;
 	p->is_forest = false;
 
-	DLIST_ADD_END(partitions, p, NULL);
+	DLIST_ADD_END(partitions, p);
 
 	/* Forest Partition */
 	p = talloc_zero(mem_ctx, struct dnsserver_partition);
@@ -70,7 +70,7 @@ struct dnsserver_partition *dnsserver_db_enumerate_partitions(TALLOC_CTX *mem_ct
 	p->dwDpFlags = DNS_DP_AUTOCREATED | DNS_DP_FOREST_DEFAULT | DNS_DP_ENLISTED;
 	p->is_forest = true;
 
-	DLIST_ADD_END(partitions, p, NULL);
+	DLIST_ADD_END(partitions, p);
 
 	return partitions;
 
@@ -86,11 +86,11 @@ struct dnsserver_zone *dnsserver_db_enumerate_zones(TALLOC_CTX *mem_ctx,
 						struct dnsserver_partition *p)
 {
 	TALLOC_CTX *tmp_ctx;
-	const char * const attrs[] = {"name", NULL};
+	const char * const attrs[] = {"name", "dNSProperty", NULL};
 	struct ldb_dn *dn;
 	struct ldb_result *res;
 	struct dnsserver_zone *zones, *z;
-	int i, ret;
+	int i, j, ret;
 
 	tmp_ctx = talloc_new(mem_ctx);
 	if (tmp_ctx == NULL) {
@@ -116,6 +116,9 @@ struct dnsserver_zone *dnsserver_db_enumerate_zones(TALLOC_CTX *mem_ctx,
 	zones = NULL;
 	for(i=0; i<res->count; i++) {
 		char *name;
+		struct ldb_message_element *element = NULL;
+		struct dnsp_DnsProperty *props = NULL;
+		enum ndr_err_code err;
 		z = talloc_zero(mem_ctx, struct dnsserver_zone);
 		if (z == NULL) {
 			goto failed;
@@ -123,7 +126,8 @@ struct dnsserver_zone *dnsserver_db_enumerate_zones(TALLOC_CTX *mem_ctx,
 
 		z->partition = p;
 		name = talloc_strdup(z,
-				ldb_msg_find_attr_as_string(res->msgs[i], "name", NULL));
+				ldb_msg_find_attr_as_string(res->msgs[i],
+							    "name", NULL));
 		if (strcmp(name, "..TrustAnchors") == 0) {
 			talloc_free(z);
 			continue;
@@ -136,10 +140,29 @@ struct dnsserver_zone *dnsserver_db_enumerate_zones(TALLOC_CTX *mem_ctx,
 		}
 		z->zone_dn = talloc_steal(z, res->msgs[i]->dn);
 
-		DLIST_ADD_END(zones, z, NULL);
+		DLIST_ADD_END(zones, z);
 		DEBUG(2, ("dnsserver: Found DNS zone %s\n", z->name));
-	}
 
+		element = ldb_msg_find_element(res->msgs[i], "dNSProperty");
+		if(element != NULL){
+			props = talloc_zero_array(tmp_ctx,
+						  struct dnsp_DnsProperty,
+						  element->num_values);
+			for (j = 0; j < element->num_values; j++ ) {
+				err = ndr_pull_struct_blob(
+					&(element->values[j]),
+					mem_ctx,
+					&props[j],
+					(ndr_pull_flags_fn_t)
+						ndr_pull_dnsp_DnsProperty);
+				if (!NDR_ERR_CODE_IS_SUCCESS(err)){
+					goto failed;
+				}
+			}
+			z->tmp_props = props;
+			z->num_props = element->num_values;
+		}
+	}
 	return zones;
 
 failed:
@@ -250,7 +273,8 @@ failed:
 /* Increment serial number and update timestamp */
 static unsigned int dnsserver_update_soa(TALLOC_CTX *mem_ctx,
 				struct ldb_context *samdb,
-				struct dnsserver_zone *z)
+				struct dnsserver_zone *z,
+				WERROR *werr)
 {
 	const char * const attrs[] = { "dnsRecord", NULL };
 	struct ldb_result *res;
@@ -258,11 +282,8 @@ static unsigned int dnsserver_update_soa(TALLOC_CTX *mem_ctx,
 	struct ldb_message_element *el;
 	enum ndr_err_code ndr_err;
 	int ret, i, serial = -1;
-	NTTIME t;
 
-	unix_to_nt_time(&t, time(NULL));
-	t /= 10*1000*1000; /* convert to seconds (NT time is in 100ns units) */
-	t /= 3600;         /* convert to hours */
+	*werr = WERR_INTERNAL_DB_ERROR;
 
 	ret = ldb_search(samdb, mem_ctx, &res, z->zone_dn, LDB_SCOPE_ONELEVEL, attrs,
 			"(&(objectClass=dnsNode)(name=@))");
@@ -285,12 +306,13 @@ static unsigned int dnsserver_update_soa(TALLOC_CTX *mem_ctx,
 		if (rec.wType == DNS_TYPE_SOA) {
 			serial = rec.data.soa.serial + 1;
 			rec.dwSerial = serial;
-			rec.dwTimeStamp = (uint32_t)t;
+			rec.dwTimeStamp = 0;
 			rec.data.soa.serial = serial;
 
 			ndr_err = ndr_push_struct_blob(&el->values[i], mem_ctx, &rec,
 					(ndr_push_flags_fn_t)ndr_push_dnsp_DnssrvRpcRecord);
 			if (!NDR_ERR_CODE_IS_SUCCESS(ndr_err)) {
+				*werr = WERR_NOT_ENOUGH_MEMORY;
 				return -1;
 			}
 			break;
@@ -301,9 +323,14 @@ static unsigned int dnsserver_update_soa(TALLOC_CTX *mem_ctx,
 		el->flags = LDB_FLAG_MOD_REPLACE;
 		ret = ldb_modify(samdb, res->msgs[0]);
 		if (ret != LDB_SUCCESS) {
+			if (ret == LDB_ERR_INSUFFICIENT_ACCESS_RIGHTS) {
+				*werr = WERR_ACCESS_DENIED;
+			}
 			return -1;
 		}
 	}
+
+	*werr = WERR_OK;
 
 	return serial;
 }
@@ -328,7 +355,7 @@ static WERROR dnsserver_db_do_add_rec(TALLOC_CTX *mem_ctx,
 	msg->dn = dn;
 	ret = ldb_msg_add_string(msg, "objectClass", "dnsNode");
 	if (ret != LDB_SUCCESS) {
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	if (num_rec > 0 && rec) {
@@ -336,12 +363,12 @@ static WERROR dnsserver_db_do_add_rec(TALLOC_CTX *mem_ctx,
 			ndr_err = ndr_push_struct_blob(&v, mem_ctx, &rec[i],
 					(ndr_push_flags_fn_t)ndr_push_dnsp_DnssrvRpcRecord);
 			if (!NDR_ERR_CODE_IS_SUCCESS(ndr_err)) {
-				return WERR_GENERAL_FAILURE;
+				return WERR_GEN_FAILURE;
 			}
 
 			ret = ldb_msg_add_value(msg, "dnsRecord", &v, NULL);
 			if (ret != LDB_SUCCESS) {
-				return WERR_NOMEM;
+				return WERR_NOT_ENOUGH_MEMORY;
 			}
 		}
 	}
@@ -364,10 +391,13 @@ WERROR dnsserver_db_add_empty_node(TALLOC_CTX *mem_ctx,
 	const char * const attrs[] = { "name", NULL };
 	struct ldb_result *res;
 	struct ldb_dn *dn;
+	char *encoded_name = ldb_binary_encode_string(mem_ctx, name);
+	struct ldb_val name_val = data_blob_string_const(name);
 	int ret;
 
 	ret = ldb_search(samdb, mem_ctx, &res, z->zone_dn, LDB_SCOPE_BASE, attrs,
-			"(&(objectClass=dnsNode)(name=%s))", name);
+			"(&(objectClass=dnsNode)(name=%s))",
+			 encoded_name);
 	if (ret != LDB_SUCCESS) {
 		return WERR_INTERNAL_DB_ERROR;
 	}
@@ -380,8 +410,8 @@ WERROR dnsserver_db_add_empty_node(TALLOC_CTX *mem_ctx,
 	dn = ldb_dn_copy(mem_ctx, z->zone_dn);
 	W_ERROR_HAVE_NO_MEMORY(dn);
 
-	if (!ldb_dn_add_child_fmt(dn, "DC=%s", name)) {
-		return WERR_NOMEM;
+	if (!ldb_dn_add_child_val(dn, "DC", name_val)) {
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	return dnsserver_db_do_add_rec(mem_ctx, samdb, dn, 0, NULL);
@@ -397,17 +427,20 @@ WERROR dnsserver_db_add_record(TALLOC_CTX *mem_ctx,
 {
 	const char * const attrs[] = { "dnsRecord", "dNSTombstoned", NULL };
 	struct ldb_result *res;
-	struct dnsp_DnssrvRpcRecord *rec;
+	struct dnsp_DnssrvRpcRecord *rec = NULL;
 	struct ldb_message_element *el;
 	struct ldb_dn *dn;
 	enum ndr_err_code ndr_err;
-	NTTIME t;
 	int ret, i;
 	int serial;
+	WERROR werr;
 	bool was_tombstoned = false;
+	char *encoded_name = ldb_binary_encode_string(mem_ctx, name);
 
-	rec = dns_to_dnsp_copy(mem_ctx, add_record);
-	W_ERROR_HAVE_NO_MEMORY(rec);
+	werr = dns_to_dnsp_convert(mem_ctx, add_record, &rec, true);
+	if (!W_ERROR_IS_OK(werr)) {
+		return werr;
+	}
 
 	/* Set the correct rank for the record. */
 	if (z->zoneinfo->dwZoneType == DNS_ZONE_TYPE_PRIMARY) {
@@ -420,20 +453,17 @@ WERROR dnsserver_db_add_record(TALLOC_CTX *mem_ctx,
 		rec->rank |= DNS_RANK_ROOT_HINT;
 	}
 
-	serial = dnsserver_update_soa(mem_ctx, samdb, z);
+	serial = dnsserver_update_soa(mem_ctx, samdb, z, &werr);
 	if (serial < 0) {
-		return WERR_INTERNAL_DB_ERROR;
+		return werr;
 	}
 
-	unix_to_nt_time(&t, time(NULL));
-	t /= 10*1000*1000; /* convert to seconds (NT time is in 100ns units) */
-	t /= 3600;         /* convert to hours */
-
 	rec->dwSerial = serial;
-	rec->dwTimeStamp = t;
+	rec->dwTimeStamp = 0;
 
 	ret = ldb_search(samdb, mem_ctx, &res, z->zone_dn, LDB_SCOPE_ONELEVEL, attrs,
-			"(&(objectClass=dnsNode)(name=%s))", name);
+			"(&(objectClass=dnsNode)(name=%s))",
+			 encoded_name);
 	if (ret != LDB_SUCCESS) {
 		return WERR_INTERNAL_DB_ERROR;
 	}
@@ -449,7 +479,7 @@ WERROR dnsserver_db_add_record(TALLOC_CTX *mem_ctx,
 	if (el == NULL) {
 		ret = ldb_msg_add_empty(res->msgs[0], "dnsRecord", 0, &el);
 		if (ret != LDB_SUCCESS) {
-			return WERR_NOMEM;
+			return WERR_NOT_ENOUGH_MEMORY;
 		}
 	}
 
@@ -465,7 +495,7 @@ WERROR dnsserver_db_add_record(TALLOC_CTX *mem_ctx,
 		ndr_err = ndr_pull_struct_blob(&el->values[i], mem_ctx, &rec2,
 						(ndr_pull_flags_fn_t)ndr_pull_dnsp_DnssrvRpcRecord);
 		if (!NDR_ERR_CODE_IS_SUCCESS(ndr_err)) {
-			return WERR_GENERAL_FAILURE;
+			return WERR_GEN_FAILURE;
 		}
 
 		if (dns_record_match(rec, &rec2)) {
@@ -485,7 +515,7 @@ WERROR dnsserver_db_add_record(TALLOC_CTX *mem_ctx,
 	ndr_err = ndr_push_struct_blob(&el->values[i], mem_ctx, rec,
 					(ndr_push_flags_fn_t)ndr_push_dnsp_DnssrvRpcRecord);
 	if (!NDR_ERR_CODE_IS_SUCCESS(ndr_err)) {
-		return WERR_GENERAL_FAILURE;
+		return WERR_GEN_FAILURE;
 	}
 
 	el->flags = LDB_FLAG_MOD_REPLACE;
@@ -514,26 +544,29 @@ WERROR dnsserver_db_update_record(TALLOC_CTX *mem_ctx,
 {
 	const char * const attrs[] = { "dnsRecord", NULL };
 	struct ldb_result *res;
-	struct dnsp_DnssrvRpcRecord *arec, *drec;
+	struct dnsp_DnssrvRpcRecord *arec = NULL, *drec = NULL;
 	struct ldb_message_element *el;
 	enum ndr_err_code ndr_err;
-	NTTIME t;
 	int ret, i;
 	int serial;
+	WERROR werr;
+	char *encoded_name = ldb_binary_encode_string(mem_ctx, name);
 
-	arec = dns_to_dnsp_copy(mem_ctx, add_record);
-	W_ERROR_HAVE_NO_MEMORY(arec);
+	werr = dns_to_dnsp_convert(mem_ctx, add_record, &arec, true);
+	if (!W_ERROR_IS_OK(werr)) {
+		return werr;
+	}
 
-	drec = dns_to_dnsp_copy(mem_ctx, del_record);
-	W_ERROR_HAVE_NO_MEMORY(drec);
+	werr = dns_to_dnsp_convert(mem_ctx, del_record, &drec, true);
+	if (!W_ERROR_IS_OK(werr)) {
+		return werr;
+	}
 
-	unix_to_nt_time(&t, time(NULL));
-	t /= 10*1000*1000;
-
-	arec->dwTimeStamp = t;
+	arec->dwTimeStamp = 0;
 
 	ret = ldb_search(samdb, mem_ctx, &res, z->zone_dn, LDB_SCOPE_ONELEVEL, attrs,
-			"(&(objectClass=dnsNode)(name=%s)(!(dNSTombstoned=TRUE)))", name);
+			"(&(objectClass=dnsNode)(name=%s)(!(dNSTombstoned=TRUE)))",
+			 encoded_name);
 	if (ret != LDB_SUCCESS) {
 		return WERR_INTERNAL_DB_ERROR;
 	}
@@ -553,7 +586,7 @@ WERROR dnsserver_db_update_record(TALLOC_CTX *mem_ctx,
 		ndr_err = ndr_pull_struct_blob(&el->values[i], mem_ctx, &rec2,
 						(ndr_pull_flags_fn_t)ndr_pull_dnsp_DnssrvRpcRecord);
 		if (!NDR_ERR_CODE_IS_SUCCESS(ndr_err)) {
-			return WERR_GENERAL_FAILURE;
+			return WERR_GEN_FAILURE;
 		}
 
 		if (dns_record_match(arec, &rec2)) {
@@ -571,7 +604,7 @@ WERROR dnsserver_db_update_record(TALLOC_CTX *mem_ctx,
 		ndr_err = ndr_pull_struct_blob(&el->values[i], mem_ctx, &rec2,
 						(ndr_pull_flags_fn_t)ndr_pull_dnsp_DnssrvRpcRecord);
 		if (!NDR_ERR_CODE_IS_SUCCESS(ndr_err)) {
-			return WERR_GENERAL_FAILURE;
+			return WERR_GEN_FAILURE;
 		}
 
 		if (dns_record_match(drec, &rec2)) {
@@ -584,9 +617,9 @@ WERROR dnsserver_db_update_record(TALLOC_CTX *mem_ctx,
 
 	/* If updating SOA record, use specified serial, otherwise increment */
 	if (arec->wType != DNS_TYPE_SOA) {
-		serial = dnsserver_update_soa(mem_ctx, samdb, z);
+		serial = dnsserver_update_soa(mem_ctx, samdb, z, &werr);
 		if (serial < 0) {
-			return WERR_INTERNAL_DB_ERROR;
+			return werr;
 		}
 		arec->dwSerial = serial;
 	}
@@ -594,7 +627,7 @@ WERROR dnsserver_db_update_record(TALLOC_CTX *mem_ctx,
 	ndr_err = ndr_push_struct_blob(&el->values[i], mem_ctx, arec,
 					(ndr_push_flags_fn_t)ndr_push_dnsp_DnssrvRpcRecord);
 	if (!NDR_ERR_CODE_IS_SUCCESS(ndr_err)) {
-		return WERR_GENERAL_FAILURE;
+		return WERR_GEN_FAILURE;
 	}
 
 	el->flags = LDB_FLAG_MOD_REPLACE;
@@ -616,28 +649,35 @@ WERROR dnsserver_db_delete_record(TALLOC_CTX *mem_ctx,
 {
 	const char * const attrs[] = { "dnsRecord", NULL };
 	struct ldb_result *res;
-	struct dnsp_DnssrvRpcRecord *rec;
+	struct dnsp_DnssrvRpcRecord *rec = NULL;
 	struct ldb_message_element *el;
 	enum ndr_err_code ndr_err;
 	int ret, i;
 	int serial;
+	WERROR werr;
 
-	serial = dnsserver_update_soa(mem_ctx, samdb, z);
+	serial = dnsserver_update_soa(mem_ctx, samdb, z, &werr);
 	if (serial < 0) {
-		return WERR_INTERNAL_DB_ERROR;
+		return werr;
 	}
 
-	rec = dns_to_dnsp_copy(mem_ctx, del_record);
-	W_ERROR_HAVE_NO_MEMORY(rec);
+	werr = dns_to_dnsp_convert(mem_ctx, del_record, &rec, false);
+	if (!W_ERROR_IS_OK(werr)) {
+		return werr;
+	}
 
 	ret = ldb_search(samdb, mem_ctx, &res, z->zone_dn, LDB_SCOPE_ONELEVEL, attrs,
-			"(&(objectClass=dnsNode)(name=%s))", name);
+			"(&(objectClass=dnsNode)(name=%s))",
+			 ldb_binary_encode_string(mem_ctx, name));
 	if (ret != LDB_SUCCESS) {
 		return WERR_INTERNAL_DB_ERROR;
 	}
 
 	if (res->count == 0) {
 		return WERR_DNS_ERROR_RECORD_DOES_NOT_EXIST;
+	}
+	if (res->count > 1) {
+		return WERR_DNS_ERROR_RCODE_SERVER_FAILURE;
 	}
 
 	el = ldb_msg_find_element(res->msgs[0], "dnsRecord");
@@ -651,7 +691,7 @@ WERROR dnsserver_db_delete_record(TALLOC_CTX *mem_ctx,
 		ndr_err = ndr_pull_struct_blob(&el->values[i], mem_ctx, &rec2,
 						(ndr_pull_flags_fn_t)ndr_pull_dnsp_DnssrvRpcRecord);
 		if (!NDR_ERR_CODE_IS_SUCCESS(ndr_err)) {
-			return WERR_GENERAL_FAILURE;
+			return WERR_GEN_FAILURE;
 		}
 
 		if (dns_record_match(rec, &rec2)) {
@@ -703,6 +743,129 @@ static bool dnsserver_db_msg_add_dnsproperty(TALLOC_CTX *mem_ctx,
 	return true;
 }
 
+WERROR dnsserver_db_do_reset_dword(struct ldb_context *samdb,
+				   struct dnsserver_zone *z,
+				   struct DNS_RPC_NAME_AND_PARAM *n_p)
+{
+	struct ldb_message_element *element = NULL;
+	struct dnsp_DnsProperty *prop = NULL;
+	enum ndr_err_code err;
+	TALLOC_CTX *tmp_ctx = NULL;
+	const char * const attrs[] = {"dNSProperty", NULL};
+	struct ldb_result *res = NULL;
+	int i, ret, prop_id;
+
+	if (strcasecmp(n_p->pszNodeName, "Aging") == 0) {
+		z->zoneinfo->fAging = n_p->dwParam;
+		prop_id = DSPROPERTY_ZONE_AGING_STATE;
+	} else if (strcasecmp(n_p->pszNodeName, "RefreshInterval") == 0) {
+		z->zoneinfo->dwRefreshInterval = n_p->dwParam;
+		prop_id = DSPROPERTY_ZONE_REFRESH_INTERVAL;
+	} else if (strcasecmp(n_p->pszNodeName, "NoRefreshInterval") == 0) {
+		z->zoneinfo->dwNoRefreshInterval = n_p->dwParam;
+		prop_id = DSPROPERTY_ZONE_NOREFRESH_INTERVAL;
+	} else if (strcasecmp(n_p->pszNodeName, "AllowUpdate") == 0) {
+		z->zoneinfo->fAllowUpdate = n_p->dwParam;
+		prop_id = DSPROPERTY_ZONE_ALLOW_UPDATE;
+	} else {
+		return WERR_UNKNOWN_PROPERTY;
+	}
+
+	tmp_ctx = talloc_new(NULL);
+	if (tmp_ctx == NULL) {
+		return WERR_NOT_ENOUGH_MEMORY;
+	}
+
+	ret = ldb_search(samdb, tmp_ctx, &res, z->zone_dn, LDB_SCOPE_BASE,
+			 attrs, "(objectClass=dnsZone)");
+	if (ret != LDB_SUCCESS) {
+		DBG_ERR("dnsserver: no zone: %s\n",
+			ldb_dn_get_linearized(z->zone_dn));
+		TALLOC_FREE(tmp_ctx);
+		return WERR_INTERNAL_DB_ERROR;
+	}
+
+	if (res->count != 1) {
+		DBG_ERR("dnsserver: duplicate zone: %s\n",
+			ldb_dn_get_linearized(z->zone_dn));
+		TALLOC_FREE(tmp_ctx);
+		return WERR_GEN_FAILURE;
+	}
+
+	element = ldb_msg_find_element(res->msgs[0], "dNSProperty");
+	if (element == NULL) {
+		DBG_ERR("dnsserver: zone %s has no properties.\n",
+			ldb_dn_get_linearized(z->zone_dn));
+		TALLOC_FREE(tmp_ctx);
+		return WERR_INTERNAL_DB_ERROR;
+	}
+
+	for (i = 0; i < element->num_values; i++) {
+		prop = talloc_zero(element, struct dnsp_DnsProperty);
+		if (prop == NULL) {
+			TALLOC_FREE(tmp_ctx);
+			return WERR_NOT_ENOUGH_MEMORY;
+		}
+		err = ndr_pull_struct_blob(
+			&(element->values[i]),
+			tmp_ctx,
+			prop,
+			(ndr_pull_flags_fn_t)ndr_pull_dnsp_DnsProperty);
+		if (!NDR_ERR_CODE_IS_SUCCESS(err)){
+			DBG_ERR("dnsserver: couldn't PULL dns property id "
+				"%d in zone %s\n",
+				prop->id,
+				ldb_dn_get_linearized(z->zone_dn));
+			TALLOC_FREE(tmp_ctx);
+			return WERR_INTERNAL_DB_ERROR;
+		}
+
+		if (prop->id == prop_id) {
+			switch (prop_id) {
+			case DSPROPERTY_ZONE_AGING_STATE:
+				prop->data.aging_enabled = n_p->dwParam;
+				break;
+			case DSPROPERTY_ZONE_NOREFRESH_INTERVAL:
+				prop->data.norefresh_hours = n_p->dwParam;
+				break;
+			case DSPROPERTY_ZONE_REFRESH_INTERVAL:
+				prop->data.refresh_hours = n_p->dwParam;
+				break;
+			case DSPROPERTY_ZONE_ALLOW_UPDATE:
+				prop->data.allow_update_flag = n_p->dwParam;
+				break;
+			}
+
+			err = ndr_push_struct_blob(
+				&(element->values[i]),
+				tmp_ctx,
+				prop,
+				(ndr_push_flags_fn_t)ndr_push_dnsp_DnsProperty);
+			if (!NDR_ERR_CODE_IS_SUCCESS(err)){
+				DBG_ERR("dnsserver: couldn't PUSH dns prop id "
+					"%d in zone %s\n",
+					prop->id,
+					ldb_dn_get_linearized(z->zone_dn));
+				TALLOC_FREE(tmp_ctx);
+				return WERR_INTERNAL_DB_ERROR;
+			}
+		}
+	}
+
+	element->flags = LDB_FLAG_MOD_REPLACE;
+	ret = ldb_modify(samdb, res->msgs[0]);
+	if (ret != LDB_SUCCESS) {
+		TALLOC_FREE(tmp_ctx);
+		DBG_ERR("dnsserver: Failed to modify zone %s prop %s: %s\n",
+			z->name,
+			n_p->pszNodeName,
+			ldb_errstring(samdb));
+		return WERR_INTERNAL_DB_ERROR;
+	}
+	TALLOC_FREE(tmp_ctx);
+
+	return WERR_OK;
+}
 
 /* Create dnsZone record to database and set security descriptor */
 static WERROR dnsserver_db_do_create_zone(TALLOC_CTX *tmp_ctx,
@@ -746,7 +909,7 @@ static WERROR dnsserver_db_do_create_zone(TALLOC_CTX *tmp_ctx,
 	sddl = talloc_asprintf(tmp_ctx, sddl_template,
 			       dom_sid_string(tmp_ctx, &dnsadmins_sid));
 	if (sddl == NULL) {
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 	talloc_free(res);
 
@@ -757,7 +920,7 @@ static WERROR dnsserver_db_do_create_zone(TALLOC_CTX *tmp_ctx,
 
 	secdesc = sddl_decode(tmp_ctx, sddl, domain_sid);
 	if (secdesc == NULL) {
-		return WERR_GENERAL_FAILURE;
+		return WERR_GEN_FAILURE;
 	}
 
 	msg = ldb_msg_new(tmp_ctx);
@@ -766,7 +929,7 @@ static WERROR dnsserver_db_do_create_zone(TALLOC_CTX *tmp_ctx,
 	msg->dn = zone_dn;
 	ret = ldb_msg_add_string(msg, "objectClass", "dnsZone");
 	if (ret != LDB_SUCCESS) {
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	sd_encoded = talloc_zero(tmp_ctx, DATA_BLOB);
@@ -775,12 +938,12 @@ static WERROR dnsserver_db_do_create_zone(TALLOC_CTX *tmp_ctx,
 	ndr_err = ndr_push_struct_blob(sd_encoded, tmp_ctx, secdesc,
 			(ndr_push_flags_fn_t)ndr_push_security_descriptor);
 	if (!NDR_ERR_CODE_IS_SUCCESS(ndr_err)) {
-		return WERR_GENERAL_FAILURE;
+		return WERR_GEN_FAILURE;
 	}
 
 	ret = ldb_msg_add_steal_value(msg, "nTSecurityDescriptor", sd_encoded);
 	if (ret != LDB_SUCCESS) {
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	/* dns zone Properties */
@@ -793,49 +956,49 @@ static WERROR dnsserver_db_do_create_zone(TALLOC_CTX *tmp_ctx,
 	prop->id = DSPROPERTY_ZONE_TYPE;
 	prop->data.zone_type = z->zoneinfo->dwZoneType;
 	if (!dnsserver_db_msg_add_dnsproperty(tmp_ctx, msg, prop)) {
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	/* allow update */
 	prop->id = DSPROPERTY_ZONE_ALLOW_UPDATE;
 	prop->data.allow_update_flag = z->zoneinfo->fAllowUpdate;
 	if (!dnsserver_db_msg_add_dnsproperty(tmp_ctx, msg, prop)) {
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	/* secure time */
 	prop->id = DSPROPERTY_ZONE_SECURE_TIME;
 	prop->data.zone_secure_time = 0;
 	if (!dnsserver_db_msg_add_dnsproperty(tmp_ctx, msg, prop)) {
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	/* norefresh interval */
 	prop->id = DSPROPERTY_ZONE_NOREFRESH_INTERVAL;
 	prop->data.norefresh_hours = 168;
 	if (!dnsserver_db_msg_add_dnsproperty(tmp_ctx, msg, prop)) {
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	/* refresh interval */
 	prop->id = DSPROPERTY_ZONE_REFRESH_INTERVAL;
 	prop->data.refresh_hours = 168;
 	if (!dnsserver_db_msg_add_dnsproperty(tmp_ctx, msg, prop)) {
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	/* aging state */
 	prop->id = DSPROPERTY_ZONE_AGING_STATE;
 	prop->data.aging_enabled = z->zoneinfo->fAging;
 	if (!dnsserver_db_msg_add_dnsproperty(tmp_ctx, msg, prop)) {
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	/* aging enabled time */
 	prop->id = DSPROPERTY_ZONE_AGING_ENABLED_TIME;
 	prop->data.next_scavenging_cycle_hours = 0;
 	if (!dnsserver_db_msg_add_dnsproperty(tmp_ctx, msg, prop)) {
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	talloc_free(prop);
@@ -844,6 +1007,11 @@ static WERROR dnsserver_db_do_create_zone(TALLOC_CTX *tmp_ctx,
 	if (ret != LDB_SUCCESS) {
 		DEBUG(0, ("dnsserver: Failed to create zone (%s): %s\n",
 		      z->name, ldb_errstring(samdb)));
+
+		if (ret == LDB_ERR_INSUFFICIENT_ACCESS_RIGHTS) {
+			return WERR_ACCESS_DENIED;
+		}
+
 		return WERR_INTERNAL_DB_ERROR;
 	}
 
@@ -865,7 +1033,7 @@ WERROR dnsserver_db_create_zone(struct ldb_context *samdb,
 	struct dnsp_DnssrvRpcRecord *dns_rec;
 	struct dnsp_soa soa;
 	char *tmpstr, *server_fqdn, *soa_email;
-	NTTIME t;
+	struct ldb_val name_val = data_blob_string_const(zone->name);
 
 	/* We only support primary zones for now */
 	if (zone->zoneinfo->dwZoneType != DNS_ZONE_TYPE_PRIMARY) {
@@ -891,9 +1059,14 @@ WERROR dnsserver_db_create_zone(struct ldb_context *samdb,
 	dn = ldb_dn_copy(tmp_ctx, p->partition_dn);
 	W_ERROR_HAVE_NO_MEMORY_AND_FREE(dn, tmp_ctx);
 
-	if(!ldb_dn_add_child_fmt(dn, "DC=%s,CN=MicrosoftDNS", zone->name)) {
+	if (!ldb_dn_add_child_fmt(dn, "CN=MicrosoftDNS")) {
 		talloc_free(tmp_ctx);
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
+	}
+
+	if (!ldb_dn_add_child_val(dn, "DC", name_val)) {
+		talloc_free(tmp_ctx);
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	/* Add dnsZone record */
@@ -905,7 +1078,7 @@ WERROR dnsserver_db_create_zone(struct ldb_context *samdb,
 
 	if (!ldb_dn_add_child_fmt(dn, "DC=@")) {
 		talloc_free(tmp_ctx);
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	dns_rec = talloc_zero_array(tmp_ctx, struct dnsp_DnssrvRpcRecord, 2);
@@ -926,10 +1099,6 @@ WERROR dnsserver_db_create_zone(struct ldb_context *samdb,
 	W_ERROR_HAVE_NO_MEMORY_AND_FREE(soa_email, tmp_ctx);
 	talloc_free(tmpstr);
 
-	unix_to_nt_time(&t, time(NULL));
-	t /= 10*1000*1000; /* convert to seconds (NT time is in 100ns units) */
-	t /= 3600;         /* convert to hours */
-
 	/* SOA Record - values same as defined in provision/sambadns.py */
 	soa.serial = 1;
 	soa.refresh = 900;
@@ -943,7 +1112,7 @@ WERROR dnsserver_db_create_zone(struct ldb_context *samdb,
 	dns_rec[0].rank = DNS_RANK_ZONE;
 	dns_rec[0].dwSerial = soa.serial;
 	dns_rec[0].dwTtlSeconds = 3600;
-	dns_rec[0].dwTimeStamp = (uint32_t)t;
+	dns_rec[0].dwTimeStamp = 0;
 	dns_rec[0].data.soa = soa;
 
 	/* NS Record */
@@ -951,7 +1120,7 @@ WERROR dnsserver_db_create_zone(struct ldb_context *samdb,
 	dns_rec[1].rank = DNS_RANK_ZONE;
 	dns_rec[1].dwSerial = soa.serial;
 	dns_rec[1].dwTtlSeconds = 3600;
-	dns_rec[1].dwTimeStamp = (uint32_t)t;
+	dns_rec[1].dwTimeStamp = 0;
 	dns_rec[1].data.ns = server_fqdn;
 
 	/* Add @ Record */
@@ -976,6 +1145,10 @@ WERROR dnsserver_db_delete_zone(struct ldb_context *samdb,
 	ret = dsdb_delete(samdb, zone->zone_dn, DSDB_TREE_DELETE);
 	if (ret != LDB_SUCCESS) {
 		ldb_transaction_cancel(samdb);
+
+		if (ret == LDB_ERR_INSUFFICIENT_ACCESS_RIGHTS) {
+			return WERR_ACCESS_DENIED;
+		}
 		return WERR_INTERNAL_DB_ERROR;
 	}
 

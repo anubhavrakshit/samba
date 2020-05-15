@@ -100,7 +100,8 @@ static int fork_tcon_client(struct torture_context *tctx,
 
 		status = smbcli_full_connection(NULL, &cli,
 				host, lpcfg_smb_ports(tctx->lp_ctx), share,
-				NULL, lpcfg_socket_options(tctx->lp_ctx), cmdline_credentials,
+				NULL, lpcfg_socket_options(tctx->lp_ctx),
+				popt_get_cmdline_credentials(),
 				lpcfg_resolve_context(tctx->lp_ctx),
 				tctx->ev, &options, &session_options,
 				lpcfg_gensec_settings(tctx, tctx->lp_ctx));
@@ -161,7 +162,7 @@ bool torture_bench_treeconnect(struct torture_context *tctx)
 	int nprocs = torture_setting_int(tctx, "nprocs", 4);
 
 	int *curr_counts = map_count_buffer(nprocs, sizeof(int));
-	int *last_counts = talloc_array(NULL, int, nprocs);
+	int *last_counts = talloc_zero_array(tctx, int, nprocs);
 
 	struct timeval now, last, start;
 	int i, delta;

@@ -1,5 +1,5 @@
 /* 
-   Unix SMB/CIFS mplementation.
+   Unix SMB/CIFS implementation.
    LDAP protocol helper functions for SAMBA
    
    Copyright (C) Andrew Tridgell  2004
@@ -322,7 +322,7 @@ static bool ldap_push_filter(struct asn1_data *data, struct ldb_parse_tree *tree
 		if (!asn1_push_tag(data, ASN1_CONTEXT_SIMPLE(7))) return false;
 		if (!asn1_write_LDAPString(data, tree->u.present.attr)) return false;
 		if (!asn1_pop_tag(data)) return false;
-		return !data->has_error;
+		return !asn1_has_error(data);
 
 	case LDB_OP_APPROX:
 		/* approx test */
@@ -366,7 +366,7 @@ static bool ldap_push_filter(struct asn1_data *data, struct ldb_parse_tree *tree
 	default:
 		return false;
 	}
-	return !data->has_error;
+	return !asn1_has_error(data);
 }
 
 static bool ldap_encode_response(struct asn1_data *data, struct ldap_Result *result)
@@ -390,7 +390,7 @@ _PUBLIC_ bool ldap_encode(struct ldap_message *msg,
 			  const struct ldap_control_handler *control_handlers,
 			  DATA_BLOB *result, TALLOC_CTX *mem_ctx)
 {
-	struct asn1_data *data = asn1_init(mem_ctx);
+	struct asn1_data *data = asn1_init(mem_ctx, ASN1_MAX_TREE_DEPTH);
 	int i, j;
 
 	if (!data) return false;
@@ -691,7 +691,10 @@ _PUBLIC_ bool ldap_encode(struct ldap_message *msg,
 
 	if (!asn1_pop_tag(data)) goto err;
 
-	*result = data_blob_talloc(mem_ctx, data->data, data->length);
+	if (!asn1_extract_blob(data, mem_ctx, result)) {
+		goto err;
+	}
+
 	asn1_free(data);
 
 	return true;
@@ -762,7 +765,7 @@ static struct ldb_val **ldap_decode_substring(TALLOC_CTX *mem_ctx, struct ldb_va
 	}
 	chunks[chunk_num]->length = strlen(value);
 
-	chunks[chunk_num + 1] = '\0';
+	chunks[chunk_num + 1] = NULL;
 
 	return chunks;
 }
@@ -845,7 +848,8 @@ static struct ldb_parse_tree *ldap_decode_filter_tree(TALLOC_CTX *mem_ctx,
 		if (!asn1_read_OctetString_talloc(mem_ctx, data, &attrib)) goto failed;
 		if (!asn1_read_OctetString(data, mem_ctx, &value)) goto failed;
 		if (!asn1_end_tag(data)) goto failed;
-		if ((data->has_error) || (attrib == NULL) || (value.data == NULL)) {
+		if (asn1_has_error(data) || (attrib == NULL) ||
+		    (value.data == NULL)) {
 			goto failed;
 		}
 
@@ -882,7 +886,7 @@ static struct ldb_parse_tree *ldap_decode_filter_tree(TALLOC_CTX *mem_ctx,
 			goto failed;
 		}
 
-		while (asn1_tag_remaining(data)) {
+		while (asn1_tag_remaining(data) > 0) {
 			if (!asn1_peek_uint8(data, &subs_tag)) goto failed;
 			subs_tag &= 0x1f;	/* strip off the asn1 stuff */
 			if (subs_tag > 2) goto failed;
@@ -960,7 +964,8 @@ static struct ldb_parse_tree *ldap_decode_filter_tree(TALLOC_CTX *mem_ctx,
 		if (!asn1_read_OctetString_talloc(mem_ctx, data, &attrib)) goto failed;
 		if (!asn1_read_OctetString(data, mem_ctx, &value)) goto failed;
 		if (!asn1_end_tag(data)) goto failed;
-		if ((data->has_error) || (attrib == NULL) || (value.data == NULL)) {
+		if (asn1_has_error(data) || (attrib == NULL) ||
+		    (value.data == NULL)) {
 			goto failed;
 		}
 
@@ -979,7 +984,8 @@ static struct ldb_parse_tree *ldap_decode_filter_tree(TALLOC_CTX *mem_ctx,
 		if (!asn1_read_OctetString_talloc(mem_ctx, data, &attrib)) goto failed;
 		if (!asn1_read_OctetString(data, mem_ctx, &value)) goto failed;
 		if (!asn1_end_tag(data)) goto failed;
-		if ((data->has_error) || (attrib == NULL) || (value.data == NULL)) {
+		if (asn1_has_error(data) || (attrib == NULL) ||
+		    (value.data == NULL)) {
 			goto failed;
 		}
 
@@ -1017,7 +1023,8 @@ static struct ldb_parse_tree *ldap_decode_filter_tree(TALLOC_CTX *mem_ctx,
 		if (!asn1_read_OctetString_talloc(mem_ctx, data, &attrib)) goto failed;
 		if (!asn1_read_OctetString(data, mem_ctx, &value)) goto failed;
 		if (!asn1_end_tag(data)) goto failed;
-		if ((data->has_error) || (attrib == NULL) || (value.data == NULL)) {
+		if (asn1_has_error(data) || (attrib == NULL) ||
+		    (value.data == NULL)) {
 			goto failed;
 		}
 
@@ -1155,6 +1162,7 @@ static bool ldap_decode_attribs(TALLOC_CTX *mem_ctx, struct asn1_data *data,
 /* This routine returns LDAP status codes */
 
 _PUBLIC_ NTSTATUS ldap_decode(struct asn1_data *data,
+			      const struct ldap_request_limits *limits,
 			      const struct ldap_control_handler *control_handlers,
 			      struct ldap_message *msg)
 {
@@ -1225,7 +1233,7 @@ _PUBLIC_ NTSTATUS ldap_decode(struct asn1_data *data,
 		if (!ldap_decode_response(msg, data, &r->response)) goto prot_err;
 		if (asn1_peek_tag(data, ASN1_CONTEXT_SIMPLE(7))) {
 			DATA_BLOB tmp_blob = data_blob(NULL, 0);
-			if (!asn1_read_ContextSimple(data, 7, &tmp_blob)) goto prot_err;
+			if (!asn1_read_ContextSimple(data, msg, 7, &tmp_blob)) goto prot_err;
 			r->SASL.secblob = talloc(msg, DATA_BLOB);
 			if (!r->SASL.secblob) {
 				return NT_STATUS_LDAP(LDAP_OPERATIONS_ERROR);
@@ -1251,7 +1259,11 @@ _PUBLIC_ NTSTATUS ldap_decode(struct asn1_data *data,
 		struct ldap_SearchRequest *r = &msg->r.SearchRequest;
 		int sizelimit, timelimit;
 		const char **attrs = NULL;
+		size_t request_size = asn1_get_length(data);
 		msg->type = LDAP_TAG_SearchRequest;
+		if (request_size > limits->max_search_size) {
+			goto prot_err;
+		}
 		if (!asn1_start_tag(data, tag)) goto prot_err;
 		if (!asn1_read_OctetString_talloc(msg, data, &r->basedn)) goto prot_err;
 		if (!asn1_read_enumerated(data, (int *)(void *)&(r->scope))) goto prot_err;
@@ -1494,7 +1506,7 @@ _PUBLIC_ NTSTATUS ldap_decode(struct asn1_data *data,
 
 		msg->type = LDAP_TAG_ExtendedRequest;
 		if (!asn1_start_tag(data,tag)) goto prot_err;
-		if (!asn1_read_ContextSimple(data, 0, &tmp_blob)) {
+		if (!asn1_read_ContextSimple(data, msg, 0, &tmp_blob)) {
 			goto prot_err;
 		}
 		r->oid = blob2string_talloc(msg, tmp_blob);
@@ -1504,7 +1516,7 @@ _PUBLIC_ NTSTATUS ldap_decode(struct asn1_data *data,
 		}
 
 		if (asn1_peek_tag(data, ASN1_CONTEXT_SIMPLE(1))) {
-			if (!asn1_read_ContextSimple(data, 1, &tmp_blob)) goto prot_err;
+			if (!asn1_read_ContextSimple(data, msg, 1, &tmp_blob)) goto prot_err;
 			r->value = talloc(msg, DATA_BLOB);
 			if (!r->value) {
 				return NT_STATUS_LDAP(LDAP_OPERATIONS_ERROR);
@@ -1528,7 +1540,7 @@ _PUBLIC_ NTSTATUS ldap_decode(struct asn1_data *data,
 		if (!ldap_decode_response(msg, data, &r->response)) goto prot_err;
 
 		if (asn1_peek_tag(data, ASN1_CONTEXT_SIMPLE(10))) {
-			if (!asn1_read_ContextSimple(data, 1, &tmp_blob)) goto prot_err;
+			if (!asn1_read_ContextSimple(data, msg, 1, &tmp_blob)) goto prot_err;
 			r->oid = blob2string_talloc(msg, tmp_blob);
 			data_blob_free(&tmp_blob);
 			if (!r->oid) {
@@ -1539,7 +1551,7 @@ _PUBLIC_ NTSTATUS ldap_decode(struct asn1_data *data,
 		}
 
 		if (asn1_peek_tag(data, ASN1_CONTEXT_SIMPLE(11))) {
-			if (!asn1_read_ContextSimple(data, 1, &tmp_blob)) goto prot_err;
+			if (!asn1_read_ContextSimple(data, msg, 1, &tmp_blob)) goto prot_err;
 			r->value = talloc(msg, DATA_BLOB);
 			if (!r->value) {
 				return NT_STATUS_LDAP(LDAP_OPERATIONS_ERROR);
@@ -1618,7 +1630,7 @@ _PUBLIC_ NTSTATUS ldap_decode(struct asn1_data *data,
 	}
 
 	if (!asn1_end_tag(data)) goto prot_err;
-	if ((data->has_error) || (data->nesting != NULL)) {
+	if (asn1_has_error(data) || asn1_has_nesting(data)) {
 		return NT_STATUS_LDAP(LDAP_PROTOCOL_ERROR);
 	}
 	return NT_STATUS_OK;
@@ -1635,6 +1647,8 @@ _PUBLIC_ NTSTATUS ldap_decode(struct asn1_data *data,
 */
 NTSTATUS ldap_full_packet(void *private_data, DATA_BLOB blob, size_t *packet_size)
 {
+	int ret;
+
 	if (blob.length < 6) {
 		/*
 		 * We need at least 6 bytes to workout the length
@@ -1642,5 +1656,10 @@ NTSTATUS ldap_full_packet(void *private_data, DATA_BLOB blob, size_t *packet_siz
 		 */
 		return STATUS_MORE_ENTRIES;
 	}
-	return asn1_peek_full_tag(blob, ASN1_SEQUENCE(0), packet_size);
+
+	ret = asn1_peek_full_tag(blob, ASN1_SEQUENCE(0), packet_size);
+	if (ret != 0) {
+		return map_nt_error_from_unix_common(ret);
+	}
+	return NT_STATUS_OK;
 }

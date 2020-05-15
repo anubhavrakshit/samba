@@ -32,6 +32,7 @@
 #include "passdb.h"
 #include "auth.h"
 #include "messages.h"
+#include "lib/messages_ctdb.h"
 #include "smbprofile.h"
 #include "rpc_server/spoolss/srv_spoolss_nt.h"
 #include "libsmb/libsmb.h"
@@ -39,9 +40,12 @@
 #include "../libcli/security/dom_sid.h"
 #include "../libcli/security/security_token.h"
 #include "lib/id_cache.h"
-#include "lib/sys_rw_data.h"
-#include "serverid.h"
+#include "lib/util/sys_rw_data.h"
 #include "system/threads.h"
+#include "lib/pthreadpool/pthreadpool_tevent.h"
+#include "util_event.h"
+#include "libcli/smb/smbXcli_base.h"
+#include "lib/util/time_basic.h"
 
 /* Internal message queue for deferred opens. */
 struct pending_message_list {
@@ -162,15 +166,9 @@ static bool smbd_unlock_socket_internal(struct smbXsrv_connection *xconn)
 
 #ifdef HAVE_ROBUST_MUTEXES
 	if (xconn->smb1.echo_handler.socket_mutex != NULL) {
-		int ret = EINTR;
-
-		while (ret == EINTR) {
-			ret = pthread_mutex_unlock(
-				xconn->smb1.echo_handler.socket_mutex);
-			if (ret == 0) {
-				break;
-			}
-		}
+		int ret;
+		ret = pthread_mutex_unlock(
+			xconn->smb1.echo_handler.socket_mutex);
 		if (ret != 0) {
 			DEBUG(1, ("pthread_mutex_unlock failed: %s\n",
 				  strerror(ret)));
@@ -231,8 +229,15 @@ bool srv_send_smb(struct smbXsrv_connection *xconn, char *buffer,
 	smbd_lock_socket(xconn);
 
 	if (do_signing) {
+		NTSTATUS status;
+
 		/* Sign the outgoing packet if required. */
-		srv_calculate_sign_mac(xconn, buf_out, seqnum);
+		status = srv_calculate_sign_mac(xconn, buf_out, seqnum);
+		if (!NT_STATUS_IS_OK(status)) {
+			DBG_ERR("Failed to calculate signing mac: %s\n",
+				nt_errstr(status));
+			return false;
+		}
 	}
 
 	if (do_encrypt) {
@@ -278,10 +283,10 @@ out:
  Setup the word count and byte count for a smb message.
 ********************************************************************/
 
-int srv_set_message(char *buf,
-                        int num_words,
-                        int num_bytes,
-                        bool zero)
+size_t srv_set_message(char *buf,
+		       size_t num_words,
+		       size_t num_bytes,
+		       bool zero)
 {
 	if (zero && (num_words || num_bytes)) {
 		memset(buf + smb_size,'\0',num_words*2 + num_bytes);
@@ -627,8 +632,8 @@ static bool init_smb_request(struct smb_request *req,
 	}
 	req->chain_fsp = NULL;
 	req->smb2req = NULL;
-	req->priv_paths = NULL;
 	req->chain = NULL;
+	req->posix_pathnames = lp_posix_pathnames();
 	smb_init_perfcount_data(&req->pcd);
 
 	/* Ensure we have at least wct words and 2 bytes of bcc. */
@@ -749,8 +754,7 @@ static bool push_queued_message(struct smb_request *req,
 	}
 #endif
 
-	DLIST_ADD_END(req->sconn->deferred_open_queue, msg,
-		      struct pending_message_list *);
+	DLIST_ADD_END(req->sconn->deferred_open_queue, msg);
 
 	DEBUG(10,("push_message: pushed message length %u on "
 		  "deferred_open_queue\n", (unsigned int)msg_len));
@@ -826,7 +830,14 @@ bool schedule_deferred_open_message_smb(struct smbXsrv_connection *xconn,
 				"scheduling mid %llu\n",
 				(unsigned long long)mid ));
 
-			te = tevent_add_timer(pml->sconn->ev_ctx,
+			/*
+			 * smbd_deferred_open_timer() calls
+			 * process_smb() to redispatch the request
+			 * including the required impersonation.
+			 *
+			 * So we can just use the raw tevent_context.
+			 */
+			te = tevent_add_timer(xconn->client->raw_ev_ctx,
 					      pml,
 					      timeval_zero(),
 					      smbd_deferred_open_timer,
@@ -925,16 +936,16 @@ bool get_deferred_open_message_state(struct smb_request *smbreq,
 ****************************************************************************/
 
 bool push_deferred_open_message_smb(struct smb_request *req,
-			       struct timeval request_time,
-			       struct timeval timeout,
-			       struct file_id id,
-			       struct deferred_open_record *open_rec)
+				    struct timeval timeout,
+				    struct file_id id,
+				    struct deferred_open_record *open_rec)
 {
+	struct timeval_buf tvbuf;
 	struct timeval end_time;
 
 	if (req->smb2req) {
 		return push_deferred_open_message_smb2(req->smb2req,
-						request_time,
+						req->request_time,
 						timeout,
 						id,
 						open_rec);
@@ -948,16 +959,14 @@ bool push_deferred_open_message_smb(struct smb_request *req,
 			"logic error unread_bytes != 0" );
 	}
 
-	end_time = timeval_sum(&request_time, &timeout);
+	end_time = timeval_sum(&req->request_time, &timeout);
 
-	DEBUG(10,("push_deferred_open_message_smb: pushing message "
-		"len %u mid %llu timeout time [%u.%06u]\n",
-		(unsigned int) smb_len(req->inbuf)+4,
-		(unsigned long long)req->mid,
-		(unsigned int)end_time.tv_sec,
-		(unsigned int)end_time.tv_usec));
+	DBG_DEBUG("pushing message len %u mid %"PRIu64" timeout time [%s]\n",
+		  (unsigned int) smb_len(req->inbuf)+4,
+		  req->mid,
+		  timeval_str_buf(&end_time, false, true, &tvbuf));
 
-	return push_queued_message(req, request_time, end_time, open_rec);
+	return push_queued_message(req, req->request_time, end_time, open_rec);
 }
 
 static void smbd_sig_term_handler(struct tevent_context *ev,
@@ -970,7 +979,7 @@ static void smbd_sig_term_handler(struct tevent_context *ev,
 	exit_server_cleanly("termination signal");
 }
 
-void smbd_setup_sig_term_handler(struct smbd_server_connection *sconn)
+static void smbd_setup_sig_term_handler(struct smbd_server_connection *sconn)
 {
 	struct tevent_signal *se;
 
@@ -1000,7 +1009,7 @@ static void smbd_sig_hup_handler(struct tevent_context *ev,
 	reload_services(sconn, conn_snum_used, false);
 }
 
-void smbd_setup_sig_hup_handler(struct smbd_server_connection *sconn)
+static void smbd_setup_sig_hup_handler(struct smbd_server_connection *sconn)
 {
 	struct tevent_signal *se;
 
@@ -1430,6 +1439,54 @@ static void smb_dump(const char *name, int type, const char *data)
 	TALLOC_FREE(fname);
 }
 
+static void smb1srv_update_crypto_flags(struct smbXsrv_session *session,
+					struct smb_request *req,
+					uint8_t type,
+					bool *update_session_globalp,
+					bool *update_tcon_globalp)
+{
+	connection_struct *conn = req->conn;
+	struct smbXsrv_tcon *tcon = conn ? conn->tcon : NULL;
+	uint8_t encrypt_flag = SMBXSRV_PROCESSED_UNENCRYPTED_PACKET;
+	uint8_t sign_flag = SMBXSRV_PROCESSED_UNSIGNED_PACKET;
+	bool update_session = false;
+	bool update_tcon = false;
+
+	if (req->encrypted) {
+		encrypt_flag = SMBXSRV_PROCESSED_ENCRYPTED_PACKET;
+	}
+
+	if (srv_is_signing_active(req->xconn)) {
+		sign_flag = SMBXSRV_PROCESSED_SIGNED_PACKET;
+	} else if ((type == SMBecho) || (type == SMBsesssetupX)) {
+		/*
+		 * echo can be unsigned. Sesssion setup except final
+		 * session setup response too
+		 */
+		sign_flag &= ~SMBXSRV_PROCESSED_UNSIGNED_PACKET;
+	}
+
+	update_session |= smbXsrv_set_crypto_flag(
+		&session->global->encryption_flags, encrypt_flag);
+	update_session |= smbXsrv_set_crypto_flag(
+		&session->global->signing_flags, sign_flag);
+
+	if (tcon) {
+		update_tcon |= smbXsrv_set_crypto_flag(
+			&tcon->global->encryption_flags, encrypt_flag);
+		update_tcon |= smbXsrv_set_crypto_flag(
+			&tcon->global->signing_flags, sign_flag);
+	}
+
+	if (update_session) {
+		session->global->channels[0].encryption_cipher = SMB_ENCRYPTION_GSSAPI;
+	}
+
+	*update_session_globalp = update_session;
+	*update_tcon_globalp = update_tcon;
+	return;
+}
+
 /****************************************************************************
  Prepare everything for calling the actual request function, and potentially
  call the request function via the "new" interface.
@@ -1445,6 +1502,8 @@ static void smb_dump(const char *name, int type, const char *data)
 
 static connection_struct *switch_message(uint8_t type, struct smb_request *req)
 {
+	const struct loadparm_substitution *lp_sub =
+		loadparm_s3_global_substitution();
 	int flags;
 	uint64_t session_tag;
 	connection_struct *conn = NULL;
@@ -1527,19 +1586,21 @@ static connection_struct *switch_message(uint8_t type, struct smb_request *req)
 		}
 	}
 
-	if (session_tag != xconn->client->last_session_id) {
-		struct user_struct *vuser = NULL;
-
-		xconn->client->last_session_id = session_tag;
-		if (session) {
-			vuser = session->compat;
-		}
-		if (vuser) {
-			set_current_user_info(
-				vuser->session_info->unix_info->sanitized_username,
-				vuser->session_info->unix_info->unix_name,
-				vuser->session_info->info->domain_name);
-		}
+	if (session != NULL &&
+	    session->global->auth_session_info != NULL &&
+	    !(flags & AS_USER))
+	{
+		/*
+		 * change_to_user() implies set_current_user_info()
+		 * and chdir_connect_service().
+		 *
+		 * So we only call set_current_user_info if
+		 * we don't have AS_USER specified.
+		 */
+		set_current_user_info(
+			session->global->auth_session_info->unix_info->sanitized_username,
+			session->global->auth_session_info->unix_info->unix_name,
+			session->global->auth_session_info->info->domain_name);
 	}
 
 	/* Does this call need to be run as the connected user? */
@@ -1559,7 +1620,13 @@ static connection_struct *switch_message(uint8_t type, struct smb_request *req)
 			return NULL;
 		}
 
-		if (!change_to_user(conn,session_tag)) {
+		set_current_case_sensitive(conn, SVAL(req->inbuf,smb_flg));
+
+		/*
+		 * change_to_user() implies set_current_user_info()
+		 * and chdir_connect_service().
+		 */
+		if (!change_to_user_and_service(conn,session_tag)) {
 			DEBUG(0, ("Error: Could not change to user. Removing "
 				"deferred open, mid=%llu.\n",
 				(unsigned long long)req->mid));
@@ -1580,6 +1647,15 @@ static connection_struct *switch_message(uint8_t type, struct smb_request *req)
 			reply_nterror(req, NT_STATUS_ACCESS_DENIED);
 			return conn;
 		}
+	} else if (flags & AS_GUEST) {
+		/*
+		 * Does this protocol need to be run as guest? (Only archane
+		 * messenger service requests have this...)
+		 */
+		if (!change_to_guest()) {
+			reply_nterror(req, NT_STATUS_ACCESS_DENIED);
+			return conn;
+		}
 	} else {
 		/* This call needs to be run as root */
 		change_to_root_user();
@@ -1595,7 +1671,7 @@ static connection_struct *switch_message(uint8_t type, struct smb_request *req)
 			if (req->cmd != SMBtrans2 && req->cmd != SMBtranss2) {
 				DEBUG(1,("service[%s] requires encryption"
 					"%s ACCESS_DENIED. mid=%llu\n",
-					lp_servicename(talloc_tos(), SNUM(conn)),
+					lp_servicename(talloc_tos(), lp_sub, SNUM(conn)),
 					smb_fn_name(type),
 					(unsigned long long)req->mid));
 				reply_nterror(req, NT_STATUS_ACCESS_DENIED);
@@ -1603,46 +1679,46 @@ static connection_struct *switch_message(uint8_t type, struct smb_request *req)
 			}
 		}
 
-		if (!set_current_service(conn,SVAL(req->inbuf,smb_flg),
-					 (flags & (AS_USER|DO_CHDIR)
-					  ?True:False))) {
-			reply_nterror(req, NT_STATUS_ACCESS_DENIED);
-			return conn;
+		if (flags & DO_CHDIR) {
+			bool ok;
+
+			ok = chdir_current_service(conn);
+			if (!ok) {
+				reply_nterror(req, NT_STATUS_ACCESS_DENIED);
+				return conn;
+			}
 		}
 		conn->num_smb_operations++;
 	}
 
 	/*
-	 * Does this protocol need to be run as guest? (Only archane
-	 * messenger service requests have this...)
+	 * Update encryption and signing state tracking flags that are
+	 * used by smbstatus to display signing and encryption status.
 	 */
-	if (flags & AS_GUEST) {
-		char *raddr;
-		bool ok;
+	if (session != NULL) {
+		bool update_session_global = false;
+		bool update_tcon_global = false;
 
-		if (!change_to_guest()) {
-			reply_nterror(req, NT_STATUS_ACCESS_DENIED);
-			return conn;
+		req->session = session;
+
+		smb1srv_update_crypto_flags(session, req, type,
+					    &update_session_global,
+					    &update_tcon_global);
+
+		if (update_session_global) {
+			status = smbXsrv_session_update(session);
+			if (!NT_STATUS_IS_OK(status)) {
+				reply_nterror(req, NT_STATUS_UNSUCCESSFUL);
+				return conn;
+			}
 		}
 
-		raddr = tsocket_address_inet_addr_string(xconn->remote_address,
-							 talloc_tos());
-		if (raddr == NULL) {
-			reply_nterror(req, NT_STATUS_NO_MEMORY);
-			return conn;
-		}
-
-		/*
-		 * Haven't we checked this in smbd_process already???
-		 */
-
-		ok = allow_access(lp_hosts_deny(-1), lp_hosts_allow(-1),
-				  xconn->remote_hostname, raddr);
-		TALLOC_FREE(raddr);
-
-		if (!ok) {
-			reply_nterror(req, NT_STATUS_ACCESS_DENIED);
-			return conn;
+		if (update_tcon_global) {
+			status = smbXsrv_tcon_update(req->conn->tcon);
+			if (!NT_STATUS_IS_OK(status)) {
+				reply_nterror(req, NT_STATUS_UNSUCCESSFUL);
+				return conn;
+			}
 		}
 	}
 
@@ -1707,7 +1783,7 @@ static void construct_reply_chain(struct smbXsrv_connection *xconn,
 	unsigned num_reqs;
 	bool ok;
 
-	ok = smb1_parse_chain(talloc_tos(), (uint8_t *)inbuf, xconn, encrypted,
+	ok = smb1_parse_chain(xconn, (uint8_t *)inbuf, xconn, encrypted,
 			      seqnum, &reqs, &num_reqs);
 	if (!ok) {
 		char errbuf[smb_size];
@@ -1777,12 +1853,13 @@ void smb_request_done(struct smb_request *req)
 
 		next->vuid = SVAL(req->outbuf, smb_uid);
 		next->tid  = SVAL(req->outbuf, smb_tid);
-		status = smb1srv_tcon_lookup(req->xconn, req->tid,
+		status = smb1srv_tcon_lookup(req->xconn, next->tid,
 					     now, &tcon);
+
 		if (NT_STATUS_IS_OK(status)) {
-			req->conn = tcon->compat;
+			next->conn = tcon->compat;
 		} else {
-			req->conn = NULL;
+			next->conn = NULL;
 		}
 		next->chain_fsp = req->chain_fsp;
 		next->inbuf = req->inbuf;
@@ -1893,9 +1970,17 @@ static void process_smb(struct smbXsrv_connection *xconn,
 		if (smbd_is_smb2_header(inbuf, nread)) {
 			const uint8_t *inpdu = inbuf + NBT_HDR_SIZE;
 			size_t pdulen = nread - NBT_HDR_SIZE;
-			smbd_smb2_first_negprot(xconn, inpdu, pdulen);
+			NTSTATUS status = smbd_smb2_process_negprot(
+						xconn,
+						0,
+						inpdu,
+						pdulen);
+			if (!NT_STATUS_IS_OK(status)) {
+				exit_server_cleanly("SMB2 negprot fail");
+			}
 			return;
-		} else if (nread >= smb_size && valid_smb_header(inbuf)
+		}
+		if (nread >= smb_size && valid_smb_header(inbuf)
 				&& CVAL(inbuf, smb_com) != 0x72) {
 			/* This is a non-negprot SMB1 packet.
 			   Disable SMB2 from now on. */
@@ -1911,11 +1996,11 @@ static void process_smb(struct smbXsrv_connection *xconn,
 
 		/* special magic for immediate exit */
 		if ((nread == 9) &&
-		    (IVAL(inbuf, 4) == 0x74697865) &&
+		    (IVAL(inbuf, 4) == SMB_SUICIDE_PACKET) &&
 		    lp_parm_bool(-1, "smbd", "suicide mode", false)) {
 			uint8_t exitcode = CVAL(inbuf, 8);
-			DEBUG(1, ("Exiting immediately with code %d\n",
-				  (int)exitcode));
+			DBG_WARNING("SUICIDE: Exiting immediately with code %d\n",
+				    (int)exitcode);
 			exit(exitcode);
 		}
 
@@ -2000,6 +2085,7 @@ static void construct_reply_common(uint8_t cmd, const uint8_t *inbuf,
 
 	SSVAL(outbuf,smb_tid,SVAL(inbuf,smb_tid));
 	SSVAL(outbuf,smb_pid,SVAL(inbuf,smb_pid));
+	SSVAL(outbuf,smb_pidhigh,SVAL(inbuf,smb_pidhigh));
 	SSVAL(outbuf,smb_uid,SVAL(inbuf,smb_uid));
 	SSVAL(outbuf,smb_mid,SVAL(inbuf,smb_mid));
 }
@@ -2026,7 +2112,7 @@ static bool find_andx_cmd_ofs(uint8_t *buf, size_t *pofs)
 
 	cmd = CVAL(buf, smb_com);
 
-	if (!is_andx_req(cmd)) {
+	if (!smb1cli_is_andx_req(cmd)) {
 		return false;
 	}
 
@@ -2034,7 +2120,7 @@ static bool find_andx_cmd_ofs(uint8_t *buf, size_t *pofs)
 
 	while (CVAL(buf, ofs) != 0xff) {
 
-		if (!is_andx_req(CVAL(buf, ofs))) {
+		if (!smb1cli_is_andx_req(CVAL(buf, ofs))) {
 			return false;
 		}
 
@@ -2191,7 +2277,7 @@ bool smb1_is_chain(const uint8_t *buf)
 	uint8_t cmd, wct, andx_cmd;
 
 	cmd = CVAL(buf, smb_com);
-	if (!is_andx_req(cmd)) {
+	if (!smb1cli_is_andx_req(cmd)) {
 		return false;
 	}
 	wct = CVAL(buf, smb_wct);
@@ -2227,7 +2313,7 @@ bool smb1_walk_chain(const uint8_t *buf,
 		return false;
 	}
 
-	if (!is_andx_req(cmd)) {
+	if (!smb1cli_is_andx_req(cmd)) {
 		return true;
 	}
 	if (wct < 2) {
@@ -2285,7 +2371,7 @@ bool smb1_walk_chain(const uint8_t *buf,
 
 		wct = CVAL(smb_buf, chain_offset);
 
-		if (is_andx_req(chain_cmd) && (wct < 2)) {
+		if (smb1cli_is_andx_req(chain_cmd) && (wct < 2)) {
 			return false;
 		}
 
@@ -2320,7 +2406,7 @@ bool smb1_walk_chain(const uint8_t *buf,
 			return false;
 		}
 
-		if (!is_andx_req(chain_cmd)) {
+		if (!smb1cli_is_andx_req(chain_cmd)) {
 			return true;
 		}
 		chain_cmd = CVAL(vwv, 0);
@@ -2616,7 +2702,8 @@ static void smbd_release_ip_immediate(struct tevent_context *ctx,
 /****************************************************************************
 received when we should release a specific IP
 ****************************************************************************/
-static int release_ip(uint32_t src_vnn, uint32_t dst_vnn,
+static int release_ip(struct tevent_context *ev,
+		      uint32_t src_vnn, uint32_t dst_vnn,
 		      uint64_t dst_srvid,
 		      const uint8_t *msg, size_t msglen,
 		      void *private_data)
@@ -2674,8 +2761,10 @@ static int release_ip(uint32_t src_vnn, uint32_t dst_vnn,
 		 * as we might be called from within ctdbd_migrate(),
 		 * we need to defer our action to the next event loop
 		 */
-		tevent_schedule_immediate(state->im, xconn->ev_ctx,
-					  smbd_release_ip_immediate, state);
+		tevent_schedule_immediate(state->im,
+					  xconn->client->raw_ev_ctx,
+					  smbd_release_ip_immediate,
+					  state);
 
 		/*
 		 * Make sure we don't get any io on the connection.
@@ -2693,8 +2782,9 @@ static NTSTATUS smbd_register_ips(struct smbXsrv_connection *xconn,
 {
 	struct smbd_release_ip_state *state;
 	struct ctdbd_connection *cconn;
+	int ret;
 
-	cconn = messaging_ctdbd_connection();
+	cconn = messaging_ctdb_connection();
 	if (cconn == NULL) {
 		return NT_STATUS_NO_MEMORY;
 	}
@@ -2712,7 +2802,11 @@ static NTSTATUS smbd_register_ips(struct smbXsrv_connection *xconn,
 		return NT_STATUS_NO_MEMORY;
 	}
 
-	return ctdbd_register_ips(cconn, srv, clnt, release_ip, state);
+	ret = ctdbd_register_ips(cconn, srv, clnt, release_ip, state);
+	if (ret != 0) {
+		return map_nt_error_from_unix(ret);
+	}
+	return NT_STATUS_OK;
 }
 
 static void msg_kill_client_ip(struct messaging_context *msg_ctx,
@@ -3141,9 +3235,9 @@ static void smbd_echo_loop(struct smbXsrv_connection *xconn,
 	}
 	state->xconn = xconn;
 	state->parent_pipe = parent_pipe;
-	state->ev = s3_tevent_context_init(state);
+	state->ev = samba_tevent_context_init(state);
 	if (state->ev == NULL) {
-		DEBUG(1, ("tevent_context_init failed\n"));
+		DEBUG(1, ("samba_tevent_context_init failed\n"));
 		TALLOC_FREE(state);
 		return;
 	}
@@ -3319,12 +3413,16 @@ bool fork_echo_handler(struct smbXsrv_connection *xconn)
 		close(listener_pipe[0]);
 		set_blocking(listener_pipe[1], false);
 
-		status = smbd_reinit_after_fork(xconn->msg_ctx, xconn->ev_ctx, true);
+		status = smbd_reinit_after_fork(xconn->client->msg_ctx,
+						xconn->client->raw_ev_ctx,
+						true,
+						"smbd-echo");
 		if (!NT_STATUS_IS_OK(status)) {
 			DEBUG(1, ("reinit_after_fork failed: %s\n",
 				  nt_errstr(status)));
 			exit(1);
 		}
+		initialize_password_db(true, xconn->client->raw_ev_ctx);
 		smbd_echo_loop(xconn, listener_pipe[1]);
 		exit(0);
 	}
@@ -3338,7 +3436,8 @@ bool fork_echo_handler(struct smbXsrv_connection *xconn)
 	 * Without smb signing this is the same as the normal smbd
 	 * listener. This needs to change once signing comes in.
 	 */
-	xconn->smb1.echo_handler.trusted_fde = tevent_add_fd(xconn->ev_ctx,
+	xconn->smb1.echo_handler.trusted_fde = tevent_add_fd(
+					xconn->client->raw_ev_ctx,
 					xconn,
 					xconn->smb1.echo_handler.trusted_fd,
 					TEVENT_FD_READ,
@@ -3372,80 +3471,106 @@ fail:
 	return false;
 }
 
-static bool uid_in_use(const struct user_struct *user, uid_t uid)
+static bool uid_in_use(struct auth_session_info *session_info,
+		       uid_t uid)
 {
-	while (user) {
-		if (user->session_info &&
-		    (user->session_info->unix_token->uid == uid)) {
+	if (session_info->unix_token->uid == uid) {
+		return true;
+	}
+	return false;
+}
+
+static bool gid_in_use(struct auth_session_info *session_info,
+		       gid_t gid)
+{
+	int i;
+	struct security_unix_token *utok = NULL;
+
+	utok = session_info->unix_token;
+	if (utok->gid == gid) {
+		return true;
+	}
+
+	for(i = 0; i < utok->ngroups; i++) {
+		if (utok->groups[i] == gid) {
 			return true;
 		}
-		user = user->next;
 	}
 	return false;
 }
 
-static bool gid_in_use(const struct user_struct *user, gid_t gid)
-{
-	while (user) {
-		if (user->session_info != NULL) {
-			int i;
-			struct security_unix_token *utok;
-
-			utok = user->session_info->unix_token;
-			if (utok->gid == gid) {
-				return true;
-			}
-			for(i=0; i<utok->ngroups; i++) {
-				if (utok->groups[i] == gid) {
-					return true;
-				}
-			}
-		}
-		user = user->next;
-	}
-	return false;
-}
-
-static bool sid_in_use(const struct user_struct *user,
+static bool sid_in_use(struct auth_session_info *session_info,
 		       const struct dom_sid *psid)
 {
-	while (user) {
-		struct security_token *tok;
+	struct security_token *tok = NULL;
 
-		if (user->session_info == NULL) {
-			continue;
-		}
-		tok = user->session_info->security_token;
-		if (tok == NULL) {
-			/*
-			 * Not sure session_info->security_token can
-			 * ever be NULL. This check might be not
-			 * necessary.
-			 */
-			continue;
-		}
-		if (security_token_has_sid(tok, psid)) {
-			return true;
-		}
-		user = user->next;
+	tok = session_info->security_token;
+	if (tok == NULL) {
+		/*
+		 * Not sure session_info->security_token can
+		 * ever be NULL. This check might be not
+		 * necessary.
+		 */
+		return false;
+	}
+	if (security_token_has_sid(tok, psid)) {
+		return true;
 	}
 	return false;
 }
 
-static bool id_in_use(const struct user_struct *user,
-		      const struct id_cache_ref *id)
+struct id_in_use_state {
+	const struct id_cache_ref *id;
+	bool match;
+};
+
+static int id_in_use_cb(struct smbXsrv_session *session,
+			void *private_data)
 {
-	switch(id->type) {
+	struct id_in_use_state *state = (struct id_in_use_state *)
+		private_data;
+	struct auth_session_info *session_info =
+		session->global->auth_session_info;
+
+	switch(state->id->type) {
 	case UID:
-		return uid_in_use(user, id->id.uid);
+		state->match = uid_in_use(session_info, state->id->id.uid);
+		break;
 	case GID:
-		return gid_in_use(user, id->id.gid);
+		state->match = gid_in_use(session_info, state->id->id.gid);
+		break;
 	case SID:
-		return sid_in_use(user, &id->id.sid);
+		state->match = sid_in_use(session_info, &state->id->id.sid);
+		break;
 	default:
+		state->match = false;
 		break;
 	}
-	return false;
+	if (state->match) {
+		return -1;
+	}
+	return 0;
+}
+
+static bool id_in_use(struct smbd_server_connection *sconn,
+		      const struct id_cache_ref *id)
+{
+	struct id_in_use_state state;
+	NTSTATUS status;
+
+	state = (struct id_in_use_state) {
+		.id = id,
+		.match = false,
+	};
+
+	status = smbXsrv_session_local_traverse(sconn->client,
+						id_in_use_cb,
+						&state);
+	if (!NT_STATUS_IS_OK(status)) {
+		return false;
+	}
+
+	return state.match;
 }
 
 static void smbd_id_cache_kill(struct messaging_context *msg_ctx,
@@ -3466,7 +3591,7 @@ static void smbd_id_cache_kill(struct messaging_context *msg_ctx,
 		return;
 	}
 
-	if (id_in_use(sconn->users, &id)) {
+	if (id_in_use(sconn, &id)) {
 		exit_server_cleanly(msg);
 	}
 	id_cache_delete_from_cache(&id);
@@ -3478,6 +3603,10 @@ NTSTATUS smbXsrv_connection_init_tables(struct smbXsrv_connection *conn,
 	NTSTATUS status;
 
 	conn->protocol = protocol;
+
+	if (conn->client->session_table != NULL) {
+		return NT_STATUS_OK;
+	}
 
 	if (protocol >= PROTOCOL_SMB2_02) {
 		status = smb2srv_session_table_init(conn);
@@ -3622,8 +3751,6 @@ NTSTATUS smbd_add_connection(struct smbXsrv_client *client, int sock_fd,
 	}
 	talloc_steal(frame, xconn);
 
-	xconn->ev_ctx = client->ev_ctx;
-	xconn->msg_ctx = client->msg_ctx;
 	xconn->transport.sock = sock_fd;
 	smbd_echo_init(xconn);
 	xconn->protocol = PROTOCOL_NONE;
@@ -3773,7 +3900,7 @@ NTSTATUS smbd_add_connection(struct smbXsrv_client *client, int sock_fd,
 	xconn->smb1.sessions.done_sesssetup = false;
 	xconn->smb1.sessions.max_send = SMB_BUFFER_SIZE_MAX;
 
-	xconn->transport.fde = tevent_add_fd(client->ev_ctx,
+	xconn->transport.fde = tevent_add_fd(client->raw_ev_ctx,
 					     xconn,
 					     sock_fd,
 					     TEVENT_FD_READ,
@@ -3785,7 +3912,7 @@ NTSTATUS smbd_add_connection(struct smbXsrv_client *client, int sock_fd,
 	}
 
 	/* for now we only have one connection */
-	DLIST_ADD_END(client->connections, xconn, NULL);
+	DLIST_ADD_END(client->connections, xconn);
 	xconn->client = client;
 	talloc_steal(client, xconn);
 
@@ -3800,6 +3927,7 @@ NTSTATUS smbd_add_connection(struct smbXsrv_client *client, int sock_fd,
 
 void smbd_process(struct tevent_context *ev_ctx,
 		  struct messaging_context *msg_ctx,
+		  struct dcesrv_context *dce_ctx,
 		  int sock_fd,
 		  bool interactive)
 {
@@ -3807,6 +3935,8 @@ void smbd_process(struct tevent_context *ev_ctx,
 		.ev = ev_ctx,
 		.frame = talloc_stackframe(),
 	};
+	const struct loadparm_substitution *lp_sub =
+		loadparm_s3_global_substitution();
 	struct smbXsrv_client *client = NULL;
 	struct smbd_server_connection *sconn = NULL;
 	struct smbXsrv_connection *xconn = NULL;
@@ -3814,10 +3944,14 @@ void smbd_process(struct tevent_context *ev_ctx,
 	const char *remaddr = NULL;
 	int ret;
 	NTSTATUS status;
+	struct timeval tv = timeval_current();
+	NTTIME now = timeval_to_nttime(&tv);
+	char *chroot_dir = NULL;
+	int rc;
 
-	client = talloc_zero(ev_ctx, struct smbXsrv_client);
-	if (client == NULL) {
-		DEBUG(0,("talloc_zero(struct smbXsrv_client)\n"));
+	status = smbXsrv_client_create(ev_ctx, ev_ctx, msg_ctx, now, &client);
+	if (!NT_STATUS_IS_OK(status)) {
+		DBG_ERR("smbXsrv_client_create(): %s\n", nt_errstr(status));
 		exit_server_cleanly("talloc_zero(struct smbXsrv_client).\n");
 	}
 
@@ -3825,9 +3959,6 @@ void smbd_process(struct tevent_context *ev_ctx,
 	 * TODO: remove this...:-)
 	 */
 	global_smbXsrv_client = client;
-
-	client->ev_ctx = ev_ctx;
-	client->msg_ctx = msg_ctx;
 
 	sconn = talloc_zero(client, struct smbd_server_connection);
 	if (sconn == NULL) {
@@ -3839,6 +3970,13 @@ void smbd_process(struct tevent_context *ev_ctx,
 
 	sconn->ev_ctx = ev_ctx;
 	sconn->msg_ctx = msg_ctx;
+	sconn->dce_ctx = dce_ctx;
+
+	ret = pthreadpool_tevent_init(sconn, lp_aio_max_threads(),
+				      &sconn->pool);
+	if (ret != 0) {
+		exit_server("pthreadpool_tevent_init() failed.");
+	}
 
 	if (lp_server_max_protocol() >= PROTOCOL_SMB2_02) {
 		/*
@@ -3854,14 +3992,6 @@ void smbd_process(struct tevent_context *ev_ctx,
 	if (!interactive) {
 		smbd_setup_sig_term_handler(sconn);
 		smbd_setup_sig_hup_handler(sconn);
-
-		if (!serverid_register(messaging_server_id(msg_ctx),
-				       FLAG_MSG_GENERAL|FLAG_MSG_SMBD
-				       |FLAG_MSG_DBWRAP
-				       |FLAG_MSG_PRINT_GENERAL)) {
-			exit_server_cleanly("Could not register myself in "
-					    "serverid.tdb");
-		}
 	}
 
 	status = smbd_add_connection(client, sock_fd, &xconn);
@@ -3929,7 +4059,7 @@ void smbd_process(struct tevent_context *ev_ctx,
 			   locaddr);
 
 	if (lp_preload_modules()) {
-		smb_load_modules(lp_preload_modules());
+		smb_load_all_modules_absoute_path(lp_preload_modules());
 	}
 
 	smb_perfcount_init();
@@ -3938,17 +4068,22 @@ void smbd_process(struct tevent_context *ev_ctx,
 		exit_server("Could not open account policy tdb.\n");
 	}
 
-	if (*lp_root_directory(talloc_tos())) {
-		if (chroot(lp_root_directory(talloc_tos())) != 0) {
-			DEBUG(0,("Failed to change root to %s\n",
-				 lp_root_directory(talloc_tos())));
+	chroot_dir = lp_root_directory(talloc_tos(), lp_sub);
+	if (chroot_dir[0] != '\0') {
+		rc = chdir(chroot_dir);
+		if (rc != 0) {
+			DBG_ERR("Failed to chdir to %s\n", chroot_dir);
+			exit_server("Failed to chdir()");
+		}
+
+		rc = chroot(chroot_dir);
+		if (rc != 0) {
+			DBG_ERR("Failed to change root to %s\n", chroot_dir);
 			exit_server("Failed to chroot()");
 		}
-		if (chdir("/") == -1) {
-			DEBUG(0,("Failed to chdir to / on chroot to %s\n", lp_root_directory(talloc_tos())));
-			exit_server("Failed to chroot()");
-		}
-		DEBUG(0,("Changed root to %s\n", lp_root_directory(talloc_tos())));
+		DBG_WARNING("Changed root to %s\n", chroot_dir);
+
+		TALLOC_FREE(chroot_dir);
 	}
 
 	if (!file_init(sconn)) {
@@ -3962,6 +4097,11 @@ void smbd_process(struct tevent_context *ev_ctx,
 	/* register our message handlers */
 	messaging_register(sconn->msg_ctx, sconn,
 			   MSG_SMB_FORCE_TDIS, msg_force_tdis);
+	messaging_register(
+		sconn->msg_ctx,
+		sconn,
+		MSG_SMB_FORCE_TDIS_DENIED,
+		msg_force_tdis_denied);
 	messaging_register(sconn->msg_ctx, sconn,
 			   MSG_SMB_CLOSE_FILE, msg_close_file);
 	messaging_register(sconn->msg_ctx, sconn,
@@ -4049,7 +4189,7 @@ bool req_is_in_chain(const struct smb_request *req)
 		return true;
 	}
 
-	if (!is_andx_req(req->cmd)) {
+	if (!smb1cli_is_andx_req(req->cmd)) {
 		return false;
 	}
 

@@ -27,7 +27,8 @@
 #include "librpc/gen_ndr/libnet_join.h"
 #include "libnet/libnet_join.h"
 #include "../libcli/auth/libcli_auth.h"
-#include "../librpc/gen_ndr/srv_wkssvc.h"
+#include "librpc/gen_ndr/ndr_wkssvc.h"
+#include "librpc/gen_ndr/ndr_wkssvc_scompat.h"
 #include "../libcli/security/security.h"
 #include "session.h"
 #include "smbd/smbd.h"
@@ -79,7 +80,8 @@ static char **get_logged_on_userlist(TALLOC_CTX *mem_ctx)
 		for (i = 0; i < num_users; i++) {
 			/* getutxent can return multiple user entries for the
 			 * same user, so ignore any dups */
-			if (strcmp(u->ut_user, usr_infos[i].name) == 0) {
+			int cmp = strncmp(u->ut_user, usr_infos[i].name, sizeof(u->ut_user));
+			if (cmp == 0) {
 				break;
 			}
 		}
@@ -345,13 +347,15 @@ static struct wkssvc_NetWkstaInfo102 *create_wks_info_102(TALLOC_CTX *mem_ctx)
 WERROR _wkssvc_NetWkstaGetInfo(struct pipes_struct *p,
 			       struct wkssvc_NetWkstaGetInfo *r)
 {
+	struct dom_sid_buf buf;
+
 	switch (r->in.level) {
 	case 100:
 		/* Level 100 can be allowed from anyone including anonymous
 		 * so no access checks are needed for this case */
 		r->out.info->info100 = create_wks_info_100(p->mem_ctx);
 		if (r->out.info->info100 == NULL) {
-			return WERR_NOMEM;
+			return WERR_NOT_ENOUGH_MEMORY;
 		}
 		break;
 	case 101:
@@ -362,15 +366,16 @@ WERROR _wkssvc_NetWkstaGetInfo(struct pipes_struct *p,
 				 "101\n"));
 			DEBUGADD(3,(" - does not have sid for Authenticated "
 				    "Users %s:\n",
-				    sid_string_dbg(
-					    &global_sid_Authenticated_Users)));
+				    dom_sid_str_buf(
+					    &global_sid_Authenticated_Users,
+					    &buf)));
 			security_token_debug(DBGC_CLASS, 3,
 					    p->session_info->security_token);
 			return WERR_ACCESS_DENIED;
 		}
 		r->out.info->info101 = create_wks_info_101(p->mem_ctx);
 		if (r->out.info->info101 == NULL) {
-			return WERR_NOMEM;
+			return WERR_NOT_ENOUGH_MEMORY;
 		}
 		break;
 	case 102:
@@ -381,18 +386,20 @@ WERROR _wkssvc_NetWkstaGetInfo(struct pipes_struct *p,
 				 "102\n"));
 			DEBUGADD(3,(" - does not have sid for Administrators "
 				    "group %s, sids are:\n",
-				    sid_string_dbg(&global_sid_Builtin_Administrators)));
+				    dom_sid_str_buf(
+					    &global_sid_Builtin_Administrators,
+					    &buf)));
 			security_token_debug(DBGC_CLASS, 3,
 					    p->session_info->security_token);
 			return WERR_ACCESS_DENIED;
 		}
 		r->out.info->info102 = create_wks_info_102(p->mem_ctx);
 		if (r->out.info->info102 == NULL) {
-			return WERR_NOMEM;
+			return WERR_NOT_ENOUGH_MEMORY;
 		}
 		break;
 	default:
-		return WERR_UNKNOWN_LEVEL;
+		return WERR_INVALID_LEVEL;
 	}
 
 	return WERR_OK;
@@ -563,10 +570,13 @@ WERROR _wkssvc_NetWkstaEnumUsers(struct pipes_struct *p,
 	/* This with any level should only be allowed from a domain administrator */
 	if (!nt_token_check_sid(&global_sid_Builtin_Administrators,
 				p->session_info->security_token)) {
+		struct dom_sid_buf buf;
 		DEBUG(1,("User not allowed for NetWkstaEnumUsers\n"));
 		DEBUGADD(3,(" - does not have sid for Administrators group "
-			    "%s\n", sid_string_dbg(
-				    &global_sid_Builtin_Administrators)));
+			    "%s\n",
+			    dom_sid_str_buf(
+				    &global_sid_Builtin_Administrators,
+				    &buf)));
 		security_token_debug(DBGC_CLASS, 3, p->session_info->security_token);
 		return WERR_ACCESS_DENIED;
 	}
@@ -575,7 +585,7 @@ WERROR _wkssvc_NetWkstaEnumUsers(struct pipes_struct *p,
 	case 0:
 		r->out.info->ctr.user0 = create_enum_users0(p->mem_ctx);
 		if (r->out.info->ctr.user0 == NULL) {
-			return WERR_NOMEM;
+			return WERR_NOT_ENOUGH_MEMORY;
 		}
 		r->out.info->level = r->in.info->level;
 		*r->out.entries_read = r->out.info->ctr.user0->entries_read;
@@ -586,7 +596,7 @@ WERROR _wkssvc_NetWkstaEnumUsers(struct pipes_struct *p,
 	case 1:
 		r->out.info->ctr.user1 = create_enum_users1(p->mem_ctx);
 		if (r->out.info->ctr.user1 == NULL) {
-			return WERR_NOMEM;
+			return WERR_NOT_ENOUGH_MEMORY;
 		}
 		r->out.info->level = r->in.info->level;
 		*r->out.entries_read = r->out.info->ctr.user1->entries_read;
@@ -595,7 +605,7 @@ WERROR _wkssvc_NetWkstaEnumUsers(struct pipes_struct *p,
 		}
 		break;
 	default:
-		return WERR_UNKNOWN_LEVEL;
+		return WERR_INVALID_LEVEL;
 	}
 
 	return WERR_OK;
@@ -825,13 +835,14 @@ WERROR _wkssvc_NetrJoinDomain2(struct pipes_struct *p,
 	struct security_token *token = p->session_info->security_token;
 	NTSTATUS status;
 	DATA_BLOB session_key;
+	bool ok;
 
 	if (!r->in.domain_name) {
-		return WERR_INVALID_PARAM;
+		return WERR_INVALID_PARAMETER;
 	}
 
 	if (!r->in.admin_account || !r->in.encrypted_password) {
-		return WERR_INVALID_PARAM;
+		return WERR_INVALID_PARAMETER;
 	}
 
 	if (!security_token_has_privilege(token, SEC_PRIV_MACHINE_ACCOUNT) &&
@@ -863,10 +874,13 @@ WERROR _wkssvc_NetrJoinDomain2(struct pipes_struct *p,
 		return werr;
 	}
 
-	split_domain_user(p->mem_ctx,
-			  r->in.admin_account,
-			  &admin_domain,
-			  &admin_account);
+	ok = split_domain_user(p->mem_ctx,
+			       r->in.admin_account,
+			       &admin_domain,
+			       &admin_account);
+	if (!ok) {
+		return WERR_NOT_ENOUGH_MEMORY;
+	}
 
 	werr = libnet_init_JoinCtx(p->mem_ctx, &j);
 	if (!W_ERROR_IS_OK(werr)) {
@@ -913,9 +927,10 @@ WERROR _wkssvc_NetrUnjoinDomain2(struct pipes_struct *p,
 	struct security_token *token = p->session_info->security_token;
 	NTSTATUS status;
 	DATA_BLOB session_key;
+	bool ok;
 
 	if (!r->in.account || !r->in.encrypted_password) {
-		return WERR_INVALID_PARAM;
+		return WERR_INVALID_PARAMETER;
 	}
 
 	if (!security_token_has_privilege(token, SEC_PRIV_MACHINE_ACCOUNT) &&
@@ -942,10 +957,13 @@ WERROR _wkssvc_NetrUnjoinDomain2(struct pipes_struct *p,
 		return werr;
 	}
 
-	split_domain_user(p->mem_ctx,
-			  r->in.account,
-			  &admin_domain,
-			  &admin_account);
+	ok = split_domain_user(p->mem_ctx,
+			       r->in.account,
+			       &admin_domain,
+			       &admin_account);
+	if (!ok) {
+		return WERR_NOT_ENOUGH_MEMORY;
+	}
 
 	werr = libnet_init_UnjoinCtx(p->mem_ctx, &u);
 	if (!W_ERROR_IS_OK(werr)) {
@@ -1053,3 +1071,6 @@ WERROR _wkssvc_NetrEnumerateComputerNames(struct pipes_struct *p,
 	p->fault_state = DCERPC_FAULT_OP_RNG_ERROR;
 	return WERR_NOT_SUPPORTED;
 }
+
+/* include the generated boilerplate */
+#include "librpc/gen_ndr/ndr_wkssvc_scompat.c"

@@ -30,8 +30,6 @@
 #include "../librpc/ndr/libndr.h"
 #include "../librpc/rpc/rpc_common.h"
 
-#define SMB_RPC_INTERFACE_VERSION 1
-
 struct NL_AUTH_MESSAGE;
 struct gensec_security;
 
@@ -40,6 +38,7 @@ struct gensec_security;
 struct pipe_auth_data {
 	enum dcerpc_AuthType auth_type;
 	enum dcerpc_AuthLevel auth_level;
+	uint32_t auth_context_id;
 	bool client_hdr_signing;
 	bool hdr_signing;
 	bool verified_bitmask1;
@@ -58,10 +57,6 @@ NTSTATUS dcerpc_push_ncacn_packet(TALLOC_CTX *mem_ctx,
 				  uint32_t call_id,
 				  union dcerpc_payload *u,
 				  DATA_BLOB *blob);
-NTSTATUS dcerpc_pull_ncacn_packet(TALLOC_CTX *mem_ctx,
-				  const DATA_BLOB *blob,
-				  struct ncacn_packet *r,
-				  bool bigendian);
 NTSTATUS dcerpc_push_dcerpc_auth(TALLOC_CTX *mem_ctx,
 				 enum dcerpc_AuthType auth_type,
 				 enum dcerpc_AuthLevel auth_level,
@@ -69,10 +64,6 @@ NTSTATUS dcerpc_push_dcerpc_auth(TALLOC_CTX *mem_ctx,
 				 uint32_t auth_context_id,
 				 const DATA_BLOB *credentials,
 				 DATA_BLOB *blob);
-NTSTATUS dcerpc_pull_dcerpc_auth(TALLOC_CTX *mem_ctx,
-				 const DATA_BLOB *blob,
-				 struct dcerpc_auth *r,
-				 bool bigendian);
 NTSTATUS dcerpc_guess_sizes(struct pipe_auth_data *auth,
 			    size_t header_len, size_t data_left,
 			    size_t max_xmit_frag,
@@ -83,8 +74,7 @@ NTSTATUS dcerpc_add_auth_footer(struct pipe_auth_data *auth,
 NTSTATUS dcerpc_check_auth(struct pipe_auth_data *auth,
 			   struct ncacn_packet *pkt,
 			   DATA_BLOB *pkt_trailer,
-			   size_t header_size,
-			   DATA_BLOB *raw_pkt,
-			   size_t *pad_len);
+			   uint8_t header_size,
+			   DATA_BLOB *raw_pkt);
 
 #endif /* __S3_DCERPC_H__ */

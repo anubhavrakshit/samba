@@ -27,14 +27,24 @@
 
 /* Updated to 4, completely new interface, SSS */
 /* Updated to 5, simplified interface by Volker */
+/* Updated to 6, modules now take TALLOC_CTX * init parameter. */
 
-#define SMB_IDMAP_INTERFACE_VERSION 5
+#define SMB_IDMAP_INTERFACE_VERSION 6
 
 #include "librpc/gen_ndr/idmap.h"
 
+struct wbint_userinfo;
+
 struct idmap_domain {
 	const char *name;
+	/*
+	 * dom_sid is currently only initialized in the unixids_to_sids request,
+	 * so don't rely on this being filled out everywhere!
+	 */
+	struct dom_sid dom_sid;
 	struct idmap_methods *methods;
+	NTSTATUS (*query_user)(struct idmap_domain *domain,
+			       struct wbint_userinfo *info);
 	uint32_t low_id;
 	uint32_t high_id;
 	bool read_only;

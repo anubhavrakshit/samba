@@ -64,7 +64,6 @@ struct idmap_ldap_context {
 
 static NTSTATUS get_credentials( TALLOC_CTX *mem_ctx,
 				 struct smbldap_state *ldap_state,
-				 const char *config_option,
 				 struct idmap_domain *dom,
 				 char **dn )
 {
@@ -76,19 +75,10 @@ static NTSTATUS get_credentials( TALLOC_CTX *mem_ctx,
 
 	/* assume anonymous if we don't have a specified user */
 
-	tmp = lp_parm_const_string(-1, config_option, "ldap_user_dn", NULL);
+	tmp = idmap_config_const_string(dom->name, "ldap_user_dn", NULL);
 
 	if ( tmp ) {
-		if (!dom) {
-			DEBUG(0, ("get_credentials: Invalid domain 'NULL' "
-				  "encountered for user DN %s\n",
-				  tmp));
-			ret = NT_STATUS_UNSUCCESSFUL;
-			goto done;
-		} else {
-			secret = idmap_fetch_secret("ldap", dom->name, tmp);
-		}
-
+		secret = idmap_fetch_secret("ldap", dom->name, tmp);
 		if (!secret) {
 			DEBUG(0, ("get_credentials: Unable to fetch "
 				  "auth credentials for %s in %s\n",
@@ -165,7 +155,8 @@ static NTSTATUS verify_idpool(struct idmap_domain *dom)
 		return NT_STATUS_UNSUCCESSFUL;
 	}
 
-	count = ldap_count_entries(ctx->smbldap_state->ldap_struct, result);
+	count = ldap_count_entries(smbldap_get_ldap(ctx->smbldap_state),
+				   result);
 
 	ldap_msgfree(result);
 
@@ -231,6 +222,7 @@ static NTSTATUS idmap_ldap_allocate_id_internal(struct idmap_domain *dom,
 	const char **attr_list;
 	const char *type;
 	struct idmap_ldap_context *ctx;
+	int error = 0;
 
 	/* Only do query if we are online */
 	if (idmap_is_offline())	{
@@ -283,23 +275,24 @@ static NTSTATUS idmap_ldap_allocate_id_internal(struct idmap_domain *dom,
 
 	smbldap_talloc_autofree_ldapmsg(mem_ctx, result);
 
-	count = ldap_count_entries(ctx->smbldap_state->ldap_struct, result);
+	count = ldap_count_entries(smbldap_get_ldap(ctx->smbldap_state),
+				   result);
 	if (count != 1) {
 		DEBUG(0,("Single %s object not found\n", LDAP_OBJ_IDPOOL));
 		goto done;
 	}
 
-	entry = ldap_first_entry(ctx->smbldap_state->ldap_struct, result);
+	entry = ldap_first_entry(smbldap_get_ldap(ctx->smbldap_state), result);
 
 	dn = smbldap_talloc_dn(mem_ctx,
-			       ctx->smbldap_state->ldap_struct,
+			       smbldap_get_ldap(ctx->smbldap_state),
 			       entry);
 	if ( ! dn) {
 		goto done;
 	}
 
 	id_str = smbldap_talloc_single_attribute(
-				ctx->smbldap_state->ldap_struct,
+				smbldap_get_ldap(ctx->smbldap_state),
 				entry, type, mem_ctx);
 	if (id_str == NULL) {
 		DEBUG(0,("%s attribute not found\n", type));
@@ -307,7 +300,11 @@ static NTSTATUS idmap_ldap_allocate_id_internal(struct idmap_domain *dom,
 		goto done;
 	}
 
-	xid->id = strtoul(id_str, NULL, 10);
+	xid->id = smb_strtoul(id_str, NULL, 10, &error, SMB_STR_STANDARD);
+	if (error != 0) {
+		ret = NT_STATUS_UNSUCCESSFUL;
+		goto done;
+	}
 
 	/* make sure we still have room to grow */
 
@@ -417,7 +414,6 @@ static NTSTATUS idmap_ldap_db_init(struct idmap_domain *dom)
 {
 	NTSTATUS ret;
 	struct idmap_ldap_context *ctx = NULL;
-	char *config_option = NULL;
 	const char *tmp = NULL;
 
 	/* Only do init if we are online */
@@ -431,14 +427,7 @@ static NTSTATUS idmap_ldap_db_init(struct idmap_domain *dom)
 		return NT_STATUS_NO_MEMORY;
 	}
 
-	config_option = talloc_asprintf(ctx, "idmap config %s", dom->name);
-	if (!config_option) {
-		DEBUG(0, ("Out of memory!\n"));
-		ret = NT_STATUS_NO_MEMORY;
-		goto done;
-	}
-
-	tmp = lp_parm_const_string(-1, config_option, "ldap_url", NULL);
+	tmp = idmap_config_const_string(dom->name, "ldap_url", NULL);
 
 	if ( ! tmp) {
 		DEBUG(1, ("ERROR: missing idmap ldap url\n"));
@@ -450,7 +439,7 @@ static NTSTATUS idmap_ldap_db_init(struct idmap_domain *dom)
 
 	trim_char(ctx->url, '\"', '\"');
 
-	tmp = lp_parm_const_string(-1, config_option, "ldap_base_dn", NULL);
+	tmp = idmap_config_const_string(dom->name, "ldap_base_dn", NULL);
 	if ( ! tmp || ! *tmp) {
 		tmp = lp_ldap_idmap_suffix(talloc_tos());
 		if ( ! tmp) {
@@ -471,14 +460,14 @@ static NTSTATUS idmap_ldap_db_init(struct idmap_domain *dom)
 
 	/* get_credentials deals with setting up creds */
 
-	ret = smbldap_init(ctx, winbind_event_context(), ctx->url,
+	ret = smbldap_init(ctx, global_event_context(), ctx->url,
 			   false, NULL, NULL, &ctx->smbldap_state);
 	if (!NT_STATUS_IS_OK(ret)) {
 		DEBUG(1, ("ERROR: smbldap_init (%s) failed!\n", ctx->url));
 		goto done;
 	}
 
-	ret = get_credentials( ctx, ctx->smbldap_state, config_option,
+	ret = get_credentials( ctx, ctx->smbldap_state,
 			       dom, &ctx->user_dn );
 	if ( !NT_STATUS_IS_OK(ret) ) {
 		DEBUG(1,("idmap_ldap_db_init: Failed to get connection "
@@ -501,7 +490,6 @@ static NTSTATUS idmap_ldap_db_init(struct idmap_domain *dom)
 		goto done;
 	}
 
-	talloc_free(config_option);
 	return NT_STATUS_OK;
 
 /*failed */
@@ -527,7 +515,7 @@ static NTSTATUS idmap_ldap_set_mapping(struct idmap_domain *dom,
 	LDAPMod **mods = NULL;
 	const char *type;
 	char *id_str;
-	char *sid;
+	struct dom_sid_buf sid;
 	char *dn;
 	int rc = -1;
 
@@ -562,24 +550,21 @@ static NTSTATUS idmap_ldap_set_mapping(struct idmap_domain *dom,
 	id_str = talloc_asprintf(memctx, "%lu", (unsigned long)map->xid.id);
 	CHECK_ALLOC_DONE(id_str);
 
-	sid = talloc_strdup(memctx, sid_string_talloc(memctx, map->sid));
-	CHECK_ALLOC_DONE(sid);
-
 	dn = talloc_asprintf(memctx, "%s=%s,%s",
 			get_attr_key2string(sidmap_attr_list, LDAP_ATTR_SID),
-			sid,
+			dom_sid_str_buf(map->sid, &sid),
 			ctx->suffix);
 	CHECK_ALLOC_DONE(dn);
 
 	smbldap_set_mod(&mods, LDAP_MOD_ADD,
 			"objectClass", LDAP_OBJ_IDMAP_ENTRY);
 
-	smbldap_make_mod(ctx->smbldap_state->ldap_struct,
+	smbldap_make_mod(smbldap_get_ldap(ctx->smbldap_state),
 			 entry, &mods, type, id_str);
 
-	smbldap_make_mod(ctx->smbldap_state->ldap_struct, entry, &mods,
+	smbldap_make_mod(smbldap_get_ldap(ctx->smbldap_state), entry, &mods,
 			 get_attr_key2string(sidmap_attr_list, LDAP_ATTR_SID),
-			 sid);
+			 sid.buf);
 
 	if ( ! mods) {
 		DEBUG(2, ("ERROR: No mods?\n"));
@@ -591,17 +576,17 @@ static NTSTATUS idmap_ldap_set_mapping(struct idmap_domain *dom,
 
 	smbldap_set_mod(&mods, LDAP_MOD_ADD, "objectClass", LDAP_OBJ_SID_ENTRY);
 
-	DEBUG(10, ("Set DN %s (%s -> %s)\n", dn, sid, id_str));
+	DEBUG(10, ("Set DN %s (%s -> %s)\n", dn, sid.buf, id_str));
 
 	rc = smbldap_add(ctx->smbldap_state, dn, mods);
 	ldap_mods_free(mods, True);
 
 	if (rc != LDAP_SUCCESS) {
 		char *ld_error = NULL;
-		ldap_get_option(ctx->smbldap_state->ldap_struct,
+		ldap_get_option(smbldap_get_ldap(ctx->smbldap_state),
 				LDAP_OPT_ERROR_STRING, &ld_error);
 		DEBUG(0,("ldap_set_mapping_internals: Failed to add %s to %lu "
-			 "mapping [%s]\n", sid,
+			 "mapping [%s]\n", sid.buf,
 			 (unsigned long)map->xid.id, type));
 		DEBUG(0, ("ldap_set_mapping_internals: Error was: %s (%s)\n",
 			ld_error ? ld_error : "(NULL)", ldap_err2string (rc)));
@@ -613,7 +598,7 @@ static NTSTATUS idmap_ldap_set_mapping(struct idmap_domain *dom,
 	}
 
 	DEBUG(10,("ldap_set_mapping: Successfully created mapping from %s to "
-		  "%lu [%s]\n",	sid, (unsigned long)map->xid.id, type));
+		  "%lu [%s]\n",	sid.buf, (unsigned long)map->xid.id, type));
 
 	ret = NT_STATUS_OK;
 
@@ -661,6 +646,7 @@ static NTSTATUS idmap_ldap_unixids_to_sids(struct idmap_domain *dom,
 	int count;
 	int rc;
 	int i;
+	int error = 0;
 
 	/* Only do query if we are online */
 	if (idmap_is_offline())	{
@@ -731,7 +717,8 @@ again:
 		goto done;
 	}
 
-	count = ldap_count_entries(ctx->smbldap_state->ldap_struct, result);
+	count = ldap_count_entries(smbldap_get_ldap(ctx->smbldap_state),
+				   result);
 
 	if (count == 0) {
 		DEBUG(10, ("NO SIDs found\n"));
@@ -743,13 +730,14 @@ again:
 		enum id_type type;
 		struct id_map *map;
 		uint32_t id;
+		struct dom_sid_buf buf;
 
 		if (i == 0) { /* first entry */
-			entry = ldap_first_entry(ctx->smbldap_state->ldap_struct,
-						 result);
+			entry = ldap_first_entry(
+				smbldap_get_ldap(ctx->smbldap_state), result);
 		} else { /* following ones */
-			entry = ldap_next_entry(ctx->smbldap_state->ldap_struct,
-						entry);
+			entry = ldap_next_entry(
+				smbldap_get_ldap(ctx->smbldap_state), entry);
 		}
 		if ( ! entry) {
 			DEBUG(2, ("ERROR: Unable to fetch ldap entries "
@@ -759,7 +747,7 @@ again:
 
 		/* first check if the SID is present */
 		sidstr = smbldap_talloc_single_attribute(
-				ctx->smbldap_state->ldap_struct,
+				smbldap_get_ldap(ctx->smbldap_state),
 				entry, LDAP_ATTRIBUTE_SID, memctx);
 		if ( ! sidstr) { /* no sid, skip entry */
 			DEBUG(2, ("WARNING SID not found on entry\n"));
@@ -772,12 +760,12 @@ again:
 		 *not the gid) */
 		type = ID_TYPE_UID;
 		tmp = smbldap_talloc_single_attribute(
-				ctx->smbldap_state->ldap_struct,
+				smbldap_get_ldap(ctx->smbldap_state),
 				entry, uidNumber, memctx);
 		if ( ! tmp) {
 			type = ID_TYPE_GID;
 			tmp = smbldap_talloc_single_attribute(
-					ctx->smbldap_state->ldap_struct,
+					smbldap_get_ldap(ctx->smbldap_state),
 					entry, gidNumber, memctx);
 		}
 		if ( ! tmp) { /* wow very strange entry, how did it match ? */
@@ -787,16 +775,23 @@ again:
 			continue;
 		}
 
-		id = strtoul(tmp, NULL, 10);
+		id = smb_strtoul(tmp, NULL, 10, &error, SMB_STR_STANDARD);
+		TALLOC_FREE(tmp);
+		if (error != 0) {
+			DEBUG(5, ("Requested id (%u) out of range (%u - %u). "
+				  "Filtered!\n", id,
+				  dom->low_id, dom->high_id));
+			TALLOC_FREE(sidstr);
+			continue;
+		}
+
 		if (!idmap_unix_id_is_in_range(id, dom)) {
 			DEBUG(5, ("Requested id (%u) out of range (%u - %u). "
 				  "Filtered!\n", id,
 				  dom->low_id, dom->high_id));
 			TALLOC_FREE(sidstr);
-			TALLOC_FREE(tmp);
 			continue;
 		}
-		TALLOC_FREE(tmp);
 
 		map = idmap_find_map_by_id(&ids[bidx], type, id);
 		if (!map) {
@@ -816,7 +811,10 @@ again:
 			DEBUG(1, ("WARNING: duplicate %s mapping in LDAP. "
 			      "overwriting mapping %u -> %s with %u -> %s\n",
 			      (type == ID_TYPE_UID) ? "UID" : "GID",
-			      id, sid_string_dbg(map->sid), id, sidstr));
+			      id,
+			      dom_sid_str_buf(map->sid, &buf),
+			      id,
+			      sidstr));
 		}
 
 		TALLOC_FREE(sidstr);
@@ -824,7 +822,8 @@ again:
 		/* mapped */
 		map->status = ID_MAPPED;
 
-		DEBUG(10, ("Mapped %s -> %lu (%d)\n", sid_string_dbg(map->sid),
+		DEBUG(10, ("Mapped %s -> %lu (%d)\n",
+			   dom_sid_str_buf(map->sid, &buf),
 			   (unsigned long)map->xid.id, map->xid.type));
 	}
 
@@ -893,12 +892,13 @@ static NTSTATUS idmap_ldap_sids_to_unixids(struct idmap_domain *dom,
 	attr_list = get_attr_list(memctx, sidmap_attr_list);
 
 	if ( ! ids[1]) {
+		struct dom_sid_buf buf;
 		/* if we are requested just one mapping use the simple filter */
 
 		filter = talloc_asprintf(memctx, "(&(objectClass=%s)(%s=%s))",
 				LDAP_OBJ_IDMAP_ENTRY,
 				LDAP_ATTRIBUTE_SID,
-				sid_string_talloc(memctx, ids[0]->sid));
+				dom_sid_str_buf(ids[0]->sid, &buf));
 		CHECK_ALLOC_DONE(filter);
 		DEBUG(10, ("Filter: [%s]\n", filter));
 	} else {
@@ -921,10 +921,10 @@ again:
 
 		bidx = idx;
 		for (i = 0; (i < IDMAP_LDAP_MAX_IDS) && ids[idx]; i++, idx++) {
+			struct dom_sid_buf buf;
 			filter = talloc_asprintf_append_buffer(filter, "(%s=%s)",
 					LDAP_ATTRIBUTE_SID,
-					sid_string_talloc(memctx,
-							  ids[idx]->sid));
+					dom_sid_str_buf(ids[idx]->sid, &buf));
 			CHECK_ALLOC_DONE(filter);
 		}
 		filter = talloc_asprintf_append_buffer(filter, "))");
@@ -945,7 +945,8 @@ again:
 		goto done;
 	}
 
-	count = ldap_count_entries(ctx->smbldap_state->ldap_struct, result);
+	count = ldap_count_entries(smbldap_get_ldap(ctx->smbldap_state),
+				   result);
 
 	if (count == 0) {
 		DEBUG(10, ("NO SIDs found\n"));
@@ -957,14 +958,16 @@ again:
 		enum id_type type;
 		struct id_map *map;
 		struct dom_sid sid;
+		struct dom_sid_buf buf;
 		uint32_t id;
+		int error = 0;
 
 		if (i == 0) { /* first entry */
-			entry = ldap_first_entry(ctx->smbldap_state->ldap_struct,
-						 result);
+			entry = ldap_first_entry(
+				smbldap_get_ldap(ctx->smbldap_state), result);
 		} else { /* following ones */
-			entry = ldap_next_entry(ctx->smbldap_state->ldap_struct,
-						entry);
+			entry = ldap_next_entry(
+				smbldap_get_ldap(ctx->smbldap_state), entry);
 		}
 		if ( ! entry) {
 			DEBUG(2, ("ERROR: Unable to fetch ldap entries "
@@ -974,7 +977,7 @@ again:
 
 		/* first check if the SID is present */
 		sidstr = smbldap_talloc_single_attribute(
-				ctx->smbldap_state->ldap_struct,
+				smbldap_get_ldap(ctx->smbldap_state),
 				entry, LDAP_ATTRIBUTE_SID, memctx);
 		if ( ! sidstr) { /* no sid ??, skip entry */
 			DEBUG(2, ("WARNING SID not found on entry\n"));
@@ -1001,12 +1004,12 @@ again:
 		 * not the gid) */
 		type = ID_TYPE_UID;
 		tmp = smbldap_talloc_single_attribute(
-				ctx->smbldap_state->ldap_struct,
+				smbldap_get_ldap(ctx->smbldap_state),
 				entry, uidNumber, memctx);
 		if ( ! tmp) {
 			type = ID_TYPE_GID;
 			tmp = smbldap_talloc_single_attribute(
-					ctx->smbldap_state->ldap_struct,
+					smbldap_get_ldap(ctx->smbldap_state),
 					entry, gidNumber, memctx);
 		}
 		if ( ! tmp) { /* no ids ?? */
@@ -1016,16 +1019,23 @@ again:
 			continue;
 		}
 
-		id = strtoul(tmp, NULL, 10);
-		if (!idmap_unix_id_is_in_range(id, dom)) {
+		id = smb_strtoul(tmp, NULL, 10, &error, SMB_STR_STANDARD);
+		TALLOC_FREE(tmp);
+		if (error != 0) {
 			DEBUG(5, ("Requested id (%u) out of range (%u - %u). "
 				  "Filtered!\n", id,
 				  dom->low_id, dom->high_id));
 			TALLOC_FREE(sidstr);
-			TALLOC_FREE(tmp);
 			continue;
 		}
-		TALLOC_FREE(tmp);
+
+		if (error != 0 || !idmap_unix_id_is_in_range(id, dom)) {
+			DEBUG(5, ("Requested id (%u) out of range (%u - %u). "
+				  "Filtered!\n", id,
+				  dom->low_id, dom->high_id));
+			TALLOC_FREE(sidstr);
+			continue;
+		}
 
 		if (map->status == ID_MAPPED) {
 			DEBUG(1, ("WARNING: duplicate %s mapping in LDAP. "
@@ -1041,8 +1051,10 @@ again:
 		map->xid.id = id;
 		map->status = ID_MAPPED;
 
-		DEBUG(10, ("Mapped %s -> %lu (%d)\n", sid_string_dbg(map->sid),
-			   (unsigned long)map->xid.id, map->xid.type));
+		DEBUG(10, ("Mapped %s -> %lu (%d)\n",
+			   dom_sid_str_buf(map->sid, &buf),
+			   (unsigned long)map->xid.id,
+			   map->xid.type));
 	}
 
 	/* free the ldap results */
@@ -1089,8 +1101,8 @@ static struct idmap_methods idmap_ldap_methods = {
 	.allocate_id = idmap_ldap_allocate_id,
 };
 
-NTSTATUS idmap_ldap_init(void);
-NTSTATUS idmap_ldap_init(void)
+NTSTATUS idmap_ldap_init(TALLOC_CTX *);
+NTSTATUS idmap_ldap_init(TALLOC_CTX *ctx)
 {
 	return smb_register_idmap(SMB_IDMAP_INTERFACE_VERSION, "ldap",
 				  &idmap_ldap_methods);

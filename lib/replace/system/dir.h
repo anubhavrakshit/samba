@@ -25,7 +25,7 @@
    License along with this library; if not, see <http://www.gnu.org/licenses/>.
 */
 
-#if HAVE_DIRENT_H
+#ifdef HAVE_DIRENT_H
 # include <dirent.h>
 # define NAMLEN(dirent) strlen((dirent)->d_name)
 #else
@@ -44,6 +44,10 @@
 
 #ifndef HAVE_MKDIR_MODE
 #define mkdir(dir, mode) mkdir(dir)
+#endif
+
+#ifdef HAVE_LIBGEN_H
+# include <libgen.h>
 #endif
 
 /* Test whether a file name is the "." or ".." directory entries.

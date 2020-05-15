@@ -39,6 +39,8 @@ struct tevent_fd;
 struct tevent_timer;
 struct tevent_immediate;
 struct tevent_signal;
+struct tevent_thread_proxy;
+struct tevent_threaded_context;
 
 /**
  * @defgroup tevent The tevent API
@@ -250,6 +252,16 @@ struct tevent_timer *_tevent_add_timer(struct tevent_context *ev,
 			  #handler, __location__)
 #endif
 
+/**
+ * @brief Set the time a tevent_timer fires
+ *
+ * @param[in]  te       The timer event to reset
+ *
+ * @param[in]  next_event  Timeval specifying the absolute time to fire this
+ * event. This is not an offset.
+ */
+void tevent_update_timer(struct tevent_timer *te, struct timeval next_event);
+
 #ifdef DOXYGEN
 /**
  * Initialize an immediate event object
@@ -417,6 +429,12 @@ int _tevent_loop_wait(struct tevent_context *ev, const char *location);
  *
  * @param[in] fde       File descriptor event on which to set the destructor
  * @param[in] close_fn  Destructor to execute when fde is freed
+ *
+ * @note That the close_fn() on tevent_fd is *NOT* wrapped on contexts
+ * created by tevent_context_wrapper_create()!
+ *
+ * @see tevent_fd_set_close_fn
+ * @see tevent_context_wrapper_create
  */
 void tevent_fd_set_close_fn(struct tevent_fd *fde,
 			    tevent_fd_close_fn_t close_fn);
@@ -427,6 +445,8 @@ void tevent_fd_set_close_fn(struct tevent_fd *fde,
  * This function calls close(fd) internally.
  *
  * @param[in] fde  File descriptor event to auto-close
+ *
+ * @see tevent_fd_set_close_fn
  */
 void tevent_fd_set_auto_close(struct tevent_fd *fde);
 
@@ -463,11 +483,11 @@ void tevent_set_abort_fn(void (*abort_fn)(const char *reason));
 /* bits for file descriptor event flags */
 
 /**
- * Monitor a file descriptor for write availability
+ * Monitor a file descriptor for data to be read
  */
 #define TEVENT_FD_READ 1
 /**
- * Monitor a file descriptor for data to be read
+ * Monitor a file descriptor for writeability
  */
 #define TEVENT_FD_WRITE 2
 
@@ -685,6 +705,22 @@ void tevent_get_trace_callback(struct tevent_context *ev,
  * the tevent_req structure can be talloc_free'ed. After it has
  * finished, it should talloc_free'ed by the API user.
  *
+ * tevent_req variable naming conventions:
+ *
+ * The name of the variable pointing to the tevent_req structure
+ * returned by a _send() function SHOULD be named differently between
+ * implementation and caller.
+ *
+ * From the point of view of the implementation (of the _send() and
+ * _recv() functions) the variable returned by tevent_req_create() is
+ * always called @em req.
+ *
+ * While the caller of the _send() function should use @em subreq to
+ * hold the result.
+ *
+ * @see tevent_req_create()
+ * @see tevent_req_fn()
+ *
  * @{
  */
 
@@ -736,9 +772,9 @@ struct tevent_req;
 /**
  * @brief A tevent request callback function.
  *
- * @param[in]  req      The tevent async request which executed this callback.
+ * @param[in]  subreq      The tevent async request which executed this callback.
  */
-typedef void (*tevent_req_fn)(struct tevent_req *req);
+typedef void (*tevent_req_fn)(struct tevent_req *subreq);
 
 /**
  * @brief Set an async request callback.
@@ -786,8 +822,6 @@ void *_tevent_req_callback_data(struct tevent_req *req);
  * @brief Get the private data for a callback from a tevent request structure.
  *
  * @param[in]  req      The structure to get the callback data from.
- *
- * @param[in]  req      The structure to get the data from.
  *
  * @return              The private data or NULL if not set.
  */
@@ -924,8 +958,8 @@ void tevent_req_set_cancel_fn(struct tevent_req *req, tevent_req_cancel_fn fn);
  *
  * @param[in]  req      The request to use.
  *
- * @return              This function returns true is the request is cancelable,
- *                      othererwise false is returned.
+ * @return              This function returns true if the request is
+ *                      cancelable, otherwise false is returned.
  *
  * @note Even if the function returns true, the caller need to wait
  *       for the function to complete normally.
@@ -1014,7 +1048,8 @@ struct tevent_req *_tevent_req_create(TALLOC_CTX *mem_ctx,
 #endif
 
 /**
- * @brief Set a timeout for an async request.
+ * @brief Set a timeout for an async request. On failure, "req" is already
+ *        set to state TEVENT_REQ_NO_MEMORY.
  *
  * @param[in]  req      The request to set the timeout for.
  *
@@ -1027,6 +1062,13 @@ struct tevent_req *_tevent_req_create(TALLOC_CTX *mem_ctx,
 bool tevent_req_set_endtime(struct tevent_req *req,
 			    struct tevent_context *ev,
 			    struct timeval endtime);
+
+/**
+ * @brief Reset the timer set by tevent_req_set_endtime.
+ *
+ * @param[in]  req      The request to reset the timeout for
+ */
+void tevent_req_reset_endtime(struct tevent_req *req);
 
 #ifdef DOXYGEN
 /**
@@ -1145,7 +1187,7 @@ void _tevent_req_oom(struct tevent_req *req,
 #endif
 
 /**
- * @brief Finish a request before the caller had the change to set the callback.
+ * @brief Finish a request before the caller had a chance to set the callback.
  *
  * An implementation of an async request might find that it can either finish
  * the request without waiting for an external event, or it can not even start
@@ -1307,6 +1349,191 @@ bool tevent_req_is_error(struct tevent_req *req,
 void tevent_req_received(struct tevent_req *req);
 
 /**
+ * @brief Mark a tevent_req for profiling
+ *
+ * This will turn on profiling for this tevent_req an all subreqs that
+ * are directly started as helper requests off this
+ * tevent_req. subreqs are chained by walking up the talloc_parent
+ * hierarchy at a subreq's tevent_req_create. This means to get the
+ * profiling chain right the subreq that needs to be profiled as part
+ * of this tevent_req's profile must be a talloc child of the requests
+ * state variable.
+ *
+ * @param[in] req The request to do tracing for
+ *
+ * @return        False if the profile could not be activated
+ */
+bool tevent_req_set_profile(struct tevent_req *req);
+
+struct tevent_req_profile;
+
+/**
+ * @brief Get the a request's profile for inspection
+ *
+ * @param[in] req The request to get the profile from
+ *
+ * @return        The request's profile
+ */
+const struct tevent_req_profile *tevent_req_get_profile(
+	struct tevent_req *req);
+
+/**
+ * @brief Move the profile out of a request
+ *
+ * This function detaches the request's profile from the request, so
+ * that the profile can outlive the request in a _recv function.
+ *
+ * @param[in] req     The request to move the profile out of
+ * @param[in] mem_ctx The new talloc context for the profile
+ *
+ * @return            The moved profile
+ */
+
+struct tevent_req_profile *tevent_req_move_profile(struct tevent_req *req,
+						   TALLOC_CTX *mem_ctx);
+
+/**
+ * @brief Get a profile description
+ *
+ * @param[in] profile  The profile to be queried
+ * @param[in] req_name The name of the request (state's name)
+ *
+ * "req_name" after this call is still in talloc-posession of "profile"
+ */
+void tevent_req_profile_get_name(const struct tevent_req_profile *profile,
+				 const char **req_name);
+
+/**
+ * @brief Get a profile's start event data
+ *
+ * @param[in] profile        The profile to be queried
+ * @param[in] start_location The location where this event started
+ * @param[in] start_time     The time this event started
+ *
+ * "start_location" after this call is still in talloc-posession of "profile"
+ */
+void tevent_req_profile_get_start(const struct tevent_req_profile *profile,
+				  const char **start_location,
+				  struct timeval *start_time);
+
+/**
+ * @brief Get a profile's stop event data
+ *
+ * @param[in] profile        The profile to be queried
+ * @param[in] stop_location  The location where this event stopped
+ * @param[in] stop_time      The time this event stopped
+ *
+ * "stop_location" after this call is still in talloc-posession of "profile"
+ */
+void tevent_req_profile_get_stop(const struct tevent_req_profile *profile,
+				 const char **stop_location,
+				 struct timeval *stop_time);
+
+/**
+ * @brief Get a profile's result data
+ *
+ * @param[in] pid        The process where this profile was taken
+ * @param[in] state      The status the profile's tevent_req finished with
+ * @param[in] user_error The user error of the profile's tevent_req
+ */
+void tevent_req_profile_get_status(const struct tevent_req_profile *profile,
+				   pid_t *pid,
+				   enum tevent_req_state *state,
+				   uint64_t *user_error);
+
+/**
+ * @brief Retrieve the first subreq's profile from a profile
+ *
+ * @param[in] profile The profile to query
+ *
+ * @return The first tevent subreq's profile
+ */
+const struct tevent_req_profile *tevent_req_profile_get_subprofiles(
+	const struct tevent_req_profile *profile);
+
+/**
+ * @brief Walk the chain of subreqs
+ *
+ * @param[in] profile The subreq's profile to walk
+ *
+ * @return The next subprofile in the list
+ */
+const struct tevent_req_profile *tevent_req_profile_next(
+	const struct tevent_req_profile *profile);
+
+/**
+ * @brief Create a fresh tevent_req_profile
+ *
+ * @param[in] mem_ctx The talloc context to hang the fresh struct off
+ *
+ * @return The fresh struct
+ */
+struct tevent_req_profile *tevent_req_profile_create(TALLOC_CTX *mem_ctx);
+
+/**
+ * @brief Set a profile's name
+ *
+ * @param[in] profile The profile to set the name for
+ * @param[in] name    The new name for the profile
+ *
+ * @return True if the internal talloc_strdup succeeded
+ */
+bool tevent_req_profile_set_name(struct tevent_req_profile *profile,
+				 const char *name);
+
+/**
+ * @brief Set a profile's start event
+ *
+ * @param[in] profile        The profile to set the start data for
+ * @param[in] start_location The new start location
+ * @param[in] start_time     The new start time
+ *
+ * @return True if the internal talloc_strdup succeeded
+ */
+bool tevent_req_profile_set_start(struct tevent_req_profile *profile,
+				  const char *start_location,
+				  struct timeval start_time);
+
+/**
+ * @brief Set a profile's stop event
+ *
+ * @param[in] profile        The profile to set the stop data for
+ * @param[in] stop_location  The new stop location
+ * @param[in] stop_time      The new stop time
+ *
+ * @return True if the internal talloc_strdup succeeded
+ */
+bool tevent_req_profile_set_stop(struct tevent_req_profile *profile,
+				 const char *stop_location,
+				 struct timeval stop_time);
+
+/**
+ * @brief Set a profile's exit status
+ *
+ * @param[in] profile    The profile to set the exit status for
+ * @param[in] pid        The process where this profile was taken
+ * @param[in] state      The status the profile's tevent_req finished with
+ * @param[in] user_error The user error of the profile's tevent_req
+ */
+void tevent_req_profile_set_status(struct tevent_req_profile *profile,
+				   pid_t pid,
+				   enum tevent_req_state state,
+				   uint64_t user_error);
+
+/**
+ * @brief Add a subprofile to a profile
+ *
+ * @param[in] parent_profile The profile to be modified
+ * @param[in] sub_profile The subreqs profile profile to be added
+ *
+ * "subreq" is talloc_move'ed into "parent_profile", so the talloc
+ * ownership of "sub_profile" changes
+ */
+
+void tevent_req_profile_append_sub(struct tevent_req_profile *parent_profile,
+				   struct tevent_req_profile **sub_profile);
+
+/**
  * @brief Create a tevent subrequest at a given time.
  *
  * The idea is that always the same syntax for tevent requests.
@@ -1368,7 +1595,7 @@ bool tevent_wakeup_recv(struct tevent_req *req);
 /* @} */
 
 /**
- * @defgroup tevent_helpers The tevent helper functiions
+ * @defgroup tevent_helpers The tevent helper functions
  * @ingroup tevent
  *
  * @todo description
@@ -1391,16 +1618,16 @@ int tevent_timeval_compare(const struct timeval *tv1,
 			   const struct timeval *tv2);
 
 /**
- * @brief Get a zero timval value.
+ * @brief Get a zero timeval value.
  *
- * @return              A zero timval value.
+ * @return              A zero timeval value.
  */
 struct timeval tevent_timeval_zero(void);
 
 /**
  * @brief Get a timeval value for the current time.
  *
- * @return              A timval value with the current time.
+ * @return              A timeval value with the current time.
  */
 struct timeval tevent_timeval_current(void);
 
@@ -1458,7 +1685,7 @@ struct timeval tevent_timeval_add(const struct timeval *tv, uint32_t secs,
  *
  * @param[in]  usecs    The microseconds of the offset from now.
  *
- * @return              A timval with the given offset in the future.
+ * @return              A timeval with the given offset in the future.
  */
 struct timeval tevent_timeval_current_ofs(uint32_t secs, uint32_t usecs);
 
@@ -1592,6 +1819,9 @@ struct tevent_queue_entry *tevent_queue_add_entry(
  * already called tevent_req_notify_callback(), tevent_req_error(),
  * tevent_req_done() or a similar function.
  *
+ * The trigger function has no chance to see the returned
+ * queue_entry in the optimized case.
+ *
  * The request can be removed from the queue by calling talloc_free()
  * (or a similar function) on the returned queue entry.
  *
@@ -1620,6 +1850,28 @@ struct tevent_queue_entry *tevent_queue_add_optimize_empty(
 					struct tevent_req *req,
 					tevent_queue_trigger_fn_t trigger,
 					void *private_data);
+
+/**
+ * @brief Untrigger an already triggered queue entry.
+ *
+ * If a trigger function detects that it needs to remain
+ * in the queue, it needs to call tevent_queue_stop()
+ * followed by tevent_queue_entry_untrigger().
+ *
+ * @note In order to call tevent_queue_entry_untrigger()
+ * the queue must be already stopped and the given queue_entry
+ * must be the first one in the queue! Otherwise it calls abort().
+ *
+ * @note You can't use this together with tevent_queue_add_optimize_empty()
+ * because the trigger function don't have access to the quene entry
+ * in the case of an empty queue.
+ *
+ * @param[in]  queue_entry The queue entry to rearm.
+ *
+ * @see tevent_queue_add_entry()
+ * @see tevent_queue_stop()
+ */
+void tevent_queue_entry_untrigger(struct tevent_queue_entry *entry);
 
 /**
  * @brief Start a tevent queue.
@@ -1655,7 +1907,7 @@ size_t tevent_queue_length(struct tevent_queue *queue);
  *
  * @param[in]  queue    The queue.
  *
- * @return              Wether the queue is running or not..
+ * @return              Whether the queue is running or not..
  */
 bool tevent_queue_running(struct tevent_queue *queue);
 
@@ -1698,9 +1950,133 @@ typedef int (*tevent_nesting_hook)(struct tevent_context *ev,
 				   bool begin,
 				   void *stack_ptr,
 				   const char *location);
+
+/**
+ * @brief Create a tevent_thread_proxy for message passing between threads.
+ *
+ * The tevent_context must have been allocated on the NULL
+ * talloc context, and talloc_disable_null_tracking() must
+ * have been called.
+ *
+ * @param[in]  dest_ev_ctx      The tevent_context to receive events.
+ *
+ * @return              An allocated tevent_thread_proxy, NULL on error.
+ *                      If tevent was compiled without PTHREAD support
+ *                      NULL is always returned and errno set to ENOSYS.
+ *
+ * @see tevent_thread_proxy_schedule()
+ */
+struct tevent_thread_proxy *tevent_thread_proxy_create(
+                struct tevent_context *dest_ev_ctx);
+
+/**
+ * @brief Schedule an immediate event on an event context from another thread.
+ *
+ * Causes dest_ev_ctx, being run by another thread, to receive an
+ * immediate event calling the handler with the *pp_private parameter.
+ *
+ * *pp_im must be a pointer to an immediate event talloced on a context owned
+ * by the calling thread, or the NULL context. Ownership will
+ * be transferred to the tevent_thread_proxy and *pp_im will be returned as NULL.
+ *
+ * *pp_private_data must be a talloced area of memory with no destructors.
+ * Ownership of this memory will be transferred to the tevent library and
+ * *pp_private_data will be set to NULL on successful completion of
+ * the call. Set pp_private to NULL if no parameter transfer
+ * needed (a pure callback). This is an asynchronous request, caller
+ * does not wait for callback to be completed before returning.
+ *
+ * @param[in]  tp               The tevent_thread_proxy to use.
+ *
+ * @param[in]  pp_im            Pointer to immediate event pointer.
+ *
+ * @param[in]  handler          The function that will be called.
+ *
+ * @param[in]  pp_private_data  The talloced memory to transfer.
+ *
+ * @see tevent_thread_proxy_create()
+ */
+void tevent_thread_proxy_schedule(struct tevent_thread_proxy *tp,
+				  struct tevent_immediate **pp_im,
+				  tevent_immediate_handler_t handler,
+				  void *pp_private_data);
+
+/*
+ * @brief Create a context for threaded activation of immediates
+ *
+ * A tevent_treaded_context provides a link into an event
+ * context. Using tevent_threaded_schedule_immediate, it is possible
+ * to activate an immediate event from within a thread.
+ *
+ * It is the duty of the caller of tevent_threaded_context_create() to
+ * keep the event context around longer than any
+ * tevent_threaded_context. tevent will abort if ev is talloc_free'ed
+ * with an active tevent_threaded_context.
+ *
+ * If tevent is build without pthread support, this always returns
+ * NULL with errno=ENOSYS.
+ *
+ * @param[in]  mem_ctx  The talloc memory context to use.
+ * @param[in]  ev       The event context to link this to.
+ * @return              The threaded context, or NULL with errno set.
+ *
+ * @see tevent_threaded_schedule_immediate()
+ *
+ * @note Available as of tevent 0.9.30
+ */
+struct tevent_threaded_context *tevent_threaded_context_create(
+	TALLOC_CTX *mem_ctx, struct tevent_context *ev);
+
+#ifdef DOXYGEN
+/*
+ * @brief Activate an immediate from a thread
+ *
+ * Activate an immediate from within a thread.
+ *
+ * This routine does not watch out for talloc hierarchies. This means
+ * that it is highly recommended to create the tevent_immediate in the
+ * thread owning tctx, allocate a threaded job description for the
+ * thread, hand over both pointers to a helper thread and not touch it
+ * in the main thread at all anymore.
+ *
+ * tevent_threaded_schedule_immediate is intended as a job completion
+ * indicator for simple threaded helpers.
+ *
+ * Please be aware that tevent_threaded_schedule_immediate is very
+ * picky about its arguments: An immediate may not already be
+ * activated and the handler must exist. With
+ * tevent_threaded_schedule_immediate memory ownership is transferred
+ * to the main thread holding the tevent context behind tctx, the
+ * helper thread can't access it anymore.
+ *
+ * @param[in]  tctx     The threaded context to go through
+ * @param[in]  im       The immediate event to activate
+ * @param[in]  handler  The immediate handler to call in the main thread
+ * @param[in]  private_data Pointer for the immediate handler
+ *
+ * @see tevent_threaded_context_create()
+ *
+ * @note Available as of tevent 0.9.30
+ */
+void tevent_threaded_schedule_immediate(struct tevent_threaded_context *tctx,
+					struct tevent_immediate *im,
+					tevent_immediate_handler_t handler,
+					void *private_data);
+#else
+void _tevent_threaded_schedule_immediate(struct tevent_threaded_context *tctx,
+					 struct tevent_immediate *im,
+					 tevent_immediate_handler_t handler,
+					 void *private_data,
+					 const char *handler_name,
+					 const char *location);
+#define tevent_threaded_schedule_immediate(tctx, im, handler, private_data) \
+	_tevent_threaded_schedule_immediate(tctx, im, handler, private_data, \
+				   #handler, __location__);
+#endif
+
 #ifdef TEVENT_DEPRECATED
 #ifndef _DEPRECATED_
-#if (__GNUC__ >= 3) && (__GNUC_MINOR__ >= 1 )
+#ifdef HAVE___ATTRIBUTE__
 #define _DEPRECATED_ __attribute__ ((deprecated))
 #else
 #define _DEPRECATED_
@@ -1783,6 +2159,265 @@ struct tevent_ops {
 bool tevent_register_backend(const char *name, const struct tevent_ops *ops);
 
 /* @} */
+
+#ifdef TEVENT_DEPRECATED
+/**
+ * @defgroup tevent_wrapper_ops The tevent wrapper operation functions
+ * @ingroup tevent
+ *
+ * The following structure and registration functions are exclusively
+ * needed for people writing wrapper functions for event handlers
+ * e.g. wrappers can be used for debugging/profiling or impersonation.
+ *
+ * There is nothing useful for normal tevent user in here.
+ *
+ * @note That the close_fn() on tevent_fd is *NOT* wrapped!
+ *
+ * @see tevent_context_wrapper_create
+ * @see tevent_fd_set_auto_close
+ * @{
+ */
+
+struct tevent_wrapper_ops {
+	const char *name;
+
+	bool (*before_use)(struct tevent_context *wrap_ev,
+			   void *private_state,
+			   struct tevent_context *main_ev,
+			   const char *location);
+	void (*after_use)(struct tevent_context *wrap_ev,
+			  void *private_state,
+			  struct tevent_context *main_ev,
+			  const char *location);
+
+	void (*before_fd_handler)(struct tevent_context *wrap_ev,
+				  void *private_state,
+				  struct tevent_context *main_ev,
+				  struct tevent_fd *fde,
+				  uint16_t flags,
+				  const char *handler_name,
+				  const char *location);
+	void (*after_fd_handler)(struct tevent_context *wrap_ev,
+				 void *private_state,
+				 struct tevent_context *main_ev,
+				 struct tevent_fd *fde,
+				 uint16_t flags,
+				 const char *handler_name,
+				 const char *location);
+
+	void (*before_timer_handler)(struct tevent_context *wrap_ev,
+				     void *private_state,
+				     struct tevent_context *main_ev,
+				     struct tevent_timer *te,
+				     struct timeval requested_time,
+				     struct timeval trigger_time,
+				     const char *handler_name,
+				     const char *location);
+	void (*after_timer_handler)(struct tevent_context *wrap_ev,
+				    void *private_state,
+				    struct tevent_context *main_ev,
+				    struct tevent_timer *te,
+				    struct timeval requested_time,
+				    struct timeval trigger_time,
+				    const char *handler_name,
+				    const char *location);
+
+	void (*before_immediate_handler)(struct tevent_context *wrap_ev,
+					 void *private_state,
+					 struct tevent_context *main_ev,
+					 struct tevent_immediate *im,
+					 const char *handler_name,
+					 const char *location);
+	void (*after_immediate_handler)(struct tevent_context *wrap_ev,
+					void *private_state,
+					struct tevent_context *main_ev,
+					struct tevent_immediate *im,
+					const char *handler_name,
+					const char *location);
+
+	void (*before_signal_handler)(struct tevent_context *wrap_ev,
+				      void *private_state,
+				      struct tevent_context *main_ev,
+				      struct tevent_signal *se,
+				      int signum,
+				      int count,
+				      void *siginfo,
+				      const char *handler_name,
+				      const char *location);
+	void (*after_signal_handler)(struct tevent_context *wrap_ev,
+				     void *private_state,
+				     struct tevent_context *main_ev,
+				     struct tevent_signal *se,
+				     int signum,
+				     int count,
+				     void *siginfo,
+				     const char *handler_name,
+				     const char *location);
+};
+
+#ifdef DOXYGEN
+/**
+ * @brief Create a wrapper tevent_context.
+ *
+ * @param[in]  main_ev        The main event context to work on.
+ *
+ * @param[in]  mem_ctx        The talloc memory context to use.
+ *
+ * @param[in]  ops            The tevent_wrapper_ops function table.
+ *
+ * @param[out] private_state  The private state use by the wrapper functions.
+ *
+ * @param[in]  private_type   The talloc type of the private_state.
+ *
+ * @return                    The wrapper event context, NULL on error.
+ *
+ * @note Available as of tevent 0.9.37
+ * @note Deprecated as of tevent 0.9.38
+ */
+struct tevent_context *tevent_context_wrapper_create(struct tevent_context *main_ev,
+						TALLOC_CTX *mem_ctx,
+						const struct tevent_wrapper_ops *ops,
+						void **private_state,
+						const char *private_type);
+#else
+struct tevent_context *_tevent_context_wrapper_create(struct tevent_context *main_ev,
+						TALLOC_CTX *mem_ctx,
+						const struct tevent_wrapper_ops *ops,
+						void *pstate,
+						size_t psize,
+						const char *type,
+						const char *location) _DEPRECATED_;
+#define tevent_context_wrapper_create(main_ev, mem_ctx, ops, state, type) \
+	_tevent_context_wrapper_create(main_ev, mem_ctx, ops, \
+				       state, sizeof(type), #type, __location__)
+#endif
+
+/**
+ * @brief Check if the event context is a wrapper event context.
+ *
+ * @param[in]  ev       The event context to work on.
+ *
+ * @return              Is a wrapper (true), otherwise (false).
+ *
+ * @see tevent_context_wrapper_create()
+ *
+ * @note Available as of tevent 0.9.37
+ * @note Deprecated as of tevent 0.9.38
+ */
+bool tevent_context_is_wrapper(struct tevent_context *ev) _DEPRECATED_;
+
+#ifdef DOXYGEN
+/**
+ * @brief Prepare the environment of a (wrapper) event context.
+ *
+ * A caller might call this before passing a wrapper event context
+ * to a tevent_req based *_send() function.
+ *
+ * The wrapper event context might do something like impersonation.
+ *
+ * tevent_context_push_use() must always be used in combination
+ * with tevent_context_pop_use().
+ *
+ * There is a global stack of currently active/busy wrapper event contexts.
+ * Each wrapper can only appear once on that global stack!
+ * The stack size is limited to 32 elements, which should be enough
+ * for all useful scenarios.
+ *
+ * In addition to an explicit tevent_context_push_use() also
+ * the invocation of an immediate, timer or fd handler implicitly
+ * pushes the wrapper on the stack.
+ *
+ * Therefore there are some strict constraints for the usage of
+ * tevent_context_push_use():
+ * - It must not be called from within an event handler
+ *   that already acts on the wrapper.
+ * - tevent_context_pop_use() must be called before
+ *   leaving the code block that called tevent_context_push_use().
+ * - The caller is responsible ensure the correct stack ordering
+ * - Any violation of these constraints results in calling
+ *   the abort handler of the given tevent context.
+ *
+ * Calling tevent_context_push_use() on a raw event context
+ * still consumes an element on the stack, but it's otherwise
+ * a no-op.
+ *
+ * If tevent_context_push_use() returns false, it means
+ * that the wrapper's before_use() hook returned this failure,
+ * in that case you must not call tevent_context_pop_use() as
+ * the wrapper is not pushed onto the stack.
+ *
+ * @param[in]  ev       The event context to work on.
+ *
+ * @return              Success (true) or failure (false).
+ *
+ * @note This is only needed if wrapper event contexts are in use.
+ *
+ * @see tevent_context_pop_use
+ *
+ * @note Available as of tevent 0.9.37
+ * @note Deprecated as of tevent 0.9.38
+ */
+bool tevent_context_push_use(struct tevent_context *ev);
+#else
+bool _tevent_context_push_use(struct tevent_context *ev,
+				const char *location) _DEPRECATED_;
+#define tevent_context_push_use(ev) \
+	_tevent_context_push_use(ev, __location__)
+#endif
+
+#ifdef DOXYGEN
+/**
+ * @brief Release the environment of a (wrapper) event context.
+ *
+ * The wrapper event context might undo something like impersonation.
+ *
+ * This must be called after a succesful tevent_context_push_use().
+ * Any ordering violation results in calling
+ * the abort handler of the given tevent context.
+ *
+ * This basically calls the wrapper's after_use() hook.
+ *
+ * @param[in]  ev       The event context to work on.
+ *
+ * @note This is only needed if wrapper event contexts are in use.
+ *
+ * @see tevent_context_push_use
+ *
+ * @note Available as of tevent 0.9.37
+ * @note Deprecated as of tevent 0.9.38
+ */
+void tevent_context_pop_use(struct tevent_context *ev);
+#else
+void _tevent_context_pop_use(struct tevent_context *ev,
+			       const char *location) _DEPRECATED_;
+#define tevent_context_pop_use(ev) \
+	_tevent_context_pop_use(ev, __location__)
+#endif
+
+/**
+ * @brief Check is the two context pointers belong to the same low level loop
+ *
+ * With the introduction of wrapper contexts it's not trivial
+ * to check if two context pointers belong to the same low level
+ * event loop. Some code may need to know this in order
+ * to make some caching decisions.
+ *
+ * @param[in]  ev1       The first event context.
+ * @param[in]  ev2       The second event context.
+ *
+ * @return true if both contexts belong to the same (still existing) context
+ * loop, false otherwise.
+ *
+ * @see tevent_context_wrapper_create
+ *
+ * @note Available as of tevent 0.9.37
+ * @note Deprecated as of tevent 0.9.38
+ */
+bool tevent_context_same_loop(struct tevent_context *ev1,
+			      struct tevent_context *ev2) _DEPRECATED_;
+
+/* @} */
+#endif /* TEVENT_DEPRECATED */
 
 /**
  * @defgroup tevent_compat The tevent compatibility functions

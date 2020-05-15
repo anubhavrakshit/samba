@@ -297,7 +297,6 @@ static void reply_nt1(struct smbsrv_request *req, uint16_t choice)
 	   supports it and we can do encrypted passwords */
 	
 	if (req->smb_conn->negotiate.encrypted_passwords && 
-	    lpcfg_use_spnego(req->smb_conn->lp_ctx) &&
 	    (req->flags2 & FLAGS2_EXTENDED_SECURITY)) {
 		negotiate_spnego = true; 
 		capabilities |= CAP_EXTENDED_SECURITY;
@@ -372,7 +371,7 @@ static void reply_nt1(struct smbsrv_request *req, uint16_t choice)
 		struct cli_credentials *server_credentials;
 		struct gensec_security *gensec_security;
 		DATA_BLOB null_data_blob = data_blob(NULL, 0);
-		DATA_BLOB blob;
+		DATA_BLOB blob = data_blob_null;
 		const char *oid;
 		NTSTATUS nt_status;
 		
@@ -387,8 +386,10 @@ static void reply_nt1(struct smbsrv_request *req, uint16_t choice)
 		nt_status = cli_credentials_set_machine_account(server_credentials, req->smb_conn->lp_ctx);
 		if (!NT_STATUS_IS_OK(nt_status)) {
 			DEBUG(10, ("Failed to obtain server credentials, perhaps a standalone server?: %s\n", nt_errstr(nt_status)));
-			talloc_free(server_credentials);
-			server_credentials = NULL;
+			/*
+			 * We keep the server_credentials as anonymous
+			 * this is required for the spoolss.notify test
+			 */
 		}
 
 		nt_status = samba_server_gensec_start(req,
@@ -416,7 +417,8 @@ static void reply_nt1(struct smbsrv_request *req, uint16_t choice)
 		
 		if (NT_STATUS_IS_OK(nt_status)) {
 			/* Get and push the proposed OID list into the packets */
-			nt_status = gensec_update_ev(gensec_security, req, req->smb_conn->connection->event.ctx, null_data_blob, &blob);
+			nt_status = gensec_update(gensec_security, req,
+						  null_data_blob, &blob);
 
 			if (!NT_STATUS_IS_OK(nt_status) && !NT_STATUS_EQUAL(nt_status, NT_STATUS_MORE_PROCESSING_REQUIRED)) {
 				DEBUG(1, ("Failed to get SPNEGO to give us the first token: %s\n", nt_errstr(nt_status)));

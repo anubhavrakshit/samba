@@ -19,6 +19,10 @@
 */
 
 #include "includes.h"
+
+#undef DBGC_CLASS
+#define DBGC_CLASS DBGC_AUTH
+
 #ifdef HAVE_KRB5
 
 #include "auth/kerberos/pac_utils.h"
@@ -112,8 +116,11 @@ NTSTATUS gssapi_obtain_pac_blob(TALLOC_CTX *mem_ctx,
 		&pac_buffer, &pac_display_buffer, &more);
 
 	if (gss_maj != 0) {
-		DEBUG(0, ("obtaining PAC via GSSAPI gss_get_name_attribute failed: %s\n",
-			  gssapi_error_string(mem_ctx, gss_maj, gss_min, gss_mech_krb5)));
+		gss_OID oid = discard_const(gss_mech_krb5);
+		DBG_NOTICE("obtaining PAC via GSSAPI gss_get_name_attribute "
+			   "failed: %s\n", gssapi_error_string(mem_ctx,
+							       gss_maj, gss_min,
+							       oid));
 		return NT_STATUS_ACCESS_DENIED;
 	} else if (authenticated && complete) {
 		/* The PAC blob is returned directly */
@@ -126,8 +133,8 @@ NTSTATUS gssapi_obtain_pac_blob(TALLOC_CTX *mem_ctx,
 			status = NT_STATUS_OK;
 		}
 
-		gss_maj = gss_release_buffer(&gss_min, &pac_buffer);
-		gss_maj = gss_release_buffer(&gss_min, &pac_display_buffer);
+		gss_release_buffer(&gss_min, &pac_buffer);
+		gss_release_buffer(&gss_min, &pac_display_buffer);
 		return status;
 	} else {
 		DEBUG(0, ("obtaining PAC via GSSAPI failed: authenticated: %s, complete: %s, more: %s\n",
@@ -158,7 +165,7 @@ NTSTATUS gssapi_obtain_pac_blob(TALLOC_CTX *mem_ctx,
 		DEBUG(1, ("unable to obtain a PAC against this GSSAPI library.  "
 			  "GSSAPI secured connections are available only with Heimdal or MIT Kerberos >= 1.8\n"));
 	} else if (gss_maj != 0) {
-		DEBUG(2, ("obtaining PAC via GSSAPI gss_inqiure_sec_context_by_oid (Heimdal OID) failed: %s\n",
+		DEBUG(2, ("obtaining PAC via GSSAPI gss_inquire_sec_context_by_oid (Heimdal OID) failed: %s\n",
 			  gssapi_error_string(mem_ctx, gss_maj, gss_min, gss_mech_krb5)));
 	} else {
 		if (set == GSS_C_NO_BUFFER_SET) {
@@ -199,7 +206,11 @@ NTSTATUS gssapi_get_session_key(TALLOC_CTX *mem_ctx,
 				&gse_sesskey_inq_oid, &set);
 	if (gss_maj) {
 		DEBUG(0, ("gss_inquire_sec_context_by_oid failed [%s]\n",
-			  gssapi_error_string(mem_ctx, gss_maj, gss_min, gss_mech_krb5)));
+			  gssapi_error_string(mem_ctx,
+					      gss_maj,
+					      gss_min,
+					      discard_const_p(struct gss_OID_desc_struct,
+							      gss_mech_krb5))));
 		return NT_STATUS_NO_USER_SESSION_KEY;
 	}
 
@@ -238,6 +249,7 @@ NTSTATUS gssapi_get_session_key(TALLOC_CTX *mem_ctx,
 		int diflen, i;
 		const uint8_t *p;
 
+		*keytype = 0;
 		if (set->count < 2) {
 
 #ifdef HAVE_GSSKRB5_GET_SUBKEY
@@ -248,13 +260,9 @@ NTSTATUS gssapi_get_session_key(TALLOC_CTX *mem_ctx,
 			if (gss_maj == 0) {
 				*keytype = KRB5_KEY_TYPE(subkey);
 				krb5_free_keyblock(NULL /* should be krb5_context */, subkey);
-			} else
-#else
-			{
-				*keytype = 0;
 			}
 #endif
-			gss_maj = gss_release_buffer_set(&gss_min, &set);
+			gss_release_buffer_set(&gss_min, &set);
 	
 			return NT_STATUS_OK;
 
@@ -262,27 +270,25 @@ NTSTATUS gssapi_get_session_key(TALLOC_CTX *mem_ctx,
 				  gse_sesskeytype_oid.elements,
 				  gse_sesskeytype_oid.length) != 0) {
 			/* Perhaps a non-krb5 session key */
-			*keytype = 0;
-			gss_maj = gss_release_buffer_set(&gss_min, &set);
+			gss_release_buffer_set(&gss_min, &set);
 			return NT_STATUS_OK;
 		}
 		p = (const uint8_t *)set->elements[1].value + gse_sesskeytype_oid.length;
 		diflen = set->elements[1].length - gse_sesskeytype_oid.length;
 		if (diflen <= 0) {
-			gss_maj = gss_release_buffer_set(&gss_min, &set);
+			gss_release_buffer_set(&gss_min, &set);
 			return NT_STATUS_INVALID_PARAMETER;
 		}
-		*keytype = 0;
 		for (i = 0; i < diflen; i++) {
 			*keytype = (*keytype << 7) | (p[i] & 0x7f);
 			if (i + 1 != diflen && (p[i] & 0x80) == 0) {
-				gss_maj = gss_release_buffer_set(&gss_min, &set);
+				gss_release_buffer_set(&gss_min, &set);
 				return NT_STATUS_INVALID_PARAMETER;
 			}
 		}
 	}
 
-	gss_maj = gss_release_buffer_set(&gss_min, &set);
+	gss_release_buffer_set(&gss_min, &set);
 	return NT_STATUS_OK;
 }
 

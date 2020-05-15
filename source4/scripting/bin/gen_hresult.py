@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 #
 # Unix SMB/CIFS implementation.
@@ -22,6 +22,7 @@
 #
 
 
+from __future__ import print_function
 import sys, os.path, io, string
 
 # parsed error data
@@ -50,6 +51,8 @@ def parseErrorDescriptions( input_file, isWinError ):
     for line in fileContents:
         content = line.strip().split(None,1)
         # start new error definition ?
+        if len(content) == 0:
+            continue
         if line.startswith("0x"):
             newError = ErrorDef()
             newError.err_code = content[0]
@@ -61,12 +64,12 @@ def parseErrorDescriptions( input_file, isWinError ):
             Errors.append(newError)
         else:
             if len(Errors) == 0:
-                print "Error parsing file as line %d"%count
+                print("Error parsing file as line %d"%count)
                 sys.exit()
             err = Errors[-1]
             if err.err_define == None:
                 err.err_define = "HRES_" + content[0]
-	    else:
+            else:
                 if len(content) > 0:
                     desc =  escapeString(line.strip())
                     if len(desc):
@@ -76,7 +79,7 @@ def parseErrorDescriptions( input_file, isWinError ):
                             err.err_string = err.err_string + " " + desc
         count = count + 1
     fileContents.close()
-    print "parsed %d lines generated %d error definitions"%(count,len(Errors))
+    print("parsed %d lines generated %d error definitions"%(count,len(Errors)))
 
 def write_license(out_file):
     out_file.write("/*\n")
@@ -134,6 +137,7 @@ def generateHeaderFile(out_file):
     out_file.write("\n#define FACILITY_WIN32 0x0007\n")
     out_file.write("#define WIN32_FROM_HRESULT(x) (HRES_ERROR_V(x) == 0 ? HRES_ERROR_V(x) : ~((FACILITY_WIN32 << 16) | 0x80000000) & HRES_ERROR_V(x))\n")
     out_file.write("#define HRESULT_IS_LIKELY_WERR(x) ((HRES_ERROR_V(x) & 0xFFFF0000) == 0x80070000)\n")
+    out_file.write("#define HRESULT_FROM_WERROR(x) (HRES_ERROR(0x80070000 | W_ERROR_V(x)))\n")
     out_file.write("\n\n\n#endif /*_HRESULT_H_*/")
 
 
@@ -184,7 +188,7 @@ def generateSourceFile(out_file):
     out_file.write("\n")
     out_file.write("const char *hresult_errstr(HRESULT err_code)\n")
     out_file.write("{\n");
-    out_file.write("	static char msg[20];\n")
+    out_file.write("	static char msg[22];\n")
     out_file.write("	int i;\n")
     out_file.write("\n")
     out_file.write("	for (i = 0; i < ARRAY_SIZE(hresult_errs); i++) {\n")
@@ -210,7 +214,7 @@ def main ():
     if len(sys.argv) > 1:
         input_file1 =  sys.argv[1]
     else:
-        print "usage: %s winerrorfile"%(sys.argv[0])
+        print("usage: %s winerrorfile"%(sys.argv[0]))
         sys.exit()
 
     parseErrorDescriptions(input_file1, False)

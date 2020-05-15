@@ -20,33 +20,53 @@
 import ldb
 import os
 import samba
+from samba import arcfour_encrypt, string_to_byte_array
 from samba.tests import TestCase, TestCaseInTempDir
+
 
 class SubstituteVarTestCase(TestCase):
 
     def test_empty(self):
-        self.assertEquals("", samba.substitute_var("", {}))
+        self.assertEqual("", samba.substitute_var("", {}))
 
     def test_nothing(self):
-        self.assertEquals("foo bar",
-                samba.substitute_var("foo bar", {"bar": "bla"}))
+        self.assertEqual("foo bar",
+                          samba.substitute_var("foo bar", {"bar": "bla"}))
 
     def test_replace(self):
-        self.assertEquals("foo bla",
-                samba.substitute_var("foo ${bar}", {"bar": "bla"}))
+        self.assertEqual("foo bla",
+                          samba.substitute_var("foo ${bar}", {"bar": "bla"}))
 
     def test_broken(self):
-        self.assertEquals("foo ${bdkjfhsdkfh sdkfh ",
-            samba.substitute_var("foo ${bdkjfhsdkfh sdkfh ", {"bar": "bla"}))
+        self.assertEqual("foo ${bdkjfhsdkfh sdkfh ",
+                          samba.substitute_var("foo ${bdkjfhsdkfh sdkfh ", {"bar": "bla"}))
 
     def test_unknown_var(self):
-        self.assertEquals("foo ${bla} gsff",
-                samba.substitute_var("foo ${bla} gsff", {"bar": "bla"}))
+        self.assertEqual("foo ${bla} gsff",
+                          samba.substitute_var("foo ${bla} gsff", {"bar": "bla"}))
 
     def test_check_all_substituted(self):
         samba.check_all_substituted("nothing to see here")
         self.assertRaises(Exception, samba.check_all_substituted,
-                "Not subsituted: ${FOOBAR}")
+                          "Not subsituted: ${FOOBAR}")
+
+
+class ArcfourTestCase(TestCase):
+
+    def test_arcfour_direct(self):
+        key = b'12345678'
+        plain = b'abcdefghi'
+        crypt_expected = b'\xda\x91Z\xb0l\xd7\xb9\xcf\x99'
+        crypt_calculated = arcfour_encrypt(key, plain)
+        self.assertEqual(crypt_expected, crypt_calculated)
+
+
+class StringToByteArrayTestCase(TestCase):
+
+    def test_byte_array(self):
+        expected = [218, 145, 90, 176, 108, 215, 185, 207, 153]
+        calculated = string_to_byte_array('\xda\x91Z\xb0l\xd7\xb9\xcf\x99')
+        self.assertEqual(expected, calculated)
 
 
 class LdbExtensionTests(TestCaseInTempDir):
@@ -56,8 +76,8 @@ class LdbExtensionTests(TestCaseInTempDir):
         l = samba.Ldb(path)
         try:
             l.add({"dn": "foo=dc", "bar": "bla"})
-            self.assertEquals("bla",
-                l.searchone(basedn=ldb.Dn(l, "foo=dc"), attribute="bar"))
+            self.assertEqual(b"bla",
+                              l.searchone(basedn=ldb.Dn(l, "foo=dc"), attribute="bar"))
         finally:
             del l
             os.unlink(path)

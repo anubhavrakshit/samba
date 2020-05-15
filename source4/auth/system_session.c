@@ -29,6 +29,8 @@
 #include "auth/session.h"
 #include "auth/system_session_proto.h"
 
+#undef DBGC_CLASS
+#define DBGC_CLASS DBGC_AUTH
 
 /*
   prevent the static system session being freed
@@ -39,7 +41,7 @@ static int system_session_destructor(struct auth_session_info *info)
 }
 
 /* Create a security token for a session SYSTEM (the most
- * trusted/prvilaged account), including the local machine account as
+ * trusted/privileged account), including the local machine account as
  * the off-host credentials
  */ 
 _PUBLIC_ struct auth_session_info *system_session(struct loadparm_context *lp_ctx)
@@ -51,12 +53,16 @@ _PUBLIC_ struct auth_session_info *system_session(struct loadparm_context *lp_ct
 		return static_session;
 	}
 
-	nt_status = auth_system_session_info(talloc_autofree_context(),
+	/*
+	 * Use NULL here, not the autofree context for this
+	 * static pointer. The destructor prevents freeing this
+	 * memory anyway.
+	 */
+	nt_status = auth_system_session_info(NULL,
 					     lp_ctx,
 					     &static_session);
 	if (!NT_STATUS_IS_OK(nt_status)) {
-		talloc_free(static_session);
-		static_session = NULL;
+		TALLOC_FREE(static_session);
 		return NULL;
 	}
 	talloc_set_destructor(static_session, system_session_destructor);
@@ -70,7 +76,12 @@ NTSTATUS auth_system_session_info(TALLOC_CTX *parent_ctx,
 	NTSTATUS nt_status;
 	struct auth_user_info_dc *user_info_dc = NULL;
 	struct auth_session_info *session_info = NULL;
-	TALLOC_CTX *mem_ctx = talloc_new(parent_ctx);
+	TALLOC_CTX *mem_ctx = NULL;
+
+	mem_ctx = talloc_new(parent_ctx);
+	if (mem_ctx == NULL) {
+		return NT_STATUS_NO_MEMORY;
+	}
 	
 	nt_status = auth_system_user_info_dc(mem_ctx, lpcfg_netbios_name(lp_ctx),
 					    &user_info_dc);

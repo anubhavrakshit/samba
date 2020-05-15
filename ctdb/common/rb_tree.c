@@ -17,8 +17,14 @@
    along with this program; if not, see <http://www.gnu.org/licenses/>.
 */
 
-#include "includes.h"
-#include "rb_tree.h"
+#include "replace.h"
+
+#include <talloc.h>
+
+#include "lib/util/debug.h"
+
+#include "common/logging.h"
+#include "common/rb_tree.h"
 
 #define NO_MEMORY_FATAL(p) do { if (!(p)) { \
           DEBUG(DEBUG_CRIT,("Out of memory for %s at %s\n", #p, __location__)); \
@@ -58,9 +64,9 @@ static int tree_destructor(trbt_tree_t *tree)
 
 	/* traverse the tree and remove the node destructor and steal
 	   the node to the temporary context.
-	   we dont want to use the existing destructor for the node
+	   we don't want to use the existing destructor for the node
 	   since that will remove the nodes one by one from the tree.
-	   since the entire tree will be completely destroyed we dont care
+	   since the entire tree will be completely destroyed we don't care
 	   if it is inconsistent or unbalanced while freeing the
 	   individual nodes
 	*/
@@ -210,21 +216,21 @@ static inline int trbt_get_color_right(trbt_node_t *node)
 /* setting a NULL node to black is a nop */
 static inline void trbt_set_color(trbt_node_t *node, int color)
 {
-	if ( (node==NULL) && (color==TRBT_BLACK) ) {
+	if (node == NULL) {
 		return;
 	}
 	node->rb_color = color;
 }
 static inline void trbt_set_color_left(trbt_node_t *node, int color)
 {
-	if ( ((node==NULL)||(node->left==NULL)) && (color==TRBT_BLACK) ) {
+	if (node == NULL || node->left == NULL) {
 		return;
 	}
 	node->left->rb_color = color;
 }
 static inline void trbt_set_color_right(trbt_node_t *node, int color)
 {
-	if ( ((node==NULL)||(node->right==NULL)) && (color==TRBT_BLACK) ) {
+	if (node == NULL || node->right == NULL) {
 		return;
 	}
 	node->right->rb_color = color;
@@ -498,7 +504,7 @@ delete_node(trbt_node_t *node, bool from_destructor)
 	   Once the delete of the node is finished, we remove this dummy
 	   node, which is simple to do since it is guaranteed that it will
 	   still not have any children after the delete operation.
-	   This is because we dont represent the leaf-nodes as actual nodes
+	   This is because we don't represent the leaf-nodes as actual nodes
 	   in this implementation.
 	 */
 	if (!child) {
@@ -537,7 +543,7 @@ delete_node(trbt_node_t *node, bool from_destructor)
 	   This is simple since this dummy node originally had no children
 	   and we are guaranteed that it will also not have any children 
 	   after the node has been deleted and any possible rotations 
-	   have occured.
+	   have occurred.
 
 	   The only special case is if this was the last node of the tree
 	   in which case we have to reset the root to NULL as well.
@@ -1023,7 +1029,7 @@ trbt_findfirstarray32(trbt_tree_t *tree, uint32_t keylen)
 }
 
 
-#if TEST_RB_TREE
+#ifdef TEST_RB_TREE
 static void printtree(trbt_node_t *node, int levels)
 {
 	int i;
@@ -1092,4 +1098,4 @@ exit(0);
 
 }
 
-#endif
+#endif /* TEST_RB_TREE */

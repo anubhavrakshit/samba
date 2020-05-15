@@ -19,7 +19,9 @@
 */
 
 #include <Python.h>
+#include "python/py3compat.h"
 #include "includes.h"
+#include "python/modules.h"
 #include "libcli/util/pyerrors.h"
 #include "lib/registry/registry.h"
 #include <pytalloc.h>
@@ -30,8 +32,6 @@
 extern PyTypeObject PyRegistryKey;
 extern PyTypeObject PyRegistry;
 extern PyTypeObject PyHiveKey;
-
-void initregistry(void);
 
 /*#define PyRegistryKey_AsRegistryKey(obj) pytalloc_get_type(obj, struct registry_key)*/
 #define PyRegistry_AsRegistryContext(obj) ((struct registry_context *)pytalloc_get_ptr(obj))
@@ -121,7 +121,7 @@ static PyObject *py_mount_hive(PyObject *self, PyObject *args)
 		int i;
 		elements = talloc_array(NULL, const char *, PyList_Size(py_elements));
 		for (i = 0; i < PyList_Size(py_elements); i++)
-			elements[i] = PyString_AsString(PyList_GetItem(py_elements, i));
+			elements[i] = PyUnicode_AsUTF8(PyList_GetItem(py_elements, i));
 	}
 
 	SMB_ASSERT(ctx != NULL);
@@ -153,14 +153,13 @@ static PyMethodDef registry_methods[] = {
         	"Apply the diff from the specified file" },
 	{ "mount_hive", py_mount_hive, METH_VARARGS, "S.mount_hive(key, key_id, elements=None) -> None\n"
 		"Mount the specified key at the specified path." },
-	{ NULL }
+	{0}
 };
 
 PyTypeObject PyRegistry = {
 	.tp_name = "Registry",
 	.tp_methods = registry_methods,
 	.tp_new = registry_new,
-	.tp_basicsize = sizeof(pytalloc_Object),
 	.tp_flags = Py_TPFLAGS_DEFAULT,
 };
 
@@ -180,7 +179,8 @@ static PyObject *py_hive_key_del(PyObject *self, PyObject *args)
 	Py_RETURN_NONE; 
 }
 
-static PyObject *py_hive_key_flush(PyObject *self)
+static PyObject *py_hive_key_flush(PyObject *self,
+		PyObject *Py_UNUSED(ignored))
 {
 	WERROR result;
 	struct hive_key *key = PyHiveKey_AsHiveKey(self);
@@ -212,11 +212,11 @@ static PyObject *py_hive_key_set_value(PyObject *self, PyObject *args)
 	char *name;
 	uint32_t type;
 	DATA_BLOB value;
-	int value_length = 0;
+	Py_ssize_t value_length = 0;
 	WERROR result;
 	struct hive_key *key = PyHiveKey_AsHiveKey(self);
 
-	if (!PyArg_ParseTuple(args, "siz#", &name, &type, &value.data, &value_length)) {
+	if (!PyArg_ParseTuple(args, "sIz#", &name, &type, &value.data, &value_length)) {
 		return NULL;
 	}
 	value.length = value_length;
@@ -240,7 +240,7 @@ static PyMethodDef hive_key_methods[] = {
                  "Delete a value" },
 	{ "set_value", py_hive_key_set_value, METH_VARARGS, "S.set_value(name, type, data) -> None\n"
                  "Set a value" },
-	{ NULL }
+	{0}
 };
 
 static PyObject *hive_new(PyTypeObject *type, PyObject *args, PyObject *kwargs) {
@@ -252,7 +252,9 @@ static PyObject *py_open_hive(PyTypeObject *type, PyObject *args, PyObject *kwar
 	const char *kwnames[] = { "location", "lp_ctx", "session_info", "credentials", NULL };
 	WERROR result;
 	struct loadparm_context *lp_ctx;
-	PyObject *py_lp_ctx, *py_session_info, *py_credentials;
+	PyObject *py_lp_ctx = Py_None;
+	PyObject *py_session_info = Py_None;
+	PyObject *py_credentials = Py_None;
 	struct auth_session_info *session_info;
 	struct cli_credentials *credentials;
 	char *location;
@@ -300,13 +302,11 @@ PyTypeObject PyHiveKey = {
 	.tp_name = "HiveKey",
 	.tp_methods = hive_key_methods,
 	.tp_new = hive_new,
-	.tp_basicsize = sizeof(pytalloc_Object),
 	.tp_flags = Py_TPFLAGS_DEFAULT,
 };
 
 PyTypeObject PyRegistryKey = {
 	.tp_name = "RegistryKey",
-	.tp_basicsize = sizeof(pytalloc_Object),
 	.tp_flags = Py_TPFLAGS_DEFAULT,
 };
 
@@ -316,7 +316,9 @@ static PyObject *py_open_samba(PyObject *self, PyObject *args, PyObject *kwargs)
 	struct registry_context *reg_ctx;
 	WERROR result;
 	struct loadparm_context *lp_ctx;
-	PyObject *py_lp_ctx, *py_session_info, *py_credentials;
+	PyObject *py_lp_ctx = Py_None;
+	PyObject *py_session_info = Py_None;
+	PyObject *py_credentials = Py_None;
 	struct auth_session_info *session_info;
 	struct cli_credentials *credentials;
 	TALLOC_CTX *mem_ctx;
@@ -415,7 +417,7 @@ static PyObject *py_str_regtype(PyObject *self, PyObject *args)
 	if (!PyArg_ParseTuple(args, "i", &regtype))
 		return NULL;
 	
-	return PyString_FromString(str_regtype(regtype));
+	return PyUnicode_FromString(str_regtype(regtype));
 }
 
 static PyObject *py_get_predef_name(PyObject *self, PyObject *args)
@@ -429,52 +431,55 @@ static PyObject *py_get_predef_name(PyObject *self, PyObject *args)
 	str = reg_get_predef_name(hkey);
 	if (str == NULL)
 		Py_RETURN_NONE;
-	return PyString_FromString(str);
+	return PyUnicode_FromString(str);
 }
 
 static PyMethodDef py_registry_methods[] = {
-	{ "open_samba", (PyCFunction)py_open_samba, METH_VARARGS|METH_KEYWORDS, "open_samba() -> reg" },
-	{ "open_ldb", (PyCFunction)py_open_ldb_file, METH_VARARGS|METH_KEYWORDS, "open_ldb(location, session_info=None, credentials=None, loadparm_context=None) -> key" },
-	{ "open_hive", (PyCFunction)py_open_hive, METH_VARARGS|METH_KEYWORDS, "open_hive(location, session_info=None, credentials=None, loadparm_context=None) -> key" },
+	{ "open_samba", PY_DISCARD_FUNC_SIG(PyCFunction, py_open_samba),
+		METH_VARARGS|METH_KEYWORDS, "open_samba() -> reg" },
+	{ "open_ldb", PY_DISCARD_FUNC_SIG(PyCFunction, py_open_ldb_file),
+		METH_VARARGS|METH_KEYWORDS, "open_ldb(location, session_info=None, credentials=None, loadparm_context=None) -> key" },
+	{ "open_hive", PY_DISCARD_FUNC_SIG(PyCFunction, py_open_hive),
+		METH_VARARGS|METH_KEYWORDS, "open_hive(location, session_info=None, credentials=None, loadparm_context=None) -> key" },
 	{ "str_regtype", py_str_regtype, METH_VARARGS, "str_regtype(int) -> str" },
 	{ "get_predef_name", py_get_predef_name, METH_VARARGS, "get_predef_name(hkey) -> str" },
-	{ NULL }
+	{0}
 };
 
-void initregistry(void)
+static struct PyModuleDef moduledef = {
+    PyModuleDef_HEAD_INIT,
+    .m_name = "registry",
+    .m_doc = "Registry",
+    .m_size = -1,
+    .m_methods = py_registry_methods,
+};
+
+MODULE_INIT_FUNC(registry)
 {
 	PyObject *m;
-	PyTypeObject *talloc_type = pytalloc_GetObjectType();
 
-	if (talloc_type == NULL)
-		return;
+	if (pytalloc_BaseObject_PyType_Ready(&PyHiveKey) < 0)
+		return NULL;
 
-	PyHiveKey.tp_base = talloc_type;
-	PyRegistry.tp_base = talloc_type;
-	PyRegistryKey.tp_base = talloc_type;
+	if (pytalloc_BaseObject_PyType_Ready(&PyRegistry) < 0)
+		return NULL;
 
-	if (PyType_Ready(&PyHiveKey) < 0)
-		return;
+	if (pytalloc_BaseObject_PyType_Ready(&PyRegistryKey) < 0)
+		return NULL;
 
-	if (PyType_Ready(&PyRegistry) < 0)
-		return;
-
-	if (PyType_Ready(&PyRegistryKey) < 0)
-		return;
-
-	m = Py_InitModule3("registry", py_registry_methods, "Registry");
+	m = PyModule_Create(&moduledef);
 	if (m == NULL)
-		return;
+		return NULL;
 
-	PyModule_AddObject(m, "HKEY_CLASSES_ROOT", PyInt_FromLong(HKEY_CLASSES_ROOT));
-	PyModule_AddObject(m, "HKEY_CURRENT_USER", PyInt_FromLong(HKEY_CURRENT_USER));
-	PyModule_AddObject(m, "HKEY_LOCAL_MACHINE", PyInt_FromLong(HKEY_LOCAL_MACHINE));
-	PyModule_AddObject(m, "HKEY_USERS", PyInt_FromLong(HKEY_USERS));
-	PyModule_AddObject(m, "HKEY_PERFORMANCE_DATA", PyInt_FromLong(HKEY_PERFORMANCE_DATA));
-	PyModule_AddObject(m, "HKEY_CURRENT_CONFIG", PyInt_FromLong(HKEY_CURRENT_CONFIG));
-	PyModule_AddObject(m, "HKEY_DYN_DATA", PyInt_FromLong(HKEY_DYN_DATA));
-	PyModule_AddObject(m, "HKEY_PERFORMANCE_TEXT", PyInt_FromLong(HKEY_PERFORMANCE_TEXT));
-	PyModule_AddObject(m, "HKEY_PERFORMANCE_NLSTEXT", PyInt_FromLong(HKEY_PERFORMANCE_NLSTEXT));
+	PyModule_AddObject(m, "HKEY_CLASSES_ROOT", PyLong_FromLong(HKEY_CLASSES_ROOT));
+	PyModule_AddObject(m, "HKEY_CURRENT_USER", PyLong_FromLong(HKEY_CURRENT_USER));
+	PyModule_AddObject(m, "HKEY_LOCAL_MACHINE", PyLong_FromLong(HKEY_LOCAL_MACHINE));
+	PyModule_AddObject(m, "HKEY_USERS", PyLong_FromLong(HKEY_USERS));
+	PyModule_AddObject(m, "HKEY_PERFORMANCE_DATA", PyLong_FromLong(HKEY_PERFORMANCE_DATA));
+	PyModule_AddObject(m, "HKEY_CURRENT_CONFIG", PyLong_FromLong(HKEY_CURRENT_CONFIG));
+	PyModule_AddObject(m, "HKEY_DYN_DATA", PyLong_FromLong(HKEY_DYN_DATA));
+	PyModule_AddObject(m, "HKEY_PERFORMANCE_TEXT", PyLong_FromLong(HKEY_PERFORMANCE_TEXT));
+	PyModule_AddObject(m, "HKEY_PERFORMANCE_NLSTEXT", PyLong_FromLong(HKEY_PERFORMANCE_NLSTEXT));
 
 	Py_INCREF(&PyRegistry);
 	PyModule_AddObject(m, "Registry", (PyObject *)&PyRegistry);
@@ -484,4 +489,6 @@ void initregistry(void)
 
 	Py_INCREF(&PyRegistryKey);
 	PyModule_AddObject(m, "RegistryKey", (PyObject *)&PyRegistryKey);
+
+	return m;
 }

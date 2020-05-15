@@ -19,14 +19,14 @@
 */
 
 #include "includes.h"
-
 #include "messages.h"
 #include "serverid.h"
 #include "smbd/globals.h"
 #include "smbd/scavenger.h"
 #include "locking/proto.h"
+#include "lib/util/server_id.h"
 #include "lib/util/util_process.h"
-#include "lib/sys_rw.h"
+#include "lib/util/sys_rw_data.h"
 
 #undef DBGC_CLASS
 #define DBGC_CLASS DBGC_SCAVENGER
@@ -138,27 +138,22 @@ static bool smbd_scavenger_running(struct smbd_scavenger_state *state)
 
 static int smbd_scavenger_server_id_destructor(struct server_id *id)
 {
-	serverid_deregister(*id);
 	return 0;
 }
 
 static bool scavenger_say_hello(int fd, struct server_id self)
 {
-	const uint8_t *msg = (const uint8_t *)&self;
-	size_t remaining = sizeof(self);
-	size_t ofs = 0;
+	ssize_t ret;
 	struct server_id_buf tmp;
 
-	while (remaining > 0) {
-		ssize_t ret;
-
-		ret = sys_write(fd, msg + ofs, remaining);
-		if (ret == -1) {
-			DEBUG(2, ("Failed to write to pipe: %s\n",
-				  strerror(errno)));
-			return false;
-		}
-		remaining -= ret;
+	ret = write_data(fd, &self, sizeof(self));
+	if (ret == -1) {
+		DEBUG(2, ("Failed to write to pipe: %s\n", strerror(errno)));
+		return false;
+	}
+	if (ret < sizeof(self)) {
+		DBG_WARNING("Could not write serverid\n");
+		return false;
 	}
 
 	DEBUG(4, ("scavenger_say_hello: self[%s]\n",
@@ -168,21 +163,18 @@ static bool scavenger_say_hello(int fd, struct server_id self)
 
 static bool scavenger_wait_hello(int fd, struct server_id *child)
 {
-	uint8_t *msg = (uint8_t *)child;
-	size_t remaining = sizeof(*child);
-	size_t ofs = 0;
 	struct server_id_buf tmp;
+	ssize_t ret;
 
-	while (remaining > 0) {
-		ssize_t ret;
-
-		ret = sys_read(fd, msg + ofs, remaining);
-		if (ret == -1) {
-			DEBUG(2, ("Failed to read from pipe: %s\n",
-				  strerror(errno)));
-			return false;
-		}
-		remaining -= ret;
+	ret = read_data(fd, child, sizeof(struct server_id));
+	if (ret == -1) {
+		DEBUG(2, ("Failed to read from pipe: %s\n",
+			  strerror(errno)));
+		return false;
+	}
+	if (ret < sizeof(struct server_id)) {
+		DBG_WARNING("Could not read serverid\n");
+		return false;
 	}
 
 	DEBUG(4, ("scavenger_say_hello: child[%s]\n",
@@ -196,7 +188,6 @@ static bool smbd_scavenger_start(struct smbd_scavenger_state *state)
 	struct tevent_fd *fde = NULL;
 	int fds[2];
 	int ret;
-	uint64_t unique_id;
 	bool ok;
 
 	SMB_ASSERT(server_id_equal(&state->parent_id, &self));
@@ -234,8 +225,6 @@ static bool smbd_scavenger_start(struct smbd_scavenger_state *state)
 	smb_set_close_on_exec(fds[0]);
 	smb_set_close_on_exec(fds[1]);
 
-	unique_id = serverid_get_random_unique_id();
-
 	ret = fork();
 	if (ret == -1) {
 		int err = errno;
@@ -252,9 +241,8 @@ static bool smbd_scavenger_start(struct smbd_scavenger_state *state)
 
 		close(fds[0]);
 
-		set_my_unique_id(unique_id);
-
-		status = smbd_reinit_after_fork(state->msg, state->ev, true);
+		status = smbd_reinit_after_fork(state->msg, state->ev,
+						true, "smbd-scavenger");
 		if (!NT_STATUS_IS_OK(status)) {
 			DEBUG(2, ("reinit_after_fork failed: %s\n",
 				  nt_errstr(status)));
@@ -262,19 +250,12 @@ static bool smbd_scavenger_start(struct smbd_scavenger_state *state)
 			return false;
 		}
 
-		prctl_set_comment("smbd-scavenger");
+		reopen_logs();
 
 		state->am_scavenger = true;
 		*state->scavenger_id = messaging_server_id(state->msg);
 
 		scavenger_setup_sig_term_handler(state->ev);
-
-		if (!serverid_register(*state->scavenger_id,
-				       FLAG_MSG_GENERAL)) {
-			DBG_WARNING("serverid_register failed");
-			exit_server("serverid_register failed");
-			return false;
-		}
 
 		ok = scavenger_say_hello(fds[1], *state->scavenger_id);
 		if (!ok) {
@@ -431,6 +412,7 @@ void scavenger_schedule_disconnected(struct files_struct *fsp)
 	struct scavenger_message msg;
 	DATA_BLOB msg_blob;
 	struct server_id_buf tmp;
+	struct file_id_buf idbuf;
 
 	if (fsp->op == NULL) {
 		return;
@@ -449,7 +431,7 @@ void scavenger_schedule_disconnected(struct files_struct *fsp)
 	DEBUG(10, ("smbd: %s mark file %s as disconnected at %s with timeout "
 		   "at %s in %fs\n",
 		   server_id_str_buf(self, &tmp),
-		   file_id_string_tos(&fsp->file_id),
+		   file_id_str_buf(fsp->file_id, &idbuf),
 		   timeval_string(talloc_tos(), &disconnect_time, true),
 		   timeval_string(talloc_tos(), &until, true),
 		   fsp->op->global->durable_timeout_msec/1000.0));
@@ -487,28 +469,30 @@ static void scavenger_timer(struct tevent_context *ev,
 {
 	struct scavenger_timer_context *ctx =
 		talloc_get_type_abort(data, struct scavenger_timer_context);
+	struct file_id_buf idbuf;
 	NTSTATUS status;
 	bool ok;
 
-	DEBUG(10, ("scavenger: do cleanup for file %s at %s\n",
-		  file_id_string_tos(&ctx->msg.file_id),
-		  timeval_string(talloc_tos(), &t, true)));
+	DBG_DEBUG("do cleanup for file %s at %s\n",
+		  file_id_str_buf(ctx->msg.file_id, &idbuf),
+		  timeval_string(talloc_tos(), &t, true));
 
 	ok = share_mode_cleanup_disconnected(ctx->msg.file_id,
 					     ctx->msg.open_persistent_id);
 	if (!ok) {
-		DEBUG(2, ("Failed to cleanup share modes and byte range locks "
-			  "for file %s open %llu\n",
-			  file_id_string_tos(&ctx->msg.file_id),
-			  (unsigned long long)ctx->msg.open_persistent_id));
+		DBG_WARNING("Failed to cleanup share modes and byte range "
+			    "locks for file %s open %"PRIu64"\n",
+			    file_id_str_buf(ctx->msg.file_id, &idbuf),
+			    ctx->msg.open_persistent_id);
 	}
 
 	status = smbXsrv_open_cleanup(ctx->msg.open_persistent_id);
 	if (!NT_STATUS_IS_OK(status)) {
-		DEBUG(2, ("Failed to cleanup open global for file %s open %llu:"
-			  " %s\n", file_id_string_tos(&ctx->msg.file_id),
-			  (unsigned long long)ctx->msg.open_persistent_id,
-			  nt_errstr(status)));
+		DBG_WARNING("Failed to cleanup open global for file %s open "
+			    "%"PRIu64": %s\n",
+			    file_id_str_buf(ctx->msg.file_id, &idbuf),
+			    ctx->msg.open_persistent_id,
+			    nt_errstr(status));
 	}
 }
 
@@ -518,12 +502,13 @@ static void scavenger_add_timer(struct smbd_scavenger_state *state,
 	struct tevent_timer *te;
 	struct scavenger_timer_context *ctx;
 	struct timeval until;
+	struct file_id_buf idbuf;
 
 	nttime_to_timeval(&until, msg->until);
 
-	DEBUG(10, ("scavenger: schedule file %s for cleanup at %s\n",
-		   file_id_string_tos(&msg->file_id),
-		   timeval_string(talloc_tos(), &until, true)));
+	DBG_DEBUG("schedule file %s for cleanup at %s\n",
+		  file_id_str_buf(msg->file_id, &idbuf),
+		  timeval_string(talloc_tos(), &until, true));
 
 	ctx = talloc_zero(state, struct scavenger_timer_context);
 	if (ctx == NULL) {

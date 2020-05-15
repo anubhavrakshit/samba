@@ -1,7 +1,7 @@
 /*
    Unix SMB/CIFS mplementation.
    LDAP protocol helper functions for SAMBA
-   Copyright (C) Jean François Micouleau	1998
+   Copyright (C) Jean FranÃ§ois Micouleau	1998
    Copyright (C) Gerald Carter			2001-2003
    Copyright (C) Shahms King			2001
    Copyright (C) Andrew Bartlett		2002-2003
@@ -27,6 +27,7 @@
 #include "passdb.h"
 #include "passdb/pdb_ldap_util.h"
 #include "passdb/pdb_ldap_schema.h"
+#include "libcli/security/dom_sid.h"
 
 /**********************************************************************
  Add the account-policies below the sambaDomain object to LDAP,
@@ -53,7 +54,7 @@ static NTSTATUS add_new_domain_account_policies(struct smbldap_state *ldap_state
 
 	if (asprintf(&dn, "%s=%s,%s",
 		get_attr_key2string(dominfo_attr_list, LDAP_ATTR_DOMAIN),
-		escape_domain_name, lp_ldap_suffix(talloc_tos())) < 0) {
+		escape_domain_name, lp_ldap_suffix()) < 0) {
 		SAFE_FREE(escape_domain_name);
 		return NT_STATUS_NO_MEMORY;
 	}
@@ -90,7 +91,8 @@ static NTSTATUS add_new_domain_account_policies(struct smbldap_state *ldap_state
 
 		if (rc!=LDAP_SUCCESS) {
 			char *ld_error = NULL;
-			ldap_get_option(ldap_state->ldap_struct, LDAP_OPT_ERROR_STRING, &ld_error);
+			ldap_get_option(smbldap_get_ldap(ldap_state),
+					LDAP_OPT_ERROR_STRING, &ld_error);
 			DEBUG(1,("add_new_domain_account_policies: failed to add account policies to dn= %s with: %s\n\t%s\n",
 				dn, ldap_err2string(rc),
 				ld_error ? ld_error : "unknown"));
@@ -117,7 +119,7 @@ static NTSTATUS add_new_domain_account_policies(struct smbldap_state *ldap_state
 static NTSTATUS add_new_domain_info(struct smbldap_state *ldap_state,
                                     const char *domain_name)
 {
-	fstring sid_string;
+	struct dom_sid_buf sid_string;
 	fstring algorithmic_rid_base_string;
 	char *filter = NULL;
 	char *dn = NULL;
@@ -153,7 +155,7 @@ static NTSTATUS add_new_domain_info(struct smbldap_state *ldap_state,
 		return NT_STATUS_UNSUCCESSFUL;
 	}
 
-	num_result = ldap_count_entries(ldap_state->ldap_struct, result);
+	num_result = ldap_count_entries(smbldap_get_ldap(ldap_state), result);
 
 	if (num_result > 1) {
 		DEBUG (0, ("add_new_domain_info: More than domain with that name exists: bailing "
@@ -174,7 +176,7 @@ static NTSTATUS add_new_domain_info(struct smbldap_state *ldap_state,
 
 	if (asprintf(&dn, "%s=%s,%s",
 		     get_attr_key2string(dominfo_attr_list, LDAP_ATTR_DOMAIN),
-		     escape_domain_name, lp_ldap_suffix(talloc_tos())) < 0) {
+		     escape_domain_name, lp_ldap_suffix()) < 0) {
 		SAFE_FREE(escape_domain_name);
 		return NT_STATUS_NO_MEMORY;
 	}
@@ -195,11 +197,10 @@ static NTSTATUS add_new_domain_info(struct smbldap_state *ldap_state,
 	/* If we don't have an entry, then ask secrets.tdb for what it thinks.
 	   It may choose to make it up */
 
-	sid_to_fstring(sid_string, get_global_sam_sid());
 	smbldap_set_mod(&mods, LDAP_MOD_ADD,
 			get_attr_key2string(dominfo_attr_list,
 					    LDAP_ATTR_DOM_SID),
-			sid_string);
+			dom_sid_str_buf(get_global_sam_sid(), &sid_string));
 
 	slprintf(algorithmic_rid_base_string,
 		 sizeof(algorithmic_rid_base_string) - 1, "%i",
@@ -229,7 +230,7 @@ static NTSTATUS add_new_domain_info(struct smbldap_state *ldap_state,
 
 	if (rc!=LDAP_SUCCESS) {
 		char *ld_error = NULL;
-		ldap_get_option(ldap_state->ldap_struct,
+		ldap_get_option(smbldap_get_ldap(ldap_state),
 				LDAP_OPT_ERROR_STRING, &ld_error);
 		DEBUG(1,("add_new_domain_info: failed to add domain dn= %s with: %s\n\t%s\n",
 			 dn, ldap_err2string(rc),
@@ -285,13 +286,13 @@ NTSTATUS smbldap_search_domain_info(struct smbldap_state *ldap_state,
 
 	if (rc != LDAP_SUCCESS) {
 		DEBUG(2,("smbldap_search_domain_info: Problem during LDAPsearch: %s\n", ldap_err2string (rc)));
-		DEBUG(2,("smbldap_search_domain_info: Query was: %s, %s\n", lp_ldap_suffix(talloc_tos()), filter));
+		DEBUG(2,("smbldap_search_domain_info: Query was: %s, %s\n", lp_ldap_suffix(), filter));
 		goto failed;
 	}
 
 	SAFE_FREE(filter);
 
-	count = ldap_count_entries(ldap_state->ldap_struct, *result);
+	count = ldap_count_entries(smbldap_get_ldap(ldap_state), *result);
 
 	if (count == 1) {
 		return NT_STATUS_OK;

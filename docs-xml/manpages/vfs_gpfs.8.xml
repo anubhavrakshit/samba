@@ -7,13 +7,13 @@
 	<manvolnum>8</manvolnum>
 	<refmiscinfo class="source">Samba</refmiscinfo>
 	<refmiscinfo class="manual">System Administration tools</refmiscinfo>
-	<refmiscinfo class="version">4.3</refmiscinfo>
+	<refmiscinfo class="version">&doc.version;</refmiscinfo>
 </refmeta>
 
 
 <refnamediv>
 	<refname>vfs_gpfs</refname>
-	<refpurpose>gpfs specific samba extensions like acls and prealloc</refpurpose>
+	<refpurpose>gpfs specific samba extensions like acls</refpurpose>
 </refnamediv>
 
 <refsynopsisdiv>
@@ -42,14 +42,14 @@
 	</itemizedlist>
 	</para>
 
-	<para><command>NOTE:</command>This module follows the posix-acl behaviour
+	<para><command>NOTE:</command> This module follows the posix-acl behaviour
 	and hence allows permission stealing via chown. Samba might allow at a later
 	point in time, to restrict the chown via this module as such restrictions
 	are the responsibility of the underlying filesystem than of Samba.
 	</para>
 
 	<para>This module makes use of the smb.conf parameter
-	<smbconfoption name="acl map full control">acl map full control</smbconfoption>
+	<smbconfoption name="acl map full control"></smbconfoption>.
 	When set to yes (the default), this parameter will add in the FILE_DELETE_CHILD
 	bit on a returned ACE entry for a file (not a directory) that already
 	contains all file permissions except for FILE_DELETE and FILE_DELETE_CHILD.
@@ -204,26 +204,6 @@
 		</varlistentry>
 		<varlistentry>
 
-		<term>gpfs:merge_writeappend = [ yes | no ]</term>
-		<listitem>
-		<para>
-		GPFS ACLs doesn't know about the 'APPEND' right.
-		This option lets Samba map the 'APPEND' right to 'WRITE'.
-		</para>
-
-		<itemizedlist>
-		<listitem><para>
-		<command>yes(default)</command> - map 'APPEND' to 'WRITE'.
-		</para></listitem>
-		<listitem><para>
-		<command>no</command> - do not map 'APPEND' to 'WRITE'.
-		</para></listitem>
-		</itemizedlist>
-		</listitem>
-
-		</varlistentry>
-		<varlistentry>
-
 		<term>gpfs:acl = [ yes | no ]</term>
 		<listitem>
 		<para>
@@ -237,6 +217,28 @@
 		<listitem><para>
 		<command>no</command> - do not use GPFS ACLs and pass everything
 		to the next SMB_VFS module.
+		</para></listitem>
+		</itemizedlist>
+		</listitem>
+
+		</varlistentry>
+		<varlistentry>
+
+		<term>gpfs:check_fstype = [ yes | no ]</term>
+		<listitem>
+		<para>
+		Check for a mounted GPFS file system on access to a SMB share.
+		</para>
+
+		<itemizedlist>
+		<listitem><para>
+		<command>yes(default)</command> - Check that the SMB share path
+		is on a GPFS file system. Share access will be denied when a
+		different file system is found.
+		</para></listitem>
+		<listitem><para>
+		<command>no</command> - skip check for GPFS file system on SMB
+		share path.
 		</para></listitem>
 		</itemizedlist>
 		</listitem>
@@ -317,31 +319,6 @@
 		</varlistentry>
 		<varlistentry>
 
-		<term>gpfs:prealloc = [ yes | no ]</term>
-		<listitem>
-		<para>
-		If set to yes the gpfs_prealloc function will be used in the
-		fallocate callback when appropriate. If set to no gpfs_prealloc
-		will not be used. In both cases the system and libc calls are
-		avoided.
-		</para>
-
-		<itemizedlist>
-		<listitem><para>
-		<command>yes (default)</command> - Use gpfs_prealloc for the
-		fallocate callback.
-		</para></listitem>
-		<listitem><para>
-		<command>no</command> - Do not use gpfs_prealloc for the
-		fallocate callback.
-		</para></listitem>
-		</itemizedlist>
-		</listitem>
-
-		</varlistentry>
-
-		<varlistentry>
-
 		<term>gpfs:settimes = [ yes | no ]</term>
 		<listitem>
 		<para>
@@ -394,10 +371,10 @@
 
 		<para>Following is the behaviour of Samba for different values :</para>
 		<itemizedlist>
-		<listitem><para><command>dontcare (default)</command> - copy the ACEs as they come</para></listitem>
-		<listitem><para><command>reject</command> - stop operation and exit with error on ACL set op</para></listitem>
-		<listitem><para><command>ignore</command> - don't include the second matching ACE</para></listitem>
-		<listitem><para><command>merge</command> - bitwise OR the 2 ace.flag fields and 2 ace.mask fields of the 2 duplicate ACEs into 1 ACE</para></listitem>
+		<listitem><para><command>dontcare</command> - copy the ACEs as they come</para></listitem>
+		<listitem><para><command>reject (deprecated)</command> - stop operation and exit with error on ACL set op</para></listitem>
+		<listitem><para><command>ignore (deprecated)</command> - don't include the second matching ACE</para></listitem>
+		<listitem><para><command>merge (default)</command> - bitwise OR the 2 ace.flag fields and 2 ace.mask fields of the 2 duplicate ACEs into 1 ACE</para></listitem>
 		</itemizedlist>
 		</listitem>
 		</varlistentry>
@@ -471,14 +448,14 @@
 	</para>
 	<para>
 	At build time, only the header file <command>gpfs_gpl.h</command>
-	is required , which is a symlink to <command>gpfs.h</command> in
+	is required, which is a symlink to <command>gpfs.h</command> in
 	gpfs versions newer than 3.2.1 PTF8.
 	</para>
 </refsect1>
 
 <refsect1>
 	<title>VERSION</title>
-	<para>This man page is correct for version 3.0.25 of the Samba suite.
+	<para>This man page is part of version &doc.version; of the Samba suite.
 	</para>
 </refsect1>
 

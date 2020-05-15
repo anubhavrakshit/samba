@@ -38,7 +38,8 @@
 
 static WERROR dns_rr_to_dnsp(TALLOC_CTX *mem_ctx,
 			     const struct dns_res_rec *rrec,
-			     struct dnsp_DnssrvRpcRecord *r);
+			     struct dnsp_DnssrvRpcRecord *r,
+			     bool name_is_static);
 
 static WERROR check_one_prerequisite(struct dns_server *dns,
 				     TALLOC_CTX *mem_ctx,
@@ -181,7 +182,7 @@ static WERROR check_one_prerequisite(struct dns_server *dns,
 	rec = talloc_zero(mem_ctx, struct dnsp_DnssrvRpcRecord);
 	W_ERROR_HAVE_NO_MEMORY(rec);
 
-	werror = dns_rr_to_dnsp(rec, pr, rec);
+	werror = dns_rr_to_dnsp(rec, pr, rec, dns_name_is_static(ans, acount));
 	W_ERROR_NOT_OK_RETURN(werror);
 
 	for (i = 0; i < acount; i++) {
@@ -297,11 +298,11 @@ static WERROR update_prescan(const struct dns_name_question *zone,
 
 static WERROR dns_rr_to_dnsp(TALLOC_CTX *mem_ctx,
 			     const struct dns_res_rec *rrec,
-			     struct dnsp_DnssrvRpcRecord *r)
+			     struct dnsp_DnssrvRpcRecord *r,
+			     bool name_is_static)
 {
-	char *tmp;
-	char *txt_record_txt;
-	char *saveptr = NULL;
+	enum ndr_err_code ndr_err;
+	NTTIME t;
 
 	if (rrec->rr_type == DNS_QTYPE_ALL) {
 		return DNS_ERR(FORMAT_ERROR);
@@ -312,6 +313,14 @@ static WERROR dns_rr_to_dnsp(TALLOC_CTX *mem_ctx,
 	r->wType = (enum dns_record_type) rrec->rr_type;
 	r->dwTtlSeconds = rrec->ttl;
 	r->rank = DNS_RANK_ZONE;
+	if (name_is_static) {
+		r->dwTimeStamp = 0;
+	} else {
+		unix_to_nt_time(&t, time(NULL));
+		t /= 10 * 1000 * 1000;
+		t /= 3600;
+		r->dwTimeStamp = t;
+	}
 
 	/* If we get QCLASS_ANY, we're done here */
 	if (rrec->rr_class == DNS_QCLASS_ANY) {
@@ -354,28 +363,11 @@ static WERROR dns_rr_to_dnsp(TALLOC_CTX *mem_ctx,
 		W_ERROR_HAVE_NO_MEMORY(r->data.mx.nameTarget);
 		break;
 	case DNS_QTYPE_TXT:
-		r->data.txt.count = 0;
-		r->data.txt.str = talloc_array(mem_ctx, const char *,
-					       r->data.txt.count);
-		W_ERROR_HAVE_NO_MEMORY(r->data.txt.str);
-
-		txt_record_txt = talloc_strdup(r->data.txt.str,
-					       rrec->rdata.txt_record.txt);
-		W_ERROR_HAVE_NO_MEMORY(txt_record_txt);
-
-		tmp = strtok_r(txt_record_txt, "\"", &saveptr);
-		while (tmp) {
-			if (strcmp(tmp, " ") == 0) {
-				tmp = strtok_r(NULL, "\"", &saveptr);
-				continue;
-			}
-			r->data.txt.str = talloc_realloc(mem_ctx, r->data.txt.str, const char *,
-							r->data.txt.count+1);
-			r->data.txt.str[r->data.txt.count] = talloc_strdup(r->data.txt.str, tmp);
-			W_ERROR_HAVE_NO_MEMORY(r->data.txt.str[r->data.txt.count]);
-
-			r->data.txt.count++;
-			tmp = strtok_r(NULL, "\"", &saveptr);
+		ndr_err = ndr_dnsp_string_list_copy(mem_ctx,
+						    &rrec->rdata.txt_record.txt,
+						    &r->data.txt);
+		if (!NDR_ERR_CODE_IS_SUCCESS(ndr_err)) {
+			return WERR_NOT_ENOUGH_MEMORY;
 		}
 
 		break;
@@ -404,6 +396,7 @@ static WERROR handle_one_update(struct dns_server *dns,
 	WERROR werror;
 	bool tombstoned = false;
 	bool needs_add = false;
+	bool name_is_static;
 
 	DEBUG(2, ("Looking at record: \n"));
 	if (DEBUGLVL(2)) {
@@ -446,6 +439,8 @@ static WERROR handle_one_update(struct dns_server *dns,
 		first = rcount;
 	}
 
+	name_is_static = dns_name_is_static(recs, rcount);
+
 	if (update->rr_class == zone->question_class) {
 		if (update->rr_type == DNS_QTYPE_CNAME) {
 			/*
@@ -470,7 +465,8 @@ static WERROR handle_one_update(struct dns_server *dns,
 					struct dnsp_DnssrvRpcRecord, rcount + 1);
 			W_ERROR_HAVE_NO_MEMORY(recs);
 
-			werror = dns_rr_to_dnsp(recs, update, &recs[rcount]);
+			werror = dns_rr_to_dnsp(
+			    recs, update, &recs[rcount], name_is_static);
 			W_ERROR_NOT_OK_RETURN(werror);
 			rcount += 1;
 
@@ -522,7 +518,8 @@ static WERROR handle_one_update(struct dns_server *dns,
 				return WERR_OK;
 			}
 
-			werror = dns_rr_to_dnsp(mem_ctx, update, &recs[i]);
+			werror = dns_rr_to_dnsp(
+			    mem_ctx, update, &recs[i], name_is_static);
 			W_ERROR_NOT_OK_RETURN(werror);
 
 			for (i++; i < rcount; i++) {
@@ -546,7 +543,8 @@ static WERROR handle_one_update(struct dns_server *dns,
 				struct dnsp_DnssrvRpcRecord, rcount+1);
 		W_ERROR_HAVE_NO_MEMORY(recs);
 
-		werror = dns_rr_to_dnsp(recs, update, &recs[rcount]);
+		werror =
+		    dns_rr_to_dnsp(recs, update, &recs[rcount], name_is_static);
 		W_ERROR_NOT_OK_RETURN(werror);
 
 		for (i = first; i < rcount; i++) {
@@ -554,7 +552,10 @@ static WERROR handle_one_update(struct dns_server *dns,
 				continue;
 			}
 
-			recs[i] = recs[rcount];
+			recs[i].data = recs[rcount].data;
+			recs[i].wType = recs[rcount].wType;
+			recs[i].dwTtlSeconds = recs[rcount].dwTtlSeconds;
+			recs[i].rank = recs[rcount].rank;
 
 			werror = dns_replace_records(dns, mem_ctx, dn,
 						     needs_add, recs, rcount);
@@ -629,8 +630,8 @@ static WERROR handle_one_update(struct dns_server *dns,
 						struct dnsp_DnssrvRpcRecord);
 			W_ERROR_HAVE_NO_MEMORY(ns_rec);
 
-
-			werror = dns_rr_to_dnsp(ns_rec, update, ns_rec);
+			werror = dns_rr_to_dnsp(
+			    ns_rec, update, ns_rec, name_is_static);
 			W_ERROR_NOT_OK_RETURN(werror);
 
 			for (i = first; i < rcount; i++) {
@@ -647,7 +648,8 @@ static WERROR handle_one_update(struct dns_server *dns,
 		del_rec = talloc(mem_ctx, struct dnsp_DnssrvRpcRecord);
 		W_ERROR_HAVE_NO_MEMORY(del_rec);
 
-		werror = dns_rr_to_dnsp(del_rec, update, del_rec);
+		werror =
+		    dns_rr_to_dnsp(del_rec, update, del_rec, name_is_static);
 		W_ERROR_NOT_OK_RETURN(werror);
 
 		for (i = first; i < rcount; i++) {
@@ -680,7 +682,10 @@ static WERROR handle_updates(struct dns_server *dns,
 	TALLOC_CTX *tmp_ctx = talloc_new(mem_ctx);
 
 	if (tkey != NULL) {
-		ret = ldb_set_opaque(dns->samdb, "sessionInfo", tkey->session_info);
+		ret = ldb_set_opaque(
+			dns->samdb,
+			DSDB_SESSION_INFO,
+			tkey->session_info);
 		if (ret != LDB_SUCCESS) {
 			DEBUG(1, ("unable to set session info\n"));
 			werror = DNS_ERR(SERVER_FAILURE);
@@ -700,7 +705,7 @@ static WERROR handle_updates(struct dns_server *dns,
 	werror = check_prerequisites(dns, tmp_ctx, zone, prereqs, pcount);
 	W_ERROR_NOT_OK_GOTO(werror, failed);
 
-	DEBUG(1, ("update count is %u\n", upd_count));
+	DBG_DEBUG("dns update count is %u\n", upd_count);
 
 	for (ri = 0; ri < upd_count; ri++) {
 		werror = handle_one_update(dns, tmp_ctx, zone,
@@ -712,8 +717,10 @@ static WERROR handle_updates(struct dns_server *dns,
 	TALLOC_FREE(tmp_ctx);
 
 	if (tkey != NULL) {
-		ldb_set_opaque(dns->samdb, "sessionInfo",
-			       system_session(dns->task->lp_ctx));
+		ldb_set_opaque(
+			dns->samdb,
+			DSDB_SESSION_INFO,
+			system_session(dns->task->lp_ctx));
 	}
 
 	return WERR_OK;
@@ -722,8 +729,10 @@ failed:
 	ldb_transaction_cancel(dns->samdb);
 
 	if (tkey != NULL) {
-		ldb_set_opaque(dns->samdb, "sessionInfo",
-			       system_session(dns->task->lp_ctx));
+		ldb_set_opaque(
+			dns->samdb,
+			DSDB_SESSION_INFO,
+			system_session(dns->task->lp_ctx));
 	}
 
 	TALLOC_FREE(tmp_ctx);

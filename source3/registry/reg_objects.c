@@ -71,32 +71,32 @@ struct regsubkey_ctr {
 WERROR regsubkey_ctr_init(TALLOC_CTX *mem_ctx, struct regsubkey_ctr **ctr)
 {
 	if (ctr == NULL) {
-		return WERR_INVALID_PARAM;
+		return WERR_INVALID_PARAMETER;
 	}
 
 	*ctr = talloc_zero(mem_ctx, struct regsubkey_ctr);
 	if (*ctr == NULL) {
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	(*ctr)->subkeys_hash = db_open_rbt(*ctr);
 	if ((*ctr)->subkeys_hash == NULL) {
 		talloc_free(*ctr);
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	return WERR_OK;
 }
 
 /**
- * re-initialize the list of subkeys (to the emtpy list)
+ * re-initialize the list of subkeys (to the empty list)
  * in an already allocated regsubkey_ctr
  */
 
 WERROR regsubkey_ctr_reinit(struct regsubkey_ctr *ctr)
 {
 	if (ctr == NULL) {
-		return WERR_INVALID_PARAM;
+		return WERR_INVALID_PARAMETER;
 	}
 
 	talloc_free(ctr->subkeys_hash);
@@ -114,7 +114,7 @@ WERROR regsubkey_ctr_reinit(struct regsubkey_ctr *ctr)
 WERROR regsubkey_ctr_set_seqnum(struct regsubkey_ctr *ctr, int seqnum)
 {
 	if (ctr == NULL) {
-		return WERR_INVALID_PARAM;
+		return WERR_INVALID_PARAMETER;
 	}
 
 	ctr->seqnum = seqnum;
@@ -173,7 +173,7 @@ static WERROR regsubkey_ctr_index_for_keyname(struct regsubkey_ctr *ctr,
 	NTSTATUS status;
 
 	if ((ctr == NULL) || (keyname == NULL)) {
-		return WERR_INVALID_PARAM;
+		return WERR_INVALID_PARAMETER;
 	}
 
 	status = dbwrap_fetch_bystring_upper(ctr->subkeys_hash, ctr, keyname,
@@ -216,7 +216,7 @@ WERROR regsubkey_ctr_addkey( struct regsubkey_ctr *ctr, const char *keyname )
 
 	if (!(newkeys = talloc_realloc(ctr, ctr->subkeys, char *,
 					     ctr->num_subkeys+1))) {
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	ctr->subkeys = newkeys;
@@ -226,7 +226,7 @@ WERROR regsubkey_ctr_addkey( struct regsubkey_ctr *ctr, const char *keyname )
 		/*
 		 * Don't shrink the new array again, this wastes a pointer
 		 */
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	werr = regsubkey_ctr_hash_keyname(ctr, keyname, ctr->num_subkeys);
@@ -247,7 +247,7 @@ WERROR regsubkey_ctr_delkey( struct regsubkey_ctr *ctr, const char *keyname )
 	uint32_t idx, j;
 
 	if (keyname == NULL) {
-		return WERR_INVALID_PARAM;
+		return WERR_INVALID_PARAMETER;
 	}
 
 	/* make sure the keyname is actually already there */
@@ -275,7 +275,7 @@ WERROR regsubkey_ctr_delkey( struct regsubkey_ctr *ctr, const char *keyname )
 }
 
 /***********************************************************************
- Check for the existance of a key
+ Check for the existence of a key
  **********************************************************************/
 
 bool regsubkey_ctr_key_exists( struct regsubkey_ctr *ctr, const char *keyname )
@@ -304,7 +304,7 @@ int regsubkey_ctr_numkeys( struct regsubkey_ctr *ctr )
 }
 
 /***********************************************************************
- Retreive a specific key string
+ Retrieve a specific key string
  **********************************************************************/
 
 char* regsubkey_ctr_specific_key( struct regsubkey_ctr *ctr, uint32_t key_index )
@@ -325,12 +325,12 @@ char* regsubkey_ctr_specific_key( struct regsubkey_ctr *ctr, uint32_t key_index 
 WERROR regval_ctr_init(TALLOC_CTX *mem_ctx, struct regval_ctr **ctr)
 {
 	if (ctr == NULL) {
-		return WERR_INVALID_PARAM;
+		return WERR_INVALID_PARAMETER;
 	}
 
 	*ctr = talloc_zero(mem_ctx, struct regval_ctr);
 	if (*ctr == NULL) {
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	return WERR_OK;
@@ -378,7 +378,7 @@ uint32_t regval_type(struct regval_blob *val)
 }
 
 /***********************************************************************
- Retreive a pointer to a specific value.  Caller shoud dup the structure
+ Retrieve a pointer to a specific value.  Caller shoud dup the structure
  since this memory will go away when the ctr is free()'d
  **********************************************************************/
 
@@ -392,12 +392,12 @@ struct regval_blob *regval_ctr_specific_value(struct regval_ctr *ctr,
 }
 
 /***********************************************************************
- Check for the existance of a value
+ Check for the existence of a value
  **********************************************************************/
 
 bool regval_ctr_value_exists(struct regval_ctr *ctr, const char *value)
 {
-	int 	i;
+	uint32_t i;
 
 	for ( i=0; i<ctr->num_values; i++ ) {
 		if ( strequal( ctr->values[i]->valuename, value) )
@@ -413,7 +413,7 @@ bool regval_ctr_value_exists(struct regval_ctr *ctr, const char *value)
 struct regval_blob *regval_ctr_value_byname(struct regval_ctr *ctr,
 					    const char *value)
 {
-	int i;
+	uint32_t i;
 
 	for (i = 0; i < ctr->num_values; i++) {
 		if (strequal(ctr->values[i]->valuename, value)) {
@@ -484,7 +484,7 @@ int regval_ctr_addvalue(struct regval_ctr *ctr, const char *name, uint32_t type,
 		return 0;
 	}
 
-	/* allocate a new value and store the pointer in the arrya */
+	/* allocate a new value and store the pointer in the array */
 
 	ctr->values[ctr->num_values] = regval_compose(ctr, name, type, data_p,
 						      size);
@@ -552,7 +552,7 @@ int regval_ctr_copyvalue(struct regval_ctr *ctr, struct regval_blob *val)
 
 int regval_ctr_delvalue(struct regval_ctr *ctr, const char *name)
 {
-	int 	i;
+	uint32_t i;
 
 	for ( i=0; i<ctr->num_values; i++ ) {
 		if ( strequal( ctr->values[i]->valuename, name ) )
@@ -581,7 +581,7 @@ int regval_ctr_delvalue(struct regval_ctr *ctr, const char *name)
 struct regval_blob* regval_ctr_getvalue(struct regval_ctr *ctr,
 					const char *name)
 {
-	int 	i;
+	uint32_t i;
 
 	/* search for the value */
 
@@ -605,7 +605,7 @@ int regval_ctr_get_seqnum(struct regval_ctr *ctr)
 WERROR regval_ctr_set_seqnum(struct regval_ctr *ctr, int seqnum)
 {
 	if (ctr == NULL) {
-		return WERR_INVALID_PARAM;
+		return WERR_INVALID_PARAMETER;
 	}
 
 	ctr->seqnum = seqnum;

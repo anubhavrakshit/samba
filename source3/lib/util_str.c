@@ -64,16 +64,6 @@ bool strnorm(char *s, int case_default)
 }
 
 /**
- *  Skip past some strings in a buffer - old version - no checks.
- *  **/
-
-char *push_skip_string(char *buf)
-{
-	buf += strlen(buf) + 1;
-	return(buf);
-}
-
-/**
  Skip past a string in a buffer. Buffer may not be
  null terminated. end_ptr points to the first byte after
  then end of the buffer.
@@ -171,32 +161,6 @@ bool trim_char(char *s,char cfront,char cback)
 }
 
 /**
- Like strncpy but always null terminates. Make sure there is room!
- The variable n should always be one less than the available size.
-**/
-char *StrnCpy(char *dest,const char *src,size_t n)
-{
-	char *d = dest;
-
-	if (!dest) {
-		smb_panic("ERROR: NULL dest in StrnCpy");
-	}
-
-	if (!src) {
-		*dest = 0;
-		return(dest);
-	}
-
-	while (n-- && (*d = *src)) {
-		d++;
-		src++;
-	}
-
-	*d = 0;
-	return(dest);
-}
-
-/**
  Check if a string is part of a list.
 **/
 
@@ -276,6 +240,8 @@ char *talloc_string_sub2(TALLOC_CTX *mem_ctx, const char *src,
 				if (allow_trailing_dollar && (i == li - 1 )) {
 					break;
 				}
+
+				FALL_THROUGH;
 			case '`':
 			case '"':
 			case '\'':
@@ -287,6 +253,8 @@ char *talloc_string_sub2(TALLOC_CTX *mem_ctx, const char *src,
 					in[i] = '_';
 					break;
 				}
+
+				FALL_THROUGH;
 			default:
 				/* ok */
 				break;
@@ -592,80 +560,6 @@ int fstr_sprintf(fstring s, const char *fmt, ...)
 	return ret;
 }
 
-/**
- List of Strings manipulation functions
-**/
-
-#define S_LIST_ABS 16 /* List Allocation Block Size */
-
-/******************************************************************************
- substitute a specific pattern in a string list
- *****************************************************************************/
-
-bool str_list_substitute(char **list, const char *pattern, const char *insert)
-{
-	TALLOC_CTX *ctx = list;
-	char *p, *s, *t;
-	ssize_t ls, lp, li, ld, i, d;
-
-	if (!list)
-		return false;
-	if (!pattern)
-		return false;
-	if (!insert)
-		return false;
-
-	lp = (ssize_t)strlen(pattern);
-	li = (ssize_t)strlen(insert);
-	ld = li -lp;
-
-	while (*list) {
-		s = *list;
-		ls = (ssize_t)strlen(s);
-
-		while ((p = strstr_m(s, pattern))) {
-			t = *list;
-			d = p -t;
-			if (ld) {
-				t = talloc_array(ctx, char, ls +ld +1);
-				if (!t) {
-					DEBUG(0,("str_list_substitute: "
-						"Unable to allocate memory"));
-					return false;
-				}
-				memcpy(t, *list, d);
-				memcpy(t +d +li, p +lp, ls -d -lp +1);
-				TALLOC_FREE(*list);
-				*list = t;
-				ls += ld;
-				s = t +d +li;
-			}
-
-			for (i = 0; i < li; i++) {
-				switch (insert[i]) {
-					case '`':
-					case '"':
-					case '\'':
-					case ';':
-					case '$':
-					case '%':
-					case '\r':
-					case '\n':
-						t[d +i] = '_';
-						break;
-					default:
-						t[d +i] = insert[i];
-				}
-			}
-		}
-
-		list++;
-	}
-
-	return true;
-}
-
-
 #define IPSTR_LIST_SEP	","
 #define IPSTR_LIST_CHAR	','
 
@@ -776,8 +670,7 @@ int ipstr_list_parse(const char *ipstr_list, struct ip_service **ip_list)
 {
 	TALLOC_CTX *frame;
 	char *token_str = NULL;
-	size_t count;
-	int i;
+	size_t i, count;
 
 	if (!ipstr_list || !ip_list)
 		return 0;
@@ -872,19 +765,20 @@ uint64_t STR_TO_SMB_BIG_UINT(const char *nptr, const char **entptr)
 uint64_t conv_str_size(const char * str)
 {
         uint64_t lval;
-	char * end;
+        char *end;
+	int error = 0;
 
         if (str == NULL || *str == '\0') {
                 return 0;
         }
 
-	lval = strtoull(str, &end, 10 /* base */);
+	lval = smb_strtoull(str, &end, 10, &error, SMB_STR_STANDARD);
 
-        if (end == NULL || end == str) {
+        if (error != 0) {
                 return 0;
         }
 
-        if (*end == '\0') {
+	if (*end == '\0') {
 		return lval;
 	}
 
@@ -907,65 +801,6 @@ uint64_t conv_str_size(const char * str)
 	}
 
 	return lval;
-}
-
-/* Append an sprintf'ed string. Double buffer size on demand. Usable without
- * error checking in between. The indication that something weird happened is
- * string==NULL */
-
-void sprintf_append(TALLOC_CTX *mem_ctx, char **string, ssize_t *len,
-		    size_t *bufsize, const char *fmt, ...)
-{
-	va_list ap;
-	char *newstr;
-	int ret;
-	bool increased;
-
-	/* len<0 is an internal marker that something failed */
-	if (*len < 0)
-		goto error;
-
-	if (*string == NULL) {
-		if (*bufsize == 0)
-			*bufsize = 128;
-
-		*string = talloc_array(mem_ctx, char, *bufsize);
-		if (*string == NULL)
-			goto error;
-	}
-
-	va_start(ap, fmt);
-	ret = vasprintf(&newstr, fmt, ap);
-	va_end(ap);
-
-	if (ret < 0)
-		goto error;
-
-	increased = false;
-
-	while ((*len)+ret >= *bufsize) {
-		increased = true;
-		*bufsize *= 2;
-		if (*bufsize >= (1024*1024*256))
-			goto error;
-	}
-
-	if (increased) {
-		*string = talloc_realloc(mem_ctx, *string, char,
-					       *bufsize);
-		if (*string == NULL) {
-			goto error;
-		}
-	}
-
-	StrnCpy((*string)+(*len), newstr, ret);
-	(*len) += ret;
-	free(newstr);
-	return;
-
- error:
-	*len = -1;
-	*string = NULL;
 }
 
 /*

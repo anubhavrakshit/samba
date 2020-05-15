@@ -40,32 +40,13 @@
 
 #ifdef WITH_QUOTAS
 
-#if defined(VXFS_QUOTA)
-
-/*
- * In addition to their native filesystems, some systems have Veritas VxFS.
- * Declare here, define at end: reduces likely "include" interaction problems.
- *	David Lee <T.D.Lee@durham.ac.uk>
- */
-bool disk_quotas_vxfs(const char *name, char *path, uint64_t *bsize, uint64_t *dfree, uint64_t *dsize);
-
-#endif /* VXFS_QUOTA */
-
-
-#if defined(SUNOS5) || defined(SUNOS4)
+#if defined(SUNOS5) /* Solaris */
 
 #include <fcntl.h>
 #include <sys/param.h>
-#if defined(SUNOS5)
 #include <sys/fs/ufs_quota.h>
 #include <sys/mnttab.h>
 #include <sys/mntent.h>
-#else /* defined(SUNOS4) */
-#include <ufs/quota.h>
-#include <mntent.h>
-#endif
-
-#if defined(SUNOS5)
 
 /****************************************************************************
  Allows querying of remote hosts for quotas on NFS mounted shares.
@@ -171,17 +152,12 @@ static bool nfs_quotas(char *nfspath, uid_t euser_id, uint64_t *bsize, uint64_t 
 	}
 
 	/*
-	 * gqr.status returns 0 if the rpc call fails, 1 if quotas exist, 2 if there is
-	 * no quota set, and 3 if no permission to get the quota.  If 0 or 3 return
-	 * something sensible.
+	 * gqr.status returns 1 if quotas exist, 2 if there is
+	 * no quota set, and 3 if no permission to get the quota.
+	 * If 3, return something sensible.
 	 */
 
 	switch (gqr.status) {
-	case 0:
-		DEBUG(9,("nfs_quotas: Remote Quotas Failed!  Error \"%i\" \n", gqr.status));
-		ret = False;
-		goto out;
-
 	case 1:
 		DEBUG(9,("nfs_quotas: Good quota data\n"));
 		D.dqb_bsoftlimit = gqr.getquota_rslt_u.gqr_rquota.rq_bsoftlimit;
@@ -197,8 +173,10 @@ static bool nfs_quotas(char *nfspath, uid_t euser_id, uint64_t *bsize, uint64_t 
 		break;
 
 	default:
-		DEBUG(9,("nfs_quotas: Remote Quotas Questionable!  Error \"%i\" \n", gqr.status ));
-		break;
+		DEBUG(9, ("nfs_quotas: Unknown Remote Quota Status \"%i\"\n",
+				gqr.status));
+		ret = false;
+		goto out;
 	}
 
 	DEBUG(10,("nfs_quotas: Let`s look at D a bit closer... status \"%i\" bsize \"%i\" active? \"%i\" bhard \"%i\" bsoft \"%i\" curb \"%i\" \n",
@@ -232,44 +210,33 @@ static bool nfs_quotas(char *nfspath, uid_t euser_id, uint64_t *bsize, uint64_t 
 	DEBUG(10,("nfs_quotas: End of nfs_quotas\n" ));
 	return ret;
 }
-#endif
 
 /****************************************************************************
 try to get the disk space from disk quotas (SunOS & Solaris2 version)
 Quota code by Peter Urbanec (amiga@cse.unsw.edu.au).
 ****************************************************************************/
 
-bool disk_quotas(const char *path,
-		uint64_t *bsize,
-		uint64_t *dfree,
-		uint64_t *dsize)
+bool disk_quotas(connection_struct *conn, struct smb_filename *fname,
+		 uint64_t *bsize, uint64_t *dfree, uint64_t *dsize)
 {
 	uid_t euser_id;
 	int ret;
 	struct dqblk D;
-#if defined(SUNOS5)
 	struct quotctl command;
 	int file;
 	struct mnttab mnt;
-#else /* SunOS4 */
-	struct mntent *mnt;
-#endif
 	char *name = NULL;
 	FILE *fd;
 	SMB_STRUCT_STAT sbuf;
 	SMB_DEV_T devno;
 	bool found = false;
+	const char *path = fname->base_name;
 
 	euser_id = geteuid();
 
-	if (sys_stat(path, &sbuf, false) == -1) {
-		return false;
-	}
-
-	devno = sbuf.st_ex_dev ;
+	devno = fname->st.st_ex_dev;
 	DEBUG(5,("disk_quotas: looking for path \"%s\" devno=%x\n",
 		path, (unsigned int)devno));
-#if defined(SUNOS5)
 	if ((fd = fopen(MNTTAB, "r")) == NULL) {
 		return false;
 	}
@@ -296,28 +263,6 @@ bool disk_quotas(const char *path,
 	}
 
 	fclose(fd);
-#else /* SunOS4 */
-	if ((fd = setmntent(MOUNTED, "r")) == NULL) {
-		return false;
-	}
-
-	while ((mnt = getmntent(fd)) != NULL) {
-		if (sys_stat(mnt->mnt_dir, &sbuf, false) == -1) {
-			continue;
-		}
-		DEBUG(5,("disk_quotas: testing \"%s\" devno=%x\n",
-					mnt->mnt_dir,
-					(unsigned int)sbuf.st_ex_dev));
-		if (sbuf.st_ex_dev == devno) {
-			found = true;
-			name = talloc_strdup(talloc_tos(),
-					mnt->mnt_fsname);
-			break;
-		}
-	}
-
-	endmntent(fd);
-#endif
 	if (!found) {
 		return false;
 	}
@@ -327,7 +272,6 @@ bool disk_quotas(const char *path,
 	}
 	become_root();
 
-#if defined(SUNOS5)
 	if (strcmp(mnt.mnt_fstype, "nfs") == 0) {
 		bool retval;
 		DEBUG(5,("disk_quotas: looking for mountpath (NFS) \"%s\"\n",
@@ -348,10 +292,6 @@ bool disk_quotas(const char *path,
 	command.addr = (caddr_t) &D;
 	ret = ioctl(file, Q_QUOTACTL, &command);
 	close(file);
-#else
-	DEBUG(5,("disk_quotas: trying quotactl on device \"%s\"\n", name));
-	ret = quotactl(Q_GETQUOTA, name, euser_id, &D);
-#endif
 
 	unbecome_root();
 
@@ -359,19 +299,7 @@ bool disk_quotas(const char *path,
 		DEBUG(5,("disk_quotas ioctl (Solaris) failed. Error = %s\n",
 					strerror(errno) ));
 
-#if defined(SUNOS5) && defined(VXFS_QUOTA)
-		/* If normal quotactl() fails, try vxfs private calls */
-		set_effective_uid(euser_id);
-		DEBUG(5,("disk_quotas: mount type \"%s\"\n", mnt.mnt_fstype));
-		if ( 0 == strcmp ( mnt.mnt_fstype, "vxfs" )) {
-			bool retval;
-			retval = disk_quotas_vxfs(name, path,
-					bsize, dfree, dsize);
-			return retval;
-		}
-#else
 		return false;
-#endif
 	}
 
 	/* If softlimit is zero, set it equal to hardlimit.
@@ -407,261 +335,12 @@ bool disk_quotas(const char *path,
 	return true;
 }
 
-
-#else
-
-#if           AIX
-/* AIX quota patch from Ole Holm Nielsen <ohnielse@fysik.dtu.dk> */
-#include <jfs/quota.h>
-/* AIX 4.X: Rename members of the dqblk structure (ohnielse@fysik.dtu.dk) */
-#define dqb_curfiles dqb_curinodes
-#define dqb_fhardlimit dqb_ihardlimit
-#define dqb_fsoftlimit dqb_isoftlimit
-#ifdef _AIXVERSION_530 
-#include <sys/statfs.h>
-#include <sys/vmount.h>
-#endif /* AIX 5.3 */
-#else /* !AIX */
-#include <sys/quota.h>
-#include <devnm.h>
-#endif
-
-
-/****************************************************************************
-try to get the disk space from disk quotas - default version
-****************************************************************************/
-
-bool disk_quotas(const char *path, uint64_t *bsize, uint64_t *dfree, uint64_t *dsize)
-{
-  int r;
-  struct dqblk D;
-  uid_t euser_id;
-#if !defined(AIX)
-  char dev_disk[256];
-  SMB_STRUCT_STAT S;
-
-  /* find the block device file */
-
-  if ((sys_stat(path, &S, false)<0)
-      || (devnm(S_IFBLK, S.st_ex_dev, dev_disk, 256, 0)<0))
-	return (False);
-
-#endif /* !defined(AIX) */
-
-  euser_id = geteuid();
-
-#if   defined(AIX)
-  /* AIX has both USER and GROUP quotas: 
-     Get the USER quota (ohnielse@fysik.dtu.dk) */
-#ifdef _AIXVERSION_530
-  {
-    struct statfs statbuf;
-    quota64_t user_quota;
-    if (statfs(path,&statbuf) != 0)
-      return False;
-    if(statbuf.f_vfstype == MNT_J2)
-    {
-    /* For some reason we need to be root for jfs2 */
-      become_root();
-      r = quotactl(path,QCMD(Q_J2GETQUOTA,USRQUOTA),euser_id,(char *) &user_quota);
-      unbecome_root();
-    /* Copy results to old struct to let the following code work as before */
-      D.dqb_curblocks  = user_quota.bused;
-      D.dqb_bsoftlimit = user_quota.bsoft;
-      D.dqb_bhardlimit = user_quota.bhard;
-      D.dqb_curfiles   = user_quota.iused;
-      D.dqb_fsoftlimit = user_quota.isoft;
-      D.dqb_fhardlimit = user_quota.ihard;
-    }
-    else if(statbuf.f_vfstype == MNT_JFS)
-    {
-#endif /* AIX 5.3 */
-  save_re_uid();
-  if (set_re_uid() != 0) 
-    return False;
-  r= quotactl(path,QCMD(Q_GETQUOTA,USRQUOTA),euser_id,(char *) &D);
-  restore_re_uid();
-#ifdef _AIXVERSION_530
-    }
-    else
-      r = 1; /* Fail for other FS-types */
-  }
-#endif /* AIX 5.3 */
-#else /* !AIX */
-  r=quotactl(Q_GETQUOTA, dev_disk, euser_id, &D);
-#endif /* !AIX */
-
-  /* Use softlimit to determine disk space, except when it has been exceeded */
-  *bsize = 1024;
-
-  if (r)
-    {
-      if (errno == EDQUOT) 
-	{
- 	  *dfree =0;
- 	  *dsize =D.dqb_curblocks;
- 	  return (True);
-	}
-      else return(False);
-    }
-
-  /* If softlimit is zero, set it equal to hardlimit.
-   */
-
-  if (D.dqb_bsoftlimit==0)
-    D.dqb_bsoftlimit = D.dqb_bhardlimit;
-
-  if (D.dqb_bsoftlimit==0)
-    return(False);
-  /* Use softlimit to determine disk space, except when it has been exceeded */
-  if ((D.dqb_curblocks>D.dqb_bsoftlimit)
-||((D.dqb_curfiles>D.dqb_fsoftlimit) && (D.dqb_fsoftlimit != 0))
-    ) {
-      *dfree = 0;
-      *dsize = D.dqb_curblocks;
-    }
-  else {
-    *dfree = D.dqb_bsoftlimit - D.dqb_curblocks;
-    *dsize = D.dqb_bsoftlimit;
-  }
-  return (True);
-}
-
-#endif
-
-#if defined(VXFS_QUOTA)
-
-/****************************************************************************
-Try to get the disk space from Veritas disk quotas.
-    David Lee <T.D.Lee@durham.ac.uk> August 1999.
-
-Background assumptions:
-    Potentially under many Operating Systems.  Initially Solaris 2.
-
-    My guess is that Veritas is largely, though not entirely,
-    independent of OS.  So I have separated it out.
-
-    There may be some details.  For example, OS-specific "include" files.
-
-    It is understood that HPUX 10 somehow gets Veritas quotas without
-    any special effort; if so, this routine need not be compiled in.
-        Dirk De Wachter <Dirk.DeWachter@rug.ac.be>
-
-Warning:
-    It is understood that Veritas do not publicly support this ioctl interface.
-    Rather their preference would be for the user (us) to call the native
-    OS and then for the OS itself to call through to the VxFS filesystem.
-    Presumably HPUX 10, see above, does this.
-
-Hints for porting:
-    Add your OS to "IFLIST" below.
-    Get it to compile successfully:
-        Almost certainly "include"s require attention: see SUNOS5.
-    In the main code above, arrange for it to be called: see SUNOS5.
-    Test!
-    
-****************************************************************************/
-
-/* "IFLIST"
- * This "if" is a list of ports:
- *	if defined(OS1) || defined(OS2) || ...
- */
-#if defined(SUNOS5)
-
-#if defined(SUNOS5)
-#include <sys/fs/vx_solaris.h>
-#endif
-#include <sys/fs/vx_machdep.h>
-#include <sys/fs/vx_layout.h>
-#include <sys/fs/vx_quota.h>
-#include <sys/fs/vx_aioctl.h>
-#include <sys/fs/vx_ioctl.h>
-
-bool disk_quotas_vxfs(const char *name, char *path, uint64_t *bsize, uint64_t *dfree, uint64_t *dsize)
-{
-  uid_t user_id, euser_id;
-  int ret;
-  struct vx_dqblk D;
-  struct vx_quotctl quotabuf;
-  struct vx_genioctl genbuf;
-  char *qfname;
-  int file;
-
-  /*
-   * "name" may or may not include a trailing "/quotas".
-   * Arranging consistency of calling here in "quotas.c" may not be easy and
-   * it might be easier to examine and adjust it here.
-   * Fortunately, VxFS seems not to mind at present.
-   */
-  qfname = talloc_strdup(talloc_tos(), name);
-  if (!qfname) {
-	  return false;
-  }
-  /* pstrcat(qfname, "/quotas") ; */	/* possibly examine and adjust "name" */
-
-  euser_id = geteuid();
-  set_effective_uid(0);
-
-  DEBUG(5,("disk_quotas: looking for VxFS quotas file \"%s\"\n", qfname));
-  if((file=open(qfname, O_RDONLY,0))<0) {
-    set_effective_uid(euser_id);
-    return(False);
-  }
-  genbuf.ioc_cmd = VX_QUOTACTL;
-  genbuf.ioc_up = (void *) &quotabuf;
-
-  quotabuf.cmd = VX_GETQUOTA;
-  quotabuf.uid = euser_id;
-  quotabuf.addr = (caddr_t) &D;
-  ret = ioctl(file, VX_ADMIN_IOCTL, &genbuf);
-  close(file);
-
-  set_effective_uid(euser_id);
-
-  if (ret < 0) {
-    DEBUG(5,("disk_quotas ioctl (VxFS) failed. Error = %s\n", strerror(errno) ));
-    return(False);
-  }
-
-  /* If softlimit is zero, set it equal to hardlimit.
-   */
-
-  if (D.dqb_bsoftlimit==0)
-    D.dqb_bsoftlimit = D.dqb_bhardlimit;
-
-  /* Use softlimit to determine disk space. A user exceeding the quota is told
-   * that there's no space left. Writes might actually work for a bit if the
-   * hardlimit is set higher than softlimit. Effectively the disk becomes
-   * made of rubber latex and begins to expand to accommodate the user :-)
-   */
-  DEBUG(5,("disk_quotas for path \"%s\" block c/s/h %ld/%ld/%ld; file c/s/h %ld/%ld/%ld\n",
-         path, D.dqb_curblocks, D.dqb_bsoftlimit, D.dqb_bhardlimit,
-         D.dqb_curfiles, D.dqb_fsoftlimit, D.dqb_fhardlimit));
-
-  if (D.dqb_bsoftlimit==0)
-    return(False);
-  *bsize = DEV_BSIZE;
-  *dsize = D.dqb_bsoftlimit;
-
-  if (D.dqb_curblocks > D.dqb_bsoftlimit) {
-     *dfree = 0;
-     *dsize = D.dqb_curblocks;
-  } else
-    *dfree = D.dqb_bsoftlimit - D.dqb_curblocks;
-      
-  DEBUG(5,("disk_quotas for path \"%s\" returning  bsize %.0f, dfree %.0f, dsize %.0f\n",
-         path,(double)*bsize,(double)*dfree,(double)*dsize));
-
-  return(True);
-}
-
-#endif /* SUNOS5 || ... */
-
-#endif /* VXFS_QUOTA */
+#endif /* Solaris */
 
 #else /* WITH_QUOTAS */
 
-bool disk_quotas(const char *path,uint64_t *bsize,uint64_t *dfree,uint64_t *dsize)
+bool disk_quotas(connection_struct *conn, struct smb_filename *fname,
+		 uint64_t *bsize, uint64_t *dfree, uint64_t *dsize)
 {
 	(*bsize) = 512; /* This value should be ignored */
 
@@ -679,29 +358,57 @@ bool disk_quotas(const char *path,uint64_t *bsize,uint64_t *dfree,uint64_t *dsiz
 /* wrapper to the new sys_quota interface
    this file should be removed later
    */
-bool disk_quotas(const char *path,uint64_t *bsize,uint64_t *dfree,uint64_t *dsize)
+bool disk_quotas(connection_struct *conn, struct smb_filename *fname,
+		 uint64_t *bsize, uint64_t *dfree, uint64_t *dsize)
 {
 	int r;
 	SMB_DISK_QUOTA D;
 	unid_t id;
 
-	id.uid = geteuid();
-
+	/*
+	 * First of all, check whether user quota is
+	 * enforced. If the call fails, assume it is
+	 * not enforced.
+	 */
 	ZERO_STRUCT(D);
-  	r=sys_get_quota(path, SMB_USER_QUOTA_TYPE, id, &D);
-
-	/* Use softlimit to determine disk space, except when it has been exceeded */
-	*bsize = D.bsize;
-	if (r == -1) {
-		if (errno == EDQUOT) {
-			*dfree =0;
-			*dsize =D.curblocks;
-			return (True);
-		} else {
-			goto try_group_quota;
-		}
+	id.uid = -1;
+	r = SMB_VFS_GET_QUOTA(conn, fname, SMB_USER_FS_QUOTA_TYPE,
+			      id, &D);
+	if (r == -1 && errno != ENOSYS) {
+		goto try_group_quota;
+	}
+	if (r == 0 && (D.qflags & QUOTAS_DENY_DISK) == 0) {
+		goto try_group_quota;
 	}
 
+	ZERO_STRUCT(D);
+	id.uid = geteuid();
+
+	/* if new files created under this folder get this
+	 * folder's UID, then available space is governed by
+	 * the quota of the folder's UID, not the creating user.
+	 */
+	if (lp_inherit_owner(SNUM(conn)) != INHERIT_OWNER_NO &&
+	    id.uid != fname->st.st_ex_uid && id.uid != sec_initial_uid()) {
+		int save_errno;
+
+		id.uid = fname->st.st_ex_uid;
+		become_root();
+		r = SMB_VFS_GET_QUOTA(conn, fname,
+				      SMB_USER_QUOTA_TYPE, id, &D);
+		save_errno = errno;
+		unbecome_root();
+		errno = save_errno;
+	} else {
+		r = SMB_VFS_GET_QUOTA(conn, fname,
+				      SMB_USER_QUOTA_TYPE, id, &D);
+	}
+
+	if (r == -1) {
+		goto try_group_quota;
+	}
+
+	*bsize = D.bsize;
 	/* Use softlimit to determine disk space, except when it has been exceeded */
 	if (
 		(D.softlimit && D.curblocks >= D.softlimit) ||
@@ -714,8 +421,9 @@ bool disk_quotas(const char *path,uint64_t *bsize,uint64_t *dfree,uint64_t *dsiz
 	} else if (D.softlimit==0 && D.hardlimit==0) {
 		goto try_group_quota;
 	} else {
-		if (D.softlimit == 0)
+		if (D.softlimit == 0) {
 			D.softlimit = D.hardlimit;
+		}
 		*dfree = D.softlimit - D.curblocks;
 		*dsize = D.softlimit;
 	}
@@ -723,23 +431,48 @@ bool disk_quotas(const char *path,uint64_t *bsize,uint64_t *dfree,uint64_t *dsiz
 	return True;
 	
 try_group_quota:
-	id.gid = getegid();
-
+	/*
+	 * First of all, check whether group quota is
+	 * enforced. If the call fails, assume it is
+	 * not enforced.
+	 */
 	ZERO_STRUCT(D);
-  	r=sys_get_quota(path, SMB_GROUP_QUOTA_TYPE, id, &D);
-
-	/* Use softlimit to determine disk space, except when it has been exceeded */
-	*bsize = D.bsize;
-	if (r == -1) {
-		if (errno == EDQUOT) {
-			*dfree =0;
-			*dsize =D.curblocks;
-			return (True);
-		} else {
-			return False;
-		}
+	id.gid = -1;
+	r = SMB_VFS_GET_QUOTA(conn, fname, SMB_GROUP_FS_QUOTA_TYPE,
+			      id, &D);
+	if (r == -1 && errno != ENOSYS) {
+		return false;
+	}
+	if (r == 0 && (D.qflags & QUOTAS_DENY_DISK) == 0) {
+		return false;
 	}
 
+	ZERO_STRUCT(D);
+
+	/*
+	 * If new files created under this folder get this folder's
+	 * GID, then available space is governed by the quota of the
+	 * folder's GID, not the primary group of the creating user.
+	 */
+	if (VALID_STAT(fname->st) &&
+	    S_ISDIR(fname->st.st_ex_mode) &&
+	    fname->st.st_ex_mode & S_ISGID) {
+		id.gid = fname->st.st_ex_gid;
+		become_root();
+		r = SMB_VFS_GET_QUOTA(conn, fname, SMB_GROUP_QUOTA_TYPE, id,
+				      &D);
+		unbecome_root();
+	} else {
+		id.gid = getegid();
+		r = SMB_VFS_GET_QUOTA(conn, fname, SMB_GROUP_QUOTA_TYPE, id,
+				      &D);
+	}
+
+	if (r == -1) {
+		return False;
+	}
+
+	*bsize = D.bsize;
 	/* Use softlimit to determine disk space, except when it has been exceeded */
 	if (
 		(D.softlimit && D.curblocks >= D.softlimit) ||
@@ -752,8 +485,9 @@ try_group_quota:
 	} else if (D.softlimit==0 && D.hardlimit==0) {
 		return False;
 	} else {
-		if (D.softlimit == 0)
+		if (D.softlimit == 0) {
 			D.softlimit = D.hardlimit;
+		}
 		*dfree = D.softlimit - D.curblocks;
 		*dsize = D.softlimit;
 	}

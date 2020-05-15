@@ -34,6 +34,7 @@ static void PyType_AddMethods(PyTypeObject *type, PyMethodDef *methods)
                         descr = PyDescr_NewMethod(type, &methods[i]);
                 PyDict_SetItemString(dict, methods[i].ml_name,
                                      descr);
+		Py_CLEAR(descr);
         }
 }
 
@@ -43,11 +44,15 @@ static void ntacl_print_debug_helper(struct ndr_print *ndr, const char *format, 
 {
         va_list ap;
         char *s = NULL;
-        int i;
+        int i, ret;
 
         va_start(ap, format);
-        vasprintf(&s, format, ap);
+        ret = vasprintf(&s, format, ap);
         va_end(ap);
+
+	if (ret == -1) {
+		return;
+	}
 
         for (i=0;i<ndr->depth;i++) {
                 printf("    ");
@@ -82,7 +87,7 @@ static PyObject *py_ntacl_print(PyObject *self, PyObject *args)
 static PyMethodDef py_ntacl_extra_methods[] = {
 	{ "dump", (PyCFunction)py_ntacl_print, METH_NOARGS,
 		NULL },
-	{ NULL }
+	{0}
 };
 
 static void py_xattr_NTACL_patch(PyTypeObject *type)

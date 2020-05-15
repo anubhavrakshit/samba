@@ -22,7 +22,7 @@
 */
 
 #include "includes.h"
-#include "popt_common.h"
+#include "popt_common_cmdline.h"
 #include "rpc_client/cli_pipe.h"
 #include "../librpc/gen_ndr/ndr_lsa.h"
 #include "rpc_client/cli_lsarpc.h"
@@ -40,6 +40,7 @@ static int test_args;
 static int sddl;
 static int query_sec_info = -1;
 static int set_sec_info = -1;
+static bool want_mxac;
 
 static const char *domain_sid = NULL;
 
@@ -51,13 +52,21 @@ static NTSTATUS cli_lsa_lookup_domain_sid(struct cli_state *cli,
 					  struct dom_sid *sid)
 {
 	union lsa_PolicyInformation *info = NULL;
-	uint16_t orig_cnum = cli_state_get_tid(cli);
+	struct smbXcli_tcon *orig_tcon = NULL;
 	struct rpc_pipe_client *rpc_pipe = NULL;
 	struct policy_handle handle;
 	NTSTATUS status, result;
 	TALLOC_CTX *frame = talloc_stackframe();
 
-	status = cli_tree_connect(cli, "IPC$", "?????", "", 0);
+	if (cli_state_has_tcon(cli)) {
+		orig_tcon = cli_state_save_tcon(cli);
+		if (orig_tcon == NULL) {
+			status = NT_STATUS_NO_MEMORY;
+			goto done;
+		}
+	}
+
+	status = cli_tree_connect(cli, "IPC$", "?????", NULL);
 	if (!NT_STATUS_IS_OK(status)) {
 		goto done;
 	}
@@ -88,7 +97,7 @@ tdis:
 	TALLOC_FREE(rpc_pipe);
 	cli_tdis(cli);
 done:
-	cli_state_set_tid(cli, orig_cnum);
+	cli_state_restore_tcon(cli, orig_tcon);
 	TALLOC_FREE(frame);
 	return status;
 }
@@ -96,6 +105,7 @@ done:
 static struct dom_sid *get_domain_sid(struct cli_state *cli)
 {
 	NTSTATUS status;
+	struct dom_sid_buf buf;
 
 	struct dom_sid *sid = talloc(talloc_tos(), struct dom_sid);
 	if (sid == NULL) {
@@ -118,7 +128,7 @@ static struct dom_sid *get_domain_sid(struct cli_state *cli)
 
 	}
 
-	DEBUG(2,("Domain SID: %s\n", sid_string_dbg(sid)));
+	DEBUG(2,("Domain SID: %s\n", dom_sid_str_buf(sid, &buf)));
 	return sid;
 }
 
@@ -221,30 +231,22 @@ get fileinfo for filename
 static uint16_t get_fileinfo(struct cli_state *cli, const char *filename)
 {
 	uint16_t fnum = (uint16_t)-1;
-	uint16_t mode = 0;
 	NTSTATUS status;
+	struct smb_create_returns cr = {0};
 
 	/* The desired access below is the only one I could find that works
 	   with NT4, W2KP and Samba */
 
 	status = cli_ntcreate(cli, filename, 0, CREATE_ACCESS_READ,
 			      0, FILE_SHARE_READ|FILE_SHARE_WRITE,
-			      FILE_OPEN, 0x0, 0x0, &fnum, NULL);
+			      FILE_OPEN, 0x0, 0x0, &fnum, &cr);
 	if (!NT_STATUS_IS_OK(status)) {
 		printf("Failed to open %s: %s\n", filename, nt_errstr(status));
 		return 0;
 	}
 
-	status = cli_qfileinfo_basic(cli, fnum, &mode, NULL, NULL, NULL,
-				     NULL, NULL, NULL);
-	if (!NT_STATUS_IS_OK(status)) {
-		printf("Failed to file info %s: %s\n", filename,
-		       nt_errstr(status));
-        }
-
 	cli_close(cli, fnum);
-
-        return mode;
+	return cr.file_attributes;
 }
 
 /*****************************************************
@@ -349,7 +351,7 @@ static bool set_secdesc(struct cli_state *cli, const char *filename,
 
 	status = cli_set_security_descriptor(cli, fnum, sec_info, sd);
 	if (!NT_STATUS_IS_OK(status)) {
-		printf("ERROR: security description set failed: %s\n",
+		printf("ERROR: security descriptor set failed: %s\n",
                        nt_errstr(status));
 		result=false;
 	}
@@ -359,11 +361,32 @@ static bool set_secdesc(struct cli_state *cli, const char *filename,
 }
 
 /*****************************************************
+get maximum access for a file
+*******************************************************/
+static int cacl_mxac(struct cli_state *cli, const char *filename)
+{
+	NTSTATUS status;
+	uint32_t mxac;
+
+	status = cli_query_mxac(cli, filename, &mxac);
+	if (!NT_STATUS_IS_OK(status)) {
+		printf("Failed to get mxac: %s\n", nt_errstr(status));
+		return EXIT_FAILED;
+	}
+
+	printf("Maximum access: 0x%x\n", mxac);
+
+	return EXIT_OK;
+}
+
+
+/*****************************************************
 dump the acls for a file
 *******************************************************/
 static int cacl_dump(struct cli_state *cli, const char *filename, bool numeric)
 {
 	struct security_descriptor *sd;
+	int ret;
 
 	if (test_args) {
 		return EXIT_OK;
@@ -385,6 +408,13 @@ static int cacl_dump(struct cli_state *cli, const char *filename, bool numeric)
 		sec_desc_print(cli, stdout, sd, numeric);
 	}
 
+	if (want_mxac) {
+		ret = cacl_mxac(cli, filename);
+		if (ret != EXIT_OK) {
+			return ret;
+		}
+	}
+
 	return EXIT_OK;
 }
 
@@ -397,21 +427,17 @@ static int owner_set(struct cli_state *cli, enum chown_mode change_mode,
 			const char *filename, const char *new_username)
 {
 	struct dom_sid sid;
-	struct security_descriptor *sd, *old;
+	struct security_descriptor *sd;
 	size_t sd_size;
 
 	if (!StringToSid(cli, &sid, new_username))
 		return EXIT_PARSE_ERROR;
 
-	old = get_secdesc(cli, filename);
-
-	if (!old) {
-		return EXIT_FAILED;
-	}
-
-	sd = make_sec_desc(talloc_tos(),old->revision, SEC_DESC_SELF_RELATIVE,
-				(change_mode == REQUEST_CHOWN) ? &sid : NULL,
-				(change_mode == REQUEST_CHGRP) ? &sid : NULL,
+	sd = make_sec_desc(talloc_tos(),
+			   SECURITY_DESCRIPTOR_REVISION_1,
+			   SEC_DESC_SELF_RELATIVE,
+			   (change_mode == REQUEST_CHOWN) ? &sid : NULL,
+			   (change_mode == REQUEST_CHGRP) ? &sid : NULL,
 			   NULL, NULL, &sd_size);
 
 	if (!set_secdesc(cli, filename, sd)) {
@@ -473,10 +499,8 @@ static void sort_acl(struct security_acl *the_acl)
 	for (i=1;i<the_acl->num_aces;) {
 		if (security_ace_equal(&the_acl->aces[i-1],
 				       &the_acl->aces[i])) {
-			int j;
-			for (j=i; j<the_acl->num_aces-1; j++) {
-				the_acl->aces[j] = the_acl->aces[j+1];
-			}
+			ARRAY_DEL_ELEMENT(
+				the_acl->aces, i, the_acl->num_aces);
 			the_acl->num_aces--;
 		} else {
 			i++;
@@ -505,10 +529,16 @@ static int cacl_set(struct cli_state *cli, const char *filename,
 	if (!sd) return EXIT_PARSE_ERROR;
 	if (test_args) return EXIT_OK;
 
-	old = get_secdesc(cli, filename);
+	if (mode != SMB_ACL_SET) {
+		/*
+		 * Do not fetch old ACL when it will be overwritten
+		 * completely with a new one.
+		 */
+		old = get_secdesc(cli, filename);
 
-	if (!old) {
-		return EXIT_FAILED;
+		if (!old) {
+			return EXIT_FAILED;
+		}
 	}
 
 	/* the logic here is rather more complex than I would like */
@@ -727,7 +757,7 @@ static int inherit(struct cli_state *cli, const char *filename,
 /*****************************************************
  Return a connection to a server.
 *******************************************************/
-static struct cli_state *connect_one(struct user_auth_info *auth_info,
+static struct cli_state *connect_one(const struct user_auth_info *auth_info,
 				     const char *server, const char *share)
 {
 	struct cli_state *c = NULL;
@@ -738,13 +768,6 @@ static struct cli_state *connect_one(struct user_auth_info *auth_info,
 		flags |= CLI_FULL_CONNECTION_USE_KERBEROS |
 			 CLI_FULL_CONNECTION_FALLBACK_AFTER_KERBEROS;
 	}
-
-	if (get_cmdline_auth_info_use_machine_account(auth_info) &&
-	    !set_cmdline_auth_info_machine_account_creds(auth_info)) {
-		return NULL;
-	}
-
-	set_cmdline_auth_info_getpass(auth_info);
 
 	nt_status = cli_full_connection(&c, lp_netbios_name(), server,
 				NULL, 0,
@@ -791,28 +814,137 @@ int main(int argc, char *argv[])
 	poptContext pc;
 	/* numeric is set when the user wants numeric SIDs and ACEs rather
 	   than going via LSA calls to resolve them */
-	int numeric;
+	int numeric = 0;
 
 	struct poptOption long_options[] = {
 		POPT_AUTOHELP
-		{ "delete", 'D', POPT_ARG_STRING, NULL, 'D', "Delete an acl", "ACL" },
-		{ "modify", 'M', POPT_ARG_STRING, NULL, 'M', "Modify an acl", "ACL" },
-		{ "add", 'a', POPT_ARG_STRING, NULL, 'a', "Add an acl", "ACL" },
-		{ "set", 'S', POPT_ARG_STRING, NULL, 'S', "Set acls", "ACLS" },
-		{ "chown", 'C', POPT_ARG_STRING, NULL, 'C', "Change ownership of a file", "USERNAME" },
-		{ "chgrp", 'G', POPT_ARG_STRING, NULL, 'G', "Change group ownership of a file", "GROUPNAME" },
-		{ "inherit", 'I', POPT_ARG_STRING, NULL, 'I', "Inherit allow|remove|copy" },
-		{ "numeric", 0, POPT_ARG_NONE, &numeric, 1, "Don't resolve sids or masks to names" },
-		{ "sddl", 0, POPT_ARG_NONE, &sddl, 1, "Output and input acls in sddl format" },
-		{ "query-security-info", 0, POPT_ARG_INT, &query_sec_info, 1,
-		  "The security-info flags for queries"
+		{
+			.longName   = "delete",
+			.shortName  = 'D',
+			.argInfo    = POPT_ARG_STRING,
+			.arg        = NULL,
+			.val        = 'D',
+			.descrip    = "Delete an acl",
+			.argDescrip = "ACL",
 		},
-		{ "set-security-info", 0, POPT_ARG_INT, &set_sec_info, 1,
-		  "The security-info flags for modifications"
+		{
+			.longName   = "modify",
+			.shortName  = 'M',
+			.argInfo    = POPT_ARG_STRING,
+			.arg        = NULL,
+			.val        = 'M',
+			.descrip    = "Modify an acl",
+			.argDescrip = "ACL",
 		},
-		{ "test-args", 't', POPT_ARG_NONE, &test_args, 1, "Test arguments"},
-		{ "domain-sid", 0, POPT_ARG_STRING, &domain_sid, 0, "Domain SID for sddl", "SID"},
-		{ "max-protocol", 'm', POPT_ARG_STRING, NULL, 'm', "Set the max protocol level", "LEVEL" },
+		{
+			.longName   = "add",
+			.shortName  = 'a',
+			.argInfo    = POPT_ARG_STRING,
+			.arg        = NULL,
+			.val        = 'a',
+			.descrip    = "Add an acl",
+			.argDescrip = "ACL",
+		},
+		{
+			.longName   = "set",
+			.shortName  = 'S',
+			.argInfo    = POPT_ARG_STRING,
+			.arg        = NULL,
+			.val        = 'S',
+			.descrip    = "Set acls",
+			.argDescrip = "ACLS",
+		},
+		{
+			.longName   = "chown",
+			.shortName  = 'C',
+			.argInfo    = POPT_ARG_STRING,
+			.arg        = NULL,
+			.val        = 'C',
+			.descrip    = "Change ownership of a file",
+			.argDescrip = "USERNAME",
+		},
+		{
+			.longName   = "chgrp",
+			.shortName  = 'G',
+			.argInfo    = POPT_ARG_STRING,
+			.arg        = NULL,
+			.val        = 'G',
+			.descrip    = "Change group ownership of a file",
+			.argDescrip = "GROUPNAME",
+		},
+		{
+			.longName   = "inherit",
+			.shortName  = 'I',
+			.argInfo    = POPT_ARG_STRING,
+			.arg        = NULL,
+			.val        = 'I',
+			.descrip    = "Inherit allow|remove|copy",
+		},
+		{
+			.longName   = "numeric",
+			.shortName  = 0,
+			.argInfo    = POPT_ARG_NONE,
+			.arg        = &numeric,
+			.val        = 1,
+			.descrip    = "Don't resolve sids or masks to names",
+		},
+		{
+			.longName   = "sddl",
+			.shortName  = 0,
+			.argInfo    = POPT_ARG_NONE,
+			.arg        = &sddl,
+			.val        = 1,
+			.descrip    = "Output and input acls in sddl format",
+		},
+		{
+			.longName   = "query-security-info",
+			.shortName  = 0,
+			.argInfo    = POPT_ARG_INT,
+			.arg        = &query_sec_info,
+			.val        = 1,
+			.descrip    = "The security-info flags for queries"
+		},
+		{
+			.longName   = "set-security-info",
+			.shortName  = 0,
+			.argInfo    = POPT_ARG_INT,
+			.arg        = &set_sec_info,
+			.val        = 1,
+			.descrip    = "The security-info flags for modifications"
+		},
+		{
+			.longName   = "test-args",
+			.shortName  = 't',
+			.argInfo    = POPT_ARG_NONE,
+			.arg        = &test_args,
+			.val        = 1,
+			.descrip    = "Test arguments"
+		},
+		{
+			.longName   = "domain-sid",
+			.shortName  = 0,
+			.argInfo    = POPT_ARG_STRING,
+			.arg        = &domain_sid,
+			.val        = 0,
+			.descrip    = "Domain SID for sddl",
+			.argDescrip = "SID"},
+		{
+			.longName   = "max-protocol",
+			.shortName  = 'm',
+			.argInfo    = POPT_ARG_STRING,
+			.arg        = NULL,
+			.val        = 'm',
+			.descrip    = "Set the max protocol level",
+			.argDescrip = "LEVEL",
+		},
+		{
+			.longName   = "maximum-access",
+			.shortName  = 'x',
+			.argInfo    = POPT_ARG_NONE,
+			.arg        = NULL,
+			.val        = 'x',
+			.descrip    = "Query maximum persmissions",
+		},
 		POPT_COMMON_SAMBA
 		POPT_COMMON_CONNECTION
 		POPT_COMMON_CREDENTIALS
@@ -823,7 +955,6 @@ int main(int argc, char *argv[])
 	TALLOC_CTX *frame = talloc_stackframe();
 	const char *owner_username = "";
 	char *server;
-	struct user_auth_info *auth_info;
 
 	smb_init_locale();
 
@@ -833,12 +964,7 @@ int main(int argc, char *argv[])
 
 	setlinebuf(stdout);
 
-
-	auth_info = user_auth_info_init(frame);
-	if (auth_info == NULL) {
-		exit(1);
-	}
-	popt_common_set_auth_info(auth_info);
+	popt_common_credentials_set_ignore_missing_conf();
 
 	pc = poptGetContext("smbcacls", argc, argv_const, long_options, 0);
 
@@ -884,6 +1010,9 @@ int main(int argc, char *argv[])
 		case 'm':
 			lp_set_cmdline("client max protocol", poptGetOptArg(pc));
 			break;
+		case 'x':
+			want_mxac = true;
+			break;
 		}
 	}
 
@@ -903,9 +1032,6 @@ int main(int argc, char *argv[])
 		return -1;
 	}
 
-	lp_load_global(get_dyn_CONFIGFILE());
-	load_interfaces();
-
 	filename = talloc_strdup(frame, poptGetArg(pc));
 	if (!filename) {
 		return -1;
@@ -913,6 +1039,7 @@ int main(int argc, char *argv[])
 
 	poptFreeContext(pc);
 	popt_burn_cmdline_password(argc, argv);
+	popt_common_credentials_post();
 
 	string_replace(path,'/','\\');
 
@@ -921,8 +1048,8 @@ int main(int argc, char *argv[])
 		return -1;
 	}
 	share = strchr_m(server,'\\');
-	if (!share) {
-		printf("Invalid argument: %s\n", share);
+	if (share == NULL) {
+		printf("Invalid argument\n");
 		return -1;
 	}
 
@@ -930,11 +1057,12 @@ int main(int argc, char *argv[])
 	share++;
 
 	if (!test_args) {
-		cli = connect_one(auth_info, server, share);
+		cli = connect_one(popt_get_cmdline_auth_info(), server, share);
 		if (!cli) {
 			exit(EXIT_FAILED);
 		}
 	} else {
+		popt_free_cmdline_auth_info();
 		exit(0);
 	}
 
@@ -960,6 +1088,7 @@ int main(int argc, char *argv[])
 		result = cacl_dump(cli, filename, numeric);
 	}
 
+	popt_free_cmdline_auth_info();
 	TALLOC_FREE(frame);
 
 	return result;

@@ -44,17 +44,20 @@ static bool get_sorted_dir_mtime(vfs_handle_struct *handle,
 {
 	int ret;
 	struct timespec mtime;
+	NTSTATUS status;
 
 	if (data->fsp) {
-		ret = fsp_stat(data->fsp);
+		status = vfs_stat_fsp(data->fsp);
+		if (!NT_STATUS_IS_OK(status)) {
+			return false;
+		}
 		mtime = data->fsp->fsp_name->st.st_ex_mtime;
 	} else {
 		ret = SMB_VFS_STAT(handle->conn, data->smb_fname);
+		if (ret == -1) {
+			return false;
+		}
 		mtime = data->smb_fname->st.st_ex_mtime;
-	}
-
-	if (ret == -1) {
-		return false;
 	}
 
 	*ret_mtime = mtime;
@@ -65,8 +68,10 @@ static bool get_sorted_dir_mtime(vfs_handle_struct *handle,
 static bool open_and_sort_dir(vfs_handle_struct *handle,
 				struct dirsort_privates *data)
 {
-	unsigned int i = 0;
-	unsigned int total_count = 0;
+	uint32_t total_count = 0;
+	/* This should be enough for most use cases */
+	uint32_t dirent_allocated = 64;
+	struct dirent *dp;
 
 	data->number_of_entries = 0;
 
@@ -74,90 +79,55 @@ static bool open_and_sort_dir(vfs_handle_struct *handle,
 		return false;
 	}
 
-	while (SMB_VFS_NEXT_READDIR(handle, data->source_directory, NULL)
-	       != NULL) {
-		total_count++;
-	}
-
-	if (total_count == 0) {
+	dp = SMB_VFS_NEXT_READDIR(handle, data->source_directory, NULL);
+	if (dp == NULL) {
 		return false;
 	}
-
-	/* Open the underlying directory and count the number of entries
-	   Skip back to the beginning as we'll read it again */
-	SMB_VFS_NEXT_REWINDDIR(handle, data->source_directory);
 
 	/* Set up an array and read the directory entries into it */
 	TALLOC_FREE(data->directory_list); /* destroy previous cache if needed */
 	data->directory_list = talloc_zero_array(data,
-					struct dirent,
-					total_count);
-	if (!data->directory_list) {
+						 struct dirent,
+						 dirent_allocated);
+	if (data->directory_list == NULL) {
 		return false;
 	}
-	for (i = 0; i < total_count; i++) {
-		struct dirent *dp = SMB_VFS_NEXT_READDIR(handle,
-						data->source_directory,
-						NULL);
-		if (dp == NULL) {
-			break;
-		}
-		data->directory_list[i] = *dp;
-	}
 
-	data->number_of_entries = i;
+	do {
+		if (total_count >= dirent_allocated) {
+			struct dirent *dlist;
+
+			/*
+			 * Be memory friendly.
+			 *
+			 * We should not double the amount of memory. With a lot
+			 * of files we reach easily 50MB, and doubling will
+			 * get much bigger just for a few files more.
+			 *
+			 * For 200k files this means 50 memory reallocations.
+			 */
+			dirent_allocated += 4096;
+
+			dlist = talloc_realloc(data,
+					       data->directory_list,
+					       struct dirent,
+					       dirent_allocated);
+			if (dlist == NULL) {
+				break;
+			}
+			data->directory_list = dlist;
+		}
+		data->directory_list[total_count] = *dp;
+
+		total_count++;
+		dp = SMB_VFS_NEXT_READDIR(handle, data->source_directory, NULL);
+	} while (dp != NULL);
+
+	data->number_of_entries = total_count;
 
 	/* Sort the directory entries by name */
 	TYPESAFE_QSORT(data->directory_list, data->number_of_entries, compare_dirent);
 	return true;
-}
-
-static DIR *dirsort_opendir(vfs_handle_struct *handle,
-				       const char *fname, const char *mask,
-				       uint32_t attr)
-{
-	struct dirsort_privates *list_head = NULL;
-	struct dirsort_privates *data = NULL;
-
-	if (SMB_VFS_HANDLE_TEST_DATA(handle)) {
-		/* Find the list head of all open directories. */
-		SMB_VFS_HANDLE_GET_DATA(handle, list_head, struct dirsort_privates,
-				return NULL);
-	}
-
-	/* set up our private data about this directory */
-	data = talloc_zero(handle->conn, struct dirsort_privates);
-	if (!data) {
-		return NULL;
-	}
-
-	data->smb_fname = synthetic_smb_fname(data, fname, NULL, NULL);
-	if (data->smb_fname == NULL) {
-		TALLOC_FREE(data);
-		return NULL;
-	}
-
-	/* Open the underlying directory and count the number of entries */
-	data->source_directory = SMB_VFS_NEXT_OPENDIR(handle, fname, mask,
-						      attr);
-
-	if (data->source_directory == NULL) {
-		TALLOC_FREE(data);
-		return NULL;
-	}
-
-	if (!open_and_sort_dir(handle, data)) {
-		SMB_VFS_NEXT_CLOSEDIR(handle,data->source_directory);
-		TALLOC_FREE(data);
-		return NULL;
-	}
-
-	/* Add to the private list of all open directories. */
-	DLIST_ADD(list_head, data);
-	SMB_VFS_HANDLE_SET_DATA(handle, list_head, NULL,
-				struct dirsort_privates, return NULL);
-
-	return data->source_directory;
 }
 
 static DIR *dirsort_fdopendir(vfs_handle_struct *handle,
@@ -349,7 +319,6 @@ static int dirsort_closedir(vfs_handle_struct *handle, DIR *dirp)
 }
 
 static struct vfs_fn_pointers vfs_dirsort_fns = {
-	.opendir_fn = dirsort_opendir,
 	.fdopendir_fn = dirsort_fdopendir,
 	.readdir_fn = dirsort_readdir,
 	.seekdir_fn = dirsort_seekdir,
@@ -359,7 +328,7 @@ static struct vfs_fn_pointers vfs_dirsort_fns = {
 };
 
 static_decl_vfs;
-NTSTATUS vfs_dirsort_init(void)
+NTSTATUS vfs_dirsort_init(TALLOC_CTX *ctx)
 {
 	return smb_register_vfs(SMB_VFS_INTERFACE_VERSION, "dirsort",
 				&vfs_dirsort_fns);

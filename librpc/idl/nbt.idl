@@ -482,6 +482,17 @@ interface nbt
 		uint16               lm20_token;
 	} NETLOGON_SAM_LOGON_RESPONSE_EX;
 
+	typedef [nopush,nopull] union {
+		[case(NETLOGON_NT_VERSION_1)] NETLOGON_SAM_LOGON_RESPONSE_NT40 nt4;
+		[case(NETLOGON_NT_VERSION_5)] NETLOGON_SAM_LOGON_RESPONSE nt5;
+		[case(NETLOGON_NT_VERSION_5EX)] NETLOGON_SAM_LOGON_RESPONSE_EX nt5_ex;
+	} netlogon_samlogon_response_union;
+
+	typedef [nopush,nopull] struct {
+		uint32 ntver;
+		[switch_is(ntver)] netlogon_samlogon_response_union data;
+	} netlogon_samlogon_response;
+
 	/* query for pdc request */
 	typedef struct {
 		astring              computer_name;
@@ -563,10 +574,6 @@ interface nbt
 		netlogon_command command;
 		[switch_is(command)] nbt_netlogon_request req;
 	} nbt_netlogon_packet;
-
-	void decode_nbt_netlogon_packet(
-		[in] nbt_netlogon_packet packet
-		);
 
 	/********************************************************/
 	/* \MAILSLOT\BROWSE mailslot requests			*/

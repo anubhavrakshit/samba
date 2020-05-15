@@ -97,7 +97,7 @@ static bool test_fsrvp_state_sc(struct torture_context *tctx,
 	sc->id = GUID_random();
 	sc->id_str = GUID_string(sc, &sc->id);
 	sc->volume_name = talloc_strdup(sc, "/this/is/a/path");
-	/* keep snap path NULL, i.e. not yet commited */
+	/* keep snap path NULL, i.e. not yet committed */
 	sc->create_ts = time(NULL);
 	*sc_out = sc;
 
@@ -262,7 +262,7 @@ static bool test_fsrvp_state_compare(struct torture_context *tctx,
 }
 
 /*
- * test a simple heirarchy of:
+ * test a simple hierarchy of:
  *
  *       |
  *     sc_set
@@ -298,12 +298,12 @@ static bool test_fsrvp_state_single(struct torture_context *tctx)
 	ok = test_fsrvp_state_smap(tctx, sc, "base_share", "sc_share", &smap);
 	torture_assert(tctx, ok, "failed to create smap");
 
-	DLIST_ADD_END(fss_gs.sc_sets, sc_set, struct fss_sc_set *);
+	DLIST_ADD_END(fss_gs.sc_sets, sc_set);
 	fss_gs.sc_sets_count++;
-	DLIST_ADD_END(sc_set->scs, sc, struct fss_sc *);
+	DLIST_ADD_END(sc_set->scs, sc);
 	sc_set->scs_count++;
 	sc->sc_set = sc_set;
-	DLIST_ADD_END(sc->smaps, smap, struct fss_sc_smap *);
+	DLIST_ADD_END(sc->smaps, smap);
 	sc->smaps_count++;
 
 	status = fss_state_store(fss_gs.mem_ctx, fss_gs.sc_sets,
@@ -334,7 +334,7 @@ static bool test_fsrvp_state_single(struct torture_context *tctx)
 }
 
 /*
- * test a complex heirarchy of:
+ * test a complex hierarchy of:
  *
  *              /\
  *             /  \
@@ -392,23 +392,23 @@ static bool test_fsrvp_state_multi(struct torture_context *tctx)
 				   &smap_abb);
 	torture_assert(tctx, ok, "failed to create smap");
 
-	DLIST_ADD_END(fss_gs.sc_sets, sc_set_a, struct fss_sc_set *);
+	DLIST_ADD_END(fss_gs.sc_sets, sc_set_a);
 	fss_gs.sc_sets_count++;
-	DLIST_ADD_END(fss_gs.sc_sets, sc_set_b, struct fss_sc_set *);
+	DLIST_ADD_END(fss_gs.sc_sets, sc_set_b);
 	fss_gs.sc_sets_count++;
 
-	DLIST_ADD_END(sc_set_a->scs, sc_aa, struct fss_sc *);
+	DLIST_ADD_END(sc_set_a->scs, sc_aa);
 	sc_set_a->scs_count++;
 	sc_aa->sc_set = sc_set_a;
-	DLIST_ADD_END(sc_set_a->scs, sc_ab, struct fss_sc *);
+	DLIST_ADD_END(sc_set_a->scs, sc_ab);
 	sc_set_a->scs_count++;
 	sc_ab->sc_set = sc_set_a;
 
-	DLIST_ADD_END(sc_aa->smaps, smap_aaa, struct fss_sc_smap *);
+	DLIST_ADD_END(sc_aa->smaps, smap_aaa);
 	sc_aa->smaps_count++;
-	DLIST_ADD_END(sc_ab->smaps, smap_aba, struct fss_sc_smap *);
+	DLIST_ADD_END(sc_ab->smaps, smap_aba);
 	sc_ab->smaps_count++;
-	DLIST_ADD_END(sc_ab->smaps, smap_abb, struct fss_sc_smap *);
+	DLIST_ADD_END(sc_ab->smaps, smap_abb);
 	sc_ab->smaps_count++;
 
 	status = fss_state_store(fss_gs.mem_ctx, fss_gs.sc_sets,

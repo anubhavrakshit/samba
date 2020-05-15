@@ -48,17 +48,69 @@ bool init_systemtime(struct spoolss_Time *r,
 
 time_t spoolss_Time_to_time_t(const struct spoolss_Time *r)
 {
-	struct tm unixtime;
-
-	unixtime.tm_year	= r->year - 1900;
-	unixtime.tm_mon		= r->month - 1;
-	unixtime.tm_wday	= r->day_of_week;
-	unixtime.tm_mday	= r->day;
-	unixtime.tm_hour	= r->hour;
-	unixtime.tm_min		= r->minute;
-	unixtime.tm_sec		= r->second;
+	struct tm unixtime = {
+		.tm_year	= r->year - 1900,
+		.tm_mon		= r->month - 1,
+		.tm_wday	= r->day_of_week,
+		.tm_mday	= r->day,
+		.tm_hour	= r->hour,
+		.tm_min		= r->minute,
+		.tm_sec		= r->second,
+	};
 
 	return mktime(&unixtime);
+}
+
+/*******************************************************************
+ ********************************************************************/
+
+bool spoolss_timestr_to_NTTIME(const char *str,
+			       NTTIME *data)
+{
+	struct tm tm;
+	time_t t;
+
+	if (strequal(str, "01/01/1601")) {
+		*data = 0;
+		return true;
+	}
+
+	ZERO_STRUCT(tm);
+
+	if (sscanf(str, "%d/%d/%d",
+		   &tm.tm_mon, &tm.tm_mday, &tm.tm_year) != 3) {
+		return false;
+	}
+	tm.tm_mon -= 1;
+	tm.tm_year -= 1900;
+	tm.tm_isdst = -1;
+
+	t = mktime(&tm);
+	unix_to_nt_time(data, t);
+
+	return true;
+}
+
+/*******************************************************************
+ ********************************************************************/
+
+bool spoolss_driver_version_to_qword(const char *str,
+				     uint64_t *data)
+{
+	unsigned int v1, v2, v3, v4 = 0;
+
+	if ((sscanf(str, "%u.%u.%u.%u", &v1, &v2, &v3, &v4) != 4) &&
+	    (sscanf(str, "%u.%u.%u", &v1, &v2, &v3) != 3))
+	{
+		return false;
+	}
+
+	*data = ((uint64_t)(v1 & 0xFFFF) << 48) +
+		((uint64_t)(v2 & 0xFFFF) << 32) +
+		((uint64_t)(v3 & 0xFFFF) << 16) +
+		(uint64_t)(v4 & 0xFFFF);
+
+	return true;
 }
 
 /*******************************************************************
@@ -73,7 +125,7 @@ WERROR pull_spoolss_PrinterData(TALLOC_CTX *mem_ctx,
 	ndr_err = ndr_pull_union_blob(blob, mem_ctx, data, type,
 			(ndr_pull_flags_fn_t)ndr_pull_spoolss_PrinterData);
 	if (!NDR_ERR_CODE_IS_SUCCESS(ndr_err)) {
-		return WERR_GENERAL_FAILURE;
+		return WERR_GEN_FAILURE;
 	}
 	return WERR_OK;
 }
@@ -89,7 +141,7 @@ WERROR push_spoolss_PrinterData(TALLOC_CTX *mem_ctx, DATA_BLOB *blob,
 	ndr_err = ndr_push_union_blob(blob, mem_ctx, data, type,
 			(ndr_push_flags_fn_t)ndr_push_spoolss_PrinterData);
 	if (!NDR_ERR_CODE_IS_SUCCESS(ndr_err)) {
-		return WERR_GENERAL_FAILURE;
+		return WERR_GEN_FAILURE;
 	}
 	return WERR_OK;
 }
@@ -107,12 +159,12 @@ void spoolss_printerinfo2_to_setprinterinfo2(const struct spoolss_PrinterInfo2 *
 	s->drivername		= i->drivername;
 	s->comment		= i->comment;
 	s->location		= i->location;
-	s->devmode_ptr		= NULL;
+	s->devmode_ptr		= 0;
 	s->sepfile		= i->sepfile;
 	s->printprocessor	= i->printprocessor;
 	s->datatype		= i->datatype;
 	s->parameters		= i->parameters;
-	s->secdesc_ptr		= NULL;
+	s->secdesc_ptr		= 0;
 	s->attributes		= i->attributes;
 	s->priority		= i->priority;
 	s->defaultpriority	= i->defaultpriority;
@@ -225,12 +277,12 @@ WERROR spoolss_create_default_devmode(TALLOC_CTX *mem_ctx,
 
 	dm = talloc_zero(mem_ctx, struct spoolss_DeviceMode);
 	if (dm == NULL) {
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	dname = talloc_asprintf(dm, "%s", devicename);
 	if (dname == NULL) {
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 	if (strlen(dname) > MAXDEVICENAME) {
 		dname[MAXDEVICENAME] = '\0';
@@ -239,7 +291,7 @@ WERROR spoolss_create_default_devmode(TALLOC_CTX *mem_ctx,
 
 	dm->formname = talloc_strdup(dm, "Letter");
 	if (dm->formname == NULL) {
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	dm->specversion          = DMSPEC_NT4_AND_ABOVE;
@@ -373,13 +425,55 @@ WERROR spoolss_create_default_secdesc(TALLOC_CTX *mem_ctx,
 
 	if (psd == NULL) {
 		DEBUG(0,("construct_default_printer_sd: Failed to make SEC_DESC.\n"));
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	DEBUG(4,("construct_default_printer_sdb: size = %u.\n",
 		 (unsigned int)sd_size));
 
 	*secdesc = psd;
+
+	return WERR_OK;
+}
+
+const char *spoolss_get_short_filesys_environment(const char *environment)
+{
+	if (strequal(environment, SPOOLSS_ARCHITECTURE_x64)) {
+		return "amd64";
+	} else if (strequal(environment, SPOOLSS_ARCHITECTURE_NT_X86)) {
+		return "x86";
+	} else {
+		return NULL;
+	}
+}
+
+/* Windows 7 and Windows Server 2008 R2 */
+#define GLOBAL_SPOOLSS_CLIENT_OS_MAJOR_DEFAULT 6
+#define GLOBAL_SPOOLSS_CLIENT_OS_MINOR_DEFAULT 1
+#define GLOBAL_SPOOLSS_CLIENT_OS_BUILD_DEFAULT 7007
+
+WERROR spoolss_init_spoolss_UserLevel1(TALLOC_CTX *mem_ctx,
+				       const char *username,
+				       struct spoolss_UserLevel1 *r)
+{
+	ZERO_STRUCTP(r);
+
+	r->size		= 28;
+	r->client	= talloc_asprintf(mem_ctx, "\\\\%s", lp_netbios_name());
+	W_ERROR_HAVE_NO_MEMORY(r->client);
+	r->user		= talloc_strdup(mem_ctx, username);
+	W_ERROR_HAVE_NO_MEMORY(r->user);
+	r->processor	= 0;
+
+	r->major	= lp_parm_int(GLOBAL_SECTION_SNUM,
+				      "spoolss_client", "os_major",
+				      GLOBAL_SPOOLSS_CLIENT_OS_MAJOR_DEFAULT);
+	r->minor	= lp_parm_int(GLOBAL_SECTION_SNUM,
+				      "spoolss_client", "os_minor",
+				      GLOBAL_SPOOLSS_CLIENT_OS_MINOR_DEFAULT);
+	r->build	= lp_parm_int(GLOBAL_SECTION_SNUM,
+				      "spoolss_client", "os_build",
+				      GLOBAL_SPOOLSS_CLIENT_OS_BUILD_DEFAULT);
 
 	return WERR_OK;
 }

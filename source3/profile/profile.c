@@ -33,13 +33,17 @@
 #include <sys/resource.h>
 #endif
 
+#include <gnutls/gnutls.h>
+#include <gnutls/crypto.h>
+#include "lib/crypto/gnutls_helpers.h"
+
 struct profile_stats *profile_p;
 struct smbprofile_global_state smbprofile_state;
 
 /****************************************************************************
 Set a profiling level.
 ****************************************************************************/
-void set_profile_level(int level, struct server_id src)
+void set_profile_level(int level, const struct server_id *src)
 {
 	SMB_ASSERT(smbprofile_state.internal.db != NULL);
 
@@ -48,25 +52,25 @@ void set_profile_level(int level, struct server_id src)
 		smbprofile_state.config.do_count = false;
 		smbprofile_state.config.do_times = false;
 		DEBUG(1,("INFO: Profiling turned OFF from pid %d\n",
-			 (int)procid_to_pid(&src)));
+			 (int)procid_to_pid(src)));
 		break;
 	case 1:		/* turn on counter profiling only */
 		smbprofile_state.config.do_count = true;
 		smbprofile_state.config.do_times = false;
 		DEBUG(1,("INFO: Profiling counts turned ON from pid %d\n",
-			 (int)procid_to_pid(&src)));
+			 (int)procid_to_pid(src)));
 		break;
 	case 2:		/* turn on complete profiling */
 		smbprofile_state.config.do_count = true;
 		smbprofile_state.config.do_times = true;
 		DEBUG(1,("INFO: Full profiling turned ON from pid %d\n",
-			 (int)procid_to_pid(&src)));
+			 (int)procid_to_pid(src)));
 		break;
 	case 3:		/* reset profile values */
 		ZERO_STRUCT(profile_p->values);
 		tdb_wipe_all(smbprofile_state.internal.db->tdb);
 		DEBUG(1,("INFO: Profiling values cleared from pid %d\n",
-			 (int)procid_to_pid(&src)));
+			 (int)procid_to_pid(src)));
 		break;
 	}
 }
@@ -88,7 +92,7 @@ static void profile_message(struct messaging_context *msg_ctx,
 	}
 
 	memcpy(&level, data->data, sizeof(level));
-	set_profile_level(level, src);
+	set_profile_level(level, &src);
 }
 
 /****************************************************************************
@@ -121,15 +125,17 @@ static void reqprofile_message(struct messaging_context *msg_ctx,
   ******************************************************************/
 bool profile_setup(struct messaging_context *msg_ctx, bool rdonly)
 {
-	unsigned char tmp[16] = {};
-	MD5_CTX md5;
+	uint8_t digest[gnutls_hash_get_len(GNUTLS_DIG_SHA1)];
+	gnutls_hash_hd_t hash_hnd = NULL;
 	char *db_name;
+	bool ok = false;
+	int rc;
 
 	if (smbprofile_state.internal.db != NULL) {
 		return true;
 	}
 
-	db_name = cache_path("smbprofile.tdb");
+	db_name = cache_path(talloc_tos(), "smbprofile.tdb");
 	if (db_name == NULL) {
 		return false;
 	}
@@ -149,14 +155,18 @@ bool profile_setup(struct messaging_context *msg_ctx, bool rdonly)
 				   reqprofile_message);
 	}
 
-	MD5Init(&md5);
+	GNUTLS_FIPS140_SET_LAX_MODE();
 
-	MD5Update(&md5,
-		  (const uint8_t *)&smbprofile_state.stats.global,
-		  sizeof(smbprofile_state.stats.global));
+	rc = gnutls_hash_init(&hash_hnd, GNUTLS_DIG_SHA1);
+	if (rc < 0) {
+		goto out;
+	}
+	rc = gnutls_hash(hash_hnd,
+			 &smbprofile_state.stats.global,
+			 sizeof(smbprofile_state.stats.global));
 
 #define __UPDATE(str) do { \
-	MD5Update(&md5, (const uint8_t *)str, strlen(str)); \
+	rc |= gnutls_hash(hash_hnd, str, strlen(str)); \
 } while(0)
 #define SMBPROFILE_STATS_START
 #define SMBPROFILE_STATS_SECTION_START(name, display) do { \
@@ -198,17 +208,27 @@ bool profile_setup(struct messaging_context *msg_ctx, bool rdonly)
 #undef SMBPROFILE_STATS_IOBYTES
 #undef SMBPROFILE_STATS_SECTION_END
 #undef SMBPROFILE_STATS_END
+	if (rc != 0) {
+		gnutls_hash_deinit(hash_hnd, NULL);
+		goto out;
+	}
 
-	MD5Final(tmp, &md5);
+	gnutls_hash_deinit(hash_hnd, digest);
+
+	GNUTLS_FIPS140_SET_STRICT_MODE();
 
 	profile_p = &smbprofile_state.stats.global;
 
-	profile_p->magic = BVAL(tmp, 0);
+	profile_p->magic = BVAL(digest, 0);
 	if (profile_p->magic == 0) {
-		profile_p->magic = BVAL(tmp, 8);
+		profile_p->magic = BVAL(digest, 8);
 	}
 
-	return True;
+	ok = true;
+out:
+	GNUTLS_FIPS140_SET_STRICT_MODE();
+
+	return ok;
 }
 
 void smbprofile_dump_setup(struct tevent_context *ev)
@@ -271,6 +291,11 @@ void smbprofile_dump(void)
 
 	TALLOC_FREE(smbprofile_state.internal.te);
 
+	if (! (smbprofile_state.config.do_count ||
+	       smbprofile_state.config.do_times)) {
+			return;
+	}
+
 	if (smbprofile_state.internal.db == NULL) {
 		return;
 	}
@@ -312,7 +337,7 @@ void smbprofile_dump(void)
 	return;
 }
 
-void smbprofile_cleanup(pid_t pid)
+void smbprofile_cleanup(pid_t pid, pid_t dst)
 {
 	TDB_DATA key = { .dptr = (uint8_t *)&pid, .dsize = sizeof(pid) };
 	struct profile_stats s = {};
@@ -336,7 +361,7 @@ void smbprofile_cleanup(pid_t pid)
 	tdb_delete(smbprofile_state.internal.db->tdb, key);
 	tdb_chainunlock(smbprofile_state.internal.db->tdb, key);
 
-	pid = getpid();
+	pid = dst;
 	ret = tdb_chainlock(smbprofile_state.internal.db->tdb, key);
 	if (ret != 0) {
 		return;

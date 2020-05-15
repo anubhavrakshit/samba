@@ -19,16 +19,16 @@
 
 __docformat__ = "restructuredText"
 
-REGISTRY_VALUE_PREFIX = "SAMBA_REGVAL"
+REGISTRY_VALUE_PREFIX = b"SAMBA_REGVAL"
 REGISTRY_DB_VERSION = 1
 
 import os
 import struct
 import tdb
 
-import passdb
-import param as s3param
-
+from samba.samba3 import passdb
+from samba.samba3 import param as s3param
+from samba.compat import get_bytes
 
 def fetch_uint32(db, key):
     try:
@@ -80,7 +80,7 @@ class Registry(DbDatabase):
 
     def keys(self):
         """Return list with all the keys."""
-        return [k.rstrip("\x00") for k in self.db.iterkeys() if not k.startswith(REGISTRY_VALUE_PREFIX)]
+        return [k.rstrip(b"\x00") for k in self.db if not k.startswith(REGISTRY_VALUE_PREFIX)]
 
     def subkeys(self, key):
         """Retrieve the subkeys for the specified key.
@@ -88,12 +88,12 @@ class Registry(DbDatabase):
         :param key: Key path.
         :return: list with key names
         """
-        data = self.db.get("%s\x00" % key)
+        data = self.db.get(key + b"\x00")
         if data is None:
             return []
         (num, ) = struct.unpack("<L", data[0:4])
-        keys = data[4:].split("\0")
-        assert keys[-1] == ""
+        keys = data[4:].split(b"\0")
+        assert keys[-1] == b""
         keys.pop()
         assert len(keys) == num
         return keys
@@ -104,7 +104,7 @@ class Registry(DbDatabase):
         :param key: Key to retrieve values for.
         :return: Dictionary with value names as key, tuple with type and
             data as value."""
-        data = self.db.get("%s/%s\x00" % (REGISTRY_VALUE_PREFIX, key))
+        data = self.db.get(REGISTRY_VALUE_PREFIX + b'/' + key + b'\x00')
         if data is None:
             return {}
         ret = {}
@@ -112,7 +112,7 @@ class Registry(DbDatabase):
         data = data[4:]
         for i in range(num):
             # Value name
-            (name, data) = data.split("\0", 1)
+            (name, data) = data.split(b"\0", 1)
 
             (type, ) = struct.unpack("<L", data[0:4])
             data = data[4:]
@@ -126,48 +126,49 @@ class Registry(DbDatabase):
 
 
 # High water mark keys
-IDMAP_HWM_GROUP = "GROUP HWM\0"
-IDMAP_HWM_USER = "USER HWM\0"
+IDMAP_HWM_GROUP = b"GROUP HWM\0"
+IDMAP_HWM_USER = b"USER HWM\0"
 
-IDMAP_GROUP_PREFIX = "GID "
-IDMAP_USER_PREFIX = "UID "
+IDMAP_GROUP_PREFIX = b"GID "
+IDMAP_USER_PREFIX = b"UID "
 
 # idmap version determines auto-conversion
 IDMAP_VERSION_V2 = 2
+
 
 class IdmapDatabase(DbDatabase):
     """Samba 3 ID map database reader."""
 
     def _check_version(self):
-        assert fetch_int32(self.db, "IDMAP_VERSION\0") == IDMAP_VERSION_V2
+        assert fetch_int32(self.db, b"IDMAP_VERSION\0") == IDMAP_VERSION_V2
 
     def ids(self):
         """Retrieve a list of all ids in this database."""
-        for k in self.db.iterkeys():
+        for k in self.db:
             if k.startswith(IDMAP_USER_PREFIX):
-                yield k.rstrip("\0").split(" ")
+                yield k.rstrip(b"\0").split(b" ")
             if k.startswith(IDMAP_GROUP_PREFIX):
-                yield k.rstrip("\0").split(" ")
+                yield k.rstrip(b"\0").split(b" ")
 
     def uids(self):
         """Retrieve a list of all uids in this database."""
-        for k in self.db.iterkeys():
+        for k in self.db:
             if k.startswith(IDMAP_USER_PREFIX):
-                yield int(k[len(IDMAP_USER_PREFIX):].rstrip("\0"))
+                yield int(k[len(IDMAP_USER_PREFIX):].rstrip(b"\0"))
 
     def gids(self):
         """Retrieve a list of all gids in this database."""
-        for k in self.db.iterkeys():
+        for k in self.db:
             if k.startswith(IDMAP_GROUP_PREFIX):
-                yield int(k[len(IDMAP_GROUP_PREFIX):].rstrip("\0"))
+                yield int(k[len(IDMAP_GROUP_PREFIX):].rstrip(b"\0"))
 
     def get_sid(self, xid, id_type):
         """Retrive SID associated with a particular id and type.
 
-        :param xid: UID or GID to retrive SID for.
+        :param xid: UID or GID to retrieve SID for.
         :param id_type: Type of id specified - 'UID' or 'GID'
         """
-        data = self.db.get("%s %s\0" % (id_type, str(xid)))
+        data = self.db.get(get_bytes("%s %s\0" % (id_type, str(xid))))
         if data is None:
             return data
         return data.rstrip("\0")
@@ -178,16 +179,16 @@ class IdmapDatabase(DbDatabase):
         :param uid: UID to retrieve SID for.
         :return: A SID or None if no mapping was found.
         """
-        data = self.db.get("%s%d\0" % (IDMAP_USER_PREFIX, uid))
+        data = self.db.get(IDMAP_USER_PREFIX + str(uid).encode() + b'\0')
         if data is None:
             return data
-        return data.rstrip("\0")
+        return data.rstrip(b"\0")
 
     def get_group_sid(self, gid):
-        data = self.db.get("%s%d\0" % (IDMAP_GROUP_PREFIX, gid))
+        data = self.db.get(IDMAP_GROUP_PREFIX + str(gid).encode() + b'\0')
         if data is None:
             return data
-        return data.rstrip("\0")
+        return data.rstrip(b"\0")
 
     def get_user_hwm(self):
         """Obtain the user high-water mark."""
@@ -202,19 +203,19 @@ class SecretsDatabase(DbDatabase):
     """Samba 3 Secrets database reader."""
 
     def get_auth_password(self):
-        return self.db.get("SECRETS/AUTH_PASSWORD")
+        return self.db.get(b"SECRETS/AUTH_PASSWORD")
 
     def get_auth_domain(self):
-        return self.db.get("SECRETS/AUTH_DOMAIN")
+        return self.db.get(b"SECRETS/AUTH_DOMAIN")
 
     def get_auth_user(self):
-        return self.db.get("SECRETS/AUTH_USER")
+        return self.db.get(b"SECRETS/AUTH_USER")
 
     def get_domain_guid(self, host):
-        return self.db.get("SECRETS/DOMGUID/%s" % host)
+        return self.db.get(b"SECRETS/DOMGUID/%s" % host)
 
     def ldap_dns(self):
-        for k in self.db.iterkeys():
+        for k in self.db:
             if k.startswith("SECRETS/LDAP_BIND_PW/"):
                 yield k[len("SECRETS/LDAP_BIND_PW/"):].rstrip("\0")
 
@@ -223,41 +224,41 @@ class SecretsDatabase(DbDatabase):
 
         :return: Iterator over the names of domains in this database.
         """
-        for k in self.db.iterkeys():
+        for k in self.db:
             if k.startswith("SECRETS/SID/"):
                 yield k[len("SECRETS/SID/"):].rstrip("\0")
 
     def get_ldap_bind_pw(self, host):
-        return self.db.get("SECRETS/LDAP_BIND_PW/%s" % host)
+        return self.db.get(get_bytes("SECRETS/LDAP_BIND_PW/%s" % host))
 
     def get_afs_keyfile(self, host):
-        return self.db.get("SECRETS/AFS_KEYFILE/%s" % host)
+        return self.db.get(get_bytes("SECRETS/AFS_KEYFILE/%s" % host))
 
     def get_machine_sec_channel_type(self, host):
-        return fetch_uint32(self.db, "SECRETS/MACHINE_SEC_CHANNEL_TYPE/%s" % host)
+        return fetch_uint32(self.db, get_bytes("SECRETS/MACHINE_SEC_CHANNEL_TYPE/%s" % host))
 
     def get_machine_last_change_time(self, host):
         return fetch_uint32(self.db, "SECRETS/MACHINE_LAST_CHANGE_TIME/%s" % host)
 
     def get_machine_password(self, host):
-        return self.db.get("SECRETS/MACHINE_PASSWORD/%s" % host)
+        return self.db.get(get_bytes("SECRETS/MACHINE_PASSWORD/%s" % host))
 
     def get_machine_acc(self, host):
-        return self.db.get("SECRETS/$MACHINE.ACC/%s" % host)
+        return self.db.get(get_bytes("SECRETS/$MACHINE.ACC/%s" % host))
 
     def get_domtrust_acc(self, host):
-        return self.db.get("SECRETS/$DOMTRUST.ACC/%s" % host)
+        return self.db.get(get_bytes("SECRETS/$DOMTRUST.ACC/%s" % host))
 
     def trusted_domains(self):
-        for k in self.db.iterkeys():
+        for k in self.db:
             if k.startswith("SECRETS/$DOMTRUST.ACC/"):
                 yield k[len("SECRETS/$DOMTRUST.ACC/"):].rstrip("\0")
 
     def get_random_seed(self):
-        return self.db.get("INFO/random_seed")
+        return self.db.get(b"INFO/random_seed")
 
     def get_sid(self, host):
-        return self.db.get("SECRETS/SID/%s" % host.upper())
+        return self.db.get(get_bytes("SECRETS/SID/%s" % host.upper()))
 
 
 SHARE_DATABASE_VERSION_V1 = 1
@@ -275,7 +276,7 @@ class ShareInfoDatabase(DbDatabase):
 
         :param name: Name of the share
         """
-        secdesc = self.db.get("SECDESC/%s" % name)
+        secdesc = self.db.get(get_bytes("SECDESC/%s" % name))
         # FIXME: Run ndr_pull_security_descriptor
         return secdesc
 
@@ -325,7 +326,7 @@ class WinsDatabase(object):
         f = open(file, 'r')
         assert f.readline().rstrip("\n") == "VERSION 1 0"
         for l in f.readlines():
-            if l[0] == "#": # skip comments
+            if l[0] == "#":  # skip comments
                 continue
             entries = shellsplit(l.rstrip("\n"))
             name = entries[0]
@@ -334,9 +335,9 @@ class WinsDatabase(object):
             ips = []
             while "." in entries[i]:
                 ips.append(entries[i])
-                i+=1
+                i += 1
             nb_flags = int(entries[i][:-1], 16)
-            assert not name in self.entries, "Name %s exists twice" % name
+            assert name not in self.entries, "Name %s exists twice" % name
             self.entries[name] = (ttl, ips, nb_flags)
         f.close()
 
@@ -353,7 +354,7 @@ class WinsDatabase(object):
         """Return the entries in this WINS database."""
         return self.entries.items()
 
-    def close(self): # for consistency
+    def close(self):  # for consistency
         pass
 
 

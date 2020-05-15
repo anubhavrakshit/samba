@@ -13,7 +13,7 @@ import "security.idl", "misc.idl", "lsa.idl", "samr.idl";
 ]
 interface drsuapi
 {
-	typedef bitmap samr_GroupAttrs samr_GroupAttrs;
+	typedef bitmap security_GroupAttrs security_GroupAttrs;
 
 	/* see MS-DRSR section 5.39 */
 	typedef [public,bitmap32bit] bitmap {
@@ -58,6 +58,10 @@ interface drsuapi
 		DRSUAPI_DRS_GET_ALL_GROUP_MEMBERSHIP  = 0x80000000
 	} drsuapi_DrsOptions;
 
+	typedef [public,bitmap32bit] bitmap {
+		DRSUAPI_DRS_GET_TGT                   = 0x00000001
+	} drsuapi_DrsMoreOptions;
+
 	/* see DRS_MSG_REPMOD_V1 */
 	typedef [public,bitmap32bit] bitmap {
 		DRSUAPI_DRS_UPDATE_FLAGS              = 0x00000001,
@@ -66,7 +70,9 @@ interface drsuapi
         } drsuapi_DrsUpdate;
 
 	/*****************/
-        /* Function 0x00 */
+        /* Function 0x00 drsuapi_DsBind() */
+
+        /* MS-DRSR 5.39 DRS_EXTENSIONS_INT */
         typedef [bitmap32bit] bitmap {
 		DRSUAPI_SUPPORTED_EXTENSION_BASE			= 0x00000001,
 		DRSUAPI_SUPPORTED_EXTENSION_ASYNC_REPLICATION		= 0x00000002,
@@ -454,6 +460,7 @@ interface drsuapi
 		DRSUAPI_ATTID_ou				= 0x0000000b,
 		DRSUAPI_ATTID_description			= 0x0000000d,
 		DRSUAPI_ATTID_member				= 0x0000001f,
+		DRSUAPI_ATTID_distinguishedName			= 0x00000031,
 		DRSUAPI_ATTID_instanceType			= 0x00020001,
 		DRSUAPI_ATTID_whenCreated			= 0x00020002,
 		DRSUAPI_ATTID_possSuperiors			= 0x00020008,
@@ -483,6 +490,8 @@ interface drsuapi
 		DRSUAPI_ATTID_auxiliaryClass			= 0x0002015f,
 		DRSUAPI_ATTID_lDAPDisplayName			= 0x000201cc,
 		DRSUAPI_ATTID_name				= 0x00090001,
+		DRSUAPI_ATTID_objectGUID			= 0x00090002,
+		DRSUAPI_ATTID_replPropertyMetaData		= 0x00090003,
 		DRSUAPI_ATTID_userAccountControl		= 0x00090008,
 		DRSUAPI_ATTID_badPwdCount			= 0x0009000c,
 		DRSUAPI_ATTID_codePage				= 0x00090010,
@@ -506,8 +515,10 @@ interface drsuapi
 		DRSUAPI_ATTID_trustAuthOutgoing			= 0x00090087,
 		DRSUAPI_ATTID_userParameters			= 0x0009008a,
 		DRSUAPI_ATTID_profilePath			= 0x0009008b,
+		DRSUAPI_ATTID_operatorCount			= 0x00090090,
 		DRSUAPI_ATTID_objectSid				= 0x00090092,
 		DRSUAPI_ATTID_schemaIDGUID			= 0x00090094,
+		DRSUAPI_ATTID_adminCount			= 0x00090096,
 		DRSUAPI_ATTID_comment				= 0x0009009C,/* User-Comment */
 		DRSUAPI_ATTID_accountExpires			= 0x0009009f,
 		DRSUAPI_ATTID_lmPwdHistory			= 0x000900a0,
@@ -523,11 +534,13 @@ interface drsuapi
 		DRSUAPI_ATTID_systemFlags			= 0x00090177,
 		DRSUAPI_ATTID_serverReference			= 0x00090203,
 		DRSUAPI_ATTID_serverReferenceBL			= 0x00090204,
+		DRSUAPI_ATTID_nonSecurityMember			= 0x00090212,
 		DRSUAPI_ATTID_initialAuthIncoming		= 0x0009021b,
 		DRSUAPI_ATTID_initialAuthOutgoing		= 0x0009021c,
 		DRSUAPI_ATTID_wellKnownObjects			= 0x0009026a,
 		DRSUAPI_ATTID_dNSHostName			= 0x0009026b,
 		DRSUAPI_ATTID_isMemberOfPartialAttributeSet	= 0x0009027f,
+		DRSUAPI_ATTID_managedBy				= 0x0009028d,
 		DRSUAPI_ATTID_userPrincipalName			= 0x00090290,
 		DRSUAPI_ATTID_groupType				= 0x000902ee,
 		DRSUAPI_ATTID_servicePrincipalName		= 0x00090303,
@@ -535,10 +548,16 @@ interface drsuapi
 		DRSUAPI_ATTID_objectCategory			= 0x0009030e,
 		DRSUAPI_ATTID_gPLink				= 0x0009037b,
 		DRSUAPI_ATTID_transportAddressAttribute		= 0x0009037f,
+		DRSUAPI_ATTID_schemaInfo			= 0x0009054e,
 		DRSUAPI_ATTID_msDS_Behavior_Version		= 0x000905b3,
 		DRSUAPI_ATTID_msDS_KeyVersionNumber		= 0x000906f6,
+		DRSUAPI_ATTID_msDS_NonMembers			= 0x00090701,
+		DRSUAPI_ATTID_msDS_MembersForAzRole		= 0x0009070e,
 		DRSUAPI_ATTID_msDS_HasDomainNCs			= 0x0009071c,
 		DRSUAPI_ATTID_msDS_hasMasterNCs			= 0x0009072c,
+		DRSUAPI_ATTID_msDS_NeverRevealGroup		= 0x00090786,
+		DRSUAPI_ATTID_msDS_RevealOnDemandGroup		= 0x00090788,
+		DRSUAPI_ATTID_msDS_HostServiceAccount		= 0x00090808,
 		DRSUAPI_ATTID_isRecycled			= 0x0009080a,
 
 		DRSUAPI_ATTID_INVALID				= 0xFFFFFFFF
@@ -551,7 +570,7 @@ interface drsuapi
 		[size_is(num_attids)] drsuapi_DsAttributeId attids[];
 	} drsuapi_DsPartialAttributeSet;
 
-	typedef struct {
+	typedef [public] struct {
 		GUID destination_dsa_guid;
 		GUID source_dsa_invocation_id; /* the 'invocationId' field of the CN=NTDS Settings object */
 		[ref] drsuapi_DsReplicaObjectIdentifier *naming_context;
@@ -567,7 +586,7 @@ interface drsuapi
 		drsuapi_DsReplicaOIDMapping_Ctr mapping_ctr;
 	} drsuapi_DsGetNCChangesRequest8;
 
-	typedef struct {
+	typedef [public] struct {
 		GUID destination_dsa_guid;
 		GUID source_dsa_invocation_id; /* the 'invocationId' field of the CN=NTDS Settings object */
 		[ref] drsuapi_DsReplicaObjectIdentifier *naming_context;
@@ -581,7 +600,7 @@ interface drsuapi
 		drsuapi_DsPartialAttributeSet *partial_attribute_set;
 		drsuapi_DsPartialAttributeSet *partial_attribute_set_ex;
 		drsuapi_DsReplicaOIDMapping_Ctr mapping_ctr;
-		uint32 more_flags;
+		drsuapi_DrsMoreOptions more_flags;
 	} drsuapi_DsGetNCChangesRequest10;
 
 	typedef [switch_type(uint32)] union {
@@ -671,7 +690,8 @@ interface drsuapi
 	} drsuapi_DsReplicaMetaDataCtr;
 
 	typedef [public,noprint] struct {
-		drsuapi_DsReplicaObjectListItemEx *next_object;
+		[max_recursion(20000)]
+			drsuapi_DsReplicaObjectListItemEx *next_object;
 		drsuapi_DsReplicaObject object;
 		boolean32 is_nc_prefix;
 		GUID *parent_object_guid;
@@ -926,7 +946,7 @@ interface drsuapi
 		[range(0,10000)] uint32 num_memberships;
 		[range(0,10000)] uint32 num_sids;
 		[size_is(num_memberships)] drsuapi_DsReplicaObjectIdentifier **info_array;
-		[size_is(num_memberships)] samr_GroupAttrs *group_attrs;
+		[size_is(num_memberships)] security_GroupAttrs *group_attrs;
 		[size_is(num_sids)] dom_sid28 **sids;
 	} drsuapi_DsGetMembershipsCtr1;
 
@@ -1289,7 +1309,8 @@ interface drsuapi
 	/*****************/
         /* Function 0x11 */
 	typedef [public,noprint] struct {
-		drsuapi_DsReplicaObjectListItem *next_object;
+		[max_recursion(20000)]
+			drsuapi_DsReplicaObjectListItem *next_object;
 		drsuapi_DsReplicaObject object;
 	} drsuapi_DsReplicaObjectListItem;
 
@@ -1389,7 +1410,8 @@ interface drsuapi
 	} drsuapi_DsAddEntry_AttrErr_V1;
 
 	typedef [noprint] struct {
-		drsuapi_DsAddEntry_AttrErrListItem_V1 *next;
+		[max_recursion(20000)]
+			drsuapi_DsAddEntry_AttrErrListItem_V1 *next;
 		drsuapi_DsAddEntry_AttrErr_V1 err_data;
 	} drsuapi_DsAddEntry_AttrErrListItem_V1;
 
@@ -1433,7 +1455,7 @@ interface drsuapi
 	/* list of network names of the DCs
 	 * to which the referral is directed */
 	typedef struct  {
-		drsuapi_DsaAddressListItem_V1 *next;
+		[max_recursion(1024)] drsuapi_DsaAddressListItem_V1 *next;
 		lsa_String *address;
 	} drsuapi_DsaAddressListItem_V1;
 
@@ -1445,7 +1467,8 @@ interface drsuapi
 		drsuapi_DsAddEntry_RefType ref_type;
 		uint16 addr_list_count;
 		drsuapi_DsaAddressListItem_V1 *addr_list;
-		drsuapi_DsAddEntry_RefErrListItem_V1 *next;
+		[max_recursion(20000)]
+			drsuapi_DsAddEntry_RefErrListItem_V1 *next;
 		boolean32 is_choice_set;
 		drsuapi_DsAddEntry_ChoiceType choice;
 	} drsuapi_DsAddEntry_RefErrListItem_V1;

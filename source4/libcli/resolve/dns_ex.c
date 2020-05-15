@@ -31,7 +31,6 @@
 */
 
 #include "includes.h"
-#include "lib/events/events.h"
 #include "system/network.h"
 #include "system/filesys.h"
 #include "lib/socket/socket.h"
@@ -41,6 +40,7 @@
 #include "lib/util/util_net.h"
 #include "lib/addns/dnsquery.h"
 #include "lib/addns/dns.h"
+#include "lib/util/sys_rw.h"
 #include <arpa/nameser.h>
 #include <resolv.h>
 
@@ -272,7 +272,7 @@ static struct dns_records_container get_srv_records(TALLOC_CTX *mem_ctx,
 	struct dns_rr_srv *dclist;
 	NTSTATUS status;
 	uint32_t total;
-	unsigned i;
+	int i;
 	int count;
 
 	memset(&ret, 0, sizeof(struct dns_records_container));
@@ -370,7 +370,7 @@ static void run_child_dns_lookup(struct dns_ex_state *state, int fd)
 
 	if (addrs) {
 		DEBUG(11, ("Addrs = %s\n", addrs));
-		write(fd, addrs, talloc_get_size(addrs));
+		sys_write_v(fd, addrs, talloc_get_size(addrs));
 	}
 
 done:
@@ -436,7 +436,7 @@ static void run_child_getaddrinfo(struct dns_ex_state *state, int fd)
 	}
 
 	if (addrs) {
-		write(fd, addrs, talloc_get_size(addrs));
+		sys_write_v(fd, addrs, talloc_get_size(addrs));
 	}
 done:
 	if (res_list) {
@@ -513,6 +513,7 @@ static void pipe_handler(struct tevent_context *ev, struct tevent_fd *fde,
 		uint32_t port = 0;
 		char *p = strrchr(addrs[i], '@');
 		char *n;
+		int error = 0;
 
 		if (!p) {
 			composite_error(c, NT_STATUS_OBJECT_NAME_NOT_FOUND);
@@ -535,8 +536,8 @@ static void pipe_handler(struct tevent_context *ev, struct tevent_fd *fde,
 			composite_error(c, NT_STATUS_OBJECT_NAME_NOT_FOUND);
 			return;
 		}
-		port = strtoul(p, NULL, 10);
-		if (port > UINT16_MAX) {
+		port = smb_strtoul(p, NULL, 10, &error, SMB_STR_STANDARD);
+		if (port > UINT16_MAX || error != 0) {
 			composite_error(c, NT_STATUS_OBJECT_NAME_NOT_FOUND);
 			return;
 		}

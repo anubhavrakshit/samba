@@ -161,7 +161,7 @@ static NTSTATUS migrate_internal(TALLOC_CTX *mem_ctx,
 						 dbuf.dptr,
 						 dbuf.dsize);
 			SAFE_FREE(dbuf.dptr);
-			if (NT_STATUS_EQUAL(status, werror_to_ntstatus(WERR_BADFILE))) {
+			if (NT_STATUS_EQUAL(status, werror_to_ntstatus(WERR_FILE_NOT_FOUND))) {
 				DEBUG(2, ("Skipping secdesc migration for non-existent "
 						"printer: %s\n", secdesc_name));
 			} else if (!NT_STATUS_IS_OK(status)) {
@@ -198,9 +198,9 @@ bool nt_printing_tdb_migrate(struct messaging_context *msg_ctx)
 	NTSTATUS status;
 
 	/* paths talloced on new stackframe */
-	drivers_path = state_path("ntdrivers.tdb");
-	printers_path = state_path("ntprinters.tdb");
-	forms_path = state_path("ntforms.tdb");
+	drivers_path = state_path(talloc_tos(), "ntdrivers.tdb");
+	printers_path = state_path(talloc_tos(), "ntprinters.tdb");
+	forms_path = state_path(talloc_tos(), "ntforms.tdb");
 	if ((drivers_path == NULL) || (printers_path == NULL)
 						|| (forms_path == NULL)) {
 		talloc_free(tmp_ctx);
@@ -226,6 +226,7 @@ bool nt_printing_tdb_migrate(struct messaging_context *msg_ctx)
 	status = rpc_pipe_open_interface(tmp_ctx,
 					&ndr_table_winreg,
 					session_info,
+					NULL,
 					NULL,
 					msg_ctx,
 					&winreg_pipe);

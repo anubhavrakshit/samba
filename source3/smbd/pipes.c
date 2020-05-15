@@ -48,10 +48,15 @@ NTSTATUS open_np_file(struct smb_request *smb_req, const char *name,
 	fsp->conn = conn;
 	fsp->fh->fd = -1;
 	fsp->vuid = smb_req->vuid;
-	fsp->can_lock = false;
+	fsp->fsp_flags.can_lock = false;
 	fsp->access_mask = FILE_READ_DATA | FILE_WRITE_DATA;
 
-	smb_fname = synthetic_smb_fname(talloc_tos(), name, NULL, NULL);
+	smb_fname = synthetic_smb_fname(talloc_tos(),
+					name,
+					NULL,
+					NULL,
+					0,
+					0);
 	if (smb_fname == NULL) {
 		file_free(smb_req, fsp);
 		return NT_STATUS_NO_MEMORY;
@@ -64,11 +69,12 @@ NTSTATUS open_np_file(struct smb_request *smb_req, const char *name,
 	}
 
 	status = np_open(fsp, name,
-			 conn->sconn->local_address,
 			 conn->sconn->remote_address,
+			 conn->sconn->local_address,
 			 conn->session_info,
 			 conn->sconn->ev_ctx,
 			 conn->sconn->msg_ctx,
+			 conn->sconn->dce_ctx,
 			 &fsp->fake_file_handle);
 	if (!NT_STATUS_IS_OK(status)) {
 		DEBUG(10, ("np_open(%s) returned %s\n", name,
@@ -492,7 +498,6 @@ static void pipe_read_andx_done(struct tevent_req *subreq)
 	      + 12 * sizeof(uint16_t) /* vwv */
 	      + 2		/* the buflen field */
 	      + 1);		/* padding byte */
-	SSVAL(req->outbuf,smb_vwv11,state->smb_maxcnt);
 
 	DEBUG(3,("readX-IPC min=%d max=%d nread=%d\n",
 		 state->smb_mincnt, state->smb_maxcnt, (int)nread));

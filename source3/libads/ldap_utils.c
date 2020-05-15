@@ -49,7 +49,7 @@ static ADS_STATUS ads_do_search_retry_internal(ADS_STRUCT *ads, const char *bind
 					       const char **attrs, void *args,
 					       LDAPMessage **res)
 {
-	ADS_STATUS status = ADS_SUCCESS;
+	ADS_STATUS status;
 	int count = 3;
 	char *bp;
 
@@ -85,7 +85,9 @@ static ADS_STATUS ads_do_search_retry_internal(ADS_STRUCT *ads, const char *bind
 
 	while (--count) {
 
-		if (NT_STATUS_EQUAL(ads_ntstatus(status), NT_STATUS_IO_TIMEOUT) && ads->config.ldap_page_size >= 250) {
+		if (NT_STATUS_EQUAL(ads_ntstatus(status), NT_STATUS_IO_TIMEOUT) &&
+		    ads->config.ldap_page_size >= (lp_ldap_page_size() / 4) &&
+		    lp_ldap_page_size() > 4) {
 			int new_page_size = (ads->config.ldap_page_size / 2);
 			DEBUG(1, ("Reducing LDAP page size from %d to %d due to IO_TIMEOUT\n",
 				  ads->config.ldap_page_size, new_page_size));
@@ -103,9 +105,18 @@ static ADS_STATUS ads_do_search_retry_internal(ADS_STRUCT *ads, const char *bind
 		status = ads_connect(ads);
 
 		if (!ADS_ERR_OK(status)) {
+			bool orig_is_mine = ads->is_mine;
+
 			DEBUG(1,("ads_search_retry: failed to reconnect (%s)\n",
 				 ads_errstr(status)));
+			/*
+			 * We need to keep the ads pointer
+			 * from being freed here as we don't own it and
+			 * callers depend on it being around.
+			 */
+			ads->is_mine = false;
 			ads_destroy(&ads);
+			ads->is_mine = orig_is_mine;
 			SAFE_FREE(bp);
 			return status;
 		}

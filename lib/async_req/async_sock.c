@@ -127,24 +127,30 @@ struct tevent_req *async_connect_send(
 		return tevent_req_post(req, ev);
 	}
 
-	/**
-	 * A number of error messages show that something good is progressing
-	 * and that we have to wait for readability.
+	/*
+	 * The only errno indicating that an initial connect is still
+	 * in flight is EINPROGRESS.
 	 *
-	 * If none of them are present, bail out.
+	 * This allows callers like open_socket_out_send() to reuse
+	 * fds and call us with an fd for which the connect is still
+	 * in flight. The proper thing to do for callers would be
+	 * closing the fd and starting from scratch with a fresh
+	 * socket.
 	 */
 
-	if (!(errno == EINPROGRESS || errno == EALREADY ||
-#ifdef EISCONN
-	      errno == EISCONN ||
-#endif
-	      errno == EAGAIN || errno == EINTR)) {
+	if (errno != EINPROGRESS) {
 		tevent_req_error(req, errno);
 		return tevent_req_post(req, ev);
 	}
 
-	state->fde = tevent_add_fd(ev, state, fd,
-				   TEVENT_FD_READ | TEVENT_FD_WRITE,
+	/*
+	 * Note for historic reasons TEVENT_FD_WRITE is not enough
+	 * to get notified for POLLERR or EPOLLHUP even if they
+	 * come together with POLLOUT. That means we need to
+	 * use TEVENT_FD_READ in addition until we have
+	 * TEVENT_FD_ERROR.
+	 */
+	state->fde = tevent_add_fd(ev, state, fd, TEVENT_FD_READ|TEVENT_FD_WRITE,
 				   async_connect_connected, req);
 	if (state->fde == NULL) {
 		tevent_req_error(req, ENOMEM);
@@ -189,27 +195,32 @@ static void async_connect_connected(struct tevent_context *ev,
 	struct async_connect_state *state =
 		tevent_req_data(req, struct async_connect_state);
 	int ret;
+	int socket_error = 0;
+	socklen_t slen = sizeof(socket_error);
 
-	if (state->before_connect != NULL) {
-		state->before_connect(state->private_data);
-	}
+	ret = getsockopt(state->fd, SOL_SOCKET, SO_ERROR,
+			 &socket_error, &slen);
 
-	ret = connect(state->fd, (struct sockaddr *)(void *)&state->address,
-		      state->address_len);
-
-	if (state->after_connect != NULL) {
-		state->after_connect(state->private_data);
-	}
-
-	if (ret == 0) {
-		tevent_req_done(req);
+	if (ret != 0) {
+		/*
+		 * According to Stevens this is the Solaris behaviour
+		 * in case the connection encountered an error:
+		 * getsockopt() fails, error is in errno
+		 */
+		tevent_req_error(req, errno);
 		return;
 	}
-	if (errno == EINPROGRESS) {
-		/* Try again later, leave the fde around */
+
+	if (socket_error != 0) {
+		/*
+		 * Berkeley derived implementations (including) Linux
+		 * return the pending error via socket_error.
+		 */
+		tevent_req_error(req, socket_error);
 		return;
 	}
-	tevent_req_error(req, errno);
+
+	tevent_req_done(req);
 	return;
 }
 
@@ -227,6 +238,7 @@ int async_connect_recv(struct tevent_req *req, int *perrno)
 
 struct writev_state {
 	struct tevent_context *ev;
+	struct tevent_queue_entry *queue_entry;
 	int fd;
 	struct tevent_fd *fde;
 	struct iovec *iov;
@@ -238,6 +250,7 @@ struct writev_state {
 
 static void writev_cleanup(struct tevent_req *req,
 			   enum tevent_req_state req_state);
+static bool writev_cancel(struct tevent_req *req);
 static void writev_trigger(struct tevent_req *req, void *private_data);
 static void writev_handler(struct tevent_context *ev, struct tevent_fd *fde,
 			   uint16_t flags, void *private_data);
@@ -267,6 +280,7 @@ struct tevent_req *writev_send(TALLOC_CTX *mem_ctx, struct tevent_context *ev,
 	state->err_on_readability = err_on_readability;
 
 	tevent_req_set_cleanup_fn(req, writev_cleanup);
+	tevent_req_set_cancel_fn(req, writev_cancel);
 
 	if (queue == NULL) {
 		state->fde = tevent_add_fd(state->ev, state, state->fd,
@@ -277,8 +291,21 @@ struct tevent_req *writev_send(TALLOC_CTX *mem_ctx, struct tevent_context *ev,
 		return req;
 	}
 
-	if (!tevent_queue_add(queue, ev, req, writev_trigger, NULL)) {
-		tevent_req_oom(req);
+	/*
+	 * writev_trigger tries a nonblocking write. If that succeeds,
+	 * we can't directly notify the callback to call
+	 * writev_recv. The callback would TALLOC_FREE(req) after
+	 * calling writev_recv even before writev_trigger can inspect
+	 * it for success.
+	 */
+	tevent_req_defer_callback(req, ev);
+
+	state->queue_entry = tevent_queue_add_optimize_empty(
+		queue, ev, req, writev_trigger, NULL);
+	if (tevent_req_nomem(state->queue_entry, req)) {
+		return tevent_req_post(req, ev);
+	}
+	if (!tevent_req_is_in_progress(req)) {
 		return tevent_req_post(req, ev);
 	}
 	return req;
@@ -289,12 +316,74 @@ static void writev_cleanup(struct tevent_req *req,
 {
 	struct writev_state *state = tevent_req_data(req, struct writev_state);
 
+	TALLOC_FREE(state->queue_entry);
 	TALLOC_FREE(state->fde);
+}
+
+static bool writev_cancel(struct tevent_req *req)
+{
+	struct writev_state *state = tevent_req_data(req, struct writev_state);
+
+	if (state->total_size > 0) {
+		/*
+		 * We've already started to write :-(
+		 */
+		return false;
+	}
+
+	TALLOC_FREE(state->queue_entry);
+	TALLOC_FREE(state->fde);
+
+	tevent_req_defer_callback(req, state->ev);
+	tevent_req_error(req, ECANCELED);
+	return true;
+}
+
+static void writev_do(struct tevent_req *req, struct writev_state *state)
+{
+	ssize_t written;
+	bool ok;
+
+	written = writev(state->fd, state->iov, state->count);
+	if ((written == -1) &&
+	    ((errno == EINTR) ||
+	     (errno == EAGAIN) ||
+	     (errno == EWOULDBLOCK))) {
+		/* retry after going through the tevent loop */
+		return;
+	}
+	if (written == -1) {
+		tevent_req_error(req, errno);
+		return;
+	}
+	if (written == 0) {
+		tevent_req_error(req, EPIPE);
+		return;
+	}
+	state->total_size += written;
+
+	ok = iov_advance(&state->iov, &state->count, written);
+	if (!ok) {
+		tevent_req_error(req, EIO);
+		return;
+	}
+
+	if (state->count == 0) {
+		tevent_req_done(req);
+		return;
+	}
 }
 
 static void writev_trigger(struct tevent_req *req, void *private_data)
 {
 	struct writev_state *state = tevent_req_data(req, struct writev_state);
+
+	state->queue_entry = NULL;
+
+	writev_do(req, state);
+	if (!tevent_req_is_in_progress(req)) {
+		return;
+	}
 
 	state->fde = tevent_add_fd(state->ev, state, state->fd, state->flags,
 			    writev_handler, req);
@@ -310,8 +399,6 @@ static void writev_handler(struct tevent_context *ev, struct tevent_fd *fde,
 		private_data, struct tevent_req);
 	struct writev_state *state =
 		tevent_req_data(req, struct writev_state);
-	size_t written;
-	bool ok;
 
 	if ((state->flags & TEVENT_FD_READ) && (flags & TEVENT_FD_READ)) {
 		int ret, value;
@@ -345,31 +432,7 @@ static void writev_handler(struct tevent_context *ev, struct tevent_fd *fde,
 		}
 	}
 
-	written = writev(state->fd, state->iov, state->count);
-	if ((written == -1) && (errno == EINTR)) {
-		/* retry */
-		return;
-	}
-	if (written == -1) {
-		tevent_req_error(req, errno);
-		return;
-	}
-	if (written == 0) {
-		tevent_req_error(req, EPIPE);
-		return;
-	}
-	state->total_size += written;
-
-	ok = iov_advance(&state->iov, &state->count, written);
-	if (!ok) {
-		tevent_req_error(req, EIO);
-		return;
-	}
-
-	if (state->count == 0) {
-		tevent_req_done(req);
-		return;
-	}
+	writev_do(req, state);
 }
 
 ssize_t writev_recv(struct tevent_req *req, int *perrno)
@@ -636,4 +699,88 @@ bool wait_for_read_recv(struct tevent_req *req, int *perr)
 	}
 
 	return true;
+}
+
+struct accept_state {
+	struct tevent_fd *fde;
+	int listen_sock;
+	socklen_t addrlen;
+	struct sockaddr_storage addr;
+	int sock;
+};
+
+static void accept_handler(struct tevent_context *ev, struct tevent_fd *fde,
+			   uint16_t flags, void *private_data);
+
+struct tevent_req *accept_send(TALLOC_CTX *mem_ctx, struct tevent_context *ev,
+			       int listen_sock)
+{
+	struct tevent_req *req;
+	struct accept_state *state;
+
+	req = tevent_req_create(mem_ctx, &state, struct accept_state);
+	if (req == NULL) {
+		return NULL;
+	}
+
+	state->listen_sock = listen_sock;
+
+	state->fde = tevent_add_fd(ev, state, listen_sock, TEVENT_FD_READ,
+				   accept_handler, req);
+	if (tevent_req_nomem(state->fde, req)) {
+		return tevent_req_post(req, ev);
+	}
+	return req;
+}
+
+static void accept_handler(struct tevent_context *ev, struct tevent_fd *fde,
+			   uint16_t flags, void *private_data)
+{
+	struct tevent_req *req = talloc_get_type_abort(
+		private_data, struct tevent_req);
+	struct accept_state *state = tevent_req_data(req, struct accept_state);
+	int ret;
+
+	TALLOC_FREE(state->fde);
+
+	if ((flags & TEVENT_FD_READ) == 0) {
+		tevent_req_error(req, EIO);
+		return;
+	}
+	state->addrlen = sizeof(state->addr);
+
+	ret = accept(state->listen_sock, (struct sockaddr *)&state->addr,
+		     &state->addrlen);
+	if ((ret == -1) && (errno == EINTR)) {
+		/* retry */
+		return;
+	}
+	if (ret == -1) {
+		tevent_req_error(req, errno);
+		return;
+	}
+	smb_set_close_on_exec(ret);
+	state->sock = ret;
+	tevent_req_done(req);
+}
+
+int accept_recv(struct tevent_req *req, struct sockaddr_storage *paddr,
+		socklen_t *paddrlen, int *perr)
+{
+	struct accept_state *state = tevent_req_data(req, struct accept_state);
+	int err;
+
+	if (tevent_req_is_unix_error(req, &err)) {
+		if (perr != NULL) {
+			*perr = err;
+		}
+		return -1;
+	}
+	if (paddr != NULL) {
+		memcpy(paddr, &state->addr, state->addrlen);
+	}
+	if (paddrlen != NULL) {
+		*paddrlen = state->addrlen;
+	}
+	return state->sock;
 }

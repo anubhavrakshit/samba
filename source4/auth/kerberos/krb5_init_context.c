@@ -77,7 +77,7 @@ static void smb_krb5_debug_close(void *private_data) {
 #ifdef SAMBA4_USES_HEIMDAL
 static void smb_krb5_debug_wrapper(const char *timestr, const char *msg, void *private_data)
 {
-	DEBUG(3, ("Kerberos: %s\n", msg));
+	DEBUGC(DBGC_KERBEROS, 3, ("Kerberos: %s\n", msg));
 }
 #endif
 
@@ -261,10 +261,14 @@ static krb5_error_code smb_krb5_send_and_recv_func_int(krb5_context context,
 		status = NT_STATUS_INVALID_PARAMETER;
 		switch (hi->proto) {
 		case KRB5_KRBHST_UDP:
-			status = socket_create(name, SOCKET_TYPE_DGRAM, &smb_krb5->sock, 0);
+			status = socket_create(smb_krb5, name,
+					       SOCKET_TYPE_DGRAM,
+					       &smb_krb5->sock, 0);
 			break;
 		case KRB5_KRBHST_TCP:
-			status = socket_create(name, SOCKET_TYPE_STREAM, &smb_krb5->sock, 0);
+			status = socket_create(smb_krb5, name,
+					       SOCKET_TYPE_STREAM,
+					       &smb_krb5->sock, 0);
 			break;
 		case KRB5_KRBHST_HTTP:
 			TALLOC_FREE(frame);
@@ -274,8 +278,6 @@ static krb5_error_code smb_krb5_send_and_recv_func_int(krb5_context context,
 			talloc_free(smb_krb5);
 			continue;
 		}
-
-		talloc_steal(smb_krb5, smb_krb5->sock);
 
 		remote_addr = socket_address_from_sockaddr(smb_krb5, a->ai_addr, a->ai_addrlen);
 		if (!remote_addr) {
@@ -476,12 +478,8 @@ smb_krb5_init_context_basic(TALLOC_CTX *tmp_ctx,
 #endif
 	krb5_context krb5_ctx;
 
-	initialize_krb5_error_table();
-
-	ret = krb5_init_context(&krb5_ctx);
+	ret = smb_krb5_init_context_common(&krb5_ctx);
 	if (ret) {
-		DEBUG(1,("krb5_init_context failed (%s)\n",
-			 error_message(ret)));
 		return ret;
 	}
 
@@ -513,6 +511,12 @@ smb_krb5_init_context_basic(TALLOC_CTX *tmp_ctx,
 		return ret;
 	}
 
+	/*
+	 * This is already called in smb_krb5_init_context_common(),
+	 * but krb5_set_config_files() may resets it.
+	 */
+	krb5_set_dns_canonicalize_hostname(krb5_ctx, false);
+
 	realm = lpcfg_realm(lp_ctx);
 	if (realm != NULL) {
 		ret = krb5_set_default_realm(krb5_ctx, realm);
@@ -538,8 +542,6 @@ krb5_error_code smb_krb5_init_context(void *parent_ctx,
 #ifdef SAMBA4_USES_HEIMDAL
 	krb5_log_facility *logf;
 #endif
-
-	initialize_krb5_error_table();
 
 	tmp_ctx = talloc_new(parent_ctx);
 	*smb_krb5_context = talloc_zero(tmp_ctx, struct smb_krb5_context);
@@ -582,12 +584,6 @@ krb5_error_code smb_krb5_init_context(void *parent_ctx,
 		return ret;
 	}
 	krb5_set_warn_dest(kctx, logf);
-
-	/* Set options in kerberos */
-
-	krb5_set_dns_canonicalize_hostname(kctx,
-			lpcfg_parm_bool(lp_ctx, NULL, "krb5",
-					"set_dns_canonicalize", false));
 #endif
 	talloc_steal(parent_ctx, *smb_krb5_context);
 	talloc_free(tmp_ctx);

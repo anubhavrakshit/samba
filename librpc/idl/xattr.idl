@@ -11,7 +11,6 @@
 import "security.idl";
 
 [
-  uuid("12345778-1234-abcd-0001-00000002"),
   version(0.0),
   helper("../librpc/ndr/ndr_xattr.h"),
   pyhelper("librpc/ndr/py_xattr.c"),
@@ -20,6 +19,7 @@ import "security.idl";
 interface xattr
 {
 	const char *XATTR_DOSATTRIB_NAME = "user.DosAttrib";
+	const char *XATTR_DOSATTRIB_NAME_S3 = "user.DOSATTRIB";
 	const int XATTR_DOSATTRIB_ESTIMATED_SIZE = 64;
 
 	/* we store basic dos attributes in a DosAttrib xattr. By
@@ -73,7 +73,8 @@ interface xattr
 		XATTR_DOSINFO_SIZE              = 0x00000004,
 		XATTR_DOSINFO_ALLOC_SIZE        = 0x00000008,
 		XATTR_DOSINFO_CREATE_TIME       = 0x00000010,
-		XATTR_DOSINFO_CHANGE_TIME       = 0x00000020
+		XATTR_DOSINFO_CHANGE_TIME       = 0x00000020,
+		XATTR_DOSINFO_ITIME             = 0x00000040
 	} xattr_DosInfoValidFlags;
 
 	typedef struct {
@@ -86,11 +87,19 @@ interface xattr
 		NTTIME change_time;
 	} xattr_DosInfo3;
 
+	typedef struct {
+		xattr_DosInfoValidFlags valid_flags;
+		uint32 attrib;
+		NTTIME itime;
+		NTTIME create_time;
+	} xattr_DosInfo4;
+
 	typedef [public,switch_type(uint16)] union {
 		[case(0xFFFF)] xattr_DosInfoFFFFCompat compatinfoFFFF;
                 [case(1)] xattr_DosInfo1 info1;
                 [case(2)] xattr_DosInfo2Old oldinfo2;
 		[case(3)] xattr_DosInfo3 info3;
+		[case(4)] xattr_DosInfo4 info4;
         } xattr_DosInfo;
 
 	typedef [public] struct {
@@ -103,10 +112,6 @@ interface xattr
 		uint16 version;
 		[switch_is(version)] xattr_DosInfo info;
 	} xattr_DOSATTRIB;
-
-	void xattr_parse_DOSATTRIB(
-		[in] xattr_DOSATTRIB x
-	);
 
 	/* we store DOS style extended attributes in a DosEAs xattr */
 	const char *XATTR_DOSEAS_NAME = "user.DosEAs";
@@ -190,7 +195,7 @@ interface xattr
 		uint8 hash[64]; /* 64 bytes hash. */
 		utf8string description; /* description of what created
 					 * this hash (to allow
-					 * foresnics later, if we have
+					 * forensics later, if we have
 					 * a bug in one codepath */
 		NTTIME time;
 		uint8 sys_acl_hash[64]; /* 64 bytes hash. */

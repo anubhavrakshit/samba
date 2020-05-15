@@ -21,8 +21,10 @@
 
 #include "includes.h"
 #include "lib/events/events.h"
+#include "lib/util/server_id.h"
 #include "system/filesys.h"
 #include "messaging/messaging.h"
+#include "messaging/messaging_internal.h"
 #include "../lib/util/dlinklist.h"
 #include "lib/socket/socket.h"
 #include "librpc/gen_ndr/ndr_irpc.h"
@@ -33,9 +35,9 @@
 #include "../lib/util/tevent_ntstatus.h"
 #include "lib/param/param.h"
 #include "lib/util/server_id_db.h"
-#include "lib/util/talloc_report.h"
-#include "../source3/lib/messages_dgm.h"
-#include "../source3/lib/messages_dgm_ref.h"
+#include "lib/util/talloc_report_printf.h"
+#include "lib/messaging/messages_dgm.h"
+#include "lib/messaging/messages_dgm_ref.h"
 #include "../source3/lib/messages_util.h"
 #include <tdb.h>
 
@@ -54,21 +56,6 @@ struct irpc_request {
 	} incoming;
 };
 
-struct imessaging_context {
-	struct imessaging_context *prev, *next;
-	struct server_id server_id;
-	const char *sock_dir;
-	const char *lock_dir;
-	struct dispatch_fn **dispatch;
-	uint32_t num_types;
-	struct idr_context *dispatch_tree;
-	struct irpc_list *irpc;
-	struct idr_context *idr;
-	struct server_id_db *names;
-	struct timeval start_time;
-	void *msg_dgm_ref;
-};
-
 /* we have a linked list of dispatch handlers for each msg_type that
    this messaging server can deal with */
 struct dispatch_fn {
@@ -80,37 +67,166 @@ struct dispatch_fn {
 
 /* an individual message */
 
-static void irpc_handler(struct imessaging_context *, void *,
-			 uint32_t, struct server_id, DATA_BLOB *);
+static void irpc_handler(struct imessaging_context *,
+			 void *,
+			 uint32_t,
+			 struct server_id,
+			 size_t,
+			 int *,
+			 DATA_BLOB *);
 
 
 /*
  A useful function for testing the message system.
 */
-static void ping_message(struct imessaging_context *msg, void *private_data,
-			 uint32_t msg_type, struct server_id src, DATA_BLOB *data)
+static void ping_message(struct imessaging_context *msg,
+			 void *private_data,
+			 uint32_t msg_type,
+			 struct server_id src,
+			 size_t num_fds,
+			 int *fds,
+			 DATA_BLOB *data)
 {
 	struct server_id_buf idbuf;
+
+	if (num_fds != 0) {
+		DBG_WARNING("Received %zu fds, ignoring message\n", num_fds);
+		return;
+	}
+
 	DEBUG(1,("INFO: Received PING message from server %s [%.*s]\n",
 		 server_id_str_buf(src, &idbuf), (int)data->length,
 		 data->data?(const char *)data->data:""));
 	imessaging_send(msg, src, MSG_PONG, data);
 }
 
-static void pool_message(struct imessaging_context *msg, void *private_data,
-			 uint32_t msg_type, struct server_id src,
+static void pool_message(struct imessaging_context *msg,
+			 void *private_data,
+			 uint32_t msg_type,
+			 struct server_id src,
+			 size_t num_fds,
+			 int *fds,
 			 DATA_BLOB *data)
 {
-	char *report;
+	FILE *f = NULL;
 
-	report = talloc_report_str(msg, NULL);
-
-	if (report != NULL) {
-		DATA_BLOB blob = { .data = (uint8_t *)report,
-				   .length = talloc_get_size(report) - 1};
-		imessaging_send(msg, src, MSG_POOL_USAGE, &blob);
+	if (num_fds != 1) {
+		DBG_WARNING("Received %zu fds, ignoring message\n", num_fds);
+		return;
 	}
-	talloc_free(report);
+
+	f = fdopen(fds[0], "w");
+	if (f == NULL) {
+		DBG_DEBUG("fopen failed: %s\n", strerror(errno));
+		return;
+	}
+
+	talloc_full_report_printf(NULL, f);
+	fclose(f);
+}
+
+static void ringbuf_log_msg(struct imessaging_context *msg,
+			    void *private_data,
+			    uint32_t msg_type,
+			    struct server_id src,
+			    size_t num_fds,
+			    int *fds,
+			    DATA_BLOB *data)
+{
+	char *log = debug_get_ringbuf();
+	size_t logsize = debug_get_ringbuf_size();
+	DATA_BLOB blob;
+
+	if (num_fds != 0) {
+		DBG_WARNING("Received %zu fds, ignoring message\n", num_fds);
+		return;
+	}
+
+	if (log == NULL) {
+		log = discard_const_p(char, "*disabled*\n");
+		logsize = strlen(log) + 1;
+	}
+
+	blob.data = (uint8_t *)log;
+	blob.length = logsize;
+
+	imessaging_send(msg, src, MSG_RINGBUF_LOG, &blob);
+}
+
+/****************************************************************************
+ Receive a "set debug level" message.
+****************************************************************************/
+
+static void debug_imessage(struct imessaging_context *msg_ctx,
+			   void *private_data,
+			   uint32_t msg_type,
+			   struct server_id src,
+			   size_t num_fds,
+			   int *fds,
+			   DATA_BLOB *data)
+{
+	const char *params_str = (const char *)data->data;
+	struct server_id_buf src_buf;
+	struct server_id dst = imessaging_get_server_id(msg_ctx);
+	struct server_id_buf dst_buf;
+
+	if (num_fds != 0) {
+		DBG_WARNING("Received %zu fds, ignoring message\n", num_fds);
+		return;
+	}
+
+	/* Check, it's a proper string! */
+	if (params_str[(data->length)-1] != '\0') {
+		DBG_ERR("Invalid debug message from pid %s to pid %s\n",
+			server_id_str_buf(src, &src_buf),
+			server_id_str_buf(dst, &dst_buf));
+		return;
+	}
+
+	DBG_ERR("INFO: Remote set of debug to `%s' (pid %s from pid %s)\n",
+		params_str,
+		server_id_str_buf(dst, &dst_buf),
+		server_id_str_buf(src, &src_buf));
+
+	debug_parse_levels(params_str);
+}
+
+/****************************************************************************
+ Return current debug level.
+****************************************************************************/
+
+static void debuglevel_imessage(struct imessaging_context *msg_ctx,
+				void *private_data,
+				uint32_t msg_type,
+				struct server_id src,
+				size_t num_fds,
+				int *fds,
+				DATA_BLOB *data)
+{
+	char *message = debug_list_class_names_and_levels();
+	DATA_BLOB blob = data_blob_null;
+	struct server_id_buf src_buf;
+	struct server_id dst = imessaging_get_server_id(msg_ctx);
+	struct server_id_buf dst_buf;
+
+	if (num_fds != 0) {
+		DBG_WARNING("Received %zu fds, ignoring message\n", num_fds);
+		return;
+	}
+
+	DBG_DEBUG("Received REQ_DEBUGLEVEL message (pid %s from pid %s)\n",
+		  server_id_str_buf(dst, &dst_buf),
+		  server_id_str_buf(src, &src_buf));
+
+	if (message == NULL) {
+		DBG_ERR("debug_list_class_names_and_levels returned NULL\n");
+		return;
+	}
+
+	blob = data_blob_string_const_null(message);
+	imessaging_send(msg_ctx, src, MSG_DEBUGLEVEL, &blob);
+
+	TALLOC_FREE(message);
 }
 
 /*
@@ -149,7 +265,7 @@ NTSTATUS imessaging_register(struct imessaging_context *msg, void *private_data,
 	/* possibly expand dispatch array */
 	if (msg_type >= msg->num_types) {
 		struct dispatch_fn **dp;
-		int i;
+		uint32_t i;
 		dp = talloc_realloc(msg, msg->dispatch, struct dispatch_fn *, msg_type+1);
 		NT_STATUS_HAVE_NO_MEMORY(dp);
 		msg->dispatch = dp;
@@ -223,64 +339,6 @@ void imessaging_deregister(struct imessaging_context *msg, uint32_t msg_type, vo
 }
 
 /*
-  Send a message to a particular server
-*/
-NTSTATUS imessaging_send(struct imessaging_context *msg, struct server_id server,
-			uint32_t msg_type, const DATA_BLOB *data)
-{
-	uint8_t hdr[MESSAGE_HDR_LENGTH];
-	struct iovec iov[2];
-	int num_iov, ret;
-	pid_t pid;
-	void *priv;
-
-	if (!cluster_node_equal(&msg->server_id, &server)) {
-		/* No cluster in source4... */
-		return NT_STATUS_OK;
-	}
-
-	message_hdr_put(hdr, msg_type, msg->server_id, server);
-
-	iov[0] = (struct iovec) { .iov_base = &hdr, .iov_len = sizeof(hdr) };
-	num_iov = 1;
-
-	if (data != NULL) {
-		iov[1] = (struct iovec) { .iov_base = data->data,
-					  .iov_len = data->length };
-		num_iov += 1;
-	}
-
-	pid = server.pid;
-	if (pid == 0) {
-		pid = getpid();
-	}
-
-	priv = root_privileges();
-	ret = messaging_dgm_send(pid, iov, num_iov, NULL, 0);
-	TALLOC_FREE(priv);
-	if (ret != 0) {
-		return map_nt_error_from_unix_common(ret);
-	}
-	return NT_STATUS_OK;
-}
-
-/*
-  Send a message to a particular server, with the message containing a single pointer
-*/
-NTSTATUS imessaging_send_ptr(struct imessaging_context *msg, struct server_id server,
-			    uint32_t msg_type, void *ptr)
-{
-	DATA_BLOB blob;
-
-	blob.data = (uint8_t *)&ptr;
-	blob.length = sizeof(void *);
-
-	return imessaging_send(msg, server, msg_type, &blob);
-}
-
-
-/*
-  remove our messaging socket and database entry
 */
 int imessaging_cleanup(struct imessaging_context *msg)
 {
@@ -290,27 +348,138 @@ int imessaging_cleanup(struct imessaging_context *msg)
 	return 0;
 }
 
-static void imessaging_dgm_recv(const uint8_t *buf, size_t buf_len,
+static void imessaging_dgm_recv(struct tevent_context *ev,
+				const uint8_t *buf, size_t buf_len,
 				int *fds, size_t num_fds,
 				void *private_data);
 
+/* Keep a list of imessaging contexts */
+static struct imessaging_context *msg_ctxs;
+
+/*
+ * A process has terminated, clean-up any names it has registered.
+ */
+NTSTATUS imessaging_process_cleanup(
+	struct imessaging_context *msg_ctx,
+	pid_t pid)
+{
+	struct irpc_name_records *names = NULL;
+	uint32_t i = 0;
+	uint32_t j = 0;
+	TALLOC_CTX *mem_ctx = talloc_new(NULL);
+
+	if (mem_ctx == NULL) {
+		DBG_ERR("OOM unable to clean up messaging for process (%d)\n",
+			pid);
+		return NT_STATUS_NO_MEMORY;
+	}
+
+	names = irpc_all_servers(msg_ctx, mem_ctx);
+	if (names == NULL) {
+		TALLOC_FREE(mem_ctx);
+		return NT_STATUS_OK;
+	}
+	for (i = 0; i < names->num_records; i++) {
+		for (j = 0; j < names->names[i]->count; j++) {
+			if (names->names[i]->ids[j].pid == pid) {
+				int ret = server_id_db_prune_name(
+					msg_ctx->names,
+					names->names[i]->name,
+					names->names[i]->ids[j]);
+				if (ret != 0 && ret != ENOENT) {
+					TALLOC_FREE(mem_ctx);
+					return map_nt_error_from_unix_common(
+					    ret);
+				}
+			}
+		}
+	}
+	TALLOC_FREE(mem_ctx);
+	return NT_STATUS_OK;
+}
+
+static int imessaging_context_destructor(struct imessaging_context *msg)
+{
+	DLIST_REMOVE(msg_ctxs, msg);
+	TALLOC_FREE(msg->msg_dgm_ref);
+	return 0;
+}
+
+/*
+ * Cleanup messaging dgm contexts on a specific event context.
+ *
+ * We must make sure to unref all messaging_dgm_ref's *before* the
+ * tevent context goes away. Only when the last ref is freed, the
+ * refcounted messaging dgm context will be freed.
+ */
+void imessaging_dgm_unref_ev(struct tevent_context *ev)
+{
+	struct imessaging_context *msg = NULL;
+
+	for (msg = msg_ctxs; msg != NULL; msg = msg->next) {
+		if (msg->ev == ev) {
+			TALLOC_FREE(msg->msg_dgm_ref);
+		}
+	}
+}
+
+static NTSTATUS imessaging_reinit(struct imessaging_context *msg)
+{
+	int ret = -1;
+
+	TALLOC_FREE(msg->msg_dgm_ref);
+
+	msg->server_id.pid = getpid();
+
+	msg->msg_dgm_ref = messaging_dgm_ref(msg,
+				msg->ev,
+				&msg->server_id.unique_id,
+				msg->sock_dir,
+				msg->lock_dir,
+				imessaging_dgm_recv,
+				msg,
+				&ret);
+
+	if (msg->msg_dgm_ref == NULL) {
+		DEBUG(2, ("messaging_dgm_ref failed: %s\n",
+			strerror(ret)));
+		return map_nt_error_from_unix_common(ret);
+	}
+
+	server_id_db_reinit(msg->names, msg->server_id);
+	return NT_STATUS_OK;
+}
+
+/*
+ * Must be called after a fork.
+ */
+NTSTATUS imessaging_reinit_all(void)
+{
+	struct imessaging_context *msg = NULL;
+
+	for (msg = msg_ctxs; msg != NULL; msg = msg->next) {
+		NTSTATUS status = imessaging_reinit(msg);
+		if (!NT_STATUS_IS_OK(status)) {
+			return status;
+		}
+	}
+	return NT_STATUS_OK;
+}
+
 /*
   create the listening socket and setup the dispatcher
-
-  use auto_remove=true when you want a destructor to remove the
-  associated messaging socket and database entry on talloc free. Don't
-  use this in processes that may fork and a child may talloc free this
-  memory
 */
 struct imessaging_context *imessaging_init(TALLOC_CTX *mem_ctx,
 					   struct loadparm_context *lp_ctx,
 					   struct server_id server_id,
-					   struct tevent_context *ev,
-					   bool auto_remove)
+					   struct tevent_context *ev)
 {
+	NTSTATUS status;
 	struct imessaging_context *msg;
 	bool ok;
 	int ret;
+	const char *lock_dir = NULL;
+	int tdb_flags = TDB_INCOMPATIBLE_HASH | TDB_CLEAR_IF_FIRST;
 
 	if (ev == NULL) {
 		return NULL;
@@ -320,10 +489,18 @@ struct imessaging_context *imessaging_init(TALLOC_CTX *mem_ctx,
 	if (msg == NULL) {
 		return NULL;
 	}
+	msg->ev = ev;
+
+	talloc_set_destructor(msg, imessaging_context_destructor);
 
 	/* create the messaging directory if needed */
 
-	msg->sock_dir = lpcfg_private_path(msg, lp_ctx, "sock");
+	lock_dir = lpcfg_lock_directory(lp_ctx);
+	if (lock_dir == NULL) {
+		goto fail;
+	}
+
+	msg->sock_dir = lpcfg_private_path(msg, lp_ctx, "msg.sock");
 	if (msg->sock_dir == NULL) {
 		goto fail;
 	}
@@ -332,7 +509,7 @@ struct imessaging_context *imessaging_init(TALLOC_CTX *mem_ctx,
 		goto fail;
 	}
 
-	msg->lock_dir = lpcfg_lock_path(msg, lp_ctx, "msg");
+	msg->lock_dir = lpcfg_lock_path(msg, lp_ctx, "msg.lock");
 	if (msg->lock_dir == NULL) {
 		goto fail;
 	}
@@ -342,7 +519,7 @@ struct imessaging_context *imessaging_init(TALLOC_CTX *mem_ctx,
 	}
 
 	msg->msg_dgm_ref = messaging_dgm_ref(
-		msg, ev, server_id.unique_id, msg->sock_dir, msg->lock_dir,
+		msg, ev, &server_id.unique_id, msg->sock_dir, msg->lock_dir,
 		imessaging_dgm_recv, msg, &ret);
 
 	if (msg->msg_dgm_ref == NULL) {
@@ -362,22 +539,61 @@ struct imessaging_context *imessaging_init(TALLOC_CTX *mem_ctx,
 
 	msg->start_time    = timeval_current();
 
-	msg->names = server_id_db_init(
-		msg, server_id, msg->lock_dir, 0,
-		TDB_INCOMPATIBLE_HASH|TDB_CLEAR_IF_FIRST|
-		lpcfg_tdb_flags(lp_ctx, 0));
+	tdb_flags |= lpcfg_tdb_flags(lp_ctx, 0);
+
+	/*
+	 * This context holds a destructor that cleans up any names
+	 * registered on this context on talloc_free()
+	 */
+	msg->names = server_id_db_init(msg, server_id, lock_dir, 0, tdb_flags);
 	if (msg->names == NULL) {
 		goto fail;
 	}
 
-	if (auto_remove) {
-		talloc_set_destructor(msg, imessaging_cleanup);
+	status = imessaging_register(msg, NULL, MSG_PING, ping_message);
+	if (!NT_STATUS_IS_OK(status)) {
+		goto fail;
 	}
+	status = imessaging_register(msg, NULL, MSG_REQ_POOL_USAGE,
+				     pool_message);
+	if (!NT_STATUS_IS_OK(status)) {
+		goto fail;
+	}
+	status = imessaging_register(msg, NULL, MSG_IRPC, irpc_handler);
+	if (!NT_STATUS_IS_OK(status)) {
+		goto fail;
+	}
+	status = imessaging_register(msg, NULL, MSG_REQ_RINGBUF_LOG,
+				     ringbuf_log_msg);
+	if (!NT_STATUS_IS_OK(status)) {
+		goto fail;
+	}
+	status = imessaging_register(msg, NULL, MSG_DEBUG,
+				     debug_imessage);
+	if (!NT_STATUS_IS_OK(status)) {
+		goto fail;
+	}
+	status = imessaging_register(msg, NULL, MSG_REQ_DEBUGLEVEL,
+				     debuglevel_imessage);
+	if (!NT_STATUS_IS_OK(status)) {
+		goto fail;
+	}
+	status = IRPC_REGISTER(msg, irpc, IRPC_UPTIME, irpc_uptime, msg);
+	if (!NT_STATUS_IS_OK(status)) {
+		goto fail;
+	}
+#if defined(DEVELOPER) || defined(ENABLE_SELFTEST)
+	/*
+	 * Register handlers for messages specific to developer and
+	 * self test builds
+	 */
+	status = imessaging_register_extra_handlers(msg);
+	if (!NT_STATUS_IS_OK(status)) {
+		goto fail;
+	}
+#endif /* defined(DEVELOPER) || defined(ENABLE_SELFTEST) */
 
-	imessaging_register(msg, NULL, MSG_PING, ping_message);
-	imessaging_register(msg, NULL, MSG_REQ_POOL_USAGE, pool_message);
-	imessaging_register(msg, NULL, MSG_IRPC, irpc_handler);
-	IRPC_REGISTER(msg, irpc, IRPC_UPTIME, irpc_uptime, msg);
+	DLIST_ADD(msg_ctxs, msg);
 
 	return msg;
 fail:
@@ -385,7 +601,87 @@ fail:
 	return NULL;
 }
 
-static void imessaging_dgm_recv(const uint8_t *buf, size_t buf_len,
+struct imessaging_post_state {
+	struct imessaging_context *msg_ctx;
+	struct imessaging_post_state **busy_ref;
+	size_t buf_len;
+	uint8_t buf[];
+};
+
+static int imessaging_post_state_destructor(struct imessaging_post_state *state)
+{
+	if (state->busy_ref != NULL) {
+		*state->busy_ref = NULL;
+		state->busy_ref = NULL;
+	}
+	return 0;
+}
+
+static void imessaging_post_handler(struct tevent_context *ev,
+				    struct tevent_immediate *ti,
+				    void *private_data)
+{
+	struct imessaging_post_state *state = talloc_get_type_abort(
+		private_data, struct imessaging_post_state);
+
+	if (state == NULL) {
+		return;
+	}
+
+	/*
+	 * In usecases like using messaging_client_init() with irpc processing
+	 * we may free the imessaging_context during the messaging handler.
+	 * imessaging_post_state is a child of imessaging_context and
+	 * might be implicitly free'ed before the explicit TALLOC_FREE(state).
+	 *
+	 * The busy_ref pointer makes sure the destructor clears
+	 * the local 'state' variable.
+	 */
+
+	SMB_ASSERT(state->busy_ref == NULL);
+	state->busy_ref = &state;
+
+	imessaging_dgm_recv(ev, state->buf, state->buf_len, NULL, 0,
+			    state->msg_ctx);
+
+	state->busy_ref = NULL;
+	TALLOC_FREE(state);
+}
+
+static int imessaging_post_self(struct imessaging_context *msg,
+				const uint8_t *buf, size_t buf_len)
+{
+	struct tevent_immediate *ti;
+	struct imessaging_post_state *state;
+
+	state = talloc_size(
+		msg, offsetof(struct imessaging_post_state, buf) + buf_len);
+	if (state == NULL) {
+		return ENOMEM;
+	}
+	talloc_set_name_const(state, "struct imessaging_post_state");
+
+	talloc_set_destructor(state, imessaging_post_state_destructor);
+
+	ti = tevent_create_immediate(state);
+	if (ti == NULL) {
+		TALLOC_FREE(state);
+		return ENOMEM;
+	}
+
+	state->msg_ctx = msg;
+	state->busy_ref = NULL;
+	state->buf_len = buf_len;
+	memcpy(state->buf, buf, buf_len);
+
+	tevent_schedule_immediate(ti, msg->ev, imessaging_post_handler,
+				  state);
+
+	return 0;
+}
+
+static void imessaging_dgm_recv(struct tevent_context *ev,
+				const uint8_t *buf, size_t buf_len,
 				int *fds, size_t num_fds,
 				void *private_data)
 {
@@ -398,6 +694,16 @@ static void imessaging_dgm_recv(const uint8_t *buf, size_t buf_len,
 
 	if (buf_len < MESSAGE_HDR_LENGTH) {
 		/* Invalid message, ignore */
+		return;
+	}
+
+	if (ev != msg->ev) {
+		int ret;
+		ret = imessaging_post_self(msg, buf, buf_len);
+		if (ret != 0) {
+			DBG_WARNING("imessaging_post_self failed: %s\n",
+				    strerror(ret));
+		}
 		return;
 	}
 
@@ -420,7 +726,13 @@ static void imessaging_dgm_recv(const uint8_t *buf, size_t buf_len,
 
 		for (; d; d = next) {
 			next = d->next;
-			d->fn(msg, d->private_data, d->msg_type, src, &data);
+			d->fn(msg,
+			      d->private_data,
+			      d->msg_type,
+			      src,
+			      num_fds,
+			      fds,
+			      &data);
 		}
 	} else {
 		DEBUG(10, ("%s: Ignoring type=0x%x dst %s, I am %s, \n",
@@ -446,7 +758,7 @@ struct imessaging_context *imessaging_client_init(TALLOC_CTX *mem_ctx,
 	/* This is because we are not in the s3 serverid database */
 	id.unique_id = SERVERID_UNIQUE_ID_NOT_TO_VERIFY;
 
-	return imessaging_init(mem_ctx, lp_ctx, id, ev, true);
+	return imessaging_init(mem_ctx, lp_ctx, id, ev);
 }
 /*
   a list of registered irpc server functions
@@ -615,11 +927,21 @@ failed:
 /*
   handle an incoming irpc message
 */
-static void irpc_handler(struct imessaging_context *msg_ctx, void *private_data,
-			 uint32_t msg_type, struct server_id src, DATA_BLOB *packet)
+static void irpc_handler(struct imessaging_context *msg_ctx,
+			 void *private_data,
+			 uint32_t msg_type,
+			 struct server_id src,
+			 size_t num_fds,
+			 int *fds,
+			 DATA_BLOB *packet)
 {
 	struct irpc_message *m;
 	enum ndr_err_code ndr_err;
+
+	if (num_fds != 0) {
+		DBG_WARNING("Received %zu fds, ignoring message\n", num_fds);
+		return;
+	}
 
 	m = talloc(msg_ctx, struct irpc_message);
 	if (m == NULL) goto failed;
@@ -661,30 +983,15 @@ static int irpc_destructor(struct irpc_request *irpc)
 
 /*
   add a string name that this irpc server can be called on
+
+  It will be removed from the DB either via irpc_remove_name or on
+  talloc_free(msg_ctx->names).
 */
 NTSTATUS irpc_add_name(struct imessaging_context *msg_ctx, const char *name)
 {
 	int ret;
 
 	ret = server_id_db_add(msg_ctx->names, name);
-	if (ret != 0) {
-		return map_nt_error_from_unix_common(ret);
-	}
-	return NT_STATUS_OK;
-}
-
-/*
-  return a list of server ids for a server name
-*/
-NTSTATUS irpc_servers_byname(struct imessaging_context *msg_ctx,
-			     TALLOC_CTX *mem_ctx, const char *name,
-			     unsigned *num_servers,
-			     struct server_id **servers)
-{
-	int ret;
-
-	ret = server_id_db_lookup(msg_ctx->names, name, mem_ctx,
-				  num_servers, servers);
 	if (ret != 0) {
 		return map_nt_error_from_unix_common(ret);
 	}
@@ -698,7 +1005,7 @@ static int all_servers_func(const char *name, unsigned num_servers,
 	struct irpc_name_records *name_records = talloc_get_type(
 		private_data, struct irpc_name_records);
 	struct irpc_name_record *name_record;
-	int i;
+	uint32_t i;
 
 	name_records->names
 		= talloc_realloc(name_records, name_records->names,

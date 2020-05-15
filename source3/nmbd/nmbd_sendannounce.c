@@ -288,8 +288,10 @@ void announce_my_server_names(time_t t)
 			}
 
 			/* Announce every minute at first then progress to every 12 mins */
-			if ((t - work->lastannounce_time) < work->announce_interval)
+			if (t >= work->lastannounce_time &&
+			    (t - work->lastannounce_time) < work->announce_interval) {
 				continue;
+			}
 
 			if (work->announce_interval < (CHECK_TIME_MAX_HOST_ANNCE * 60))
 				work->announce_interval += 60;
@@ -459,7 +461,7 @@ void announce_my_servers_removed(void)
 
 void announce_remote(time_t t)
 {
-	char *s;
+	char *s = NULL;
 	const char *ptr;
 	static time_t last_time = 0;
 	char *s2;
@@ -467,17 +469,19 @@ void announce_remote(time_t t)
 	char *comment;
 	int stype = lp_default_server_announce();
 	TALLOC_CTX *frame = NULL;
+	const struct loadparm_substitution *lp_sub =
+		loadparm_s3_global_substitution();
 
 	if (last_time && (t < (last_time + REMOTE_ANNOUNCE_INTERVAL)))
 		return;
 
 	last_time = t;
 
-	s = lp_remote_announce(talloc_tos());
+	s = lp_remote_announce(talloc_tos(), lp_sub);
 	if (!*s)
 		return;
 
-	comment = string_truncate(lp_server_string(talloc_tos()),
+	comment = string_truncate(lp_server_string(talloc_tos(), lp_sub),
 				  MAX_SERVER_STRING_LENGTH);
 
 	frame = talloc_stackframe();
@@ -538,13 +542,15 @@ void browse_sync_remote(time_t t)
 	char *p;
 	unstring myname;
 	TALLOC_CTX *frame = NULL;
+	const struct loadparm_substitution *lp_sub =
+		loadparm_s3_global_substitution();
 
 	if (last_time && (t < (last_time + REMOTE_ANNOUNCE_INTERVAL)))
 		return;
 
 	last_time = t;
 
-	s = lp_remote_browse_sync(talloc_tos());
+	s = lp_remote_browse_sync(talloc_tos(), lp_sub);
 	if (!*s)
 		return;
 

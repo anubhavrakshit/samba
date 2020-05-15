@@ -26,6 +26,7 @@
 #include "../librpc/gen_ndr/ndr_srvsvc_c.h"
 #include "lib/smbconf/smbconf.h"
 #include "lib/smbconf/smbconf_reg.h"
+#include "libsmb/dsgetdcname.h"
 
 /****************************************************************
 ****************************************************************/
@@ -33,6 +34,8 @@
 static WERROR NetServerGetInfo_l_101(struct libnetapi_ctx *ctx,
 				     uint8_t **buffer)
 {
+	const struct loadparm_substitution *lp_sub =
+		loadparm_s3_global_substitution();
 	struct SERVER_INFO_101 i;
 
 	i.sv101_platform_id	= PLATFORM_ID_NT;
@@ -40,11 +43,11 @@ static WERROR NetServerGetInfo_l_101(struct libnetapi_ctx *ctx,
 	i.sv101_version_major	= SAMBA_MAJOR_NBT_ANNOUNCE_VERSION;
 	i.sv101_version_minor	= SAMBA_MINOR_NBT_ANNOUNCE_VERSION;
 	i.sv101_type		= lp_default_server_announce();
-	i.sv101_comment		= lp_server_string(ctx);
+	i.sv101_comment		= lp_server_string(ctx, lp_sub);
 
 	*buffer = (uint8_t *)talloc_memdup(ctx, &i, sizeof(i));
 	if (!*buffer) {
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	return WERR_OK;
@@ -56,12 +59,14 @@ static WERROR NetServerGetInfo_l_101(struct libnetapi_ctx *ctx,
 static WERROR NetServerGetInfo_l_1005(struct libnetapi_ctx *ctx,
 				      uint8_t **buffer)
 {
+	const struct loadparm_substitution *lp_sub =
+		loadparm_s3_global_substitution();
 	struct SERVER_INFO_1005 info1005;
 
-	info1005.sv1005_comment = lp_server_string(ctx);
+	info1005.sv1005_comment = lp_server_string(ctx, lp_sub);
 	*buffer = (uint8_t *)talloc_memdup(ctx, &info1005, sizeof(info1005));
 	if (!*buffer) {
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	return WERR_OK;
@@ -82,7 +87,7 @@ WERROR NetServerGetInfo_l(struct libnetapi_ctx *ctx,
 			break;
 	}
 
-	return WERR_UNKNOWN_LEVEL;
+	return WERR_INVALID_LEVEL;
 }
 
 /****************************************************************
@@ -486,7 +491,7 @@ WERROR NetServerGetInfo_r(struct libnetapi_ctx *ctx,
 	struct dcerpc_binding_handle *b;
 
 	if (!r->out.buffer) {
-		return WERR_INVALID_PARAM;
+		return WERR_INVALID_PARAMETER;
 	}
 
 	switch (r->in.level) {
@@ -499,7 +504,7 @@ WERROR NetServerGetInfo_r(struct libnetapi_ctx *ctx,
 		case 1005:
 			break;
 		default:
-			return WERR_UNKNOWN_LEVEL;
+			return WERR_INVALID_LEVEL;
 	}
 
 	werr = libnetapi_get_binding_handle(ctx, r->in.server_name,
@@ -547,14 +552,14 @@ static WERROR NetServerSetInfo_l_1005(struct libnetapi_ctx *ctx,
 
 	if (!r->in.buffer) {
 		*r->out.parm_error = 1005; /* sure here ? */
-		return WERR_INVALID_PARAM;
+		return WERR_INVALID_PARAMETER;
 	}
 
 	info1005 = (struct srvsvc_NetSrvInfo1005 *)r->in.buffer;
 
 	if (!info1005->comment) {
 		*r->out.parm_error = 1005;
-		return WERR_INVALID_PARAM;
+		return WERR_INVALID_PARAMETER;
 	}
 
 	if (!lp_config_backend_is_registry()) {
@@ -569,7 +574,7 @@ static WERROR NetServerSetInfo_l_1005(struct libnetapi_ctx *ctx,
 		libnetapi_set_error_string(ctx,
 			"Could not initialize backend: %s",
 			sbcErrorString(err));
-		werr = WERR_NO_SUCH_SERVICE;
+		werr = WERR_SERVICE_DOES_NOT_EXIST;
 		goto done;
 	}
 
@@ -579,7 +584,7 @@ static WERROR NetServerSetInfo_l_1005(struct libnetapi_ctx *ctx,
 		libnetapi_set_error_string(ctx,
 			"Could not set global parameter: %s",
 			sbcErrorString(err));
-		werr = WERR_NO_SUCH_SERVICE;
+		werr = WERR_SERVICE_DOES_NOT_EXIST;
 		goto done;
 	}
 
@@ -601,7 +606,7 @@ WERROR NetServerSetInfo_l(struct libnetapi_ctx *ctx,
 			break;
 	}
 
-	return WERR_UNKNOWN_LEVEL;
+	return WERR_INVALID_LEVEL;
 }
 
 /****************************************************************

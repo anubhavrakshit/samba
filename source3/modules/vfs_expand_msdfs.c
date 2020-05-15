@@ -44,12 +44,12 @@
 static char *read_target_host(TALLOC_CTX *ctx, const char *mapfile,
 			      const char *clientaddr)
 {
-	XFILE *f;
+	FILE *f;
 	char buf[1024];
 	char *space = buf;
 	bool found = false;
 
-	f = x_fopen(mapfile, O_RDONLY, 0);
+	f = fopen(mapfile, "r");
 
 	if (f == NULL) {
 		DEBUG(0,("can't open IP map %s. Error %s\n",
@@ -59,7 +59,7 @@ static char *read_target_host(TALLOC_CTX *ctx, const char *mapfile,
 
 	DEBUG(10, ("Scanning mapfile [%s]\n", mapfile));
 
-	while (x_fgets(buf, sizeof(buf), f) != NULL) {
+	while (fgets(buf, sizeof(buf), f) != NULL) {
 
 		if ((strlen(buf) > 0) && (buf[strlen(buf)-1] == '\n'))
 			buf[strlen(buf)-1] = '\0';
@@ -81,7 +81,7 @@ static char *read_target_host(TALLOC_CTX *ctx, const char *mapfile,
 		}
 	}
 
-	x_fclose(f);
+	fclose(f);
 
 	if (!found) {
 		return NULL;
@@ -112,6 +112,8 @@ static char *expand_msdfs_target(TALLOC_CTX *ctx,
 				connection_struct *conn,
 				char *target)
 {
+	const struct loadparm_substitution *lp_sub =
+		loadparm_s3_global_substitution();
 	char *mapfilename = NULL;
 	char *filename_start = strchr_m(target, '@');
 	char *filename_end = NULL;
@@ -147,16 +149,15 @@ static char *expand_msdfs_target(TALLOC_CTX *ctx,
 		return NULL;
 	}
 
-	targethost = read_target_host(
-		ctx, raddr, mapfilename);
+	targethost = read_target_host(ctx, mapfilename, raddr);
 	if (targethost == NULL) {
 		DEBUG(1, ("Could not expand target host from file %s\n",
 			  mapfilename));
 		return NULL;
 	}
 
-	targethost = talloc_sub_advanced(ctx,
-				lp_servicename(talloc_tos(), SNUM(conn)),
+	targethost = talloc_sub_full(ctx,
+				lp_servicename(talloc_tos(), lp_sub, SNUM(conn)),
 				conn->session_info->unix_info->unix_name,
 				conn->connectpath,
 				conn->session_info->unix_token->gid,
@@ -181,8 +182,11 @@ static char *expand_msdfs_target(TALLOC_CTX *ctx,
 	return new_target;
 }
 
-static int expand_msdfs_readlink(struct vfs_handle_struct *handle,
-				 const char *path, char *buf, size_t bufsiz)
+static int expand_msdfs_readlinkat(struct vfs_handle_struct *handle,
+				files_struct *dirfsp,
+				const struct smb_filename *smb_fname,
+				char *buf,
+				size_t bufsiz)
 {
 	TALLOC_CTX *ctx = talloc_tos();
 	int result;
@@ -198,8 +202,11 @@ static int expand_msdfs_readlink(struct vfs_handle_struct *handle,
 		return -1;
 	}
 
-	result = SMB_VFS_NEXT_READLINK(handle, path, target,
-				       PATH_MAX);
+	result = SMB_VFS_NEXT_READLINKAT(handle,
+				dirfsp,
+				smb_fname,
+				target,
+				PATH_MAX);
 
 	if (result <= 0)
 		return result;
@@ -224,11 +231,11 @@ static int expand_msdfs_readlink(struct vfs_handle_struct *handle,
 }
 
 static struct vfs_fn_pointers vfs_expand_msdfs_fns = {
-	.readlink_fn = expand_msdfs_readlink
+	.readlinkat_fn = expand_msdfs_readlinkat
 };
 
-NTSTATUS vfs_expand_msdfs_init(void);
-NTSTATUS vfs_expand_msdfs_init(void)
+static_decl_vfs;
+NTSTATUS vfs_expand_msdfs_init(TALLOC_CTX *ctx)
 {
 	return smb_register_vfs(SMB_VFS_INTERFACE_VERSION, "expand_msdfs",
 				&vfs_expand_msdfs_fns);

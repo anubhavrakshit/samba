@@ -314,7 +314,8 @@ NTSTATUS fill_netlogon_samlogon_response(struct ldb_context *sam_ctx,
 	server_site      = samdb_server_site_name(sam_ctx, mem_ctx);
 	NT_STATUS_HAVE_NO_MEMORY(server_site);
 	client_site      = samdb_client_site_name(sam_ctx, mem_ctx,
-						  src_address, NULL);
+						  src_address, NULL,
+						  true);
 	NT_STATUS_HAVE_NO_MEMORY(client_site);
 	if (strcasecmp(server_site, client_site) == 0) {
 		server_type |= DS_SERVER_CLOSEST;
@@ -425,7 +426,7 @@ NTSTATUS parse_netlogon_request(struct ldb_parse_tree *tree,
 	*domain_guid = NULL;
 	*domain_sid = NULL;
 	*acct_control = -1;
-	*version = -1;
+	*version = NETLOGON_NT_VERSION_5;
 
 	if (tree->operation != LDB_OP_AND) goto failed;
 
@@ -484,10 +485,6 @@ NTSTATUS parse_netlogon_request(struct ldb_parse_tree *tree,
 
 	if ((*domain == NULL) && (*domain_guid == NULL) && (*domain_sid == NULL)) {
 		*domain = lpcfg_dnsdomain(lp_ctx);
-	}
-
-	if (*version == -1) {
-		goto failed;
 	}
 
 	return NT_STATUS_OK;

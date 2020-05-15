@@ -22,34 +22,33 @@
 #ifndef _RPC_EP_SETUP_H
 #define _RPC_EP_SETUP_H
 
-struct ndr_interface_table;
+#include "rpc_server/rpc_server.h"
 
-/**
- * @brief Register an endpoint at the endpoint mapper.
- *
- * This just sets up a register and monitor loop to try to regsiter the
- * endpoint at the endpoint mapper.
- *
- * @param[in] ev_ctx    The event context to setup the loop.
- *
- * @param[in] msg_ctx   The messaging context to use for the connnection.
- *
- * @param[in] iface     The interface table to register.
- *
- * @param[in] ncalrpc   The name of the ncalrpc pipe or NULL.
- *
- * @param[in] port      The tcpip port or 0.
- *
- * @return              NT_STATUS_OK on success or a corresponding error code.
- */
-NTSTATUS rpc_ep_setup_register(struct tevent_context *ev_ctx,
-			       struct messaging_context *msg_ctx,
-			       const struct ndr_interface_table *iface,
-			       const char *ncalrpc,
-			       uint16_t port);
+struct pf_listen_fd;
 
-bool dcesrv_ep_setup(struct tevent_context *ev_ctx,
-		     struct messaging_context *msg_ctx);
+NTSTATUS dcesrv_init(TALLOC_CTX *mem_ctx,
+		     struct tevent_context *ev_ctx,
+		     struct messaging_context *msg_ctx,
+		     struct dcesrv_context *dce_ctx);
+
+NTSTATUS dcesrv_setup_endpoint_sockets(struct tevent_context *ev_ctx,
+				       struct messaging_context *msg_ctx,
+				       struct dcesrv_context *dce_ctx,
+				       struct dcesrv_endpoint *e,
+				       dcerpc_ncacn_termination_fn term_fn,
+				       void *term_data);
+
+NTSTATUS dcesrv_create_endpoint_sockets(struct tevent_context *ev_ctx,
+					struct messaging_context *msg_ctx,
+					struct dcesrv_context *dce_ctx,
+					struct dcesrv_endpoint *e,
+					struct pf_listen_fd *listen_fds,
+					int *listen_fds_size);
+
+NTSTATUS rpc_setup_embedded(struct tevent_context *ev_ctx,
+			    struct messaging_context *msg_ctx,
+			    struct dcesrv_context *dce_ctx,
+			    const struct dcesrv_interface *iface);
 
 #endif /* _RPC_EP_SETUP_H */
 

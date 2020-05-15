@@ -17,6 +17,9 @@ interface drsblobs {
 	 * replPropertyMetaData
 	 * w2k  uses version 1
 	 * w2k3 uses version 1
+	 *
+	 * Also equivalent to
+	 * MS-DRSR 4.1.10.2.22 PROPERTY_META_DATA
 	 */
 	typedef [public] struct {
 		drsuapi_DsAttributeId attid;
@@ -42,10 +45,6 @@ interface drsblobs {
 		[value(0)] uint32 reserved;
 		[switch_is(version)] replPropertyMetaDataCtr ctr;
 	} replPropertyMetaDataBlob;
-
-	void decode_replPropertyMetaData(
-		[in] replPropertyMetaDataBlob blob
-		);
 
 	/*
 	 * replUpToDateVector
@@ -74,10 +73,6 @@ interface drsblobs {
 		[value(0)] uint32 reserved;
 		[switch_is(version)] replUpToDateVectorCtr ctr;
 	} replUpToDateVectorBlob;
-
-	void decode_replUpToDateVector(
-		[in] replUpToDateVectorBlob blob
-		);
 
 	/*
 	 * repsFrom/repsTo
@@ -147,10 +142,6 @@ interface drsblobs {
 		[switch_is(version)] repsFromTo ctr;
 	} repsFromToBlob;
 
-	void decode_repsFromTo(
-		[in] repsFromToBlob blob
-		);
-
 	/* Replication schedule structures as defined in MS-ADTS 7.1.4.5
          * Appears as attribute of NTDSConnection object
          */
@@ -166,7 +157,7 @@ interface drsblobs {
         typedef [public] struct {
 		uint32             size;
 		[value(0)] uint32  bandwidth;         /* ignored */
-		[value(1)] uint32  numberOfSchedules; /* always 1 */
+		uint32             numberOfSchedules; /* typically 1 */
 		scheduleHeader     headerArray[numberOfSchedules];
 		scheduleSlots      dataArray[numberOfSchedules];
 	} schedule;
@@ -190,11 +181,6 @@ interface drsblobs {
 		[value(0)] uint32 reserved;
 		[switch_is(version)] partialAttributeSetCtr ctr;
 	} partialAttributeSetBlob;
-
-	void decode_partialAttributeSet(
-		[in] partialAttributeSetBlob blob
-		);
-
 
 	/*
 	 * schemaInfo attribute
@@ -257,11 +243,6 @@ interface drsblobs {
 		[switch_is(version)] prefixMapCtr ctr;
 	} prefixMapBlob;
 
-	void decode_prefixMap(
-		[in] prefixMapBlob blob
-		);
-
-
 	/*
 	 * the cookie for the LDAP dirsync control
 	 */
@@ -287,11 +268,7 @@ interface drsblobs {
 		[subcontext(0)] ldapControlDirSyncBlob blob;
 	} ldapControlDirSyncCookie;
 
-	void decode_ldapControlDirSync(
-		[in] ldapControlDirSyncCookie cookie
-		);
-
-	typedef struct {
+	typedef [public] struct {
 		[value(2*strlen_m(name))] uint16 name_len;
 		[value(strlen(data))] uint16 data_len;
 		uint16 reserved; /* 2 for 'Packages', 1 for 'Primary:*', but should be ignored */
@@ -316,6 +293,16 @@ interface drsblobs {
 		 * 'Primary:CLEARTEXT':
 		 *    data contains the cleartext password
 		 *    as UTF16 string encoded as HEX string
+		 *
+		 * 'Primary:userPassword':
+		 *    ...
+		 *
+		 * 'Primary:SambaGPG':
+		 *    ...
+		 *
+		 * 'Primary:NTLM-Strong-NTOWF':
+		 *    ... Not yet implemented.
+		 *
 		 */
 		[charset(DOS)] uint8 data[data_len];
 	} supplementalCredentialsPackage;
@@ -323,11 +310,11 @@ interface drsblobs {
 	/* this are 0x30 (48) whitespaces (0x20) */
 	const string SUPPLEMENTAL_CREDENTIALS_PREFIX = "                                                ";
 
-	typedef [flag(NDR_PAHEX)] enum {
+	typedef [flag(NDR_PAHEX),public] enum {
 		SUPPLEMENTAL_CREDENTIALS_SIGNATURE = 0x0050
 	} supplementalCredentialsSignature;
 
-	typedef [gensize] struct {
+	typedef [gensize,nopush,nopull] struct {
 		[value(SUPPLEMENTAL_CREDENTIALS_PREFIX),charset(UTF16)] uint16 prefix[0x30];
 		[value(SUPPLEMENTAL_CREDENTIALS_SIGNATURE)] supplementalCredentialsSignature signature;
 		uint16 num_packages;
@@ -342,17 +329,9 @@ interface drsblobs {
 		[value(0)] uint8 unknown3;
 	} supplementalCredentialsBlob;
 
-	void decode_supplementalCredentials(
-		[in] supplementalCredentialsBlob blob
-		);
-
 	typedef [public] struct {
 		[flag(STR_NOTERM|NDR_REMAINING)] string_array names;
 	} package_PackagesBlob;
-
-	void decode_Packages(
-		[in] package_PackagesBlob blob
-		);
 
 	typedef struct {
 		[value(2*strlen_m(string))] uint16 length;
@@ -416,17 +395,9 @@ interface drsblobs {
 		[switch_is(version)] package_PrimaryKerberosCtr ctr;
 	} package_PrimaryKerberosBlob;
 
-	void decode_PrimaryKerberos(
-		[in] package_PrimaryKerberosBlob blob
-		);
-
 	typedef [public] struct {
 		[flag(NDR_REMAINING)] DATA_BLOB cleartext;
 	} package_PrimaryCLEARTEXTBlob;
-
-	void decode_PrimaryCLEARTEXT(
-		[in] package_PrimaryCLEARTEXTBlob blob
-		);
 
 	typedef [flag(NDR_PAHEX)] struct {
 		uint8 hash[16];
@@ -441,9 +412,39 @@ interface drsblobs {
 		package_PrimaryWDigestHash hashes[num_hashes];
 	} package_PrimaryWDigestBlob;
 
-	void decode_PrimaryWDigest(
-		[in] package_PrimaryWDigestBlob blob
-		);
+	typedef [public] struct {
+		[flag(NDR_REMAINING)] DATA_BLOB gpg_blob;
+	} package_PrimarySambaGPGBlob;
+
+	/*
+	 * Password hashes stored in a scheme compatible with
+	 * OpenLDAP's userPassword attribute. The Package is named
+	 * Primary:userPassword each calculated hash,
+	 * which is typically caclulated via crypt(), the scheme is stored.
+	 * The scheme name and the {scheme} format is re-used from OpenLDAP's
+	 * use for userPassword to aid interopability when exported.
+	 *
+	 * The currently supported scheme so far is {CRYPT}, which may
+	 * be specified multiple times if both CryptSHA256 ($5$) and
+	 * CryptSHA512 ($6$) are in use.
+	 *
+	 * current_nt_hash is either the unicodePwd or the
+	 * NTLM-Strong-NTOWF, to allow us to prove this password is
+	 * a valid element.
+	 */
+	typedef struct {
+		[value(2*strlen_m(scheme))] uint16 scheme_len;
+		[charset(UTF16)] uint8 scheme[scheme_len];
+		[value((value?value->length:0))] uint32 value_len;
+		[relative,subcontext(0),subcontext_size(value_len),
+			flag(NDR_REMAINING)] DATA_BLOB *value;
+	} package_PrimaryUserPasswordValue;
+
+	typedef [public] struct {
+		samr_Password current_nt_hash;
+		uint16 num_hashes;
+		package_PrimaryUserPasswordValue hashes[num_hashes];
+	} package_PrimaryUserPasswordBlob;
 
 	typedef struct {
 		[value(0)] uint32 size;
@@ -509,10 +510,6 @@ interface drsblobs {
 		[subcontext(0)] [flag(NDR_REMAINING)] AuthenticationInformationArray previous;
 	} trustAuthInOutBlob;
 
-	[nopython] void decode_trustAuthInOut(
-		[in] trustAuthInOutBlob blob
-		);
-
 	typedef [public,nopull] struct {
 		uint8 confounder[512];
 		[subcontext(0),subcontext_size(outgoing_size)] trustAuthInOutBlob outgoing;
@@ -520,10 +517,6 @@ interface drsblobs {
 		[value(ndr_size_trustAuthInOutBlob(&outgoing, ndr->flags))] uint32 outgoing_size;
 		[value(ndr_size_trustAuthInOutBlob(&incoming, ndr->flags))] uint32 incoming_size;
 	} trustDomainPasswords;
-
-	[nopython] void decode_trustDomainPasswords(
-		[in] trustDomainPasswords blob
-		);
 
 	typedef [public] struct {
 		uint32 marker;
@@ -586,7 +579,7 @@ interface drsblobs {
 	} ExtendedErrorParam;
 
 	typedef [public] struct {
-		ExtendedErrorInfo *next;
+		[max_recursion(20000)] ExtendedErrorInfo *next;
 		ExtendedErrorComputerName computer_name;
 		hyper pid;
 		NTTIME time;
@@ -601,10 +594,6 @@ interface drsblobs {
 	typedef struct {
 		[unique] ExtendedErrorInfo *info;
 	} ExtendedErrorInfoPtr;
-
-	[nopython] void decode_ExtendedErrorInfo (
-		[in,subcontext(0xFFFFFC01)] ExtendedErrorInfoPtr ptr
-		);
 
 	/* MS-ADTS 7.1.6.9.3 msDS-TrustForestTrustInfo Attribute */
 
@@ -659,7 +648,33 @@ interface drsblobs {
 		ForestTrustInfoRecordArmor records[count];
 	} ForestTrustInfo;
 
-	[nopython] void decode_ForestTrustInfo(
-		[in] ForestTrustInfo blob
-		);
+	typedef enum {
+		ENC_SECRET_AES_128_AEAD = 1
+	} EncryptedSecretAlgorithm;
+
+	const uint32 ENCRYPTED_SECRET_MAGIC_VALUE = 0xCA5CADED;
+
+	typedef [public] struct {
+		DATA_BLOB cleartext;
+	} PlaintextSecret;
+
+	/* The AEAD routines uses this as the additional authenticated data */
+	typedef [public] struct {
+		uint32 magic;
+		uint32 version;
+		uint32 algorithm;
+		uint32 flags;
+	} EncryptedSecretHeader;
+
+	typedef [public] struct {
+		/*
+		 * The iv is before the header to ensure that the first bytes of
+		 * the encrypted values are not predictable.
+		 * We do this so that if the decryption gets disabled, we don't
+		 * end up with predictable unicodePasswords.
+		 */
+		DATA_BLOB iv;
+		EncryptedSecretHeader header;
+		[flag(NDR_REMAINING)] DATA_BLOB encrypted;
+	} EncryptedSecret;
 }

@@ -235,7 +235,9 @@ done:
 {
 	krb5_error_code ret;
 	const char *password;
+#ifdef SAMBA4_USES_HEIMDAL
 	const char *self_service;
+#endif
 	const char *target_service;
 	time_t kdc_time = 0;
 	krb5_principal princ;
@@ -267,7 +269,9 @@ done:
 		return ret;
 	}
 
+#ifdef SAMBA4_USES_HEIMDAL
 	self_service = cli_credentials_get_self_service(credentials);
+#endif
 	target_service = cli_credentials_get_target_service(credentials);
 
 	password = cli_credentials_get_password(credentials);
@@ -309,6 +313,8 @@ done:
 	 */
 	krb5_get_init_creds_opt_set_win2k(smb_krb5_context->krb5_context,
 					  krb_options, true);
+	krb5_get_init_creds_opt_set_canonicalize(smb_krb5_context->krb5_context,
+						 krb_options, true);
 #else /* MIT */
 	krb5_get_init_creds_opt_set_canonicalize(krb_options, true);
 #endif
@@ -327,12 +333,16 @@ done:
 		if (password) {
 			if (impersonate_principal) {
 #ifdef SAMBA4_USES_HEIMDAL
-				ret = kerberos_kinit_s4u2_cc(
-						smb_krb5_context->krb5_context,
-						ccache, princ, password,
-						impersonate_principal,
-						self_service, target_service,
-						krb_options, NULL, &kdc_time);
+				ret = smb_krb5_kinit_s4u2_ccache(smb_krb5_context->krb5_context,
+								 ccache,
+								 princ,
+								 password,
+								 impersonate_principal,
+								 self_service,
+								 target_service,
+								 krb_options,
+								 NULL,
+								 &kdc_time);
 #else
 				talloc_free(mem_ctx);
 				(*error_string) = "INTERNAL error: s4u2 ops "
@@ -340,11 +350,14 @@ done:
 				return EINVAL;
 #endif
 			} else {
-				ret = kerberos_kinit_password_cc(
-						smb_krb5_context->krb5_context,
-						ccache, princ, password,
-						target_service,
-						krb_options, NULL, &kdc_time);
+				ret = smb_krb5_kinit_password_ccache(smb_krb5_context->krb5_context,
+								     ccache,
+								     princ,
+								     password,
+								     target_service,
+								     krb_options,
+								     NULL,
+								     &kdc_time);
 			}
 		} else if (impersonate_principal) {
 			talloc_free(mem_ctx);
@@ -371,10 +384,14 @@ done:
 						 &keyblock);
 			
 			if (ret == 0) {
-				ret = kerberos_kinit_keyblock_cc(smb_krb5_context->krb5_context, ccache, 
-								 princ, &keyblock,
-								 target_service, krb_options,
-								 NULL, &kdc_time);
+				ret = smb_krb5_kinit_keyblock_ccache(smb_krb5_context->krb5_context,
+								     ccache,
+								     princ,
+								     &keyblock,
+								     target_service,
+								     krb_options,
+								     NULL,
+								     &kdc_time);
 				krb5_free_keyblock_contents(smb_krb5_context->krb5_context, &keyblock);
 			}
 		}
@@ -618,7 +635,7 @@ krb5_error_code smb_krb5_remove_obsolete_keytab_entries(TALLOC_CTX *mem_ctx,
 		krb5_kt_free_entry(context, &entry);
 		/* Make sure we do not double free */
 		ZERO_STRUCT(entry);
-	} while (code != 0);
+	} while (code == 0);
 
 	krb5_kt_end_seq_get(context, keytab, &cursor);
 
@@ -627,7 +644,6 @@ krb5_error_code smb_krb5_remove_obsolete_keytab_entries(TALLOC_CTX *mem_ctx,
 		break;
 	case ENOENT:
 	case KRB5_KT_END:
-		code = 0;
 		break;
 	default:
 		*error_string = talloc_asprintf(mem_ctx,

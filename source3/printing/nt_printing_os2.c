@@ -73,7 +73,9 @@ static bool set_driver_mapping(const char *from, const char *to)
  */
 WERROR spoolss_map_to_os2_driver(TALLOC_CTX *mem_ctx, const char **pdrivername)
 {
-	const char *mapfile = lp_os2_driver_map(talloc_tos());
+	const struct loadparm_substitution *lp_sub =
+		loadparm_s3_global_substitution();
+	const char *mapfile = lp_os2_driver_map(talloc_tos(), lp_sub);
 	char **lines = NULL;
 	const char *drivername;
 	int numlines = 0;
@@ -86,7 +88,7 @@ WERROR spoolss_map_to_os2_driver(TALLOC_CTX *mem_ctx, const char **pdrivername)
 	drivername = *pdrivername;
 
 	if (mapfile[0] == '\0') {
-		return WERR_BADFILE;
+		return WERR_FILE_NOT_FOUND;
 	}
 
 	if (strequal(drivername, get_win_driver())) {
@@ -94,7 +96,7 @@ WERROR spoolss_map_to_os2_driver(TALLOC_CTX *mem_ctx, const char **pdrivername)
 			drivername, get_os2_driver()));
 		drivername = talloc_strdup(mem_ctx, get_os2_driver());
 		if (drivername == NULL) {
-			return WERR_NOMEM;
+			return WERR_NOT_ENOUGH_MEMORY;
 		}
 		*pdrivername = drivername;
 		return WERR_OK;
@@ -153,7 +155,7 @@ WERROR spoolss_map_to_os2_driver(TALLOC_CTX *mem_ctx, const char **pdrivername)
 			drivername = talloc_strdup(mem_ctx, os2_name);
 			TALLOC_FREE(lines);
 			if (drivername == NULL) {
-				return WERR_NOMEM;
+				return WERR_NOT_ENOUGH_MEMORY;
 			}
 			*pdrivername = drivername;
 			return WERR_OK;

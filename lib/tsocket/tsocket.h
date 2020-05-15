@@ -24,9 +24,9 @@
 #ifndef _TSOCKET_H
 #define _TSOCKET_H
 
-#include <talloc.h>
 #include <tevent.h>
 
+struct samba_sockaddr;
 struct tsocket_address;
 struct tdgram_context;
 struct tstream_context;
@@ -481,7 +481,7 @@ int tstream_disconnect_recv(struct tevent_req *req,
  * @defgroup tsocket_bsd  tsocket_bsd - inet, inet6 and unix
  * @ingroup tsocket
  *
- * The main tsocket library comes with implentations for BSD style ipv4, ipv6
+ * The main tsocket library comes with implementations for BSD style ipv4, ipv6
  * and unix sockets.
  *
  * @{
@@ -501,7 +501,7 @@ int tstream_disconnect_recv(struct tevent_req *req,
  */
 bool tsocket_address_is_inet(const struct tsocket_address *addr, const char *fam);
 
-#if DOXYGEN
+#ifdef DOXYGEN
 /**
  * @brief Create a tsocket_address for ipv4 and ipv6 endpoint addresses.
  *
@@ -805,7 +805,7 @@ bool tstream_bsd_optimize_readv(struct tstream_context *stream,
  * @brief Connect async to a TCP endpoint and create a tstream_context for the
  * stream based communication.
  *
- * Use this function to connenct asynchronously to a remote ipv4 or ipv6 TCP
+ * Use this function to connect asynchronously to a remote ipv4 or ipv6 TCP
  * endpoint and create a tstream_context for the stream based communication.
  *
  * @param[in]  mem_ctx  The talloc memory context to use.
@@ -961,7 +961,7 @@ struct sockaddr;
  *
  * @param[in]  sa       The sockaddr structure to convert.
  *
- * @param[in]  sa_socklen   The lenth of the sockaddr sturucte.
+ * @param[in]  sa_socklen   The length of the sockaddr structure.
  *
  * @param[out] addr     The tsocket pointer to allocate and fill.
  *
@@ -981,6 +981,32 @@ int _tsocket_address_bsd_from_sockaddr(TALLOC_CTX *mem_ctx,
 #define tsocket_address_bsd_from_sockaddr(mem_ctx, sa, sa_socklen, _addr) \
 	_tsocket_address_bsd_from_sockaddr(mem_ctx, sa, sa_socklen, _addr, \
 					   __location__)
+#endif
+
+#ifdef DOXYGEN
+/**
+ * @brief Convert a samba address to a tsocket address.
+ *
+ * @param[in]  mem_ctx  The talloc memory context to use.
+ *
+ * @param[in]  s_addr   The samba address structure to convert.
+ *
+ * @param[out] t_addr   The tsocket pointer to allocate and fill.
+ *
+ * @return              0 on success, -1 on error with errno set.
+ */
+int tsocket_address_bsd_from_samba_sockaddr(TALLOC_CTX *mem_ctx,
+					const struct samba_sockaddr *xs_addr,
+					struct tsocket_address **t_addr);
+#else
+int _tsocket_address_bsd_from_samba_sockaddr(TALLOC_CTX *mem_ctx,
+					 const struct samba_sockaddr *xs_addr,
+					 struct tsocket_address **t_addr,
+					 const char *location);
+
+#define tsocket_address_bsd_from_samba_sockaddr(mem_ctx, xs_addr, t_addr) \
+	_tsocket_address_bsd_from_samba_sockaddr(mem_ctx, xs_addr, t_addr, \
+						 __location__)
 #endif
 
 /**

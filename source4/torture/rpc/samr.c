@@ -31,7 +31,7 @@
 #include "librpc/gen_ndr/ndr_netlogon_c.h"
 #include "librpc/gen_ndr/ndr_samr_c.h"
 #include "librpc/gen_ndr/ndr_lsa_c.h"
-#include "../lib/crypto/crypto.h"
+#include "lib/crypto/crypto.h"
 #include "libcli/auth/libcli_auth.h"
 #include "libcli/security/security.h"
 #include "torture/rpc/torture_rpc.h"
@@ -39,6 +39,10 @@
 #include "auth/gensec/gensec.h"
 #include "auth/gensec/gensec_proto.h"
 #include "../libcli/auth/schannel.h"
+#include "torture/util.h"
+#include "source4/librpc/rpc/dcerpc.h"
+#include "source3/rpc_client/init_samr.h"
+#include "lib/crypto/gnutls_helpers.h"
 
 #define TEST_ACCOUNT_NAME "samrtorturetest"
 #define TEST_ACCOUNT_NAME_PWD "samrpwdlastset"
@@ -46,6 +50,9 @@
 #define TEST_GROUPNAME "samrtorturetestgroup"
 #define TEST_MACHINENAME "samrtestmach$"
 #define TEST_DOMAINNAME "samrtestdom$"
+
+#include <gnutls/gnutls.h>
+#include <gnutls/crypto.h>
 
 enum torture_samr_choice {
 	TORTURE_SAMR_PASSWORDS,
@@ -633,7 +640,6 @@ static bool test_SetUserPass(struct dcerpc_pipe *p, struct torture_context *tctx
 	s.in.info = &u;
 	s.in.level = 24;
 
-	encode_pw_buffer(u.info24.password.data, newpass, STR_UNICODE);
 	u.info24.password_expired = 0;
 
 	status = dcerpc_fetch_session_key(p, &session_key);
@@ -643,7 +649,12 @@ static bool test_SetUserPass(struct dcerpc_pipe *p, struct torture_context *tctx
 		return false;
 	}
 
-	arcfour_crypt_blob(u.info24.password.data, 516, &session_key);
+	status = init_samr_CryptPassword(newpass,
+					  &session_key,
+					  &u.info24.password);
+	torture_assert_ntstatus_ok(tctx,
+				   status,
+				   "init_samr_CryptPassword failed");
 
 	torture_comment(tctx, "Testing SetUserInfo level 24 (set password)\n");
 
@@ -696,8 +707,6 @@ static bool test_SetUserPass_23(struct dcerpc_pipe *p, struct torture_context *t
 
 	u.info23.info.fields_present = fields_present;
 
-	encode_pw_buffer(u.info23.password.data, newpass, STR_UNICODE);
-
 	status = dcerpc_fetch_session_key(p, &session_key);
 	if (!NT_STATUS_IS_OK(status)) {
 		torture_result(tctx, TORTURE_FAIL, "SetUserInfo level %u - no session key - %s\n",
@@ -705,7 +714,12 @@ static bool test_SetUserPass_23(struct dcerpc_pipe *p, struct torture_context *t
 		return false;
 	}
 
-	arcfour_crypt_blob(u.info23.password.data, 516, &session_key);
+	status = init_samr_CryptPassword(newpass,
+					 &session_key,
+					 &u.info23.password);
+	torture_assert_ntstatus_ok(tctx,
+				   status,
+				   "init_samr_CryptPassword failed");
 
 	torture_comment(tctx, "Testing SetUserInfo level 23 (set password)\n");
 
@@ -722,8 +736,6 @@ static bool test_SetUserPass_23(struct dcerpc_pipe *p, struct torture_context *t
 		*password = newpass;
 	}
 
-	encode_pw_buffer(u.info23.password.data, newpass, STR_UNICODE);
-
 	status = dcerpc_fetch_session_key(p, &session_key);
 	if (!NT_STATUS_IS_OK(status)) {
 		torture_result(tctx, TORTURE_FAIL, "SetUserInfo level %u - no session key - %s\n",
@@ -732,8 +744,17 @@ static bool test_SetUserPass_23(struct dcerpc_pipe *p, struct torture_context *t
 	}
 
 	/* This should break the key nicely */
-	session_key.length--;
-	arcfour_crypt_blob(u.info23.password.data, 516, &session_key);
+	session_key.data[0]++;
+
+	status = init_samr_CryptPassword(newpass,
+					 &session_key,
+					 &u.info23.password);
+	torture_assert_ntstatus_ok(tctx,
+				   status,
+				   "init_samr_CryptPassword failed");
+
+	/* Reset the session key */
+	session_key.data[0]--;
 
 	torture_comment(tctx, "Testing SetUserInfo level 23 (set password) with wrong password\n");
 
@@ -761,14 +782,12 @@ static bool test_SetUserPassEx(struct dcerpc_pipe *p, struct torture_context *tc
 	union samr_UserInfo u;
 	bool ret = true;
 	DATA_BLOB session_key;
-	DATA_BLOB confounded_session_key = data_blob_talloc(tctx, NULL, 16);
-	uint8_t confounder[16];
 	char *newpass;
 	struct dcerpc_binding_handle *b = p->binding_handle;
-	MD5_CTX ctx;
 	struct samr_GetUserPwInfo pwp;
 	struct samr_PwInfo info;
 	int policy_min_pw_len = 0;
+
 	pwp.in.user_handle = handle;
 	pwp.out.info = &info;
 
@@ -787,7 +806,6 @@ static bool test_SetUserPassEx(struct dcerpc_pipe *p, struct torture_context *tc
 	s.in.info = &u;
 	s.in.level = 26;
 
-	encode_pw_buffer(u.info26.password.data, newpass, STR_UNICODE);
 	u.info26.password_expired = 0;
 
 	status = dcerpc_fetch_session_key(p, &session_key);
@@ -797,15 +815,12 @@ static bool test_SetUserPassEx(struct dcerpc_pipe *p, struct torture_context *tc
 		return false;
 	}
 
-	generate_random_buffer((uint8_t *)confounder, 16);
-
-	MD5Init(&ctx);
-	MD5Update(&ctx, confounder, 16);
-	MD5Update(&ctx, session_key.data, session_key.length);
-	MD5Final(confounded_session_key.data, &ctx);
-
-	arcfour_crypt_blob(u.info26.password.data, 516, &confounded_session_key);
-	memcpy(&u.info26.password.data[516], confounder, 16);
+	status = init_samr_CryptPasswordEx(newpass,
+					   &session_key,
+					   &u.info26.password);
+	torture_assert_ntstatus_ok(tctx,
+				   status,
+				   "init_samr_CryptPasswordEx failed");
 
 	torture_comment(tctx, "Testing SetUserInfo level 26 (set password ex)\n");
 
@@ -823,10 +838,17 @@ static bool test_SetUserPassEx(struct dcerpc_pipe *p, struct torture_context *tc
 	}
 
 	/* This should break the key nicely */
-	confounded_session_key.data[0]++;
+	session_key.data[0]++;
 
-	arcfour_crypt_blob(u.info26.password.data, 516, &confounded_session_key);
-	memcpy(&u.info26.password.data[516], confounder, 16);
+	status = init_samr_CryptPasswordEx(newpass,
+					   &session_key,
+					   &u.info26.password);
+	torture_assert_ntstatus_ok(tctx,
+				   status,
+				   "init_samr_CryptPasswordEx failed");
+
+	/* Reset the key */
+	session_key.data[0]--;
 
 	torture_comment(tctx, "Testing SetUserInfo level 26 (set password ex) with wrong session key\n");
 
@@ -855,14 +877,12 @@ static bool test_SetUserPass_25(struct dcerpc_pipe *p, struct torture_context *t
 	union samr_UserInfo u;
 	bool ret = true;
 	DATA_BLOB session_key;
-	DATA_BLOB confounded_session_key = data_blob_talloc(tctx, NULL, 16);
-	MD5_CTX ctx;
-	uint8_t confounder[16];
 	char *newpass;
 	struct dcerpc_binding_handle *b = p->binding_handle;
 	struct samr_GetUserPwInfo pwp;
 	struct samr_PwInfo info;
 	int policy_min_pw_len = 0;
+
 	pwp.in.user_handle = handle;
 	pwp.out.info = &info;
 
@@ -881,8 +901,6 @@ static bool test_SetUserPass_25(struct dcerpc_pipe *p, struct torture_context *t
 
 	u.info25.info.fields_present = fields_present;
 
-	encode_pw_buffer(u.info25.password.data, newpass, STR_UNICODE);
-
 	status = dcerpc_fetch_session_key(p, &session_key);
 	if (!NT_STATUS_IS_OK(status)) {
 		torture_result(tctx, TORTURE_FAIL, "SetUserInfo level %u - no session key - %s\n",
@@ -890,15 +908,12 @@ static bool test_SetUserPass_25(struct dcerpc_pipe *p, struct torture_context *t
 		return false;
 	}
 
-	generate_random_buffer((uint8_t *)confounder, 16);
-
-	MD5Init(&ctx);
-	MD5Update(&ctx, confounder, 16);
-	MD5Update(&ctx, session_key.data, session_key.length);
-	MD5Final(confounded_session_key.data, &ctx);
-
-	arcfour_crypt_blob(u.info25.password.data, 516, &confounded_session_key);
-	memcpy(&u.info25.password.data[516], confounder, 16);
+	status = init_samr_CryptPasswordEx(newpass,
+					   &session_key,
+					   &u.info25.password);
+	torture_assert_ntstatus_ok(tctx,
+				   status,
+				   "init_samr_CryptPasswordEx failed");
 
 	torture_comment(tctx, "Testing SetUserInfo level 25 (set password ex)\n");
 
@@ -916,10 +931,17 @@ static bool test_SetUserPass_25(struct dcerpc_pipe *p, struct torture_context *t
 	}
 
 	/* This should break the key nicely */
-	confounded_session_key.data[0]++;
+	session_key.data[0]++;
 
-	arcfour_crypt_blob(u.info25.password.data, 516, &confounded_session_key);
-	memcpy(&u.info25.password.data[516], confounder, 16);
+	status = init_samr_CryptPasswordEx(newpass,
+					   &session_key,
+					   &u.info25.password);
+	torture_assert_ntstatus_ok(tctx,
+				   status,
+				   "init_samr_CryptPasswordEx failed");
+
+	/* Reset the key */
+	session_key.data[0]--;
 
 	torture_comment(tctx, "Testing SetUserInfo level 25 (set password ex) with wrong session key\n");
 
@@ -985,14 +1007,14 @@ static bool test_SetUserPass_18(struct dcerpc_pipe *p, struct torture_context *t
 		DATA_BLOB in,out;
 		in = data_blob_const(nt_hash, 16);
 		out = data_blob_talloc_zero(tctx, 16);
-		sess_crypt_blob(&out, &in, &session_key, true);
+		sess_crypt_blob(&out, &in, &session_key, SAMBA_GNUTLS_ENCRYPT);
 		memcpy(u.info18.nt_pwd.hash, out.data, out.length);
 	}
 	{
 		DATA_BLOB in,out;
 		in = data_blob_const(lm_hash, 16);
 		out = data_blob_talloc_zero(tctx, 16);
-		sess_crypt_blob(&out, &in, &session_key, true);
+		sess_crypt_blob(&out, &in, &session_key, SAMBA_GNUTLS_ENCRYPT);
 		memcpy(u.info18.lm_pwd.hash, out.data, out.length);
 	}
 
@@ -1074,7 +1096,7 @@ static bool test_SetUserPass_21(struct dcerpc_pipe *p, struct torture_context *t
 		in = data_blob_const(u.info21.lm_owf_password.array,
 				     u.info21.lm_owf_password.length);
 		out = data_blob_talloc_zero(tctx, 16);
-		sess_crypt_blob(&out, &in, &session_key, true);
+		sess_crypt_blob(&out, &in, &session_key, SAMBA_GNUTLS_ENCRYPT);
 		u.info21.lm_owf_password.array = (uint16_t *)out.data;
 	}
 
@@ -1083,7 +1105,7 @@ static bool test_SetUserPass_21(struct dcerpc_pipe *p, struct torture_context *t
 		in = data_blob_const(u.info21.nt_owf_password.array,
 				     u.info21.nt_owf_password.length);
 		out = data_blob_talloc_zero(tctx, 16);
-		sess_crypt_blob(&out, &in, &session_key, true);
+		sess_crypt_blob(&out, &in, &session_key, SAMBA_GNUTLS_ENCRYPT);
 		u.info21.nt_owf_password.array = (uint16_t *)out.data;
 	}
 
@@ -1145,9 +1167,6 @@ static bool test_SetUserPass_level_ex(struct dcerpc_pipe *p,
 	union samr_UserInfo u;
 	bool ret = true;
 	DATA_BLOB session_key;
-	DATA_BLOB confounded_session_key = data_blob_talloc(tctx, NULL, 16);
-	MD5_CTX ctx;
-	uint8_t confounder[16];
 	char *newpass;
 	struct dcerpc_binding_handle *b = p->binding_handle;
 	struct samr_GetUserPwInfo pwp;
@@ -1223,13 +1242,9 @@ static bool test_SetUserPass_level_ex(struct dcerpc_pipe *p,
 		u.info23.info.password_expired = password_expired;
 		u.info23.info.comment.string = comment;
 
-		encode_pw_buffer(u.info23.password.data, newpass, STR_UNICODE);
-
 		break;
 	case 24:
 		u.info24.password_expired = password_expired;
-
-		encode_pw_buffer(u.info24.password.data, newpass, STR_UNICODE);
 
 		break;
 	case 25:
@@ -1237,13 +1252,9 @@ static bool test_SetUserPass_level_ex(struct dcerpc_pipe *p,
 		u.info25.info.password_expired = password_expired;
 		u.info25.info.comment.string = comment;
 
-		encode_pw_buffer(u.info25.password.data, newpass, STR_UNICODE);
-
 		break;
 	case 26:
 		u.info26.password_expired = password_expired;
-
-		encode_pw_buffer(u.info26.password.data, newpass, STR_UNICODE);
 
 		break;
 	}
@@ -1255,27 +1266,20 @@ static bool test_SetUserPass_level_ex(struct dcerpc_pipe *p,
 		return false;
 	}
 
-	generate_random_buffer((uint8_t *)confounder, 16);
-
-	MD5Init(&ctx);
-	MD5Update(&ctx, confounder, 16);
-	MD5Update(&ctx, session_key.data, session_key.length);
-	MD5Final(confounded_session_key.data, &ctx);
-
 	switch (level) {
 	case 18:
 		{
 			DATA_BLOB in,out;
 			in = data_blob_const(u.info18.nt_pwd.hash, 16);
 			out = data_blob_talloc_zero(tctx, 16);
-			sess_crypt_blob(&out, &in, &session_key, true);
+			sess_crypt_blob(&out, &in, &session_key, SAMBA_GNUTLS_ENCRYPT);
 			memcpy(u.info18.nt_pwd.hash, out.data, out.length);
 		}
 		{
 			DATA_BLOB in,out;
 			in = data_blob_const(u.info18.lm_pwd.hash, 16);
 			out = data_blob_talloc_zero(tctx, 16);
-			sess_crypt_blob(&out, &in, &session_key, true);
+			sess_crypt_blob(&out, &in, &session_key, SAMBA_GNUTLS_ENCRYPT);
 			memcpy(u.info18.lm_pwd.hash, out.data, out.length);
 		}
 
@@ -1286,7 +1290,7 @@ static bool test_SetUserPass_level_ex(struct dcerpc_pipe *p,
 			in = data_blob_const(u.info21.lm_owf_password.array,
 					     u.info21.lm_owf_password.length);
 			out = data_blob_talloc_zero(tctx, 16);
-			sess_crypt_blob(&out, &in, &session_key, true);
+			sess_crypt_blob(&out, &in, &session_key, SAMBA_GNUTLS_ENCRYPT);
 			u.info21.lm_owf_password.array = (uint16_t *)out.data;
 		}
 		if (fields_present & SAMR_FIELD_NT_PASSWORD_PRESENT) {
@@ -1294,23 +1298,41 @@ static bool test_SetUserPass_level_ex(struct dcerpc_pipe *p,
 			in = data_blob_const(u.info21.nt_owf_password.array,
 					     u.info21.nt_owf_password.length);
 			out = data_blob_talloc_zero(tctx, 16);
-			sess_crypt_blob(&out, &in, &session_key, true);
+			sess_crypt_blob(&out, &in, &session_key, SAMBA_GNUTLS_ENCRYPT);
 			u.info21.nt_owf_password.array = (uint16_t *)out.data;
 		}
 		break;
 	case 23:
-		arcfour_crypt_blob(u.info23.password.data, 516, &session_key);
+		status = init_samr_CryptPassword(newpass,
+						 &session_key,
+						 &u.info23.password);
+		torture_assert_ntstatus_ok(tctx,
+					   status,
+					   "init_samr_CryptPassword failed");
 		break;
 	case 24:
-		arcfour_crypt_blob(u.info24.password.data, 516, &session_key);
+		status = init_samr_CryptPassword(newpass,
+						 &session_key,
+						 &u.info24.password);
+		torture_assert_ntstatus_ok(tctx,
+					   status,
+					   "init_samr_CryptPassword failed");
 		break;
 	case 25:
-		arcfour_crypt_blob(u.info25.password.data, 516, &confounded_session_key);
-		memcpy(&u.info25.password.data[516], confounder, 16);
+		status = init_samr_CryptPasswordEx(newpass,
+						   &session_key,
+						   &u.info25.password);
+		torture_assert_ntstatus_ok(tctx,
+					   status,
+					   "init_samr_CryptPasswordEx failed");
 		break;
 	case 26:
-		arcfour_crypt_blob(u.info26.password.data, 516, &confounded_session_key);
-		memcpy(&u.info26.password.data[516], confounder, 16);
+		status = init_samr_CryptPasswordEx(newpass,
+						   &session_key,
+						   &u.info26.password);
+		torture_assert_ntstatus_ok(tctx,
+					   status,
+					   "init_samr_CryptPasswordEx failed");
 		break;
 	}
 
@@ -2011,6 +2033,11 @@ static bool test_OemChangePasswordUser2(struct dcerpc_pipe *p,
 	char *newpass;
 	struct dcerpc_binding_handle *b = p->binding_handle;
 	uint8_t old_lm_hash[16], new_lm_hash[16];
+	gnutls_cipher_hd_t cipher_hnd = NULL;
+	gnutls_datum_t session_key = {
+		.data = old_lm_hash,
+		.size = 16
+	};
 
 	struct samr_GetDomPwInfo dom_pw_info;
 	struct samr_PwInfo info;
@@ -2044,7 +2071,13 @@ static bool test_OemChangePasswordUser2(struct dcerpc_pipe *p,
 	E_deshash(newpass, new_lm_hash);
 
 	encode_pw_buffer(lm_pass.data, newpass, STR_ASCII);
-	arcfour_crypt(lm_pass.data, old_lm_hash, 516);
+
+	gnutls_cipher_init(&cipher_hnd,
+			   GNUTLS_CIPHER_ARCFOUR_128,
+			   &session_key,
+			   NULL);
+	gnutls_cipher_encrypt(cipher_hnd, lm_pass.data, 516);
+	gnutls_cipher_deinit(cipher_hnd);
 	E_old_pw_hash(new_lm_hash, old_lm_hash, lm_verifier.hash);
 
 	r.in.server = &server;
@@ -2071,7 +2104,12 @@ static bool test_OemChangePasswordUser2(struct dcerpc_pipe *p,
 	encode_pw_buffer(lm_pass.data, newpass, STR_ASCII);
 	/* Break the old password */
 	old_lm_hash[0]++;
-	arcfour_crypt(lm_pass.data, old_lm_hash, 516);
+	gnutls_cipher_init(&cipher_hnd,
+			   GNUTLS_CIPHER_ARCFOUR_128,
+			   &session_key,
+			   NULL);
+	gnutls_cipher_encrypt(cipher_hnd, lm_pass.data, 516);
+	gnutls_cipher_deinit(cipher_hnd);
 	/* unbreak it for the next operation */
 	old_lm_hash[0]--;
 	E_old_pw_hash(new_lm_hash, old_lm_hash, lm_verifier.hash);
@@ -2089,13 +2127,18 @@ static bool test_OemChangePasswordUser2(struct dcerpc_pipe *p,
 
 	if (!NT_STATUS_EQUAL(r.out.result, NT_STATUS_PASSWORD_RESTRICTION)
 	    && !NT_STATUS_EQUAL(r.out.result, NT_STATUS_WRONG_PASSWORD)) {
-		torture_result(tctx, TORTURE_FAIL, "OemChangePasswordUser2 failed, should have returned WRONG_PASSWORD (or at least 'PASSWORD_RESTRICTON') for invalidly encrpted password - %s\n",
+		torture_result(tctx, TORTURE_FAIL, "OemChangePasswordUser2 failed, should have returned WRONG_PASSWORD (or at least 'PASSWORD_RESTRICTON') for invalidly encrypted password - %s\n",
 			nt_errstr(r.out.result));
 		ret = false;
 	}
 
 	encode_pw_buffer(lm_pass.data, newpass, STR_ASCII);
-	arcfour_crypt(lm_pass.data, old_lm_hash, 516);
+	gnutls_cipher_init(&cipher_hnd,
+			   GNUTLS_CIPHER_ARCFOUR_128,
+			   &session_key,
+			   NULL);
+	gnutls_cipher_encrypt(cipher_hnd, lm_pass.data, 516);
+	gnutls_cipher_deinit(cipher_hnd);
 
 	r.in.server = &server;
 	r.in.account = &account;
@@ -2171,7 +2214,12 @@ static bool test_OemChangePasswordUser2(struct dcerpc_pipe *p,
 	E_deshash(newpass, new_lm_hash);
 
 	encode_pw_buffer(lm_pass.data, newpass, STR_ASCII);
-	arcfour_crypt(lm_pass.data, old_lm_hash, 516);
+	gnutls_cipher_init(&cipher_hnd,
+			   GNUTLS_CIPHER_ARCFOUR_128,
+			   &session_key,
+			   NULL);
+	gnutls_cipher_encrypt(cipher_hnd, lm_pass.data, 516);
+	gnutls_cipher_deinit(cipher_hnd);
 	E_old_pw_hash(new_lm_hash, old_lm_hash, lm_verifier.hash);
 
 	r.in.server = &server;
@@ -2212,11 +2260,19 @@ static bool test_ChangePasswordUser2(struct dcerpc_pipe *p, struct torture_conte
 	struct dcerpc_binding_handle *b = p->binding_handle;
 	uint8_t old_nt_hash[16], new_nt_hash[16];
 	uint8_t old_lm_hash[16], new_lm_hash[16];
-
+	DATA_BLOB old_nt_hash_blob
+		= data_blob_const(old_nt_hash, sizeof(old_nt_hash));
 	struct samr_GetDomPwInfo dom_pw_info;
 	struct samr_PwInfo info;
 
 	struct lsa_String domain_name;
+	NTSTATUS status;
+
+	gnutls_cipher_hd_t cipher_hnd = NULL;
+	gnutls_datum_t old_lm_key = {
+		.data = old_lm_hash,
+		.size = sizeof(old_lm_hash),
+	};
 
 	domain_name.string = "";
 	dom_pw_info.in.domain_name = &domain_name;
@@ -2249,11 +2305,25 @@ static bool test_ChangePasswordUser2(struct dcerpc_pipe *p, struct torture_conte
 	E_deshash(newpass, new_lm_hash);
 
 	encode_pw_buffer(lm_pass.data, newpass, STR_ASCII|STR_TERMINATE);
-	arcfour_crypt(lm_pass.data, old_lm_hash, 516);
+
+	gnutls_cipher_init(&cipher_hnd,
+			   GNUTLS_CIPHER_ARCFOUR_128,
+			   &old_lm_key,
+			   NULL);
+	gnutls_cipher_encrypt(cipher_hnd,
+			      lm_pass.data,
+			      516);
+	gnutls_cipher_deinit(cipher_hnd);
+
 	E_old_pw_hash(new_nt_hash, old_lm_hash, lm_verifier.hash);
 
-	encode_pw_buffer(nt_pass.data, newpass, STR_UNICODE);
-	arcfour_crypt(nt_pass.data, old_nt_hash, 516);
+	status = init_samr_CryptPassword(newpass,
+					 &old_nt_hash_blob,
+					 &nt_pass);
+	torture_assert_ntstatus_ok(tctx,
+				   status,
+				   "init_samr_CryptPassword failed");
+
 	E_old_pw_hash(new_nt_hash, old_nt_hash, nt_verifier.hash);
 
 	r.in.server = &server;
@@ -2295,11 +2365,20 @@ static bool test_ChangePasswordUser2_ntstatus(struct dcerpc_pipe *p, struct tort
 	struct dcerpc_binding_handle *b = p->binding_handle;
 	uint8_t old_nt_hash[16], new_nt_hash[16];
 	uint8_t old_lm_hash[16], new_lm_hash[16];
+	DATA_BLOB old_nt_hash_blob
+		= data_blob_const(old_nt_hash, sizeof(old_nt_hash));
+	gnutls_cipher_hd_t cipher_hnd = NULL;
+	gnutls_datum_t old_lm_key = {
+		.data = old_lm_hash,
+		.size = sizeof(old_lm_hash),
+	};
 
 	struct samr_GetDomPwInfo dom_pw_info;
 	struct samr_PwInfo info;
 
 	struct lsa_String domain_name;
+	NTSTATUS crypt_status;
+
 	char *newpass;
 	int policy_min_pw_len = 0;
 
@@ -2329,11 +2408,25 @@ static bool test_ChangePasswordUser2_ntstatus(struct dcerpc_pipe *p, struct tort
 	E_deshash(newpass, new_lm_hash);
 
 	encode_pw_buffer(lm_pass.data, newpass, STR_ASCII|STR_TERMINATE);
-	arcfour_crypt(lm_pass.data, old_lm_hash, 516);
+
+	gnutls_cipher_init(&cipher_hnd,
+			   GNUTLS_CIPHER_ARCFOUR_128,
+			   &old_lm_key,
+			   NULL);
+	gnutls_cipher_encrypt(cipher_hnd,
+			      lm_pass.data,
+			      516);
+	gnutls_cipher_deinit(cipher_hnd);
+
 	E_old_pw_hash(new_nt_hash, old_lm_hash, lm_verifier.hash);
 
-	encode_pw_buffer(nt_pass.data, newpass, STR_UNICODE);
-	arcfour_crypt(nt_pass.data, old_nt_hash, 516);
+	crypt_status = init_samr_CryptPassword(newpass,
+					       &old_nt_hash_blob,
+					       &nt_pass);
+	torture_assert_ntstatus_ok(tctx,
+				   crypt_status,
+				   "init_samr_CryptPassword failed");
+
 	E_old_pw_hash(new_nt_hash, old_nt_hash, nt_verifier.hash);
 
 	r.in.server = &server;
@@ -2380,6 +2473,8 @@ bool test_ChangePasswordUser3(struct dcerpc_pipe *p, struct torture_context *tct
 	NTTIME t;
 	struct samr_DomInfo1 *dominfo = NULL;
 	struct userPwdChangeFailureInformation *reject = NULL;
+	DATA_BLOB old_nt_hash_blob = data_blob_const(old_nt_hash, 16);
+	NTSTATUS status;
 
 	torture_comment(tctx, "Testing ChangePasswordUser3\n");
 
@@ -2408,12 +2503,45 @@ bool test_ChangePasswordUser3(struct dcerpc_pipe *p, struct torture_context *tct
 	E_deshash(oldpass, old_lm_hash);
 	E_deshash(newpass, new_lm_hash);
 
-	encode_pw_buffer(lm_pass.data, newpass, STR_UNICODE);
-	arcfour_crypt(lm_pass.data, old_nt_hash, 516);
+	/*
+	 * The new plaintext password is encrypted using RC4 with the
+	 * old NT password hash (directly, with no confounder).  The
+	 * password is at the end of the random padded buffer,
+	 * offering a little protection.
+	 *
+	 * This is almost certainly wrong, it should be the old LM
+	 * hash, it was switched in an unrelated commit
+	 * 579c13da43d5b40ac6d6c1436399fbc1d8dfd054 in 2004.
+	 */
+	status = init_samr_CryptPassword(newpass,
+					 &old_nt_hash_blob,
+					 &lm_pass);
+	torture_assert_ntstatus_ok(tctx,
+				   status,
+				   "init_samr_CryptPassword");
+
+	/*
+	 * Now we prepare a DES cross-hash of the old LM and new NT
+	 * passwords to link the two buffers
+	 */
 	E_old_pw_hash(new_nt_hash, old_lm_hash, lm_verifier.hash);
 
-	encode_pw_buffer(nt_pass.data, newpass, STR_UNICODE);
-	arcfour_crypt(nt_pass.data, old_nt_hash, 516);
+	/*
+	 * The new plaintext password is also encrypted using RC4 with
+	 * the old NT password hash (directly, with no confounder).
+	 * The password is at the end of the random padded buffer,
+	 * offering a little protection.
+	 */
+	status = init_samr_CryptPassword(newpass,
+					 &old_nt_hash_blob,
+					 &nt_pass);
+	torture_assert_ntstatus_ok(tctx,
+				   status,
+				   "init_samr_CryptPassword");
+
+	/*
+	 * Another DES based cross-hash
+	 */
 	E_old_pw_hash(new_nt_hash, old_nt_hash, nt_verifier.hash);
 
 	/* Break the verification */
@@ -2442,16 +2570,28 @@ bool test_ChangePasswordUser3(struct dcerpc_pipe *p, struct torture_context *tct
 		ret = false;
 	}
 
-	encode_pw_buffer(lm_pass.data, newpass, STR_UNICODE);
-	arcfour_crypt(lm_pass.data, old_nt_hash, 516);
+	status = init_samr_CryptPassword(newpass,
+					 &old_nt_hash_blob,
+					 &lm_pass);
+	torture_assert_ntstatus_ok(tctx,
+				   status,
+				   "init_samr_CryptPassword");
+
 	E_old_pw_hash(new_nt_hash, old_lm_hash, lm_verifier.hash);
 
-	encode_pw_buffer(nt_pass.data, newpass, STR_UNICODE);
-	/* Break the NT hash */
+	/* Break the NT Hash */
 	old_nt_hash[0]++;
-	arcfour_crypt(nt_pass.data, old_nt_hash, 516);
+
+	status = init_samr_CryptPassword(newpass,
+					 &old_nt_hash_blob,
+					 &nt_pass);
+	torture_assert_ntstatus_ok(tctx,
+				   status,
+				   "init_samr_CryptPassword");
+
 	/* Unbreak it again */
 	old_nt_hash[0]--;
+
 	E_old_pw_hash(new_nt_hash, old_nt_hash, nt_verifier.hash);
 
 	r.in.server = &server;
@@ -2472,7 +2612,7 @@ bool test_ChangePasswordUser3(struct dcerpc_pipe *p, struct torture_context *tct
 			oldpass, newpass, nt_errstr(r.out.result));
 	if (!NT_STATUS_EQUAL(r.out.result, NT_STATUS_PASSWORD_RESTRICTION) &&
 	    (!NT_STATUS_EQUAL(r.out.result, NT_STATUS_WRONG_PASSWORD))) {
-		torture_result(tctx, TORTURE_FAIL, "ChangePasswordUser3 failed, should have returned WRONG_PASSWORD (or at least 'PASSWORD_RESTRICTON') for invalidly encrpted password - %s\n",
+		torture_result(tctx, TORTURE_FAIL, "ChangePasswordUser3 failed, should have returned WRONG_PASSWORD (or at least 'PASSWORD_RESTRICTON') for invalidly encrypted password - %s\n",
 			nt_errstr(r.out.result));
 		ret = false;
 	}
@@ -2498,12 +2638,22 @@ bool test_ChangePasswordUser3(struct dcerpc_pipe *p, struct torture_context *tct
 	E_deshash(oldpass, old_lm_hash);
 	E_deshash(newpass, new_lm_hash);
 
-	encode_pw_buffer(lm_pass.data, newpass, STR_UNICODE);
-	arcfour_crypt(lm_pass.data, old_nt_hash, 516);
+	status = init_samr_CryptPassword(newpass,
+					 &old_nt_hash_blob,
+					 &lm_pass);
+	torture_assert_ntstatus_ok(tctx,
+				   status,
+				   "init_samr_CryptPassword");
+
 	E_old_pw_hash(new_nt_hash, old_lm_hash, lm_verifier.hash);
 
-	encode_pw_buffer(nt_pass.data, newpass, STR_UNICODE);
-	arcfour_crypt(nt_pass.data, old_nt_hash, 516);
+	status = init_samr_CryptPassword(newpass,
+					 &old_nt_hash_blob,
+					 &nt_pass);
+	torture_assert_ntstatus_ok(tctx,
+				   status,
+				   "init_samr_CryptPassword");
+
 	E_old_pw_hash(new_nt_hash, old_nt_hash, nt_verifier.hash);
 
 	r.in.server = &server;
@@ -2628,9 +2778,6 @@ bool test_ChangePasswordRandomBytes(struct dcerpc_pipe *p, struct torture_contex
 	struct samr_SetUserInfo s;
 	union samr_UserInfo u;
 	DATA_BLOB session_key;
-	DATA_BLOB confounded_session_key = data_blob_talloc(tctx, NULL, 16);
-	uint8_t confounder[16];
-	MD5_CTX ctx;
 
 	bool ret = true;
 	struct lsa_String server, account;
@@ -2641,9 +2788,22 @@ bool test_ChangePasswordRandomBytes(struct dcerpc_pipe *p, struct torture_contex
 	char *oldpass;
 	struct dcerpc_binding_handle *b = p->binding_handle;
 	uint8_t old_nt_hash[16], new_nt_hash[16];
+	DATA_BLOB old_nt_hash_blob
+		= data_blob_const(old_nt_hash,
+				  sizeof(old_nt_hash));
 	NTTIME t;
 	struct samr_DomInfo1 *dominfo = NULL;
 	struct userPwdChangeFailureInformation *reject = NULL;
+	gnutls_cipher_hd_t cipher_hnd = NULL;
+	uint8_t _confounder[16] = {0};
+	DATA_BLOB confounder
+		= data_blob_const(_confounder,
+				  sizeof(_confounder));
+	DATA_BLOB pw_data;
+	gnutls_datum_t old_nt_key = {
+		.data = old_nt_hash,
+		.size = sizeof(old_nt_hash),
+	};
 
 	new_random_pass = samr_very_rand_pass(tctx, 128);
 
@@ -2664,6 +2824,8 @@ bool test_ChangePasswordRandomBytes(struct dcerpc_pipe *p, struct torture_contex
 
 	set_pw_in_buffer(u.info25.password.data, &new_random_pass);
 
+	pw_data = data_blob_const(u.info25.password.data, 516);
+
 	status = dcerpc_fetch_session_key(p, &session_key);
 	if (!NT_STATUS_IS_OK(status)) {
 		torture_result(tctx, TORTURE_FAIL, "SetUserInfo level %u - no session key - %s\n",
@@ -2671,15 +2833,15 @@ bool test_ChangePasswordRandomBytes(struct dcerpc_pipe *p, struct torture_contex
 		return false;
 	}
 
-	generate_random_buffer((uint8_t *)confounder, 16);
+	generate_random_buffer(_confounder,
+			       sizeof(_confounder));
 
-	MD5Init(&ctx);
-	MD5Update(&ctx, confounder, 16);
-	MD5Update(&ctx, session_key.data, session_key.length);
-	MD5Final(confounded_session_key.data, &ctx);
+	samba_gnutls_arcfour_confounded_md5(&confounder,
+					    &session_key,
+					    &pw_data,
+					    SAMBA_GNUTLS_ENCRYPT);
 
-	arcfour_crypt_blob(u.info25.password.data, 516, &confounded_session_key);
-	memcpy(&u.info25.password.data[516], confounder, 16);
+	memcpy(&u.info25.password.data[516], _confounder, sizeof(_confounder));
 
 	torture_comment(tctx, "Testing SetUserInfo level 25 (set password ex) with a password made up of only random bytes\n");
 
@@ -2703,7 +2865,16 @@ bool test_ChangePasswordRandomBytes(struct dcerpc_pipe *p, struct torture_contex
 	mdfour(new_nt_hash, new_random_pass.data, new_random_pass.length);
 
 	set_pw_in_buffer(nt_pass.data, &new_random_pass);
-	arcfour_crypt(nt_pass.data, old_nt_hash, 516);
+
+	gnutls_cipher_init(&cipher_hnd,
+			   GNUTLS_CIPHER_ARCFOUR_128,
+			   &old_nt_key,
+			   NULL);
+	gnutls_cipher_encrypt(cipher_hnd,
+			      nt_pass.data,
+			      516);
+	gnutls_cipher_deinit(cipher_hnd);
+
 	E_old_pw_hash(new_nt_hash, old_nt_hash, nt_verifier.hash);
 
 	r.in.server = &server;
@@ -2744,8 +2915,13 @@ bool test_ChangePasswordRandomBytes(struct dcerpc_pipe *p, struct torture_contex
 
 	E_md4hash(newpass, new_nt_hash);
 
-	encode_pw_buffer(nt_pass.data, newpass, STR_UNICODE);
-	arcfour_crypt(nt_pass.data, old_nt_hash, 516);
+	status = init_samr_CryptPassword(newpass,
+					 &old_nt_hash_blob,
+					 &nt_pass);
+	torture_assert_ntstatus_ok(tctx,
+				   status,
+				   "init_samr_CryptPassword failed");
+
 	E_old_pw_hash(new_nt_hash, old_nt_hash, nt_verifier.hash);
 
 	r.in.server = &server;
@@ -3057,8 +3233,7 @@ static bool test_SamLogon(struct torture_context *tctx,
 	identity.parameter_control =
 		MSV1_0_ALLOW_SERVER_TRUST_ACCOUNT |
 		MSV1_0_ALLOW_WORKSTATION_TRUST_ACCOUNT;
-	identity.logon_id_low = 0;
-	identity.logon_id_high = 0;
+	identity.logon_id = 0;
 	identity.workstation.string = cli_credentials_get_workstation(test_credentials);
 
 	if (interactive) {
@@ -3096,6 +3271,7 @@ static bool test_SamLogon(struct torture_context *tctx,
 		status = cli_credentials_get_ntlm_response(test_credentials, tctx,
 							   &flags,
 							   chal,
+							   NULL, /* server_timestamp */
 							   names_blob,
 							   &lm_resp, &nt_resp,
 							   NULL, NULL);
@@ -3257,7 +3433,8 @@ static bool setup_schannel_netlogon_pipe(struct torture_context *tctx,
 	 * with INTERNAL_ERROR */
 
 	status = dcerpc_binding_set_flags(b,
-					  DCERPC_SCHANNEL | DCERPC_SIGN |
+					  DCERPC_SCHANNEL |
+					  DCERPC_SIGN | DCERPC_SEAL |
 					  DCERPC_SCHANNEL_AUTO,
 					  DCERPC_AUTH_OPTIONS);
 	torture_assert_ntstatus_ok(tctx, status, "set flags");
@@ -4776,6 +4953,41 @@ static bool test_DeleteUser_with_privs(struct dcerpc_pipe *p,
 	}
 
 	{
+		struct lsa_RightSet rights;
+		struct lsa_StringLarge names[2];
+		struct lsa_AddAccountRights r;
+
+		torture_comment(tctx, "Testing LSA AddAccountRights 1\n");
+
+		init_lsa_StringLarge(&names[0], "SeInteractiveLogonRight");
+		init_lsa_StringLarge(&names[1], NULL);
+
+		rights.count = 1;
+		rights.names = names;
+
+		r.in.handle = lsa_handle;
+		r.in.sid = user_sid;
+		r.in.rights = &rights;
+
+		torture_assert_ntstatus_ok(tctx, dcerpc_lsa_AddAccountRights_r(lb, tctx, &r),
+			"lsa_AddAccountRights 1 failed");
+
+		if (torture_setting_bool(tctx, "nt4_dc", false)) {
+			/*
+			 * The NT4 DC doesn't implement Rights.
+			 */
+			torture_assert_ntstatus_equal(tctx, r.out.result,
+				NT_STATUS_NO_SUCH_PRIVILEGE,
+				"Add rights failed with incorrect error");
+		} else {
+			torture_assert_ntstatus_ok(tctx, r.out.result,
+				"Failed to add rights");
+
+		}
+	}
+
+
+	{
 		struct lsa_EnumAccounts r;
 		uint32_t resume_handle = 0;
 		struct lsa_SidArray lsa_sid_array;
@@ -4808,6 +5020,14 @@ static bool test_DeleteUser_with_privs(struct dcerpc_pipe *p,
 	{
 		struct lsa_EnumAccountRights r;
 		struct lsa_RightSet user_rights;
+		uint32_t expected_count = 2;
+
+		if (torture_setting_bool(tctx, "nt4_dc", false)) {
+			/*
+			 * NT4 DC doesn't store rights.
+			 */
+			expected_count = 1;
+		}
 
 		torture_comment(tctx, "Testing LSA EnumAccountRights\n");
 
@@ -4820,7 +5040,7 @@ static bool test_DeleteUser_with_privs(struct dcerpc_pipe *p,
 		torture_assert_ntstatus_ok(tctx, r.out.result,
 			"Failed to enum rights for account");
 
-		if (user_rights.count < 1) {
+		if (user_rights.count < expected_count) {
 			torture_result(tctx, TORTURE_FAIL, "failed to find newly added rights");
 			return false;
 		}

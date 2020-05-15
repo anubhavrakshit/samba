@@ -167,14 +167,15 @@ static int copy_reg(const char *source, const char *dest)
 	return -1;
 }
 
-
-static int crossrename_rename(vfs_handle_struct *handle,
-			  const struct smb_filename *smb_fname_src,
-			  const struct smb_filename *smb_fname_dst)
+static int crossrename_renameat(vfs_handle_struct *handle,
+			files_struct *srcfsp,
+			const struct smb_filename *smb_fname_src,
+			files_struct *dstfsp,
+			const struct smb_filename *smb_fname_dst)
 {
 	int result = -1;
 
-	START_PROFILE(syscall_rename);
+	START_PROFILE(syscall_renameat);
 
 	if (smb_fname_src->stream_name || smb_fname_dst->stream_name) {
 		errno = ENOENT;
@@ -189,17 +190,18 @@ static int crossrename_rename(vfs_handle_struct *handle,
 	}
 
  out:
-	END_PROFILE(syscall_rename);
+	END_PROFILE(syscall_renameat);
 	return result;
 }
 
+
 static struct vfs_fn_pointers vfs_crossrename_fns = {
 	.connect_fn = crossrename_connect,
-	.rename_fn = crossrename_rename
+	.renameat_fn = crossrename_renameat
 };
 
-NTSTATUS vfs_crossrename_init(void);
-NTSTATUS vfs_crossrename_init(void)
+static_decl_vfs;
+NTSTATUS vfs_crossrename_init(TALLOC_CTX *ctx)
 {
 	return smb_register_vfs(SMB_VFS_INTERFACE_VERSION, MODULE,
 				&vfs_crossrename_fns);

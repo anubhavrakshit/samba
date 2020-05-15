@@ -56,14 +56,12 @@ interface winbind
 	[in,out] wbint_TransIDArray *ids
 	);
 
-    NTSTATUS wbint_Uid2Sid(
-	[in] hyper uid,
-	[out] dom_sid *sid
-	);
-
-    NTSTATUS wbint_Gid2Sid(
-	[in] hyper gid,
-	[out] dom_sid *sid
+    NTSTATUS wbint_UnixIDs2Sids(
+	[in,string,charset(UTF8)] char *domain_name,
+	[in] dom_sid domain_sid,
+	[in] uint32 num_ids,
+	[in,out] unixid xids[num_ids],
+	[out] dom_sid sids[num_ids]
 	);
 
     NTSTATUS wbint_AllocateUid(
@@ -75,18 +73,20 @@ interface winbind
 	);
 
     typedef [public] struct {
+	[string,charset(UTF8)] char *domain_name;
 	[string,charset(UTF8)] char *acct_name;
 	[string,charset(UTF8)] char *full_name;
 	[string,charset(UTF8)] char *homedir;
 	[string,charset(UTF8)] char *shell;
+	hyper uid;
 	hyper primary_gid;
+	[string,charset(UTF8)] char *primary_group_name;
 	dom_sid user_sid;
 	dom_sid group_sid;
     } wbint_userinfo;
 
-    NTSTATUS wbint_QueryUser(
-	[in] dom_sid *sid,
-	[out] wbint_userinfo *info
+    NTSTATUS wbint_GetNssInfo(
+	[in,out] wbint_userinfo *info
 	);
 
     typedef [public] struct {
@@ -120,7 +120,7 @@ interface winbind
     } wbint_Principal;
 
     typedef [public] struct {
-	int num_principals;
+	uint32 num_principals;
 	[size_is(num_principals)] wbint_Principal principals[];
     } wbint_Principals;
 
@@ -135,12 +135,12 @@ interface winbind
 	[size_is(num_userinfos)] wbint_userinfo userinfos[];
     } wbint_userinfos;
 
-    NTSTATUS wbint_QueryUserList(
-	[out] wbint_userinfos *users
-	);
-
     NTSTATUS wbint_QueryGroupList(
 	[out] wbint_Principals *groups
+	);
+
+    NTSTATUS wbint_QueryUserRidList(
+	[out] wbint_RidArray *rids
 	);
 
     NTSTATUS wbint_DsGetDcName(
@@ -212,4 +212,9 @@ interface winbind
 		[in] uint32 flags,
 		[out,ref] lsa_ForestTrustInformation **forest_trust_info
 		);
+
+	NTSTATUS winbind_SendToSam(
+		[in] netr_SendToSamBase message
+		);
+
 }

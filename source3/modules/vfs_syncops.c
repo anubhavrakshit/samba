@@ -111,36 +111,27 @@ static void syncops_two_names(const char *name1, const char *name2)
 /*
   sync two meta data changes for 1 names
  */
-static void syncops_name(const char *name)
-{
-	char *parent;
-	parent = parent_dir(NULL, name);
-	if (parent) {
-		syncops_sync_directory(parent);
-		talloc_free(parent);
-	}
-}
-
-/*
-  sync two meta data changes for 1 names
- */
 static void syncops_smb_fname(const struct smb_filename *smb_fname)
 {
-	char *parent;
-	parent = parent_dir(NULL, smb_fname->base_name);
-	if (parent) {
-		syncops_sync_directory(parent);
-		talloc_free(parent);
+	char *parent = NULL;
+	if (smb_fname != NULL) {
+		parent = parent_dir(NULL, smb_fname->base_name);
+		if (parent != NULL) {
+			syncops_sync_directory(parent);
+			talloc_free(parent);
+		}
 	}
 }
 
 
 /*
-  rename needs special handling, as we may need to fsync two directories
+  renameat needs special handling, as we may need to fsync two directories
  */
-static int syncops_rename(vfs_handle_struct *handle,
-			  const struct smb_filename *smb_fname_src,
-			  const struct smb_filename *smb_fname_dst)
+static int syncops_renameat(vfs_handle_struct *handle,
+			files_struct *srcfsp,
+			const struct smb_filename *smb_fname_src,
+			files_struct *dstfsp,
+			const struct smb_filename *smb_fname_dst)
 {
 
 	int ret;
@@ -150,27 +141,17 @@ static int syncops_rename(vfs_handle_struct *handle,
 				struct syncops_config_data,
 				return -1);
 
-	ret = SMB_VFS_NEXT_RENAME(handle, smb_fname_src, smb_fname_dst);
+	ret = SMB_VFS_NEXT_RENAMEAT(handle,
+			srcfsp,
+			smb_fname_src,
+			dstfsp,
+			smb_fname_dst);
 	if (ret == 0 && config->onmeta && !config->disable) {
 		syncops_two_names(smb_fname_src->base_name,
 				  smb_fname_dst->base_name);
 	}
 	return ret;
 }
-
-/* handle the rest with a macro */
-#define SYNCOPS_NEXT(op, fname, args) do {   \
-	int ret; \
-	struct syncops_config_data *config; \
-	SMB_VFS_HANDLE_GET_DATA(handle, config, \
-				struct syncops_config_data, \
-				return -1); \
-	ret = SMB_VFS_NEXT_ ## op args; \
-	if (ret == 0 \
-		&& config->onmeta && !config->disable  \
-		&& fname) syncops_name(fname); \
-	return ret; \
-} while (0)
 
 #define SYNCOPS_NEXT_SMB_FNAME(op, fname, args) do {   \
 	int ret; \
@@ -185,17 +166,61 @@ static int syncops_rename(vfs_handle_struct *handle,
 	return ret; \
 } while (0)
 
-static int syncops_symlink(vfs_handle_struct *handle,
-			   const char *oldname, const char *newname)
+static int syncops_symlinkat(vfs_handle_struct *handle,
+			const struct smb_filename *link_contents,
+			struct files_struct *dirfsp,
+			const struct smb_filename *new_smb_fname)
 {
-	SYNCOPS_NEXT(SYMLINK, newname, (handle, oldname, newname));
+	int ret;
+	struct syncops_config_data *config;
+
+	SMB_VFS_HANDLE_GET_DATA(handle, config,
+				struct syncops_config_data,
+				return -1);
+
+	ret = SMB_VFS_NEXT_SYMLINKAT(handle,
+				link_contents,
+				dirfsp,
+				new_smb_fname);
+
+	if (ret == 0 && config->onmeta && !config->disable) {
+		syncops_two_names(link_contents->base_name,
+				  new_smb_fname->base_name);
+	}
+	return ret;
 }
 
-static int syncops_link(vfs_handle_struct *handle,
-			 const char *oldname, const char *newname)
+static int syncops_linkat(vfs_handle_struct *handle,
+			files_struct *srcfsp,
+			const struct smb_filename *old_smb_fname,
+			files_struct *dstfsp,
+			const struct smb_filename *new_smb_fname,
+			int flags)
 {
-	SYNCOPS_NEXT(LINK, newname, (handle, oldname, newname));
+	int ret;
+	struct syncops_config_data *config;
+
+	SMB_VFS_HANDLE_GET_DATA(handle, config,
+				struct syncops_config_data,
+				return -1);
+
+	SMB_ASSERT(srcfsp == srcfsp->conn->cwd_fsp);
+	SMB_ASSERT(dstfsp == dstfsp->conn->cwd_fsp);
+
+	ret = SMB_VFS_NEXT_LINKAT(handle,
+			srcfsp,
+			old_smb_fname,
+			dstfsp,
+			new_smb_fname,
+			flags);
+
+	if (ret == 0 && config->onmeta && !config->disable) {
+		syncops_two_names(old_smb_fname->base_name,
+				  new_smb_fname->base_name);
+	}
+	return ret;
 }
+
 
 static int syncops_open(vfs_handle_struct *handle,
 			struct smb_filename *smb_fname, files_struct *fsp,
@@ -205,26 +230,45 @@ static int syncops_open(vfs_handle_struct *handle,
 			       (handle, smb_fname, fsp, flags, mode));
 }
 
-static int syncops_unlink(vfs_handle_struct *handle,
-			  const struct smb_filename *smb_fname)
+static int syncops_unlinkat(vfs_handle_struct *handle,
+			files_struct *dirfsp,
+			const struct smb_filename *smb_fname,
+			int flags)
 {
-        SYNCOPS_NEXT_SMB_FNAME(UNLINK, smb_fname, (handle, smb_fname));
+        SYNCOPS_NEXT_SMB_FNAME(UNLINKAT,
+			smb_fname,
+				(handle,
+				dirfsp,
+				smb_fname,
+				flags));
 }
 
-static int syncops_mknod(vfs_handle_struct *handle,
-			 const char *fname, mode_t mode, SMB_DEV_T dev)
+static int syncops_mknodat(vfs_handle_struct *handle,
+			files_struct *dirfsp,
+			const struct smb_filename *smb_fname,
+			mode_t mode,
+			SMB_DEV_T dev)
 {
-        SYNCOPS_NEXT(MKNOD, fname, (handle, fname, mode, dev));
+        SYNCOPS_NEXT_SMB_FNAME(MKNODAT,
+			smb_fname,
+				(handle,
+				dirfsp,
+				smb_fname,
+				mode,
+				dev));
 }
 
-static int syncops_mkdir(vfs_handle_struct *handle,  const char *fname, mode_t mode)
+static int syncops_mkdirat(vfs_handle_struct *handle,
+			struct files_struct *dirfsp,
+			const struct smb_filename *smb_fname,
+			mode_t mode)
 {
-        SYNCOPS_NEXT(MKDIR, fname, (handle, fname, mode));
-}
-
-static int syncops_rmdir(vfs_handle_struct *handle,  const char *fname)
-{
-        SYNCOPS_NEXT(RMDIR, fname, (handle, fname));
+        SYNCOPS_NEXT_SMB_FNAME(MKDIRAT,
+			smb_fname,
+				(handle,
+				dirfsp,
+				smb_fname,
+				mode));
 }
 
 /* close needs to be handled specially */
@@ -236,7 +280,7 @@ static int syncops_close(vfs_handle_struct *handle, files_struct *fsp)
 				struct syncops_config_data,
 				return -1);
 
-	if (fsp->can_write && config->onclose) {
+	if (fsp->fsp_flags.can_write && config->onclose) {
 		/* ideally we'd only do this if we have written some
 		 data, but there is no flag for that in fsp yet. */
 		fsync(fsp->fh->fd);
@@ -280,19 +324,18 @@ static int syncops_connect(struct vfs_handle_struct *handle, const char *service
 
 static struct vfs_fn_pointers vfs_syncops_fns = {
 	.connect_fn = syncops_connect,
-	.mkdir_fn = syncops_mkdir,
-	.rmdir_fn = syncops_rmdir,
+	.mkdirat_fn = syncops_mkdirat,
 	.open_fn = syncops_open,
-	.rename_fn = syncops_rename,
-	.unlink_fn = syncops_unlink,
-	.symlink_fn = syncops_symlink,
-	.link_fn = syncops_link,
-	.mknod_fn = syncops_mknod,
+	.renameat_fn = syncops_renameat,
+	.unlinkat_fn = syncops_unlinkat,
+	.symlinkat_fn = syncops_symlinkat,
+	.linkat_fn = syncops_linkat,
+	.mknodat_fn = syncops_mknodat,
 	.close_fn = syncops_close,
 };
 
 static_decl_vfs;
-NTSTATUS vfs_syncops_init(void)
+NTSTATUS vfs_syncops_init(TALLOC_CTX *ctx)
 {
 	NTSTATUS ret;
 

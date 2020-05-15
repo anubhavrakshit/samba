@@ -2,6 +2,7 @@
  * NFS4 ACL handling
  *
  * Copyright (C) Jim McDonough, 2006
+ * Copyright (C) Christof Schmitt 2019
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -21,6 +22,7 @@
 #include "smbd/smbd.h"
 #include "nfs4_acls.h"
 #include "librpc/gen_ndr/ndr_security.h"
+#include "librpc/gen_ndr/idmap.h"
 #include "../libcli/security/dom_sid.h"
 #include "../libcli/security/security.h"
 #include "dbwrap/dbwrap.h"
@@ -51,23 +53,11 @@ struct SMB4ACL_T
 	struct SMB4ACE_T	*last;
 };
 
-enum smbacl4_mode_enum {e_simple=0, e_special=1};
-enum smbacl4_acedup_enum {e_dontcare=0, e_reject=1, e_ignore=2, e_merge=3};
-
-typedef struct _smbacl4_vfs_params {
-	enum smbacl4_mode_enum mode;
-	bool do_chown;
-	enum smbacl4_acedup_enum acedup;
-	bool map_full_control;
-} smbacl4_vfs_params;
-
 /*
  * Gather special parameters for NFS4 ACL handling
  */
-static int smbacl4_get_vfs_params(
-	struct connection_struct *conn,
-	smbacl4_vfs_params *params
-)
+int smbacl4_get_vfs_params(struct connection_struct *conn,
+			   struct smbacl4_vfs_params *params)
 {
 	static const struct enum_list enum_smbacl4_modes[] = {
 		{ e_simple, "simple" },
@@ -83,7 +73,7 @@ static int smbacl4_get_vfs_params(
 	};
 	int enumval;
 
-	ZERO_STRUCTP(params);
+	*params = (struct smbacl4_vfs_params) { 0 };
 
 	enumval = lp_parm_enum(SNUM(conn), SMBACL4_PARAM_TYPE_NAME, "mode",
 			       enum_smbacl4_modes, e_simple);
@@ -93,18 +83,27 @@ static int smbacl4_get_vfs_params(
 		return -1;
 	}
 	params->mode = (enum smbacl4_mode_enum)enumval;
+	if (params->mode == e_special) {
+		DBG_WARNING("nfs4:mode special is deprecated.\n");
+	}
 
 	params->do_chown = lp_parm_bool(SNUM(conn), SMBACL4_PARAM_TYPE_NAME,
 		"chown", true);
 
 	enumval = lp_parm_enum(SNUM(conn), SMBACL4_PARAM_TYPE_NAME, "acedup",
-			       enum_smbacl4_acedups, e_dontcare);
+			       enum_smbacl4_acedups, e_merge);
 	if (enumval == -1) {
 		DEBUG(10, ("value for %s:acedup unknown\n",
 			   SMBACL4_PARAM_TYPE_NAME));
 		return -1;
 	}
 	params->acedup = (enum smbacl4_acedup_enum)enumval;
+	if (params->acedup == e_ignore) {
+		DBG_WARNING("nfs4:acedup ignore is deprecated.\n");
+	}
+	if (params->acedup == e_reject) {
+		DBG_WARNING("nfs4:acedup ignore is deprecated.\n");
+	}
 
 	params->map_full_control = lp_acl_map_full_control(SNUM(conn));
 
@@ -192,12 +191,11 @@ struct SMB4ACE_T *smb_add_ace4(struct SMB4ACL_T *acl, SMB_ACE4PROP_T *prop)
 	ace = talloc_zero(acl, struct SMB4ACE_T);
 	if (ace==NULL)
 	{
-		DEBUG(0, ("TALLOC_SIZE failed\n"));
+		DBG_ERR("talloc_zero failed\n");
 		errno = ENOMEM;
 		return NULL;
 	}
-	/* ace->next = NULL not needed */
-	memcpy(&ace->prop, prop, sizeof(SMB_ACE4PROP_T));
+	ace->prop = *prop;
 
 	if (acl->first==NULL)
 	{
@@ -267,14 +265,21 @@ bool smbacl4_set_controlflags(struct SMB4ACL_T *acl, uint16_t controlflags)
 	return true;
 }
 
+bool nfs_ace_is_inherit(SMB_ACE4PROP_T *ace)
+{
+	return ace->aceFlags & (SMB_ACE4_INHERIT_ONLY_ACE|
+				SMB_ACE4_FILE_INHERIT_ACE|
+				SMB_ACE4_DIRECTORY_INHERIT_ACE);
+}
+
 static int smbacl4_GetFileOwner(struct connection_struct *conn,
-				const char *filename,
+				const struct smb_filename *smb_fname,
 				SMB_STRUCT_STAT *psbuf)
 {
 	ZERO_STRUCTP(psbuf);
 
 	/* Get the stat struct for the owner info. */
-	if (vfs_stat_smb_basename(conn, filename, psbuf) != 0)
+	if (vfs_stat_smb_basename(conn, smb_fname, psbuf) != 0)
 	{
 		DEBUG(8, ("vfs_stat_smb_basename failed with error %s\n",
 			strerror(errno)));
@@ -284,26 +289,37 @@ static int smbacl4_GetFileOwner(struct connection_struct *conn,
 	return 0;
 }
 
-static int smbacl4_fGetFileOwner(files_struct *fsp, SMB_STRUCT_STAT *psbuf)
+static void check_for_duplicate_sec_ace(struct security_ace *nt_ace_list,
+					int *good_aces)
 {
-	ZERO_STRUCTP(psbuf);
+	struct security_ace *last = NULL;
+	int i;
 
-	if (fsp->fh->fd == -1) {
-		return smbacl4_GetFileOwner(fsp->conn,
-					    fsp->fsp_name->base_name, psbuf);
-	}
-	if (SMB_VFS_FSTAT(fsp, psbuf) != 0)
-	{
-		DEBUG(8, ("SMB_VFS_FSTAT failed with error %s\n",
-			strerror(errno)));
-		return -1;
+	if (*good_aces < 2) {
+		return;
 	}
 
-	return 0;
+	last = &nt_ace_list[(*good_aces) - 1];
+
+	for (i = 0; i < (*good_aces) - 1; i++) {
+		struct security_ace *cur = &nt_ace_list[i];
+
+		if (cur->type == last->type &&
+		    cur->flags == last->flags &&
+		    cur->access_mask == last->access_mask &&
+		    dom_sid_equal(&cur->trustee, &last->trustee))
+		{
+			struct dom_sid_buf sid_buf;
+
+			DBG_INFO("Removing duplicate entry for SID %s.\n",
+				 dom_sid_str_buf(&last->trustee, &sid_buf));
+			(*good_aces)--;
+		}
+	}
 }
 
 static bool smbacl4_nfs42win(TALLOC_CTX *mem_ctx,
-	smbacl4_vfs_params *params,
+	const struct smbacl4_vfs_params *params,
 	struct SMB4ACL_T *acl, /* in */
 	struct dom_sid *psid_owner, /* in */
 	struct dom_sid *psid_group, /* in */
@@ -330,6 +346,7 @@ static bool smbacl4_nfs42win(TALLOC_CTX *mem_ctx,
 	for (aceint = acl->first; aceint != NULL; aceint = aceint->next) {
 		uint32_t mask;
 		struct dom_sid sid;
+		struct dom_sid_buf buf;
 		SMB_ACE4PROP_T	*ace = &aceint->prop;
 		uint32_t win_ace_flags;
 
@@ -362,11 +379,7 @@ static bool smbacl4_nfs42win(TALLOC_CTX *mem_ctx,
 			}
 		}
 		DEBUG(10, ("mapped %d to %s\n", ace->who.id,
-			   sid_string_dbg(&sid)));
-
-		if (is_directory && (ace->aceMask & SMB_ACE4_ADD_FILE)) {
-			ace->aceMask |= SMB_ACE4_DELETE_CHILD;
-		}
+			   dom_sid_str_buf(&sid, &buf)));
 
 		if (!is_directory && params->map_full_control) {
 			/*
@@ -398,13 +411,6 @@ static bool smbacl4_nfs42win(TALLOC_CTX *mem_ctx,
 		      ace->aceFlags, win_ace_flags));
 
 		mask = ace->aceMask;
-		/* Windows clients expect SYNC on acls to
-		   correctly allow rename. See bug #7909. */
-		/* But not on DENY ace entries. See
-		   bug #8442. */
-		if(ace->aceType == SMB_ACE4_ACCESS_ALLOWED_ACE_TYPE) {
-			mask = ace->aceMask | SMB_ACE4_SYNCHRONIZE;
-		}
 
 		/* Mapping of owner@ and group@ to creator owner and
 		   creator group. Keep old behavior in mode special. */
@@ -453,6 +459,8 @@ static bool smbacl4_nfs42win(TALLOC_CTX *mem_ctx,
 				     ace->aceType, mask,
 				     win_ace_flags);
 		}
+
+		check_for_duplicate_sec_ace(nt_ace_list, &good_aces);
 	}
 
 	nt_ace_list = talloc_realloc(mem_ctx, nt_ace_list, struct security_ace,
@@ -472,7 +480,7 @@ static bool smbacl4_nfs42win(TALLOC_CTX *mem_ctx,
 }
 
 static NTSTATUS smb_get_nt_acl_nfs4_common(const SMB_STRUCT_STAT *sbuf,
-					   smbacl4_vfs_params *params,
+					   const struct smbacl4_vfs_params *params,
 					   uint32_t security_info,
 					   TALLOC_CTX *mem_ctx,
 					   struct security_descriptor **ppdesc,
@@ -533,51 +541,73 @@ static NTSTATUS smb_get_nt_acl_nfs4_common(const SMB_STRUCT_STAT *sbuf,
 }
 
 NTSTATUS smb_fget_nt_acl_nfs4(files_struct *fsp,
+			      const struct smbacl4_vfs_params *pparams,
 			      uint32_t security_info,
 			      TALLOC_CTX *mem_ctx,
 			      struct security_descriptor **ppdesc,
 			      struct SMB4ACL_T *theacl)
 {
-	SMB_STRUCT_STAT sbuf;
-	smbacl4_vfs_params params;
+	struct smbacl4_vfs_params params;
 
 	DEBUG(10, ("smb_fget_nt_acl_nfs4 invoked for %s\n", fsp_str_dbg(fsp)));
 
-	if (smbacl4_fGetFileOwner(fsp, &sbuf)) {
-		return map_nt_error_from_unix(errno);
+	if (!VALID_STAT(fsp->fsp_name->st)) {
+		NTSTATUS status;
+
+		status = vfs_stat_fsp(fsp);
+		if (!NT_STATUS_IS_OK(status)) {
+			return status;
+		}
 	}
 
-	/* Special behaviours */
-	if (smbacl4_get_vfs_params(fsp->conn, &params)) {
-		return NT_STATUS_NO_MEMORY;
+	if (pparams == NULL) {
+		/* Special behaviours */
+		if (smbacl4_get_vfs_params(fsp->conn, &params)) {
+			return NT_STATUS_NO_MEMORY;
+		}
+		pparams = &params;
 	}
 
-	return smb_get_nt_acl_nfs4_common(&sbuf, &params, security_info,
+	return smb_get_nt_acl_nfs4_common(&fsp->fsp_name->st, pparams,
+					  security_info,
 					  mem_ctx, ppdesc, theacl);
 }
 
 NTSTATUS smb_get_nt_acl_nfs4(struct connection_struct *conn,
-			     const char *name,
+			     const struct smb_filename *smb_fname,
+			     const struct smbacl4_vfs_params *pparams,
 			     uint32_t security_info,
 			     TALLOC_CTX *mem_ctx,
 			     struct security_descriptor **ppdesc,
 			     struct SMB4ACL_T *theacl)
 {
 	SMB_STRUCT_STAT sbuf;
-	smbacl4_vfs_params params;
+	struct smbacl4_vfs_params params;
+	const SMB_STRUCT_STAT *psbuf = NULL;
 
-	DEBUG(10, ("smb_get_nt_acl_nfs4 invoked for %s\n", name));
+	DEBUG(10, ("smb_get_nt_acl_nfs4 invoked for %s\n",
+		smb_fname->base_name));
 
-	if (smbacl4_GetFileOwner(conn, name, &sbuf)) {
-		return map_nt_error_from_unix(errno);
+	if (VALID_STAT(smb_fname->st)) {
+		psbuf = &smb_fname->st;
 	}
 
-	/* Special behaviours */
-	if (smbacl4_get_vfs_params(conn, &params)) {
-		return NT_STATUS_NO_MEMORY;
+	if (psbuf == NULL) {
+		if (smbacl4_GetFileOwner(conn, smb_fname, &sbuf)) {
+			return map_nt_error_from_unix(errno);
+		}
+		psbuf = &sbuf;
 	}
 
-	return smb_get_nt_acl_nfs4_common(&sbuf, &params, security_info,
+	if (pparams == NULL) {
+		/* Special behaviours */
+		if (smbacl4_get_vfs_params(conn, &params)) {
+			return NT_STATUS_NO_MEMORY;
+		}
+		pparams = &params;
+	}
+
+	return smb_get_nt_acl_nfs4_common(psbuf, pparams, security_info,
 					  mem_ctx, ppdesc, theacl);
 }
 
@@ -644,107 +674,10 @@ static SMB_ACE4PROP_T *smbacl4_find_equal_special(
 	return NULL;
 }
 
-
-static bool smbacl4_fill_ace4(
-	const struct smb_filename *filename,
-	smbacl4_vfs_params *params,
-	uid_t ownerUID,
-	gid_t ownerGID,
-	const struct security_ace *ace_nt, /* input */
-	SMB_ACE4PROP_T *ace_v4 /* output */
-)
-{
-	DEBUG(10, ("got ace for %s\n", sid_string_dbg(&ace_nt->trustee)));
-
-	ZERO_STRUCTP(ace_v4);
-
-	/* only ACCESS|DENY supported right now */
-	ace_v4->aceType = ace_nt->type;
-
-	ace_v4->aceFlags = map_windows_ace_flags_to_nfs4_ace_flags(
-		ace_nt->flags);
-
-	/* remove inheritance flags on files */
-	if (VALID_STAT(filename->st) &&
-	    !S_ISDIR(filename->st.st_ex_mode)) {
-		DEBUG(10, ("Removing inheritance flags from a file\n"));
-		ace_v4->aceFlags &= ~(SMB_ACE4_FILE_INHERIT_ACE|
-				      SMB_ACE4_DIRECTORY_INHERIT_ACE|
-				      SMB_ACE4_NO_PROPAGATE_INHERIT_ACE|
-				      SMB_ACE4_INHERIT_ONLY_ACE);
-	}
-
-	ace_v4->aceMask = ace_nt->access_mask &
-		(SEC_STD_ALL | SEC_FILE_ALL);
-
-	se_map_generic(&ace_v4->aceMask, &file_generic_mapping);
-
-	if (ace_v4->aceFlags!=ace_nt->flags)
-		DEBUG(9, ("ace_v4->aceFlags(0x%x)!=ace_nt->flags(0x%x)\n",
-			ace_v4->aceFlags, ace_nt->flags));
-
-	if (ace_v4->aceMask!=ace_nt->access_mask)
-		DEBUG(9, ("ace_v4->aceMask(0x%x)!=ace_nt->access_mask(0x%x)\n",
-			ace_v4->aceMask, ace_nt->access_mask));
-
-	if (dom_sid_equal(&ace_nt->trustee, &global_sid_World)) {
-		ace_v4->who.special_id = SMB_ACE4_WHO_EVERYONE;
-		ace_v4->flags |= SMB_ACE4_ID_SPECIAL;
-	} else if (params->mode!=e_special &&
-		   dom_sid_equal(&ace_nt->trustee,
-				 &global_sid_Creator_Owner)) {
-		DEBUG(10, ("Map creator owner\n"));
-		ace_v4->who.special_id = SMB_ACE4_WHO_OWNER;
-		ace_v4->flags |= SMB_ACE4_ID_SPECIAL;
-		/* A non inheriting creator owner entry has no effect. */
-		ace_v4->aceFlags |= SMB_ACE4_INHERIT_ONLY_ACE;
-		if (!(ace_v4->aceFlags & SMB_ACE4_DIRECTORY_INHERIT_ACE)
-		    && !(ace_v4->aceFlags & SMB_ACE4_FILE_INHERIT_ACE)) {
-			return false;
-		}
-	} else if (params->mode!=e_special &&
-		   dom_sid_equal(&ace_nt->trustee,
-				 &global_sid_Creator_Group)) {
-		DEBUG(10, ("Map creator owner group\n"));
-		ace_v4->who.special_id = SMB_ACE4_WHO_GROUP;
-		ace_v4->flags |= SMB_ACE4_ID_SPECIAL;
-		/* A non inheriting creator group entry has no effect. */
-		ace_v4->aceFlags |= SMB_ACE4_INHERIT_ONLY_ACE;
-		if (!(ace_v4->aceFlags & SMB_ACE4_DIRECTORY_INHERIT_ACE)
-		    && !(ace_v4->aceFlags & SMB_ACE4_FILE_INHERIT_ACE)) {
-			return false;
-		}
-	} else {
-		uid_t uid;
-		gid_t gid;
-
-		if (sid_to_gid(&ace_nt->trustee, &gid)) {
-			ace_v4->aceFlags |= SMB_ACE4_IDENTIFIER_GROUP;
-			ace_v4->who.gid = gid;
-		} else if (sid_to_uid(&ace_nt->trustee, &uid)) {
-			ace_v4->who.uid = uid;
-		} else if (dom_sid_compare_domain(&ace_nt->trustee,
-						  &global_sid_Unix_NFS) == 0) {
-			return false;
-		} else {
-			DEBUG(1, ("nfs4_acls.c: file [%s]: could not "
-				  "convert %s to uid or gid\n",
-				  filename->base_name,
-				  sid_string_dbg(&ace_nt->trustee)));
-			return false;
-		}
-	}
-
-	return true; /* OK */
-}
-
-static int smbacl4_MergeIgnoreReject(
-	enum smbacl4_acedup_enum acedup,
-	struct SMB4ACL_T *theacl, /* may modify it */
-	SMB_ACE4PROP_T *ace, /* the "new" ACE */
-	bool	*paddNewACE,
-	int	i
-)
+static int smbacl4_MergeIgnoreReject(enum smbacl4_acedup_enum acedup,
+				     struct SMB4ACL_T *theacl,
+				     SMB_ACE4PROP_T *ace,
+				     bool *paddNewACE)
 {
 	int	result = 0;
 	SMB_ACE4PROP_T *ace4found = smbacl4_find_equal_special(theacl, ace);
@@ -761,7 +694,7 @@ static int smbacl4_MergeIgnoreReject(
 			*paddNewACE = false;
 			break;
 		case e_reject: /* do an error */
-			DEBUG(8, ("ACL rejected by duplicate nt ace#%d\n", i));
+			DBG_INFO("ACL rejected by duplicate nt ace.\n");
 			errno = EINVAL; /* SHOULD be set on any _real_ error */
 			result = -1;
 			break;
@@ -772,11 +705,165 @@ static int smbacl4_MergeIgnoreReject(
 	return result;
 }
 
-static int smbacl4_substitute_special(
-	struct SMB4ACL_T *acl,
-	uid_t ownerUID,
-	gid_t ownerGID
-)
+static int nfs4_acl_add_ace(enum smbacl4_acedup_enum acedup,
+			    struct SMB4ACL_T *nfs4_acl,
+			    SMB_ACE4PROP_T *nfs4_ace)
+{
+	bool add_ace = true;
+
+	if (acedup != e_dontcare) {
+		int ret;
+
+		ret = smbacl4_MergeIgnoreReject(acedup, nfs4_acl,
+						nfs4_ace, &add_ace);
+		if (ret == -1) {
+			return -1;
+		}
+	}
+
+	if (add_ace) {
+		smb_add_ace4(nfs4_acl, nfs4_ace);
+	}
+
+	return 0;
+}
+
+static int nfs4_acl_add_sec_ace(bool is_directory,
+				const struct smbacl4_vfs_params *params,
+				uid_t ownerUID,
+				gid_t ownerGID,
+				const struct security_ace *ace_nt,
+				struct SMB4ACL_T *nfs4_acl)
+{
+	struct dom_sid_buf buf;
+	SMB_ACE4PROP_T nfs4_ace = { 0 };
+	SMB_ACE4PROP_T nfs4_ace_2 = { 0 };
+	bool add_ace2 = false;
+	int ret;
+
+	DEBUG(10, ("got ace for %s\n",
+		   dom_sid_str_buf(&ace_nt->trustee, &buf)));
+
+	/* only ACCESS|DENY supported right now */
+	nfs4_ace.aceType = ace_nt->type;
+
+	nfs4_ace.aceFlags =
+		map_windows_ace_flags_to_nfs4_ace_flags(ace_nt->flags);
+
+	/* remove inheritance flags on files */
+	if (!is_directory) {
+		DEBUG(10, ("Removing inheritance flags from a file\n"));
+		nfs4_ace.aceFlags &= ~(SMB_ACE4_FILE_INHERIT_ACE|
+				       SMB_ACE4_DIRECTORY_INHERIT_ACE|
+				       SMB_ACE4_NO_PROPAGATE_INHERIT_ACE|
+				       SMB_ACE4_INHERIT_ONLY_ACE);
+	}
+
+	nfs4_ace.aceMask = ace_nt->access_mask & (SEC_STD_ALL | SEC_FILE_ALL);
+
+	se_map_generic(&nfs4_ace.aceMask, &file_generic_mapping);
+
+	if (dom_sid_equal(&ace_nt->trustee, &global_sid_World)) {
+		nfs4_ace.who.special_id = SMB_ACE4_WHO_EVERYONE;
+		nfs4_ace.flags |= SMB_ACE4_ID_SPECIAL;
+	} else if (params->mode!=e_special &&
+		   dom_sid_equal(&ace_nt->trustee,
+				 &global_sid_Creator_Owner)) {
+		DEBUG(10, ("Map creator owner\n"));
+		nfs4_ace.who.special_id = SMB_ACE4_WHO_OWNER;
+		nfs4_ace.flags |= SMB_ACE4_ID_SPECIAL;
+		/* A non inheriting creator owner entry has no effect. */
+		nfs4_ace.aceFlags |= SMB_ACE4_INHERIT_ONLY_ACE;
+		if (!(nfs4_ace.aceFlags & SMB_ACE4_DIRECTORY_INHERIT_ACE)
+		    && !(nfs4_ace.aceFlags & SMB_ACE4_FILE_INHERIT_ACE)) {
+			return 0;
+		}
+	} else if (params->mode!=e_special &&
+		   dom_sid_equal(&ace_nt->trustee,
+				 &global_sid_Creator_Group)) {
+		DEBUG(10, ("Map creator owner group\n"));
+		nfs4_ace.who.special_id = SMB_ACE4_WHO_GROUP;
+		nfs4_ace.flags |= SMB_ACE4_ID_SPECIAL;
+		/* A non inheriting creator group entry has no effect. */
+		nfs4_ace.aceFlags |= SMB_ACE4_INHERIT_ONLY_ACE;
+		if (!(nfs4_ace.aceFlags & SMB_ACE4_DIRECTORY_INHERIT_ACE)
+		    && !(nfs4_ace.aceFlags & SMB_ACE4_FILE_INHERIT_ACE)) {
+			return 0;
+		}
+	} else {
+		struct unixid unixid;
+		bool ok;
+
+		ok = sids_to_unixids(&ace_nt->trustee, 1, &unixid);
+		if (!ok) {
+			DBG_WARNING("Could not convert %s to uid or gid.\n",
+				    dom_sid_str_buf(&ace_nt->trustee, &buf));
+			return 0;
+		}
+
+		if (dom_sid_compare_domain(&ace_nt->trustee,
+					   &global_sid_Unix_NFS) == 0) {
+			return 0;
+		}
+
+		switch (unixid.type) {
+		case ID_TYPE_BOTH:
+			nfs4_ace.aceFlags |= SMB_ACE4_IDENTIFIER_GROUP;
+			nfs4_ace.who.gid = unixid.id;
+
+			if (ownerUID == unixid.id &&
+			    !nfs_ace_is_inherit(&nfs4_ace))
+			{
+				/*
+				 * IDMAP_TYPE_BOTH for owner. Add
+				 * additional user entry, which can be
+				 * mapped to special:owner to reflect
+				 * the permissions in the modebits.
+				 *
+				 * This only applies to non-inheriting
+				 * entries as only these are replaced
+				 * with SPECIAL_OWNER in nfs4:mode=simple.
+				 */
+				nfs4_ace_2 = (SMB_ACE4PROP_T) {
+					.who.uid = unixid.id,
+					.aceFlags = (nfs4_ace.aceFlags &
+						    ~SMB_ACE4_IDENTIFIER_GROUP),
+					.aceMask = nfs4_ace.aceMask,
+					.aceType = nfs4_ace.aceType,
+				};
+				add_ace2 = true;
+			}
+			break;
+		case ID_TYPE_GID:
+			nfs4_ace.aceFlags |= SMB_ACE4_IDENTIFIER_GROUP;
+			nfs4_ace.who.gid = unixid.id;
+			break;
+		case ID_TYPE_UID:
+			nfs4_ace.who.uid = unixid.id;
+			break;
+		case ID_TYPE_NOT_SPECIFIED:
+		default:
+			DBG_WARNING("Could not convert %s to uid or gid.\n",
+				    dom_sid_str_buf(&ace_nt->trustee, &buf));
+			return 0;
+		}
+	}
+
+	ret = nfs4_acl_add_ace(params->acedup, nfs4_acl, &nfs4_ace);
+	if (ret != 0) {
+		return -1;
+	}
+
+	if (!add_ace2) {
+		return 0;
+	}
+
+	return nfs4_acl_add_ace(params->acedup, nfs4_acl, &nfs4_ace_2);
+}
+
+static void smbacl4_substitute_special(struct SMB4ACL_T *acl,
+				       uid_t ownerUID,
+				       gid_t ownerGID)
 {
 	struct SMB4ACE_T *aceint;
 
@@ -804,14 +891,11 @@ static int smbacl4_substitute_special(
 			DEBUG(10,("replaced with special group ace\n"));
 		}
 	}
-	return true; /* OK */
 }
 
-static int smbacl4_substitute_simple(
-	struct SMB4ACL_T *acl,
-	uid_t ownerUID,
-	gid_t ownerGID
-)
+static void smbacl4_substitute_simple(struct SMB4ACL_T *acl,
+				      uid_t ownerUID,
+				      gid_t ownerGID)
 {
 	struct SMB4ACE_T *aceint;
 
@@ -826,9 +910,7 @@ static int smbacl4_substitute_simple(
 		if (!(ace->flags & SMB_ACE4_ID_SPECIAL) &&
 		    !(ace->aceFlags & SMB_ACE4_IDENTIFIER_GROUP) &&
 		    ace->who.uid == ownerUID &&
-		    !(ace->aceFlags & SMB_ACE4_INHERIT_ONLY_ACE) &&
-		    !(ace->aceFlags & SMB_ACE4_FILE_INHERIT_ACE) &&
-		    !(ace->aceFlags & SMB_ACE4_DIRECTORY_INHERIT_ACE)) {
+		    !nfs_ace_is_inherit(ace)) {
 			ace->flags |= SMB_ACE4_ID_SPECIAL;
 			ace->who.special_id = SMB_ACE4_WHO_OWNER;
 			DEBUG(10,("replaced with special owner ace\n"));
@@ -836,30 +918,26 @@ static int smbacl4_substitute_simple(
 
 		if (!(ace->flags & SMB_ACE4_ID_SPECIAL) &&
 		    ace->aceFlags & SMB_ACE4_IDENTIFIER_GROUP &&
-		    ace->who.uid == ownerGID &&
-		    !(ace->aceFlags & SMB_ACE4_INHERIT_ONLY_ACE) &&
-		    !(ace->aceFlags & SMB_ACE4_FILE_INHERIT_ACE) &&
-		    !(ace->aceFlags & SMB_ACE4_DIRECTORY_INHERIT_ACE)) {
+		    ace->who.gid == ownerGID &&
+		    !nfs_ace_is_inherit(ace)) {
 			ace->flags |= SMB_ACE4_ID_SPECIAL;
 			ace->who.special_id = SMB_ACE4_WHO_GROUP;
 			DEBUG(10,("replaced with special group ace\n"));
 		}
 	}
-	return true; /* OK */
 }
 
 static struct SMB4ACL_T *smbacl4_win2nfs4(
 	TALLOC_CTX *mem_ctx,
-	const files_struct *fsp,
+	bool is_directory,
 	const struct security_acl *dacl,
-	smbacl4_vfs_params *pparams,
+	const struct smbacl4_vfs_params *pparams,
 	uid_t ownerUID,
 	gid_t ownerGID
 )
 {
 	struct SMB4ACL_T *theacl;
 	uint32_t i;
-	const char *filename = fsp->fsp_name->base_name;
 
 	DEBUG(10, ("smbacl4_win2nfs4 invoked\n"));
 
@@ -868,26 +946,14 @@ static struct SMB4ACL_T *smbacl4_win2nfs4(
 		return NULL;
 
 	for(i=0; i<dacl->num_aces; i++) {
-		SMB_ACE4PROP_T	ace_v4;
-		bool	addNewACE = true;
+		int ret;
 
-		if (!smbacl4_fill_ace4(fsp->fsp_name, pparams,
-				       ownerUID, ownerGID,
-				       dacl->aces + i, &ace_v4)) {
-			DEBUG(3, ("Could not fill ace for file %s, SID %s\n",
-				  filename,
-				  sid_string_dbg(&((dacl->aces+i)->trustee))));
-			continue;
+		ret = nfs4_acl_add_sec_ace(is_directory, pparams,
+					   ownerUID, ownerGID,
+					   dacl->aces + i, theacl);
+		if (ret == -1) {
+			return NULL;
 		}
-
-		if (pparams->acedup!=e_dontcare) {
-			if (smbacl4_MergeIgnoreReject(pparams->acedup, theacl,
-				&ace_v4, &addNewACE, i))
-				return NULL;
-		}
-
-		if (addNewACE)
-			smb_add_ace4(theacl, &ace_v4);
 	}
 
 	if (pparams->mode==e_simple) {
@@ -902,19 +968,20 @@ static struct SMB4ACL_T *smbacl4_win2nfs4(
 }
 
 NTSTATUS smb_set_nt_acl_nfs4(vfs_handle_struct *handle, files_struct *fsp,
+	const struct smbacl4_vfs_params *pparams,
 	uint32_t security_info_sent,
 	const struct security_descriptor *psd,
 	set_nfs4acl_native_fn_t set_nfs4_native)
 {
-	smbacl4_vfs_params params;
+	struct smbacl4_vfs_params params;
 	struct SMB4ACL_T *theacl = NULL;
-	bool	result;
+	bool	result, is_directory;
 
-	SMB_STRUCT_STAT sbuf;
 	bool set_acl_as_root = false;
 	uid_t newUID = (uid_t)-1;
 	gid_t newGID = (gid_t)-1;
 	int saved_errno;
+	NTSTATUS status;
 	TALLOC_CTX *frame = talloc_stackframe();
 
 	DEBUG(10, ("smb_set_nt_acl_nfs4 invoked for %s\n", fsp_str_dbg(fsp)));
@@ -929,29 +996,42 @@ NTSTATUS smb_set_nt_acl_nfs4(vfs_handle_struct *handle, files_struct *fsp,
 				      * refined... */
 	}
 
-	/* Special behaviours */
-	if (smbacl4_get_vfs_params(fsp->conn, &params)) {
-		TALLOC_FREE(frame);
-		return NT_STATUS_NO_MEMORY;
+	if (security_descriptor_with_ms_nfs(psd)) {
+		return NT_STATUS_OK;
 	}
 
-	if (smbacl4_fGetFileOwner(fsp, &sbuf)) {
-		TALLOC_FREE(frame);
-		return map_nt_error_from_unix(errno);
+	if (pparams == NULL) {
+		/* Special behaviours */
+		if (smbacl4_get_vfs_params(fsp->conn, &params)) {
+			TALLOC_FREE(frame);
+			return NT_STATUS_NO_MEMORY;
+		}
+		pparams = &params;
 	}
 
-	if (params.do_chown) {
+	status = vfs_stat_fsp(fsp);
+	if (!NT_STATUS_IS_OK(status)) {
+		TALLOC_FREE(frame);
+		return status;
+	}
+
+	is_directory = S_ISDIR(fsp->fsp_name->st.st_ex_mode);
+
+	if (pparams->do_chown) {
 		/* chown logic is a copy/paste from posix_acl.c:set_nt_acl */
-		NTSTATUS status = unpack_nt_owners(fsp->conn, &newUID, &newGID,
-						   security_info_sent, psd);
+
+		uid_t old_uid = fsp->fsp_name->st.st_ex_uid;
+		uid_t old_gid = fsp->fsp_name->st.st_ex_uid;
+		status = unpack_nt_owners(fsp->conn, &newUID, &newGID,
+					  security_info_sent, psd);
 		if (!NT_STATUS_IS_OK(status)) {
 			DEBUG(8, ("unpack_nt_owners failed"));
 			TALLOC_FREE(frame);
 			return status;
 		}
-		if (((newUID != (uid_t)-1) && (sbuf.st_ex_uid != newUID)) ||
-		    ((newGID != (gid_t)-1) && (sbuf.st_ex_gid != newGID))) {
-
+		if (((newUID != (uid_t)-1) && (old_uid != newUID)) ||
+		    ((newGID != (gid_t)-1) && (old_gid != newGID)))
+		{
 			status = try_chown(fsp, newUID, newGID);
 			if (!NT_STATUS_IS_OK(status)) {
 				DEBUG(3,("chown %s, %u, %u failed. Error = "
@@ -966,11 +1046,14 @@ NTSTATUS smb_set_nt_acl_nfs4(vfs_handle_struct *handle, files_struct *fsp,
 			DEBUG(10,("chown %s, %u, %u succeeded.\n",
 				  fsp_str_dbg(fsp), (unsigned int)newUID,
 				  (unsigned int)newGID));
-			if (smbacl4_GetFileOwner(fsp->conn,
-						 fsp->fsp_name->base_name,
-						 &sbuf)){
+
+			/*
+			 * Owner change, need to update stat info.
+			 */
+			status = vfs_stat_fsp(fsp);
+			if (!NT_STATUS_IS_OK(status)) {
 				TALLOC_FREE(frame);
-				return map_nt_error_from_unix(errno);
+				return status;
 			}
 
 			/* If we successfully chowned, we know we must
@@ -987,8 +1070,9 @@ NTSTATUS smb_set_nt_acl_nfs4(vfs_handle_struct *handle, files_struct *fsp,
 		return NT_STATUS_OK;
 	}
 
-	theacl = smbacl4_win2nfs4(frame, fsp, psd->dacl, &params,
-				  sbuf.st_ex_uid, sbuf.st_ex_gid);
+	theacl = smbacl4_win2nfs4(frame, is_directory, psd->dacl, pparams,
+				  fsp->fsp_name->st.st_ex_uid,
+				  fsp->fsp_name->st.st_ex_gid);
 	if (!theacl) {
 		TALLOC_FREE(frame);
 		return map_nt_error_from_unix(errno);

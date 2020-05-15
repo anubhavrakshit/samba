@@ -27,6 +27,12 @@
 #include "system/select.h"
 #include "winbind_client.h"
 
+#ifdef HAVE_PTHREAD_H
+#include <pthread.h>
+#endif
+
+static char client_name[32];
+
 /* Global context */
 
 struct winbindd_context {
@@ -35,11 +41,31 @@ struct winbindd_context {
 	pid_t our_pid;		/* calling process pid */
 };
 
-static struct winbindd_context wb_global_ctx = {
-	.winbindd_fd = -1,
-	.is_privileged = 0,
-	.our_pid = 0
-};
+#ifdef HAVE_PTHREAD
+static pthread_mutex_t wb_global_ctx_mutex = PTHREAD_MUTEX_INITIALIZER;
+#endif
+
+static struct winbindd_context *get_wb_global_ctx(void)
+{
+	static struct winbindd_context wb_global_ctx = {
+		.winbindd_fd = -1,
+		.is_privileged = false,
+		.our_pid = 0
+	};
+
+#ifdef HAVE_PTHREAD
+	pthread_mutex_lock(&wb_global_ctx_mutex);
+#endif
+	return &wb_global_ctx;
+}
+
+static void put_wb_global_ctx(void)
+{
+#ifdef HAVE_PTHREAD
+	pthread_mutex_unlock(&wb_global_ctx_mutex);
+#endif
+	return;
+}
 
 /* Free a response structure */
 
@@ -49,6 +75,37 @@ void winbindd_free_response(struct winbindd_response *response)
 
 	if (response)
 		SAFE_FREE(response->extra_data.data);
+}
+
+void winbind_set_client_name(const char *name)
+{
+	if (name == NULL || strlen(name) == 0) {
+		return;
+	}
+
+	(void)snprintf(client_name, sizeof(client_name), "%s", name);
+}
+
+static const char *winbind_get_client_name(void)
+{
+	if (client_name[0] == '\0') {
+		const char *progname = getprogname();
+		int len;
+
+		if (progname == NULL) {
+			progname = "<unknown>";
+		}
+
+		len = snprintf(client_name,
+			       sizeof(client_name),
+			       "%s",
+			       progname);
+		if (len <= 0) {
+			return progname;
+		}
+	}
+
+	return client_name;
 }
 
 /* Initialise a request structure */
@@ -61,6 +118,10 @@ static void winbindd_init_request(struct winbindd_request *request,
 	request->cmd = (enum winbindd_cmd)request_type;
 	request->pid = getpid();
 
+	(void)snprintf(request->client_name,
+		       sizeof(request->client_name),
+		       "%s",
+		       winbind_get_client_name());
 }
 
 /* Initialise a response structure */
@@ -88,12 +149,16 @@ static void winbind_close_sock(struct winbindd_context *ctx)
 
 /* Destructor for global context to ensure fd is closed */
 
-#if HAVE_FUNCTION_ATTRIBUTE_DESTRUCTOR
+#ifdef HAVE_DESTRUCTOR_ATTRIBUTE
 __attribute__((destructor))
 #endif
 static void winbind_destructor(void)
 {
-	winbind_close_sock(&wb_global_ctx);
+	struct winbindd_context *ctx;
+
+	ctx = get_wb_global_ctx();
+	winbind_close_sock(ctx);
+	put_wb_global_ctx();
 }
 
 #define CONNECT_TIMEOUT 30
@@ -195,7 +260,7 @@ static int make_safe_fd(int fd)
  * @brief Check if we talk to the priviliged pipe which should be owned by root.
  *
  * This checks if we have uid_wrapper running and if this is the case it will
- * allow to connect to the winbind privileged pipe even it is not owned by root.
+ * allow one to connect to the winbind privileged pipe even it is not owned by root.
  *
  * @param[in]  uid      The uid to check if we can safely talk to the pipe.
  *
@@ -371,7 +436,7 @@ static int winbind_open_pipe_sock(struct winbindd_context *ctx,
 		ctx->our_pid = getpid();
 	}
 
-	if ((need_priv != 0) && (ctx->is_privileged == 0)) {
+	if ((need_priv != 0) && !ctx->is_privileged) {
 		winbind_close_sock(ctx);
 	}
 
@@ -389,7 +454,7 @@ static int winbind_open_pipe_sock(struct winbindd_context *ctx,
 		return -1;
 	}
 
-	ctx->is_privileged = 0;
+	ctx->is_privileged = false;
 
 	/* version-check the socket */
 
@@ -399,6 +464,10 @@ static int winbind_open_pipe_sock(struct winbindd_context *ctx,
 	    (response.data.interface_version != WINBIND_INTERFACE_VERSION)) {
 		winbind_close_sock(ctx);
 		return -1;
+	}
+
+	if (need_priv == 0) {
+		return ctx->winbindd_fd;
 	}
 
 	/* try and get priv pipe */
@@ -418,15 +487,15 @@ static int winbind_open_pipe_sock(struct winbindd_context *ctx,
 		if (fd != -1) {
 			close(ctx->winbindd_fd);
 			ctx->winbindd_fd = fd;
-			ctx->is_privileged = 1;
+			ctx->is_privileged = true;
 		}
+
+		SAFE_FREE(response.extra_data.data);
 	}
 
-	if ((need_priv != 0) && (ctx->is_privileged == 0)) {
+	if (!ctx->is_privileged) {
 		return -1;
 	}
-
-	SAFE_FREE(response.extra_data.data);
 
 	return ctx->winbindd_fd;
 #else
@@ -628,9 +697,11 @@ static int winbindd_read_reply(struct winbindd_context *ctx,
  * send simple types of requests
  */
 
-NSS_STATUS winbindd_send_request(struct winbindd_context *ctx,
-				 int req_type, int need_priv,
-				 struct winbindd_request *request)
+static NSS_STATUS winbindd_send_request(
+	struct winbindd_context *ctx,
+	int req_type,
+	int need_priv,
+	struct winbindd_request *request)
 {
 	struct winbindd_request lrequest;
 
@@ -678,8 +749,8 @@ NSS_STATUS winbindd_send_request(struct winbindd_context *ctx,
  * Get results from winbindd request
  */
 
-NSS_STATUS winbindd_get_response(struct winbindd_context *ctx,
-				 struct winbindd_response *response)
+static NSS_STATUS winbindd_get_response(struct winbindd_context *ctx,
+					struct winbindd_response *response)
 {
 	struct winbindd_response lresponse;
 
@@ -719,17 +790,23 @@ NSS_STATUS winbindd_request_response(struct winbindd_context *ctx,
 				     struct winbindd_response *response)
 {
 	NSS_STATUS status = NSS_STATUS_UNAVAIL;
-	struct winbindd_context *wb_ctx = ctx;
+	bool release_global_ctx = false;
 
 	if (ctx == NULL) {
-		wb_ctx = &wb_global_ctx;
+		ctx = get_wb_global_ctx();
+		release_global_ctx = true;
 	}
 
-	status = winbindd_send_request(wb_ctx, req_type, 0, request);
-	if (status != NSS_STATUS_SUCCESS)
-		return (status);
-	status = winbindd_get_response(wb_ctx, response);
+	status = winbindd_send_request(ctx, req_type, 0, request);
+	if (status != NSS_STATUS_SUCCESS) {
+		goto out;
+	}
+	status = winbindd_get_response(ctx, response);
 
+out:
+	if (release_global_ctx) {
+		put_wb_global_ctx();
+	}
 	return status;
 }
 
@@ -739,17 +816,23 @@ NSS_STATUS winbindd_priv_request_response(struct winbindd_context *ctx,
 					  struct winbindd_response *response)
 {
 	NSS_STATUS status = NSS_STATUS_UNAVAIL;
-	struct winbindd_context *wb_ctx = ctx;
+	bool release_global_ctx = false;
 
 	if (ctx == NULL) {
-		wb_ctx = &wb_global_ctx;
+		ctx = get_wb_global_ctx();
+		release_global_ctx = true;
 	}
 
-	status = winbindd_send_request(wb_ctx, req_type, 1, request);
-	if (status != NSS_STATUS_SUCCESS)
-		return (status);
-	status = winbindd_get_response(wb_ctx, response);
+	status = winbindd_send_request(ctx, req_type, 1, request);
+	if (status != NSS_STATUS_SUCCESS) {
+		goto out;
+	}
+	status = winbindd_get_response(ctx, response);
 
+out:
+	if (release_global_ctx) {
+		put_wb_global_ctx();
+	}
 	return status;
 }
 

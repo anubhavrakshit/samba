@@ -131,6 +131,8 @@
 /* Types of SMB2 Negotiate Contexts - only in dialect >= 0x310 */
 #define SMB2_PREAUTH_INTEGRITY_CAPABILITIES 0x0001
 #define SMB2_ENCRYPTION_CAPABILITIES        0x0002
+#define SMB2_COMPRESSION_CAPABILITIES       0x0003
+#define SMB2_NETNAME_NEGOTIATE_CONTEXT_ID   0x0005
 
 /* Values for the SMB2_PREAUTH_INTEGRITY_CAPABILITIES Context (>= 0x310) */
 #define SMB2_PREAUTH_INTEGRITY_SHA512       0x0001
@@ -235,6 +237,7 @@
 #define SMB2_CREATE_TAG_AAPL "AAPL"
 #define SMB2_CREATE_TAG_APP_INSTANCE_ID "\x45\xBC\xA6\x6A\xEF\xA7\xF7\x4A\x90\x08\xFA\x46\x2E\x14\x4D\x74"
 #define SVHDX_OPEN_DEVICE_CONTEXT "\x9C\xCB\xCF\x9E\x04\xC1\xE6\x43\x98\x0E\x15\x8D\xA1\xF6\xEC\x83"
+#define SMB2_CREATE_TAG_POSIX "\x93\xAD\x25\x50\x9C\xB4\x11\xE7\xB4\x23\x83\xDE\x96\x8B\xCD\x7C"
 
 /* SMB2 notify flags */
 #define SMB2_WATCH_TREE 0x0001
@@ -259,11 +262,11 @@
 #define SMB2_CONTINUE_FLAG_INDEX      0x04
 #define SMB2_CONTINUE_FLAG_REOPEN     0x10
 
-/* getinfo classes */
-#define SMB2_GETINFO_FILE               0x01
-#define SMB2_GETINFO_FS                 0x02
-#define SMB2_GETINFO_SECURITY           0x03
-#define SMB2_GETINFO_QUOTA              0x04
+/* get/setinfo classes, see [MS-SMB2] 2.2.37 and 2.2.39 */
+#define SMB2_0_INFO_FILE                0x01
+#define SMB2_0_INFO_FILESYSTEM          0x02
+#define SMB2_0_INFO_SECURITY            0x03
+#define SMB2_0_INFO_QUOTA               0x04
 
 #define SMB2_CLOSE_FLAGS_FULL_INFORMATION (0x01)
 
@@ -279,5 +282,8 @@
  * Flags for durable handle v2 requests
  */
 #define SMB2_DHANDLE_FLAG_PERSISTENT 0x00000002
+
+/* The AES CCM nonce N of 15 - L octets. Where L=4 */
+#define SMB2_AES_128_CCM_NONCE_SIZE 11
 
 #endif

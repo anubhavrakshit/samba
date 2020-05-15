@@ -7,7 +7,7 @@
 	<manvolnum>1</manvolnum>
 	<refmiscinfo class="source">Samba</refmiscinfo>
 	<refmiscinfo class="manual">User Commands</refmiscinfo>
-	<refmiscinfo class="version">4.3</refmiscinfo>
+	<refmiscinfo class="version">&doc.version;</refmiscinfo>
 </refmeta>
 
 
@@ -38,6 +38,7 @@
 		<arg choice="opt">--set-security-info FLAGS</arg>
 		<arg choice="opt">--sddl</arg>
 		<arg choice="opt">--domain-sid SID</arg>
+		<arg choice="opt">-x|--maximum-access</arg>
 	</cmdsynopsis>
 </refsynopsisdiv>
 
@@ -189,6 +190,14 @@
 		</para></listitem>
 		</varlistentry>
 
+		<varlistentry>
+		<term>-x|--maximum-access</term>
+		<listitem><para>When displaying an ACL additionally query
+		the server for effective maximum permissions. Note that this
+		is only supported with SMB protocol version 2 or higher.
+		</para></listitem>
+		</varlistentry>
+
 		&stdarg.server.debug;
 		&popt.common.samba;
 		&popt.common.credentials;
@@ -287,7 +296,7 @@ ACL:&lt;sid or name&gt;:&lt;type&gt;/&lt;flags&gt;/&lt;mask&gt;
 <refsect1>
 	<title>VERSION</title>
 
-	<para>This man page is correct for version 4 of the Samba suite.</para>
+	<para>This man page is part of version &doc.version; of the Samba suite.</para>
 </refsect1>
 
 <refsect1>

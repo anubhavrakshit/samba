@@ -29,6 +29,7 @@
 #include "../librpc/gen_ndr/ndr_wkssvc_c.h"
 #include "rpc_client/cli_pipe.h"
 #include "secrets.h"
+#include "libsmb/dsgetdcname.h"
 
 /****************************************************************
 ****************************************************************/
@@ -44,7 +45,7 @@ WERROR NetJoinDomain_l(struct libnetapi_ctx *mem_ctx,
 		struct libnetapi_private_ctx);
 
 	if (!r->in.domain) {
-		return WERR_INVALID_PARAM;
+		return WERR_INVALID_PARAMETER;
 	}
 
 	werr = libnet_init_JoinCtx(mem_ctx, &j);
@@ -116,7 +117,7 @@ WERROR NetJoinDomain_r(struct libnetapi_ctx *ctx,
 	DATA_BLOB session_key;
 
 	if (IS_DC) {
-		return WERR_SETUP_DOMAIN_CONTROLLER;
+		return WERR_NERR_SETUPDOMAINCONTROLLER;
 	}
 
 	werr = libnetapi_open_pipe(ctx, r->in.server,
@@ -136,10 +137,13 @@ WERROR NetJoinDomain_r(struct libnetapi_ctx *ctx,
 			goto done;
 		}
 
-		encode_wkssvc_join_password_buffer(ctx,
-						   r->in.password,
-						   &session_key,
-						   &encrypted_password);
+		werr = encode_wkssvc_join_password_buffer(ctx,
+							  r->in.password,
+							  &session_key,
+							  &encrypted_password);
+		if (!W_ERROR_IS_OK(werr)) {
+			goto done;
+		}
 	}
 
 	old_timeout = rpccli_set_timeout(pipe_cli, 600000);
@@ -175,19 +179,20 @@ WERROR NetUnjoinDomain_l(struct libnetapi_ctx *mem_ctx,
 	const char *domain = NULL;
 	WERROR werr;
 	struct libnetapi_private_ctx *priv;
+	const char *realm = lp_realm();
 
 	priv = talloc_get_type_abort(mem_ctx->private_data,
 		struct libnetapi_private_ctx);
 
 	if (!secrets_fetch_domain_sid(lp_workgroup(), &domain_sid)) {
-		return WERR_SETUP_NOT_JOINED;
+		return WERR_NERR_SETUPNOTJOINED;
 	}
 
 	werr = libnet_init_UnjoinCtx(mem_ctx, &u);
 	W_ERROR_NOT_OK_RETURN(werr);
 
-	if (lp_realm()) {
-		domain = lp_realm();
+	if (realm[0] != '\0') {
+		domain = realm;
 	} else {
 		domain = lp_workgroup();
 	}
@@ -277,10 +282,13 @@ WERROR NetUnjoinDomain_r(struct libnetapi_ctx *ctx,
 			goto done;
 		}
 
-		encode_wkssvc_join_password_buffer(ctx,
-						   r->in.password,
-						   &session_key,
-						   &encrypted_password);
+		werr = encode_wkssvc_join_password_buffer(ctx,
+							  r->in.password,
+							  &session_key,
+							  &encrypted_password);
+		if (!W_ERROR_IS_OK(werr)) {
+			goto done;
+		}
 	}
 
 	old_timeout = rpccli_set_timeout(pipe_cli, 60000);
@@ -352,13 +360,15 @@ WERROR NetGetJoinInformation_r(struct libnetapi_ctx *ctx,
 WERROR NetGetJoinInformation_l(struct libnetapi_ctx *ctx,
 			       struct NetGetJoinInformation *r)
 {
-	if ((lp_security() == SEC_ADS) && lp_realm()) {
-		*r->out.name_buffer = talloc_strdup(ctx, lp_realm());
+	const char *realm = lp_realm();
+
+	if ((lp_security() == SEC_ADS) && realm[0] != '\0') {
+		*r->out.name_buffer = talloc_strdup(ctx, realm);
 	} else {
 		*r->out.name_buffer = talloc_strdup(ctx, lp_workgroup());
 	}
 	if (!*r->out.name_buffer) {
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	switch (lp_server_role()) {
@@ -407,9 +417,12 @@ WERROR NetGetJoinableOUs_l(struct libnetapi_ctx *ctx,
 
 	dc = strip_hostname(info->dc_unc);
 
-	ads = ads_init(info->domain_name, info->domain_name, dc);
+	ads = ads_init(info->domain_name,
+		       info->domain_name,
+		       dc,
+		       ADS_SASL_PLAIN);
 	if (!ads) {
-		return WERR_GENERAL_FAILURE;
+		return WERR_GEN_FAILURE;
 	}
 
 	SAFE_FREE(ads->auth.user_name);
@@ -429,13 +442,13 @@ WERROR NetGetJoinableOUs_l(struct libnetapi_ctx *ctx,
 	ads_status = ads_connect_user_creds(ads);
 	if (!ADS_ERR_OK(ads_status)) {
 		ads_destroy(&ads);
-		return WERR_DEFAULT_JOIN_REQUIRED;
+		return WERR_NERR_DEFAULTJOINREQUIRED;
 	}
 
 	ads_status = ads_get_joinable_ous(ads, ctx, &p, &s);
 	if (!ADS_ERR_OK(ads_status)) {
 		ads_destroy(&ads);
-		return WERR_DEFAULT_JOIN_REQUIRED;
+		return WERR_NERR_DEFAULTJOINREQUIRED;
 	}
 	*r->out.ous = discard_const_p(const char *, p);
 	*r->out.ou_count = s;
@@ -477,10 +490,13 @@ WERROR NetGetJoinableOUs_r(struct libnetapi_ctx *ctx,
 			goto done;
 		}
 
-		encode_wkssvc_join_password_buffer(ctx,
-						   r->in.password,
-						   &session_key,
-						   &encrypted_password);
+		werr = encode_wkssvc_join_password_buffer(ctx,
+							  r->in.password,
+							  &session_key,
+							  &encrypted_password);
+		if (!W_ERROR_IS_OK(werr)) {
+			goto done;
+		}
 	}
 
 	status = dcerpc_wkssvc_NetrGetJoinableOus2(b, talloc_tos(),
@@ -530,10 +546,13 @@ WERROR NetRenameMachineInDomain_r(struct libnetapi_ctx *ctx,
 			goto done;
 		}
 
-		encode_wkssvc_join_password_buffer(ctx,
-						   r->in.password,
-						   &session_key,
-						   &encrypted_password);
+		werr = encode_wkssvc_join_password_buffer(ctx,
+							  r->in.password,
+							  &session_key,
+							  &encrypted_password);
+		if (!W_ERROR_IS_OK(werr)) {
+			goto done;
+		}
 	}
 
 	status = dcerpc_wkssvc_NetrRenameMachineInDomain2(b, talloc_tos(),

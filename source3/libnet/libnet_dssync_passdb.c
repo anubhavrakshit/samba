@@ -28,6 +28,7 @@
 #include "dbwrap/dbwrap_rbt.h"
 #include "../libds/common/flag_mapping.h"
 #include "passdb.h"
+#include "lib/util/base64.h"
 
 /****************************************************************
 ****************************************************************/
@@ -299,6 +300,7 @@ static int dssync_passdb_traverse_amembers(struct db_record *rec,
 	NTSTATUS status;
 	struct dom_sid alias_sid;
 	struct dom_sid member_sid;
+	struct dom_sid_buf buf1, buf2;
 	const char *member_dn;
 	size_t num_members;
 	size_t i;
@@ -323,9 +325,9 @@ static int dssync_passdb_traverse_amembers(struct db_record *rec,
 	mem->obj = dssync_search_obj_by_guid(pctx, pctx->all, &mem->cur->guid);
 	if (mem->obj == NULL) {
 		DEBUG(0,("alias[%s] member[%s] can't resolve member - ignoring\n",
-			 sid_string_dbg(&alias_sid),
+			 dom_sid_str_buf(&alias_sid, &buf1),
 			 is_null_sid(&member_sid)?
-			 sid_string_dbg(&member_sid):
+			 dom_sid_str_buf(&member_sid, &buf2):
 			 member_dn));
 		return 0;
 	}
@@ -334,7 +336,7 @@ static int dssync_passdb_traverse_amembers(struct db_record *rec,
 	case ATYPE_DISTRIBUTION_LOCAL_GROUP:
 	case ATYPE_DISTRIBUTION_GLOBAL_GROUP:
 		DEBUG(0, ("alias[%s] ignore distribution group [%s]\n",
-			  sid_string_dbg(&alias_sid),
+			  dom_sid_str_buf(&alias_sid, &buf1),
 			  member_dn));
 		return 0;
 	default:
@@ -342,14 +344,14 @@ static int dssync_passdb_traverse_amembers(struct db_record *rec,
 	}
 
 	DEBUG(0,("alias[%s] member[%s]\n",
-		 sid_string_dbg(&alias_sid),
-		 sid_string_dbg(&member_sid)));
+		 dom_sid_str_buf(&alias_sid, &buf1),
+		 dom_sid_str_buf(&member_sid, &buf2)));
 
 	status = pdb_enum_aliasmem(&alias_sid, talloc_tos(),
 				   &members, &num_members);
 	if (!NT_STATUS_IS_OK(status)) {
 		DEBUG(0, ("Could not find current alias members %s - %s\n",
-			  sid_string_dbg(&alias_sid),
+			  dom_sid_str_buf(&alias_sid, &buf1),
 			  nt_errstr(status)));
 		return -1;
 	}
@@ -376,8 +378,8 @@ static int dssync_passdb_traverse_amembers(struct db_record *rec,
 	if (!NT_STATUS_IS_OK(status)) {
 		DEBUG(0, ("Could not %s %s as alias members of %s - %s\n",
 			  action,
-			  sid_string_dbg(&member_sid),
-			  sid_string_dbg(&alias_sid),
+			  dom_sid_str_buf(&member_sid, &buf1),
+			  dom_sid_str_buf(&alias_sid, &buf2),
 			  nt_errstr(status)));
 		return -1;
 	}
@@ -450,6 +452,7 @@ static int dssync_passdb_traverse_gmembers(struct db_record *rec,
 	char **unix_members;
 	struct dom_sid group_sid;
 	struct dom_sid member_sid;
+	struct dom_sid_buf buf1, buf2;
 	struct samu *member = NULL;
 	const char *member_dn = NULL;
 	GROUP_MAP *map;
@@ -480,9 +483,9 @@ static int dssync_passdb_traverse_gmembers(struct db_record *rec,
 	mem->obj = dssync_search_obj_by_guid(pctx, pctx->all, &mem->cur->guid);
 	if (mem->obj == NULL) {
 		DEBUG(0,("group[%s] member[%s] can't resolve member - ignoring\n",
-			 sid_string_dbg(&group_sid),
+			 dom_sid_str_buf(&group_sid, &buf1),
 			 is_null_sid(&member_sid)?
-			 sid_string_dbg(&member_sid):
+			 dom_sid_str_buf(&member_sid, &buf2):
 			 member_dn));
 		return 0;
 	}
@@ -494,14 +497,14 @@ static int dssync_passdb_traverse_gmembers(struct db_record *rec,
 	case ATYPE_SECURITY_LOCAL_GROUP:
 	case ATYPE_SECURITY_GLOBAL_GROUP:
 		DEBUG(0, ("Group[%s] ignore member group [%s]\n",
-			  sid_string_dbg(&group_sid),
-			  sid_string_dbg(&member_sid)));
+			  dom_sid_str_buf(&group_sid, &buf1),
+			  dom_sid_str_buf(&member_sid, &buf2)));
 		return 0;
 
 	case ATYPE_DISTRIBUTION_LOCAL_GROUP:
 	case ATYPE_DISTRIBUTION_GLOBAL_GROUP:
 		DEBUG(0, ("Group[%s] ignore distribution group [%s]\n",
-			  sid_string_dbg(&group_sid),
+			  dom_sid_str_buf(&group_sid, &buf1),
 			  member_dn));
 		return 0;
 	default:
@@ -515,7 +518,7 @@ static int dssync_passdb_traverse_gmembers(struct db_record *rec,
 
 	if (!get_domain_group_from_sid(group_sid, map)) {
 		DEBUG(0, ("Could not find global group %s\n",
-			  sid_string_dbg(&group_sid)));
+			  dom_sid_str_buf(&group_sid, &buf1)));
 		//return NT_STATUS_NO_SUCH_GROUP;
 		TALLOC_FREE(map);
 		return -1;
@@ -540,7 +543,8 @@ static int dssync_passdb_traverse_gmembers(struct db_record *rec,
 
 	if (!pdb_getsampwsid(member, &member_sid)) {
 		DEBUG(1, ("Found bogus group member: (member_sid=%s group=%s)\n",
-			  sid_string_tos(&member_sid), grp->gr_name));
+			  dom_sid_str_buf(&member_sid, &buf1),
+			  grp->gr_name));
 		TALLOC_FREE(member);
 		return -1;
 	}
@@ -659,6 +663,8 @@ static NTSTATUS smb_create_user(TALLOC_CTX *mem_ctx,
 				const char *account,
 				struct passwd **passwd_p)
 {
+	const struct loadparm_substitution *lp_sub =
+		loadparm_s3_global_substitution();
 	struct passwd *passwd;
 	char *add_script = NULL;
 
@@ -670,11 +676,11 @@ static NTSTATUS smb_create_user(TALLOC_CTX *mem_ctx,
 
 	/* Create appropriate user */
 	if (acct_flags & ACB_NORMAL) {
-		add_script = lp_add_user_script(mem_ctx);
+		add_script = lp_add_user_script(mem_ctx, lp_sub);
 	} else if ( (acct_flags & ACB_WSTRUST) ||
 		    (acct_flags & ACB_SVRTRUST) ||
 		    (acct_flags & ACB_DOMTRUST) ) {
-		add_script = lp_add_machine_script(mem_ctx);
+		add_script = lp_add_machine_script(mem_ctx, lp_sub);
 	} else {
 		DEBUG(1, ("Unknown user type: %s\n",
 			  pdb_encode_acct_ctrl(acct_flags, NEW_PW_FORMAT_SPACE_PADDED_LEN)));
@@ -692,7 +698,7 @@ static NTSTATUS smb_create_user(TALLOC_CTX *mem_ctx,
 		if (!add_script) {
 			return NT_STATUS_NO_MEMORY;
 		}
-		add_ret = smbrun(add_script, NULL);
+		add_ret = smbrun(add_script, NULL, NULL);
 		DEBUG(add_ret ? 0 : 1,("fetch_account: Running the command `%s' "
 			 "gave %d\n", add_script, add_ret));
 		if (add_ret == 0) {
@@ -1103,8 +1109,8 @@ static NTSTATUS sam_account_from_object(struct samu *account,
 {
 	TALLOC_CTX *mem_ctx = account;
 	const char *old_string, *new_string;
+	struct dom_sid_buf buf;
 	time_t unix_time, stored_time;
-	uchar zero_buf[16];
 	NTSTATUS status;
 
 	NTTIME lastLogon;
@@ -1133,12 +1139,11 @@ static NTSTATUS sam_account_from_object(struct samu *account,
 	uint32_t acct_flags;
 	uint32_t units_per_week;
 
-	memset(zero_buf, '\0', sizeof(zero_buf));
-
 	objectSid = cur->object.identifier->sid;
 	GET_STRING_EX(sAMAccountName, true);
 	DEBUG(0,("sam_account_from_object(%s, %s) start\n",
-		 sAMAccountName, sid_string_dbg(&objectSid)));
+		 sAMAccountName,
+		 dom_sid_str_buf(&objectSid, &buf)));
 	GET_UINT64(lastLogon);
 	GET_UINT64(lastLogoff);
 	GET_UINT64(pwdLastSet);
@@ -1240,10 +1245,14 @@ static NTSTATUS sam_account_from_object(struct samu *account,
 	}
 
 	if (userParameters.data) {
-		char *newstr;
+		char *newstr = NULL;
 		old_string = pdb_get_munged_dial(account);
-		newstr = (userParameters.length == 0) ? NULL :
-			base64_encode_data_blob(talloc_tos(), userParameters);
+
+		if (userParameters.length != 0) {
+			newstr = base64_encode_data_blob(talloc_tos(),
+							 userParameters);
+			SMB_ASSERT(newstr != NULL);
+		}
 
 		if (STRING_CHANGED_NC(old_string, newstr))
 			pdb_set_munged_dial(account, newstr, PDB_CHANGED);
@@ -1324,11 +1333,11 @@ static NTSTATUS sam_account_from_object(struct samu *account,
 	   think this channel is secure enough - don't set the passwords at all
 	   in that case
 	*/
-	if (dBCSPwd.length == 16 && memcmp(dBCSPwd.data, zero_buf, 16) != 0) {
+	if (dBCSPwd.length == 16 && !all_zero(dBCSPwd.data, 16)) {
 		pdb_set_lanman_passwd(account, dBCSPwd.data, PDB_CHANGED);
 	}
 
-	if (unicodePwd.length == 16 && memcmp(unicodePwd.data, zero_buf, 16) != 0) {
+	if (unicodePwd.length == 16 && !all_zero(unicodePwd.data, 16)) {
 		pdb_set_nt_passwd(account, unicodePwd.data, PDB_CHANGED);
 	}
 
@@ -1341,7 +1350,8 @@ static NTSTATUS sam_account_from_object(struct samu *account,
 	pdb_set_domain(account, lp_workgroup(), PDB_CHANGED);
 
 	DEBUG(0,("sam_account_from_object(%s, %s) done\n",
-		 sAMAccountName, sid_string_dbg(&objectSid)));
+		 sAMAccountName,
+		 dom_sid_str_buf(&objectSid, &buf)));
 	return NT_STATUS_OK;
 }
 
@@ -1360,6 +1370,7 @@ static NTSTATUS handle_account_object(struct dssync_passdb *pctx,
 	struct group *grp;
 	struct dom_sid user_sid;
 	struct dom_sid group_sid;
+	struct dom_sid_buf buf;
 	struct passwd *passwd = NULL;
 	uint32_t acct_flags;
 	uint32_t rid;
@@ -1385,7 +1396,9 @@ static NTSTATUS handle_account_object(struct dssync_passdb *pctx,
 		 * pdb_smbpasswd.c also has some DOMAIN_RID_GUEST related
 		 * code...
 		 */
-		DEBUG(0,("Ignore %s - %s\n", account, sid_string_dbg(&user_sid)));
+		DEBUG(0,("Ignore %s - %s\n",
+			 account,
+			 dom_sid_str_buf(&user_sid, &buf)));
 		return NT_STATUS_OK;
 	}
 	DEBUG(0,("Creating account: %s\n", account));
@@ -1404,11 +1417,12 @@ static NTSTATUS handle_account_object(struct dssync_passdb *pctx,
 	}
 
 	DEBUG(3, ("Attempting to find SID %s for user %s in the passdb\n",
-		  sid_string_dbg(&user_sid), account));
+		  dom_sid_str_buf(&user_sid, &buf),
+		  account));
 	if (!pdb_getsampwsid(sam_account, &user_sid)) {
 		sam_account_from_object(sam_account, cur);
 		DEBUG(3, ("Attempting to add user SID %s for user %s in the passdb\n",
-			  sid_string_dbg(&user_sid),
+			  dom_sid_str_buf(&user_sid, &buf),
 			  pdb_get_username(sam_account)));
 		if (!NT_STATUS_IS_OK(pdb_add_sam_account(sam_account))) {
 			DEBUG(1, ("SAM Account for %s failed to be added to the passdb!\n",
@@ -1419,7 +1433,7 @@ static NTSTATUS handle_account_object(struct dssync_passdb *pctx,
 	} else {
 		sam_account_from_object(sam_account, cur);
 		DEBUG(3, ("Attempting to update user SID %s for user %s in the passdb\n",
-			  sid_string_dbg(&user_sid),
+			  dom_sid_str_buf(&user_sid, &buf),
 			  pdb_get_username(sam_account)));
 		if (!NT_STATUS_IS_OK(pdb_update_sam_account(sam_account))) {
 			DEBUG(1, ("SAM Account for %s failed to be updated in the passdb!\n",
@@ -1449,7 +1463,7 @@ static NTSTATUS handle_account_object(struct dssync_passdb *pctx,
 			if (!(grp = getgrgid(map->gid))) {
 				DEBUG(0, ("Could not find unix group %lu for user %s (group SID=%s)\n",
 					  (unsigned long)map->gid, pdb_get_username(sam_account),
-					  sid_string_dbg(&group_sid)));
+					  dom_sid_str_buf(&group_sid, &buf)));
 			} else {
 				smb_set_primary_group(grp->gr_name, pdb_get_username(sam_account));
 			}
@@ -1480,7 +1494,7 @@ static NTSTATUS handle_alias_object(struct dssync_passdb *pctx,
 	struct dom_sid group_sid;
 	uint32_t rid = 0;
 	struct dom_sid *dom_sid = NULL;
-	fstring sid_string;
+	struct dom_sid_buf sid_str;
 	GROUP_MAP *map;
 	bool insert = true;
 
@@ -1527,9 +1541,10 @@ static NTSTATUS handle_alias_object(struct dssync_passdb *pctx,
 		goto done;
 	}
 
-	sid_to_fstring(sid_string, &group_sid);
 	DEBUG(0,("Creating alias[%s] - %s members[%u]\n",
-		  map->nt_name, sid_string, num_members));
+		 map->nt_name,
+		 dom_sid_str_buf(&group_sid, &sid_str),
+		 num_members));
 
 	status = dssync_insert_obj(pctx, pctx->aliases, obj);
 	if (!NT_STATUS_IS_OK(status)) {
@@ -1615,7 +1630,7 @@ static NTSTATUS handle_group_object(struct dssync_passdb *pctx,
 	NTSTATUS status;
 	struct group *grp = NULL;
 	struct dom_sid group_sid;
-	fstring sid_string;
+	struct dom_sid_buf sid_str;
 	GROUP_MAP *map;
 	bool insert = true;
 
@@ -1658,9 +1673,10 @@ static NTSTATUS handle_group_object(struct dssync_passdb *pctx,
 		goto done;
 	}
 
-	sid_to_fstring(sid_string, &group_sid);
 	DEBUG(0,("Creating group[%s] - %s members [%u]\n",
-		  map->nt_name, sid_string, num_members));
+		 map->nt_name,
+		 dom_sid_str_buf(&group_sid, &sid_str),
+		 num_members));
 
 	status = dssync_insert_obj(pctx, pctx->groups, obj);
 	if (!NT_STATUS_IS_OK(status)) {
@@ -1804,7 +1820,7 @@ static NTSTATUS parse_object(struct dssync_passdb *pctx,
 	for (a=0; a < ARRAY_SIZE(dssync_object_table); a++) {
 		if (sam_type == dssync_object_table[a].type) {
 			if (dssync_object_table[a].fn) {
-				struct dssync_passdb_obj *obj;
+				struct dssync_passdb_obj *obj = NULL;
 				status = dssync_create_obj(pctx, pctx->all,
 							   sam_type, cur, &obj);
 				if (!NT_STATUS_IS_OK(status)) {

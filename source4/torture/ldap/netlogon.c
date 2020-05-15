@@ -25,6 +25,7 @@
 #include "libcli/cldap/cldap.h"
 #include "libcli/ldap/ldap_client.h"
 #include "libcli/ldap/ldap_ndr.h"
+#include "libcli/resolve/resolve.h"
 #include "librpc/gen_ndr/netlogon.h"
 #include "param/param.h"
 #include "../lib/tsocket/tsocket.h"
@@ -540,6 +541,53 @@ static bool test_netlogon_extra_attrs(struct torture_context *tctx,
 	return true;
 }
 
+/*
+  Bug #11392: Huawei Unified Storage System S5500 V3 sends no NtVer
+  [MS-ADTS] Section 7.3.3.2 "Domain Controller Response to an LDAP Ping"
+*/
+static bool test_netlogon_huawei(struct torture_context *tctx,
+				      request_rootdse_t request_rootdse,
+				      void *conn)
+{
+	struct cldap_search io;
+	struct netlogon_samlogon_response n1;
+	NTSTATUS status;
+	const char *attrs[] = {
+		"netlogon",
+		NULL
+	};
+	struct ldb_message ldbmsg = { NULL, 0, NULL };
+
+	ZERO_STRUCT(io);
+	io.in.dest_address = NULL;
+	io.in.dest_port = 0;
+	io.in.timeout   = 2;
+	io.in.retries   = 2;
+
+	torture_comment(tctx, "Requesting netlogon without NtVer filter\n");
+	io.in.filter = talloc_asprintf(tctx, "(&(DnsDomain=%s))",
+				lpcfg_dnsdomain(tctx->lp_ctx));
+	torture_assert(tctx, io.in.filter != NULL, "OOM");
+	io.in.attributes = attrs;
+	status = request_rootdse(conn, tctx, &io);
+	CHECK_STATUS(status, NT_STATUS_OK);
+	torture_assert(tctx, io.out.response != NULL, "No Entries found.");
+	CHECK_VAL(io.out.response->num_attributes, 1);
+
+	ldbmsg.num_elements = io.out.response->num_attributes;
+	ldbmsg.elements = io.out.response->attributes;
+	torture_assert(tctx, ldb_msg_find_element(&ldbmsg, "netlogon") != NULL,
+		       "Attribute netlogon not found in Result Entry\n");
+
+	status = pull_netlogon_samlogon_response(
+			io.out.response->attributes[0].values,
+			tctx,
+			&n1);
+	CHECK_STATUS(status, NT_STATUS_OK);
+	CHECK_VAL(n1.ntver, NETLOGON_NT_VERSION_5);
+
+	return true;
+}
 
 bool torture_netlogon_tcp(struct torture_context *tctx)
 {
@@ -579,14 +627,24 @@ static NTSTATUS udp_ldap_netlogon(void *data,
 bool torture_netlogon_udp(struct torture_context *tctx)
 {
 	const char *host = torture_setting_string(tctx, "host", NULL);
+	const char *ip;
+	struct nbt_name nbt_name;
 	bool ret = true;
 	int r;
 	struct cldap_socket *cldap;
 	NTSTATUS status;
 	struct tsocket_address *dest_addr;
 
+	make_nbt_name_server(&nbt_name, host);
+
+	status = resolve_name_ex(lpcfg_resolve_context(tctx->lp_ctx),
+				 0, 0, &nbt_name, tctx, &ip, tctx->ev);
+	torture_assert_ntstatus_ok(tctx, status,
+			talloc_asprintf(tctx,"Failed to resolve %s: %s",
+					nbt_name.name, nt_errstr(status)));
+
 	r = tsocket_address_inet_from_strings(tctx, "ip",
-					      host,
+					      ip,
 					      lpcfg_cldap_port(tctx->lp_ctx),
 					      &dest_addr);
 	CHECK_VAL(r, 0);
@@ -598,6 +656,7 @@ bool torture_netlogon_udp(struct torture_context *tctx)
 	ret &= test_ldap_netlogon(tctx, udp_ldap_netlogon, cldap, host);
 	ret &= test_ldap_netlogon_flags(tctx, udp_ldap_netlogon, cldap, host);
 	ret &= test_netlogon_extra_attrs(tctx, udp_ldap_rootdse, cldap);
+	ret &= test_netlogon_huawei(tctx, udp_ldap_rootdse, cldap);
 
 	return ret;
 }

@@ -50,9 +50,9 @@
 #define MAX_LEVEL (MAX_ID_SHIFT + IDR_BITS - 1) / IDR_BITS
 #define IDR_FREE_MAX MAX_LEVEL + MAX_LEVEL
 
-#define set_bit(bit, v) (v) |= (1<<(bit))
-#define clear_bit(bit, v) (v) &= ~(1<<(bit))
-#define test_bit(bit, v) ((v) & (1<<(bit)))
+#define set_bit(bit, v) (v) |= (1U<<(bit))
+#define clear_bit(bit, v) (v) &= ~(1U<<(bit))
+#define test_bit(bit, v) ((v) & (1U<<(bit)))
 
 struct idr_layer {
 	uint32_t		 bitmap;
@@ -181,8 +181,13 @@ restart:
 	 */
 	n = id;
 	while (p->bitmap == IDR_FULL) {
-		if (!(p = pa[++l]))
+		if (l >= MAX_LEVEL) {
 			break;
+		}
+		p = pa[++l];
+		if (p == NULL) {
+			break;
+		}
 		n = n >> IDR_BITS;
 		set_bit((n & IDR_MASK), p->bitmap);
 	}
@@ -284,7 +289,7 @@ static void *_idr_find(struct idr_context *idp, int id)
 	 * present.  If so, tain't one of ours!
 	 */
 	if (n + IDR_BITS < 31 &&
-	    ((id & ~(~0 << MAX_ID_SHIFT)) >> (n + IDR_BITS))) {
+	    ((id & ~(~0U << MAX_ID_SHIFT)) >> (n + IDR_BITS))) {
 		return NULL;
 	}
 

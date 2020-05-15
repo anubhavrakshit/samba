@@ -101,6 +101,8 @@ struct torture_context
 
 	/** Loadparm context (will go away in favor of torture_setting_ at some point) */
 	struct loadparm_context *lp_ctx;
+
+	int conn_index;
 };
 
 struct torture_results
@@ -247,18 +249,20 @@ void torture_warning(struct torture_context *test, const char *comment, ...) PRI
 void torture_result(struct torture_context *test,
 			enum torture_result, const char *reason, ...) PRINTF_ATTRIBUTE(3,4);
 
-#define torture_assert(torture_ctx,expr,cmt) \
+#define torture_assert(torture_ctx,expr,cmt) do { \
 	if (!(expr)) { \
 		torture_result(torture_ctx, TORTURE_FAIL, __location__": Expression `%s' failed: %s", __STRING(expr), cmt); \
 		return false; \
-	}
+	} \
+} while(0)
 
-#define torture_assert_goto(torture_ctx,expr,ret,label,cmt) \
+#define torture_assert_goto(torture_ctx,expr,ret,label,cmt) do { \
 	if (!(expr)) { \
 		torture_result(torture_ctx, TORTURE_FAIL, __location__": Expression `%s' failed: %s", __STRING(expr), cmt); \
 		ret = false; \
 		goto label; \
-	}
+	} \
+} while(0)
 
 #define torture_assert_werr_equal(torture_ctx, got, expected, cmt) \
 	do { WERROR __got = got, __expected = expected; \
@@ -293,6 +297,15 @@ void torture_result(struct torture_context *test,
 	}\
 	} while(0)
 
+#define torture_assert_ndr_err_equal_goto(torture_ctx,got,expected,ret,label,cmt) \
+	do { enum ndr_err_code __got = got, __expected = expected; \
+	if (__got != __expected) { \
+		torture_result(torture_ctx, TORTURE_FAIL, __location__": "#got" was %d (%s), expected %d (%s): %s", __got, ndr_errstr(__got), __expected, __STRING(expected), cmt); \
+		ret = false; \
+		goto label; \
+	}\
+	} while(0)
+
 #define torture_assert_hresult_equal(torture_ctx, got, expected, cmt) \
 	do { HRESULT __got = got, __expected = expected; \
 	if (!HRES_IS_EQUAL(__got, __expected)) { \
@@ -301,10 +314,20 @@ void torture_result(struct torture_context *test,
 	} \
 	} while (0)
 
+#define torture_assert_krb5_error_equal(torture_ctx, got, expected, cmt) \
+	do { krb5_error_code __got = got, __expected = expected; \
+	if (__got != __expected) { \
+		torture_result(torture_ctx, TORTURE_FAIL, __location__": "#got" was %d (%s), expected %d (%s): %s", __got, error_message(__got), __expected, error_message(__expected), cmt); \
+		return false; \
+	} \
+	} while (0)
+
 #define torture_assert_casestr_equal(torture_ctx,got,expected,cmt) \
 	do { const char *__got = (got), *__expected = (expected); \
 	if (!strequal(__got, __expected)) { \
-		torture_result(torture_ctx, TORTURE_FAIL, __location__": "#got" was %s, expected %s: %s", __got, __expected, cmt); \
+		torture_result(torture_ctx, TORTURE_FAIL, \
+			       __location__": "#got" was %s, expected %s: %s", \
+			       __got, __expected == NULL ? "null" : __expected, cmt); \
 		return false; \
 	} \
 	} while(0)
@@ -313,8 +336,8 @@ void torture_result(struct torture_context *test,
 	do { const char *__got = (got), *__expected = (expected); \
 	if (strcmp_safe(__got, __expected) != 0) { \
 		torture_result(torture_ctx, TORTURE_FAIL, \
-					   __location__": "#got" was %s, expected %s: %s", \
-					   __got, __expected, cmt); \
+			       __location__": "#got" was %s, expected %s: %s", \
+			       __got, __expected == NULL ? "NULL" : __expected, cmt); \
 		return false; \
 	} \
 	} while(0)
@@ -349,6 +372,32 @@ void torture_result(struct torture_context *test,
 	} \
 	} while(0)
 
+#define torture_assert_mem_equal_goto(torture_ctx,got,expected,len,ret,label,cmt) \
+	do { const void *__got = (got), *__expected = (expected); \
+	if (memcmp(__got, __expected, len) != 0) { \
+		torture_result(torture_ctx, TORTURE_FAIL, \
+			       __location__": "#got" of len %d did not match "#expected": %s", (int)len, cmt); \
+		ret = false; \
+		goto label; \
+	} \
+	} while(0)
+
+#define torture_assert_mem_not_equal_goto(torture_ctx,got,expected,len,ret,label,cmt) \
+	do { const void *__got = (got), *__expected = (expected); \
+	if (memcmp(__got, __expected, len) == 0) { \
+		torture_result(torture_ctx, TORTURE_FAIL, \
+			       __location__": "#got" of len %d unexpectedly matches "#expected": %s", (int)len, cmt); \
+		ret = false; \
+		goto label; \
+	} \
+	} while(0)
+
+static inline void torture_dump_data_str_cb(const char *buf, void *private_data)
+{
+	char **dump = (char **)private_data;
+	*dump = talloc_strdup_append_buffer(*dump, buf);
+}
+
 #define torture_assert_data_blob_equal(torture_ctx,got,expected,cmt)\
 	do { const DATA_BLOB __got = (got), __expected = (expected); \
 	if (__got.length != __expected.length) { \
@@ -358,6 +407,36 @@ void torture_result(struct torture_context *test,
 		return false; \
 	} \
 	if (memcmp(__got.data, __expected.data, __got.length) != 0) { \
+		char *__dump = NULL; \
+		uint8_t __byte_a = 0x00;\
+		uint8_t __byte_b = 0x00;\
+		size_t __i;\
+		for (__i=0; __i < __expected.length; __i++) {\
+			__byte_a = __expected.data[__i];\
+			if (__i == __got.length) {\
+				__byte_b = 0x00;\
+				break;\
+			}\
+			__byte_b = __got.data[__i];\
+			if (__byte_a != __byte_b) {\
+				break;\
+			}\
+		}\
+		torture_warning(torture_ctx, "blobs differ at byte 0x%02X (%zu)", (unsigned int)__i, __i);\
+		torture_warning(torture_ctx, "expected byte[0x%02X] = 0x%02X got byte[0x%02X] = 0x%02X",\
+				(unsigned int)__i, __byte_a, (unsigned int)__i, __byte_b);\
+		__dump = talloc_strdup(torture_ctx, ""); \
+		dump_data_cb(__got.data, __got.length, true, \
+			     torture_dump_data_str_cb, &__dump); \
+		torture_warning(torture_ctx, "got[0x%02X]: \n%s", \
+				(unsigned int)__got.length, __dump); \
+		TALLOC_FREE(__dump); \
+		__dump = talloc_strdup(torture_ctx, ""); \
+		dump_data_cb(__expected.data, __expected.length, true, \
+			     torture_dump_data_str_cb, &__dump); \
+		torture_warning(torture_ctx, "expected[0x%02X]: \n%s", \
+				(int)__expected.length, __dump); \
+		TALLOC_FREE(__dump); \
 		torture_result(torture_ctx, TORTURE_FAIL, \
 			       __location__": "#got" of len %d did not match "#expected": %s", (int)__got.length, cmt); \
 		return false; \
@@ -443,6 +522,54 @@ void torture_result(struct torture_context *test,
 	} \
 	} while(0)
 
+#define torture_assert_u32_equal(torture_ctx,got,expected,cmt)\
+	do { uint32_t __got = (got), __expected = (expected); \
+	if (__got != __expected) { \
+		torture_result(torture_ctx, TORTURE_FAIL, \
+			__location__": "#got" was %ju (0x%jX), expected %ju (0x%jX): %s", \
+			(uintmax_t)__got, (uintmax_t)__got, \
+			(uintmax_t)__expected, (uintmax_t)__expected, \
+			cmt); \
+		return false; \
+	} \
+	} while(0)
+
+#define torture_assert_u32_equal_goto(torture_ctx,got,expected,ret,label,cmt)\
+	do { uint32_t __got = (got), __expected = (expected); \
+	if (__got != __expected) { \
+		torture_result(torture_ctx, TORTURE_FAIL, \
+			__location__": "#got" was %ju (0x%jX), expected %ju (0x%jX): %s", \
+			(uintmax_t)__got, (uintmax_t)__got, \
+			(uintmax_t)__expected, (uintmax_t)__expected, \
+			cmt); \
+		ret = false; \
+		goto label; \
+	} \
+	} while(0)
+
+#define torture_assert_u32_not_equal(torture_ctx,got,not_expected,cmt)\
+	do { uint32_t __got = (got), __not_expected = (not_expected); \
+	if (__got == __not_expected) { \
+		torture_result(torture_ctx, TORTURE_FAIL, \
+			__location__": "#got" was %ju (0x%jX), expected a different number: %s", \
+			(uintmax_t)__got, (uintmax_t)__got, \
+			cmt); \
+		return false; \
+	} \
+	} while(0)
+
+#define torture_assert_u32_not_equal_goto(torture_ctx,got,not_expected,ret,label,cmt)\
+	do { uint32_t __got = (got), __not_expected = (not_expected); \
+	if (__got == __not_expected) { \
+		torture_result(torture_ctx, TORTURE_FAIL, \
+			__location__": "#got" was %ju (0x%jX), expected a different number: %s", \
+			(uintmax_t)__got, (uintmax_t)__got, \
+			cmt); \
+		ret = false; \
+		goto label; \
+	} \
+	} while(0)
+
 #define torture_assert_u64_equal(torture_ctx,got,expected,cmt)\
 	do { uint64_t __got = (got), __expected = (expected); \
 	if (__got != __expected) { \
@@ -479,6 +606,18 @@ void torture_result(struct torture_context *test,
 	} \
 	} while(0)
 
+#define torture_assert_u64_not_equal_goto(torture_ctx,got,not_expected,ret,label,cmt)\
+	do { uint64_t __got = (got), __not_expected = (not_expected); \
+	if (__got == __not_expected) { \
+		torture_result(torture_ctx, TORTURE_FAIL, \
+			__location__": "#got" was %llu (0x%llX), expected a different number: %s", \
+			(unsigned long long)__got, (unsigned long long)__got, \
+			cmt); \
+		ret = false; \
+		goto label; \
+	} \
+	} while(0)
+
 #define torture_assert_errno_equal(torture_ctx,expected,cmt)\
 	do { int __expected = (expected); \
 	if (errno != __expected) { \
@@ -490,8 +629,20 @@ void torture_result(struct torture_context *test,
 	} \
 	} while(0)
 
+#define torture_assert_errno_equal_goto(torture_ctx,expected,ret,label,cmt)\
+	do { int __expected = (expected); \
+	if (errno != __expected) { \
+		torture_result(torture_ctx, TORTURE_FAIL, \
+			__location__": errno was %d (%s), expected %d: %s: %s", \
+					   errno, strerror(errno), __expected, \
+					   strerror(__expected), cmt); \
+		ret = false; \
+		goto label; \
+	} \
+	} while(0)
+
 #define torture_assert_guid_equal(torture_ctx,got,expected,cmt)\
-	do { struct GUID __got = (got), __expected = (expected); \
+	do {const struct GUID __got = (got), __expected = (expected); \
 	if (!GUID_equal(&__got, &__expected)) { \
 		torture_result(torture_ctx, TORTURE_FAIL, \
 			__location__": "#got" was %s, expected %s: %s", \
@@ -509,7 +660,7 @@ void torture_result(struct torture_context *test,
 	} while(0)
 
 #define torture_assert_sid_equal(torture_ctx,got,expected,cmt)\
-	do { struct dom_sid *__got = (got), *__expected = (expected); \
+	do {const struct dom_sid *__got = (got), *__expected = (expected); \
 	if (!dom_sid_equal(__got, __expected)) { \
 		torture_result(torture_ctx, TORTURE_FAIL, \
 					   __location__": "#got" was %s, expected %s: %s", \
@@ -519,7 +670,7 @@ void torture_result(struct torture_context *test,
 	} while(0)
 
 #define torture_assert_not_null(torture_ctx,got,cmt)\
-	do { void *__got = (got); \
+	do {const void *__got = (got); \
 	if (__got == NULL) { \
 		torture_result(torture_ctx, TORTURE_FAIL, \
 			__location__": "#got" was NULL, expected != NULL: %s", \
@@ -529,7 +680,7 @@ void torture_result(struct torture_context *test,
 	} while(0)
 
 #define torture_assert_not_null_goto(torture_ctx,got,ret,label,cmt)\
-	do { void *__got = (got); \
+	do {const void *__got = (got); \
 	if (__got == NULL) { \
 		torture_result(torture_ctx, TORTURE_FAIL, \
 			__location__": "#got" was NULL, expected != NULL: %s", \
@@ -570,6 +721,9 @@ void torture_result(struct torture_context *test,
 
 #define torture_assert_ndr_success(torture_ctx,expr,cmt) \
 		torture_assert_ndr_err_equal(torture_ctx,expr,NDR_ERR_SUCCESS,cmt)
+
+#define torture_assert_ndr_success_goto(torture_ctx,expr,ret,label,cmt) \
+		torture_assert_ndr_err_equal_goto(torture_ctx,expr,NDR_ERR_SUCCESS,ret,label,cmt)
 
 #define torture_assert_hresult_ok(torture_ctx,expr,cmt) \
 		torture_assert_hresult_equal(torture_ctx,expr,HRES_ERROR(0), cmt)

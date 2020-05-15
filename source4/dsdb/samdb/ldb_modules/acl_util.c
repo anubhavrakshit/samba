@@ -39,7 +39,9 @@ struct security_token *acl_user_token(struct ldb_module *module)
 {
 	struct ldb_context *ldb = ldb_module_get_ctx(module);
 	struct auth_session_info *session_info
-		= (struct auth_session_info *)ldb_get_opaque(ldb, "sessionInfo");
+		= (struct auth_session_info *)ldb_get_opaque(
+			ldb,
+			DSDB_SESSION_INFO);
 	if(!session_info) {
 		return NULL;
 	}
@@ -67,7 +69,9 @@ int dsdb_module_check_access_on_dn(struct ldb_module *module,
 	};
 	struct ldb_context *ldb = ldb_module_get_ctx(module);
 	struct auth_session_info *session_info
-		= (struct auth_session_info *)ldb_get_opaque(ldb, "sessionInfo");
+		= (struct auth_session_info *)ldb_get_opaque(
+			ldb,
+			DSDB_SESSION_INFO);
 	if(!session_info) {
 		return ldb_operr(ldb);
 	}
@@ -231,7 +235,9 @@ const char *acl_user_name(TALLOC_CTX *mem_ctx, struct ldb_module *module)
 {
 	struct ldb_context *ldb = ldb_module_get_ctx(module);
 	struct auth_session_info *session_info
-		= (struct auth_session_info *)ldb_get_opaque(ldb, "sessionInfo");
+		= (struct auth_session_info *)ldb_get_opaque(
+			ldb,
+			DSDB_SESSION_INFO);
 	if (!session_info) {
 		return "UNKNOWN (NULL)";
 	}
@@ -280,7 +286,7 @@ uint32_t dsdb_request_sd_flags(struct ldb_request *req, bool *explicit)
 
 int dsdb_module_schedule_sd_propagation(struct ldb_module *module,
 					struct ldb_dn *nc_root,
-					struct ldb_dn *dn,
+					struct GUID guid,
 					bool include_self)
 {
 	struct ldb_context *ldb = ldb_module_get_ctx(module);
@@ -293,7 +299,7 @@ int dsdb_module_schedule_sd_propagation(struct ldb_module *module,
 	}
 
 	op->nc_root = nc_root;
-	op->dn = dn;
+	op->guid = guid;
 	op->include_self = include_self;
 
 	ret = dsdb_module_extended(module, op, NULL,

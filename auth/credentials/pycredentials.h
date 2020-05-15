@@ -20,17 +20,21 @@
 #define _PYCREDENTIALS_H_
 
 #include "auth/credentials/credentials.h"
+#include "librpc/rpc/pyrpc_util.h"
 #include <pytalloc.h>
 
 extern PyTypeObject PyCredentials;
 extern PyTypeObject PyCredentialCacheContainer;
-typedef struct {
-	PyObject_HEAD
-	TALLOC_CTX *mem_ctx;
-	struct ccache_container *ccc;
-} PyCredentialCacheContainerObject;
-#define PyCredentials_Check(py_obj) PyObject_TypeCheck(py_obj, &PyCredentials)
-#define PyCredentials_AsCliCredentials(py_obj) pytalloc_get_type(py_obj, struct cli_credentials)
-#define cli_credentials_from_py_object(py_obj) (py_obj == Py_None)?cli_credentials_init_anon(NULL):PyCredentials_AsCliCredentials(py_obj)
+#define PyCredentials_Check(py_obj)					\
+	py_check_dcerpc_type(py_obj, "samba.credentials", "Credentials")
+
+#define PyCredentials_AsCliCredentials(py_obj)				\
+	(PyCredentials_Check(py_obj) ?					\
+	 pytalloc_get_type(py_obj, struct cli_credentials) : NULL)
+
+#define cli_credentials_from_py_object(py_obj)			 \
+	((py_obj == Py_None) ?					 \
+	 cli_credentials_init_anon(NULL) :			 \
+	 PyCredentials_AsCliCredentials(py_obj))
 
 #endif /*  _PYCREDENTIALS_H_ */

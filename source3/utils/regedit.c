@@ -18,7 +18,7 @@
  */
 
 #include "includes.h"
-#include "popt_common.h"
+#include "popt_common_cmdline.h"
 #include "lib/util/data_blob.h"
 #include "lib/registry/registry.h"
 #include "regedit.h"
@@ -157,7 +157,7 @@ static void add_reg_key(struct regedit *regedit, struct tree_node *node,
 	if (subkey) {
 		msg = "Enter name of new subkey";
 	}
-	dialog_input(regedit, &name, "New Key", msg);
+	dialog_input(regedit, &name, "New Key", "%s", msg);
 	if (name) {
 		WERROR rv;
 		struct registry_key *new_key;
@@ -258,7 +258,7 @@ static WERROR regedit_search(struct regedit *regedit, struct tree_node *node,
 			save_value_name = talloc_strdup(regedit,
 							it->value_name);
 			if (save_value_name == NULL) {
-				return WERR_NOMEM;
+				return WERR_NOT_ENOUGH_MEMORY;
 			}
 		}
 
@@ -507,7 +507,8 @@ static void handle_value_input(struct regedit *regedit, int c)
 	case 'b':
 	case 'B':
 		binmode = true;
-		/* Falthrough... */
+
+		FALL_THROUGH;
 	case '\n':
 	case KEY_ENTER:
 		vitem = value_list_get_current_item(regedit->vl);
@@ -680,6 +681,7 @@ int regedit_getch(void)
 static void regedit_panic_handler(const char *msg)
 {
 	endwin();
+	smb_panic_log(msg);
 	smb_panic_s3(msg);
 }
 
@@ -748,7 +750,7 @@ static void display_window(TALLOC_CTX *mem_ctx, struct registry_context *ctx)
 		handle_main_input(regedit, key);
 		update_panels();
 		doupdate();
-	} while (key != 'q' || key == 'Q');
+	} while (key != 'q' && key != 'Q');
 
 	endwin();
 }
@@ -765,7 +767,6 @@ int main(int argc, const char **argv)
 	};
 	int opt;
 	poptContext pc;
-	struct user_auth_info *auth_info;
 	TALLOC_CTX *frame;
 	struct registry_context *ctx;
 	WERROR rv;
@@ -776,20 +777,10 @@ int main(int argc, const char **argv)
 	lp_set_cmdline("log level", "0");
 
 	/* process options */
-	auth_info = user_auth_info_init(frame);
-	if (auth_info == NULL) {
-		exit(1);
-	}
-	popt_common_set_auth_info(auth_info);
 	pc = poptGetContext("regedit", argc, argv, long_options, 0);
 
 	while ((opt = poptGetNextOpt(pc)) != -1) {
 		/* TODO */
-	}
-
-	if (!lp_load_global(get_dyn_CONFIGFILE())) {
-		DEBUG(0, ("ERROR loading config file...\n"));
-		exit(1);
 	}
 
 	rv = reg_open_samba3(frame, &ctx);
@@ -797,6 +788,7 @@ int main(int argc, const char **argv)
 		fprintf(stderr, "Unable to open registry: %s\n",
 			win_errstr(rv));
 		TALLOC_FREE(frame);
+		poptFreeContext(pc);
 
 		return 1;
 	}
@@ -804,6 +796,7 @@ int main(int argc, const char **argv)
 	display_window(frame, ctx);
 
 	TALLOC_FREE(frame);
+	poptFreeContext(pc);
 
 	return 0;
 }

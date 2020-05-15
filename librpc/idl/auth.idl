@@ -28,7 +28,10 @@ interface auth
 	 * during local privilage and group manipulations */
 	typedef [public] struct {
 		[unique,charset(UTF8),string] char *account_name;
+		[unique,charset(UTF8),string] char *user_principal_name;
+		boolean8 user_principal_constructed;
 		[unique,charset(UTF8),string] char *domain_name;
+		[unique,charset(UTF8),string] char *dns_domain_name;
 
 		[unique,charset(UTF8),string] char *full_name;
 		[unique,charset(UTF8),string] char *logon_script;
@@ -102,6 +105,13 @@ interface auth
 		[noprint] DATA_BLOB session_key;
 
 		[value(NULL), ignore] cli_credentials *credentials;
+
+	        /*
+		 * It is really handy to have our authorization code log a
+		 * token that can be used to tie later requests together.
+		 * We generate this in auth_generate_session_info()
+		 */
+	        GUID unique_session_token;
 	} auth_session_info;
 
 	typedef [public] struct {

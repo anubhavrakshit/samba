@@ -20,6 +20,7 @@
 
 #include "includes.h"
 #include "source3/include/auth.h"
+#include "source3/include/messages.h"
 #include "source4/auth/auth.h"
 #include "auth/auth_sam_reply.h"
 #include "param/param.h"
@@ -48,6 +49,7 @@ static int free_task_id(struct server_id *server_id)
  * (ie, use talloc_free()) */
 static struct server_id *new_server_id_task(TALLOC_CTX *mem_ctx)
 {
+	struct messaging_context *msg_ctx;
 	struct server_id *server_id;
 	int task_id;
 	if (!task_id_tree) {
@@ -57,12 +59,17 @@ static struct server_id *new_server_id_task(TALLOC_CTX *mem_ctx)
 		}
 	}
 
+	msg_ctx = global_messaging_context();
+	if (msg_ctx == NULL) {
+		return NULL;
+	}
+
 	server_id = talloc(mem_ctx, struct server_id);
 
 	if (!server_id) {
 		return NULL;
 	}
-	*server_id = procid_self();
+	*server_id = messaging_server_id(msg_ctx);
 
 	/* 0 is the default server_id, so we need to start with 1 */
 	task_id = idr_get_new_above(task_id_tree, server_id, 1, INT32_MAX);
@@ -111,6 +118,7 @@ static NTSTATUS check_samba4_security(const struct auth_context *auth_context,
 	NTSTATUS nt_status;
 	struct auth_user_info_dc *user_info_dc;
 	struct auth4_context *auth4_context;
+	uint8_t authoritative = 0;
 
 	nt_status = make_auth4_context_s4(auth_context, mem_ctx, &auth4_context);
 	if (!NT_STATUS_IS_OK(nt_status)) {
@@ -125,13 +133,19 @@ static NTSTATUS check_samba4_security(const struct auth_context *auth_context,
 		return nt_status;
 	}
 
-	nt_status = auth_check_password(auth4_context, auth4_context, user_info, &user_info_dc);
+	nt_status = auth_check_password(auth4_context, auth4_context, user_info,
+					&user_info_dc, &authoritative);
 	if (!NT_STATUS_IS_OK(nt_status)) {
+		if (NT_STATUS_EQUAL(nt_status, NT_STATUS_NO_SUCH_USER) &&
+				    authoritative == 0)
+		{
+			nt_status = NT_STATUS_NOT_IMPLEMENTED;
+		}
 		TALLOC_FREE(auth4_context);
 		TALLOC_FREE(frame);
 		return nt_status;
 	}
-	
+
 	nt_status = auth_convert_user_info_dc_saminfo3(mem_ctx,
 						       user_info_dc,
 						       &info3);
@@ -224,7 +238,7 @@ static NTSTATUS prepare_gensec(const struct auth_context *auth_context,
 	msg_ctx = imessaging_init(frame,
 				  lp_ctx,
 				  *server_id,
-				  event_ctx, true);
+				  event_ctx);
 	if (msg_ctx == NULL) {
 		DEBUG(1, ("imessaging_init failed\n"));
 		TALLOC_FREE(frame);
@@ -245,8 +259,8 @@ static NTSTATUS prepare_gensec(const struct auth_context *auth_context,
 	status = cli_credentials_set_machine_account(server_credentials, lp_ctx);
 	if (!NT_STATUS_IS_OK(status)) {
 		DEBUG(10, ("Failed to obtain server credentials, perhaps a standalone server?: %s\n", nt_errstr(status)));
-		talloc_free(server_credentials);
-		server_credentials = NULL;
+		TALLOC_FREE(frame);
+		return status;
 	}
 
 	status = samba_server_gensec_start(mem_ctx,
@@ -315,7 +329,7 @@ static NTSTATUS make_auth4_context_s4(const struct auth_context *auth_context,
 	msg_ctx = imessaging_init(frame,
 				  lp_ctx,
 				  *server_id,
-				  event_ctx, true);
+				  event_ctx);
 	if (msg_ctx == NULL) {
 		DEBUG(1, ("imessaging_init failed\n"));
 		TALLOC_FREE(frame);
@@ -350,8 +364,8 @@ static NTSTATUS make_auth4_context_s4(const struct auth_context *auth_context,
 
 /* module initialisation */
 static NTSTATUS auth_init_samba4(struct auth_context *auth_context,
-				    const char *param,
-				    auth_methods **auth_method)
+				 const char *param,
+				 struct auth_methods **auth_method)
 {
 	struct auth_methods *result;
 
@@ -365,7 +379,6 @@ static NTSTATUS auth_init_samba4(struct auth_context *auth_context,
 	result->auth = check_samba4_security;
 	result->prepare_gensec = prepare_gensec;
 	result->make_auth4_context = make_auth4_context_s4;
-	result->flags = AUTH_METHOD_LOCAL_SAM;
 
 	if (param && *param) {
 		auth_context->forced_samba4_methods = talloc_strdup(result, param);
@@ -378,8 +391,8 @@ static NTSTATUS auth_init_samba4(struct auth_context *auth_context,
 	return NT_STATUS_OK;
 }
 
-NTSTATUS auth_samba4_init(void);
-NTSTATUS auth_samba4_init(void)
+NTSTATUS auth_samba4_init(TALLOC_CTX *mem_ctx);
+NTSTATUS auth_samba4_init(TALLOC_CTX *mem_ctx)
 {
 	smb_register_auth(AUTH_INTERFACE_VERSION, "samba4",
 			  auth_init_samba4);

@@ -27,15 +27,11 @@
 #include <tevent.h>
 
 #if PY_MAJOR_VERSION >= 3
-#define PyStr_Check PyUnicode_Check
-#define PyStr_FromString PyUnicode_FromString
-#define PyStr_AsUTF8 PyUnicode_AsUTF8
-#define PyInt_FromLong PyLong_FromLong
-#else
-#define PyStr_Check PyString_Check
-#define PyStr_FromString PyString_FromString
-#define PyStr_AsUTF8 PyString_AsString
+#define PyLong_FromLong PyLong_FromLong
 #endif
+
+/* discard signature of 'func' in favour of 'target_sig' */
+#define PY_DISCARD_FUNC_SIG(target_sig, func) (target_sig)(void(*)(void))func
 
 void init_tevent(void);
 
@@ -188,13 +184,13 @@ static PyObject *py_register_backend(PyObject *self, PyObject *args)
 		return NULL;
 	}
 
-	if (!PyStr_Check(name)) {
+	if (!PyUnicode_Check(name)) {
 		PyErr_SetNone(PyExc_TypeError);
 		Py_DECREF(name);
 		return NULL;
 	}
 
-	if (!tevent_register_backend(PyStr_AsUTF8(name), &py_tevent_ops)) { /* FIXME: What to do with backend */
+	if (!tevent_register_backend(PyUnicode_AsUTF8(name), &py_tevent_ops)) { /* FIXME: What to do with backend */
 		PyErr_SetNone(PyExc_RuntimeError);
 		Py_DECREF(name);
 		return NULL;
@@ -205,7 +201,8 @@ static PyObject *py_register_backend(PyObject *self, PyObject *args)
 	Py_RETURN_NONE;
 }
 
-static PyObject *py_tevent_context_reinitialise(TeventContext_Object *self)
+static PyObject *py_tevent_context_reinitialise(TeventContext_Object *self,
+		PyObject *Py_UNUSED(ignored))
 {
 	int ret = tevent_re_initialise(self->ev);
 	if (ret != 0) {
@@ -215,13 +212,15 @@ static PyObject *py_tevent_context_reinitialise(TeventContext_Object *self)
 	Py_RETURN_NONE;
 }
 
-static PyObject *py_tevent_queue_stop(TeventQueue_Object *self)
+static PyObject *py_tevent_queue_stop(TeventQueue_Object *self,
+		PyObject *Py_UNUSED(ignored))
 {
 	tevent_queue_stop(self->queue);
 	Py_RETURN_NONE;
 }
 
-static PyObject *py_tevent_queue_start(TeventQueue_Object *self)
+static PyObject *py_tevent_queue_start(TeventQueue_Object *self,
+		PyObject *Py_UNUSED(ignored))
 {
 	tevent_queue_start(self->queue);
 	Py_RETURN_NONE;
@@ -262,13 +261,15 @@ static PyObject *py_tevent_queue_add(TeventQueue_Object *self, PyObject *args)
 }
 
 static PyMethodDef py_tevent_queue_methods[] = {
-	{ "stop", (PyCFunction)py_tevent_queue_stop, METH_NOARGS,
+	{ "stop", (PyCFunction)py_tevent_queue_stop,
+		METH_NOARGS,
 		"S.stop()" },
-	{ "start", (PyCFunction)py_tevent_queue_start, METH_NOARGS,
+	{ "start", (PyCFunction)py_tevent_queue_start,
+		METH_NOARGS,
 		"S.start()" },
 	{ "add", (PyCFunction)py_tevent_queue_add, METH_VARARGS,
 		"S.add(ctx, req, trigger, baton)" },
-	{ NULL },
+	{0},
 };
 
 static PyObject *py_tevent_context_wakeup_send(PyObject *self, PyObject *args)
@@ -278,7 +279,8 @@ static PyObject *py_tevent_context_wakeup_send(PyObject *self, PyObject *args)
 	Py_RETURN_NONE;
 }
 
-static PyObject *py_tevent_context_loop_wait(TeventContext_Object *self)
+static PyObject *py_tevent_context_loop_wait(TeventContext_Object *self,
+		PyObject *Py_UNUSED(ignored))
 {
 	if (tevent_loop_wait(self->ev) != 0) {
 		PyErr_SetNone(PyExc_RuntimeError);
@@ -287,7 +289,8 @@ static PyObject *py_tevent_context_loop_wait(TeventContext_Object *self)
 	Py_RETURN_NONE;
 }
 
-static PyObject *py_tevent_context_loop_once(TeventContext_Object *self)
+static PyObject *py_tevent_context_loop_once(TeventContext_Object *self,
+		PyObject *Py_UNUSED(ignored))
 {
 	if (tevent_loop_once(self->ev) != 0) {
 		PyErr_SetNone(PyExc_RuntimeError);
@@ -379,7 +382,9 @@ static int py_tevent_timer_traverse(TeventTimer_Object *self, visitproc visit, v
 	return 0;
 }
 
-static PyObject* py_tevent_timer_get_active(TeventTimer_Object *self) {
+static PyObject* py_tevent_timer_get_active(TeventTimer_Object *self,
+			PyObject *Py_UNUSED(ignored))
+{
 	return PyBool_FromLong(self->timer != NULL);
 }
 
@@ -389,7 +394,7 @@ struct PyGetSetDef py_tevent_timer_getset[] = {
 		.get = (getter)py_tevent_timer_get_active,
 		.doc = discard_const_p(char, "true if the timer is scheduled to run"),
 	},
-	{NULL},
+	{0},
 };
 
 static PyTypeObject TeventTimer_Type = {
@@ -478,9 +483,13 @@ static PyObject *py_tevent_context_add_timer(TeventContext_Object *self, PyObjec
 {
 	struct timeval next_event;
 	PyObject *callback;
-	if (!PyArg_ParseTuple(args, "lO", &next_event, &callback))
+	double secs, usecs;
+	if (!PyArg_ParseTuple(args, "dO", &secs, &callback)){
 		return NULL;
-
+	}
+	next_event.tv_sec = secs;
+	usecs = (secs - next_event.tv_sec) * 1000000.0;
+	next_event.tv_usec = usecs;
 	return py_tevent_context_add_timer_internal(self, next_event, callback);
 }
 
@@ -550,7 +559,8 @@ static PyObject *py_tevent_context_add_fd(TeventContext_Object *self, PyObject *
 }
 
 static PyMethodDef py_tevent_context_methods[] = {
-	{ "reinitialise", (PyCFunction)py_tevent_context_reinitialise, METH_NOARGS,
+	{ "reinitialise", (PyCFunction)py_tevent_context_reinitialise,
+		METH_NOARGS,
 		"S.reinitialise()" },
 	{ "wakeup_send", (PyCFunction)py_tevent_context_wakeup_send, 
 		METH_VARARGS, "S.wakeup_send(wakeup_time) -> req" },
@@ -566,34 +576,39 @@ static PyMethodDef py_tevent_context_methods[] = {
 		METH_VARARGS, "S.add_timer(offset_seconds, handler) -> timer" },
 	{ "add_fd", (PyCFunction)py_tevent_context_add_fd, 
 		METH_VARARGS, "S.add_fd(fd, flags, handler) -> fd" },
-	{ NULL },
+	{0},
 };
 
-static PyObject *py_tevent_req_wakeup_recv(PyObject *self)
+static PyObject *py_tevent_req_wakeup_recv(PyObject *self,
+		PyObject *Py_UNUSED(ignored))
 {
 	/* FIXME */
 	Py_RETURN_NONE;
 }
 
-static PyObject *py_tevent_req_received(PyObject *self)
+static PyObject *py_tevent_req_received(PyObject *self,
+		PyObject *Py_UNUSED(ignored))
 {
 	/* FIXME */
 	Py_RETURN_NONE;
 }
 
-static PyObject *py_tevent_req_is_error(PyObject *self)
+static PyObject *py_tevent_req_is_error(PyObject *self,
+		PyObject *Py_UNUSED(ignored))
 {
 	/* FIXME */
 	Py_RETURN_NONE;
 }
 
-static PyObject *py_tevent_req_poll(PyObject *self)
+static PyObject *py_tevent_req_poll(PyObject *self,
+		PyObject *Py_UNUSED(ignored))
 {
 	/* FIXME */
 	Py_RETURN_NONE;
 }
 
-static PyObject *py_tevent_req_is_in_progress(PyObject *self)
+static PyObject *py_tevent_req_is_in_progress(PyObject *self,
+		PyObject *Py_UNUSED(ignored))
 {
 	/* FIXME */
 	Py_RETURN_NONE;
@@ -605,7 +620,7 @@ static PyGetSetDef py_tevent_req_getsetters[] = {
 		.get = (getter)py_tevent_req_is_in_progress,
 		.doc = discard_const_p(char, "Whether the request is in progress"),
 	},
-	{ NULL }
+	{0}
 };
 
 static PyObject *py_tevent_req_post(PyObject *self, PyObject *args)
@@ -620,13 +635,15 @@ static PyObject *py_tevent_req_set_error(PyObject *self, PyObject *args)
 	Py_RETURN_NONE;
 }
 
-static PyObject *py_tevent_req_done(PyObject *self)
+static PyObject *py_tevent_req_done(PyObject *self,
+		PyObject *Py_UNUSED(ignored))
 {
 	/* FIXME */
 	Py_RETURN_NONE;
 }
 
-static PyObject *py_tevent_req_notify_callback(PyObject *self)
+static PyObject *py_tevent_req_notify_callback(PyObject *self,
+		PyObject *Py_UNUSED(ignored))
 {
 	/* FIXME */
 	Py_RETURN_NONE;
@@ -638,7 +655,8 @@ static PyObject *py_tevent_req_set_endtime(PyObject *self, PyObject *args)
 	Py_RETURN_NONE;
 }
 
-static PyObject *py_tevent_req_cancel(TeventReq_Object *self)
+static PyObject *py_tevent_req_cancel(TeventReq_Object *self,
+		PyObject *Py_UNUSED(ignored))
 {
 	if (!tevent_req_cancel(self->req)) {
 		PyErr_SetNone(PyExc_RuntimeError);
@@ -648,9 +666,11 @@ static PyObject *py_tevent_req_cancel(TeventReq_Object *self)
 }
 
 static PyMethodDef py_tevent_req_methods[] = {
-	{ "wakeup_recv", (PyCFunction)py_tevent_req_wakeup_recv, METH_NOARGS,
+	{ "wakeup_recv", (PyCFunction)py_tevent_req_wakeup_recv,
+		METH_NOARGS,
 		"Wakeup received" },
-	{ "received", (PyCFunction)py_tevent_req_received, METH_NOARGS,
+	{ "received", (PyCFunction)py_tevent_req_received,
+		METH_NOARGS,
 		"Receive finished" },
 	{ "is_error", (PyCFunction)py_tevent_req_is_error, METH_NOARGS,
 		"is_error() -> (error, state)" },
@@ -668,7 +688,7 @@ static PyMethodDef py_tevent_req_methods[] = {
 		METH_VARARGS, "set_endtime(ctx, endtime)" },
 	{ "cancel", (PyCFunction)py_tevent_req_cancel,
 		METH_NOARGS, "cancel()" },
-	{ NULL }
+	{0}
 };
 
 static void py_tevent_req_dealloc(TeventReq_Object *self)
@@ -686,9 +706,10 @@ static PyTypeObject TeventReq_Type = {
 	/* FIXME: .tp_new = py_tevent_req_new, */
 };
 
-static PyObject *py_tevent_queue_get_length(TeventQueue_Object *self)
+static PyObject *py_tevent_queue_get_length(TeventQueue_Object *self,
+			PyObject *Py_UNUSED(ignored))
 {
-	return PyInt_FromLong(tevent_queue_length(self->queue));
+	return PyLong_FromLong(tevent_queue_length(self->queue));
 }
 
 static PyGetSetDef py_tevent_queue_getsetters[] = {
@@ -697,7 +718,7 @@ static PyGetSetDef py_tevent_queue_getsetters[] = {
 		.get = (getter)py_tevent_queue_get_length,
 		.doc = discard_const_p(char, "The number of elements in the queue."),
 	},
-	{ NULL },
+	{0},
 };
 
 static void py_tevent_queue_dealloc(TeventQueue_Object *self)
@@ -715,7 +736,8 @@ static PyTypeObject TeventQueue_Type = {
 	.tp_methods = py_tevent_queue_methods,
 };
 
-static PyObject *py_tevent_context_signal_support(PyObject *_self)
+static PyObject *py_tevent_context_signal_support(PyObject *_self,
+		PyObject *Py_UNUSED(ignored))
 {
 	TeventContext_Object *self = (TeventContext_Object *)_self;
 	return PyBool_FromLong(tevent_signal_support(self->ev));
@@ -724,10 +746,11 @@ static PyObject *py_tevent_context_signal_support(PyObject *_self)
 static PyGetSetDef py_tevent_context_getsetters[] = {
 	{
 		.name = discard_const_p(char, "signal_support"),
-		.get = (getter)py_tevent_context_signal_support,
+		.get = PY_DISCARD_FUNC_SIG(getter,
+					   py_tevent_context_signal_support),
 		.doc = discard_const_p(char, "if this platform and tevent context support signal handling"),
 	},
-	{ NULL }
+	{0}
 };
 
 static void py_tevent_context_dealloc(TeventContext_Object *self)
@@ -789,7 +812,8 @@ static PyObject *py_set_default_backend(PyObject *self, PyObject *args)
 	Py_RETURN_NONE;
 }
 
-static PyObject *py_backend_list(PyObject *self)
+static PyObject *py_backend_list(PyObject *self,
+		PyObject *Py_UNUSED(ignored))
 {
 	PyObject *ret = NULL;
 	PyObject *string = NULL;
@@ -807,7 +831,7 @@ static PyObject *py_backend_list(PyObject *self)
 		goto err;
 	}
 	for (i = 0; backends[i]; i++) {
-		string = PyStr_FromString(backends[i]);
+		string = PyUnicode_FromString(backends[i]);
 		if (!string) {
 			goto err;
 		}
@@ -837,7 +861,7 @@ static PyMethodDef tevent_methods[] = {
 		METH_VARARGS, "set_default_backend(backend)" },
 	{ "backend_list", (PyCFunction)py_backend_list, 
 		METH_NOARGS, "backend_list() -> list" },
-	{ NULL },
+	{0},
 };
 
 #define MODULE_DOC PyDoc_STR("Python wrapping of talloc-maintained objects.")

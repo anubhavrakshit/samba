@@ -36,6 +36,7 @@
 #include "includes.h"
 #include "ldb_module.h"
 #include "dsdb/samdb/samdb.h"
+#include "dsdb/samdb/ldb_modules/util.h"
 
 struct oc_context {
 
@@ -132,7 +133,16 @@ static int oc_auto_normalise(struct ldb_context *ldb, const struct dsdb_attribut
 	for (i=0; i<el->num_values; i++) {
 		struct ldb_val v;
 		int ret;
-		ret = attr->ldb_schema_attribute->syntax->canonicalise_fn(ldb, el->values, &el->values[i], &v);
+		/*
+		 * We use msg->elements (owned by this module due to
+		 * ldb_msg_copy_shallow()) as a memory context and
+		 * then steal from there to the right spot if we don't
+		 * free it.
+		 */
+		ret = attr->ldb_schema_attribute->syntax->canonicalise_fn(ldb,
+									  msg->elements,
+									  &el->values[i],
+									  &v);
 		if (ret != LDB_SUCCESS) {
 			return ret;
 		}
@@ -155,6 +165,12 @@ static int oc_auto_normalise(struct ldb_context *ldb, const struct dsdb_attribut
 		}
 
 		el->values[i] = v;
+
+		/*
+		 * By now el->values is a talloc pointer under
+		 * msg->elements and may now be used
+		 */
+		talloc_steal(el->values, v.data);
 	}
 	return LDB_SUCCESS;
 }
@@ -214,7 +230,46 @@ static int attr_handler(struct oc_context *ac)
 					       ldb_dn_get_linearized(msg->dn));
 			return LDB_ERR_UNWILLING_TO_PERFORM;
 		}
-		
+
+		/*
+		 * Enforce systemOnly checks from [ADTS] 3.1.1.5.3.2
+		 * Constraints in Modify Operation
+		 */
+		if (ac->req->operation == LDB_MODIFY && attr->systemOnly) {
+			/*
+			 * Allow dbcheck and relax to bypass. objectClass, name
+			 * and distinguishedName are generally handled
+			 * elsewhere.
+			 *
+			 * The remaining cases, undelete, msDS-AdditionalDnsHostName
+			 * and wellKnownObjects are documented in the specification.
+			 */
+			if (!ldb_request_get_control(ac->req, LDB_CONTROL_RELAX_OID) &&
+			    !ldb_request_get_control(ac->req, DSDB_CONTROL_DBCHECK) &&
+			    !ldb_request_get_control(ac->req, DSDB_CONTROL_RESTORE_TOMBSTONE_OID) &&
+			    ldb_attr_cmp(attr->lDAPDisplayName, "objectClass") != 0 &&
+			    ldb_attr_cmp(attr->lDAPDisplayName, "name") != 0 &&
+			    ldb_attr_cmp(attr->lDAPDisplayName, "distinguishedName") != 0 &&
+			    ldb_attr_cmp(attr->lDAPDisplayName, "msDS-AdditionalDnsHostName") != 0 &&
+			    ldb_attr_cmp(attr->lDAPDisplayName, "wellKnownObjects") != 0) {
+				/*
+				 * Comparison against base schema DN is used as a substitute for
+				 * fschemaUpgradeInProgress and other specific schema checks.
+				 */
+				if (ldb_dn_compare_base(ldb_get_schema_basedn(ldb), msg->dn) != 0) {
+					struct ldb_control *as_system = ldb_request_get_control(ac->req,
+												LDB_CONTROL_AS_SYSTEM_OID);
+					if (!dsdb_module_am_system(ac->module) && !as_system) {
+						ldb_asprintf_errstring(ldb,
+								       "objectclass_attrs: attribute '%s' on entry '%s' must can only be modified as system",
+								       msg->elements[i].name,
+								       ldb_dn_get_linearized(msg->dn));
+						return LDB_ERR_CONSTRAINT_VIOLATION;
+					}
+				}
+			}
+		}
+
 		if (!(msg->elements[i].flags & LDB_FLAG_INTERNAL_DISABLE_VALIDATION)) {
 			werr = attr->syntax->validate_ldb(&syntax_ctx, attr,
 							  &msg->elements[i]);
@@ -307,7 +362,7 @@ static int attr_handler2(struct oc_context *ac)
 		return ldb_operr(ldb);
 	}
 
-	/* We rely here on the preceeding "objectclass" LDB module which did
+	/* We rely here on the preceding "objectclass" LDB module which did
 	 * already fix up the objectclass list (inheritance, order...). */
 	oc_element = ldb_msg_find_element(ac->search_res->message,
 					  "objectClass");
@@ -419,26 +474,45 @@ static int attr_handler2(struct oc_context *ac)
 		}
 	}
 
+	/*
+	 * We skip this check under dbcheck to allow fixing of other
+	 * attributes even if an attribute is missing.  This matters
+	 * for CN=RID Set as the required attribute rIDNextRid is not
+	 * replicated.
+	 */
 	if (found_must_contain[0] != NULL &&
 	    ldb_msg_check_string_attribute(msg, "isDeleted", "TRUE") == 0) {
-		ldb_asprintf_errstring(ldb, "objectclass_attrs: at least one mandatory attribute ('%s') on entry '%s' wasn't specified!",
-				       found_must_contain[0],
-				       ldb_dn_get_linearized(msg->dn));
-		return LDB_ERR_OBJECT_CLASS_VIOLATION;
+
+		for (i = 0; found_must_contain[i] != NULL; i++) {
+			const struct dsdb_attribute *broken_attr = dsdb_attribute_by_lDAPDisplayName(ac->schema,
+												     found_must_contain[i]);
+
+			bool replicated = (broken_attr->systemFlags &
+					   (DS_FLAG_ATTR_NOT_REPLICATED | DS_FLAG_ATTR_IS_CONSTRUCTED)) == 0;
+
+			if (replicated) {
+				ldb_asprintf_errstring(ldb, "objectclass_attrs: at least one mandatory "
+						       "attribute ('%s') on entry '%s' wasn't specified!",
+						       found_must_contain[i],
+						       ldb_dn_get_linearized(msg->dn));
+				return LDB_ERR_OBJECT_CLASS_VIOLATION;
+			}
+		}
 	}
 
 	if (isSchemaAttr) {
-		/* Before really adding an attribute in the database,
-			* let's check that we can translate it into a dbsd_attribute and
-			* that we can find a valid syntax object.
-			* If not it's better to reject this attribute than not be able
-			* to start samba next time due to schema being unloadable.
-			*/
+		/*
+		 * Before really adding an attribute in the database,
+		 * let's check that we can translate it into a dsdb_attribute and
+		 * that we can find a valid syntax object.
+		 * If not it's better to reject this attribute than not be able
+		 * to start samba next time due to schema being unloadable.
+		 */
 		struct dsdb_attribute *att = talloc(ac, struct dsdb_attribute);
 		const struct dsdb_syntax *attrSyntax;
 		WERROR status;
 
-		status= dsdb_attribute_from_ldb(ac->schema, msg, att);
+		status = dsdb_attribute_from_ldb(NULL, msg, att);
 		if (!W_ERROR_IS_OK(status)) {
 			ldb_set_errstring(ldb,
 						"objectclass: failed to translate the schemaAttribute to a dsdb_attribute");
@@ -512,6 +586,7 @@ static int oc_op_callback(struct ldb_request *req, struct ldb_reply *ares)
 	struct ldb_request *search_req;
 	struct ldb_dn *base_dn;
 	int ret;
+	static const char *attrs[] = {"nTSecurityDescriptor", "*", NULL};
 
 	ac = talloc_get_type(req->context, struct oc_context);
 	ldb = ldb_module_get_ctx(ac->module);
@@ -544,7 +619,7 @@ static int oc_op_callback(struct ldb_request *req, struct ldb_reply *ares)
 		: ac->req->op.mod.message->dn;
 	ret = ldb_build_search_req(&search_req, ldb, ac, base_dn,
 				   LDB_SCOPE_BASE, "(objectClass=*)",
-				   NULL, NULL, ac,
+				   attrs, NULL, ac,
 				   get_search_callback, ac->req);
 	LDB_REQ_SET_LOCATION(search_req);
 	if (ret != LDB_SUCCESS) {
@@ -553,6 +628,17 @@ static int oc_op_callback(struct ldb_request *req, struct ldb_reply *ares)
 
 	ret = ldb_request_add_control(search_req, LDB_CONTROL_SHOW_RECYCLED_OID,
 				      true, NULL);
+	if (ret != LDB_SUCCESS) {
+		return ldb_module_done(ac->req, NULL, NULL, ret);
+	}
+
+	/*
+	 * This ensures we see if there was a DN, that pointed at an
+	 * object that is now deleted, that we still consider the
+	 * schema check to have passed
+	 */
+	ret = ldb_request_add_control(search_req, LDB_CONTROL_REVEAL_INTERNALS,
+				      false, NULL);
 	if (ret != LDB_SUCCESS) {
 		return ldb_module_done(ac->req, NULL, NULL, ret);
 	}

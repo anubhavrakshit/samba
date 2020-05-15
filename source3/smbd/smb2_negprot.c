@@ -25,6 +25,10 @@
 #include "../libcli/smb/smb2_negotiate_context.h"
 #include "../lib/tsocket/tsocket.h"
 #include "../librpc/ndr/libndr.h"
+#include "../libcli/smb/smb_signing.h"
+
+#undef DBGC_CLASS
+#define DBGC_CLASS DBGC_SMB2
 
 extern fstring remote_proto;
 
@@ -32,7 +36,7 @@ extern fstring remote_proto;
  * this is the entry point if SMB2 is selected via
  * the SMB negprot and the given dialect.
  */
-static void reply_smb20xx(struct smb_request *req, uint16_t dialect)
+static NTSTATUS reply_smb20xx(struct smb_request *req, uint16_t dialect)
 {
 	uint8_t *smb2_inpdu;
 	uint8_t *smb2_hdr;
@@ -44,7 +48,7 @@ static void reply_smb20xx(struct smb_request *req, uint16_t dialect)
 	if (smb2_inpdu == NULL) {
 		DEBUG(0, ("Could not push spnego blob\n"));
 		reply_nterror(req, NT_STATUS_NO_MEMORY);
-		return;
+		return NT_STATUS_NO_MEMORY;
 	}
 	smb2_hdr = smb2_inpdu;
 	smb2_body = smb2_hdr + SMB2_HDR_BODY;
@@ -60,28 +64,27 @@ static void reply_smb20xx(struct smb_request *req, uint16_t dialect)
 
 	req->outbuf = NULL;
 
-	smbd_smb2_first_negprot(req->xconn, smb2_inpdu, len);
-	return;
+	return smbd_smb2_process_negprot(req->xconn, 0, smb2_inpdu, len);
 }
 
 /*
  * this is the entry point if SMB2 is selected via
  * the SMB negprot and the "SMB 2.002" dialect.
  */
-void reply_smb2002(struct smb_request *req, uint16_t choice)
+NTSTATUS reply_smb2002(struct smb_request *req, uint16_t choice)
 {
-	reply_smb20xx(req, SMB2_DIALECT_REVISION_202);
+	return reply_smb20xx(req, SMB2_DIALECT_REVISION_202);
 }
 
 /*
  * this is the entry point if SMB2 is selected via
  * the SMB negprot and the "SMB 2.???" dialect.
  */
-void reply_smb20ff(struct smb_request *req, uint16_t choice)
+NTSTATUS reply_smb20ff(struct smb_request *req, uint16_t choice)
 {
 	struct smbXsrv_connection *xconn = req->xconn;
 	xconn->smb2.allow_2ff = true;
-	reply_smb20xx(req, SMB2_DIALECT_REVISION_2FF);
+	return reply_smb20xx(req, SMB2_DIALECT_REVISION_2FF);
 }
 
 enum protocol_types smbd_smb2_protocol_dialect_match(const uint8_t *indyn,
@@ -104,7 +107,7 @@ enum protocol_types smbd_smb2_protocol_dialect_match(const uint8_t *indyn,
 	size_t i;
 
 	for (i = 0; i < ARRAY_SIZE(pd); i ++) {
-		size_t c = 0;
+		int c = 0;
 
 		if (lp_server_max_protocol() < pd[i].proto) {
 			continue;
@@ -127,6 +130,7 @@ enum protocol_types smbd_smb2_protocol_dialect_match(const uint8_t *indyn,
 NTSTATUS smbd_smb2_request_process_negprot(struct smbd_smb2_request *req)
 {
 	struct smbXsrv_connection *xconn = req->xconn;
+	struct smbXsrv_client_global0 *global0 = NULL;
 	NTSTATUS status;
 	const uint8_t *inbody;
 	const uint8_t *indyn = NULL;
@@ -160,6 +164,8 @@ NTSTATUS smbd_smb2_request_process_negprot(struct smbd_smb2_request *req)
 	uint32_t max_read = lp_smb2_max_read();
 	uint32_t max_write = lp_smb2_max_write();
 	NTTIME now = timeval_to_nttime(&req->request_time);
+	bool signing_required = true;
+	bool ok;
 
 	status = smbd_smb2_request_verify_sizes(req, 0x24);
 	if (!NT_STATUS_IS_OK(status)) {
@@ -258,8 +264,26 @@ NTSTATUS smbd_smb2_request_process_negprot(struct smbd_smb2_request *req)
 		}
 	}
 
-	if (get_remote_arch() != RA_SAMBA) {
+	if ((dialect != SMB2_DIALECT_REVISION_2FF) &&
+	    (protocol >= PROTOCOL_SMB2_10) &&
+	    !GUID_all_zero(&in_guid))
+	{
+		ok = remote_arch_cache_update(&in_guid);
+		if (!ok) {
+			return smbd_smb2_request_error(
+				req, NT_STATUS_UNSUCCESSFUL);
+		}
+	}
+
+	switch (get_remote_arch()) {
+	case RA_VISTA:
+	case RA_SAMBA:
+	case RA_CIFSFS:
+	case RA_OSX:
+		break;
+	default:
 		set_remote_arch(RA_VISTA);
+		break;
 	}
 
 	fstr_sprintf(remote_proto, "SMB%X_%02X",
@@ -287,7 +311,13 @@ NTSTATUS smbd_smb2_request_process_negprot(struct smbd_smb2_request *req)
 	}
 
 	security_mode = SMB2_NEGOTIATE_SIGNING_ENABLED;
-	if (lp_server_signing() == SMB_SIGNING_REQUIRED) {
+	/*
+	 * We use xconn->smb1.signing_state as that's already present
+	 * and used lpcfg_server_signing_allowed() to get the correct
+	 * defaults, e.g. signing_required for an ad_dc.
+	 */
+	signing_required = smb_signing_is_mandatory(xconn->smb1.signing_state);
+	if (signing_required) {
 		security_mode |= SMB2_NEGOTIATE_SIGNING_REQUIRED;
 	}
 
@@ -357,7 +387,6 @@ NTSTATUS smbd_smb2_request_process_negprot(struct smbd_smb2_request *req)
 		uint16_t selected_preauth = 0;
 		const uint8_t *p;
 		uint8_t buf[38];
-		DATA_BLOB b;
 		size_t i;
 
 		if (in_preauth->data.length < needed) {
@@ -404,9 +433,12 @@ NTSTATUS smbd_smb2_request_process_negprot(struct smbd_smb2_request *req)
 		SSVAL(buf, 4, selected_preauth);
 		generate_random_buffer(buf + 6, 32);
 
-		b = data_blob_const(buf, sizeof(buf));
-		status = smb2_negotiate_context_add(req, &out_c,
-					SMB2_PREAUTH_INTEGRITY_CAPABILITIES, b);
+		status = smb2_negotiate_context_add(
+			req,
+			&out_c,
+			SMB2_PREAUTH_INTEGRITY_CAPABILITIES,
+			buf,
+			sizeof(buf));
 		if (!NT_STATUS_IS_OK(status)) {
 			return smbd_smb2_request_error(req, status);
 		}
@@ -414,12 +446,11 @@ NTSTATUS smbd_smb2_request_process_negprot(struct smbd_smb2_request *req)
 		req->preauth = &req->xconn->smb2.preauth;
 	}
 
-	if (in_cipher != NULL) {
+	if ((capabilities & SMB2_CAP_ENCRYPTION) && (in_cipher != NULL)) {
 		size_t needed = 2;
 		uint16_t cipher_count;
 		const uint8_t *p;
 		uint8_t buf[4];
-		DATA_BLOB b;
 		size_t i;
 		bool aes_128_ccm_supported = false;
 		bool aes_128_gcm_supported = false;
@@ -460,22 +491,21 @@ NTSTATUS smbd_smb2_request_process_negprot(struct smbd_smb2_request *req)
 			}
 		}
 
-		/*
-		 * For now we preferr CCM because our implementation
-		 * is faster than GCM, see bug #11451.
-		 */
-		if (aes_128_ccm_supported) {
-			xconn->smb2.server.cipher = SMB2_ENCRYPTION_AES128_CCM;
-		} else if (aes_128_gcm_supported) {
+		if (aes_128_gcm_supported) {
 			xconn->smb2.server.cipher = SMB2_ENCRYPTION_AES128_GCM;
+		} else if (aes_128_ccm_supported) {
+			xconn->smb2.server.cipher = SMB2_ENCRYPTION_AES128_CCM;
 		}
 
 		SSVAL(buf, 0, 1); /* ChiperCount */
 		SSVAL(buf, 2, xconn->smb2.server.cipher);
 
-		b = data_blob_const(buf, sizeof(buf));
-		status = smb2_negotiate_context_add(req, &out_c,
-					SMB2_ENCRYPTION_CAPABILITIES, b);
+		status = smb2_negotiate_context_add(
+			req,
+			&out_c,
+			SMB2_ENCRYPTION_CAPABILITIES,
+			buf,
+			sizeof(buf));
 		if (!NT_STATUS_IS_OK(status)) {
 			return smbd_smb2_request_error(req, status);
 		}
@@ -483,6 +513,14 @@ NTSTATUS smbd_smb2_request_process_negprot(struct smbd_smb2_request *req)
 
 	if (capabilities & SMB2_CAP_ENCRYPTION) {
 		xconn->smb2.server.cipher = SMB2_ENCRYPTION_AES128_CCM;
+	}
+
+	if (protocol >= PROTOCOL_SMB2_22 &&
+	    xconn->client->server_multi_channel_enabled)
+	{
+		if (in_capabilities & SMB2_CAP_MULTI_CHANNEL) {
+			capabilities |= SMB2_CAP_MULTI_CHANNEL;
+		}
 	}
 
 	security_offset = SMB2_HDR_BODY + 0x40;
@@ -509,7 +547,6 @@ NTSTATUS smbd_smb2_request_process_negprot(struct smbd_smb2_request *req)
 		static const uint8_t zeros[8];
 		size_t pad = 0;
 		size_t ofs;
-		bool ok;
 
 		outdyn = data_blob_dup_talloc(req, security_buffer);
 		if (outdyn.length != security_buffer.length) {
@@ -578,33 +615,91 @@ NTSTATUS smbd_smb2_request_process_negprot(struct smbd_smb2_request *req)
 
 	req->sconn->using_smb2 = true;
 
-	if (dialect != SMB2_DIALECT_REVISION_2FF) {
-		status = smbXsrv_connection_init_tables(xconn, protocol);
+	if (dialect == SMB2_DIALECT_REVISION_2FF) {
+		return smbd_smb2_request_done(req, outbody, &outdyn);
+	}
+
+	status = smbXsrv_connection_init_tables(xconn, protocol);
+	if (!NT_STATUS_IS_OK(status)) {
+		return smbd_smb2_request_error(req, status);
+	}
+
+	xconn->smb2.client.capabilities = in_capabilities;
+	xconn->smb2.client.security_mode = in_security_mode;
+	xconn->smb2.client.guid = in_guid;
+	xconn->smb2.client.num_dialects = dialect_count;
+	xconn->smb2.client.dialects = talloc_array(xconn,
+						   uint16_t,
+						   dialect_count);
+	if (xconn->smb2.client.dialects == NULL) {
+		return smbd_smb2_request_error(req, NT_STATUS_NO_MEMORY);
+	}
+	for (c=0; c < dialect_count; c++) {
+		xconn->smb2.client.dialects[c] = SVAL(indyn, c*2);
+	}
+
+	xconn->smb2.server.capabilities = capabilities;
+	xconn->smb2.server.security_mode = security_mode;
+	xconn->smb2.server.guid = out_guid;
+	xconn->smb2.server.dialect = dialect;
+	xconn->smb2.server.max_trans = max_trans;
+	xconn->smb2.server.max_read  = max_read;
+	xconn->smb2.server.max_write = max_write;
+
+	if (xconn->protocol < PROTOCOL_SMB2_10) {
+		/*
+		 * SMB2_02 doesn't support client guids
+		 */
+		return smbd_smb2_request_done(req, outbody, &outdyn);
+	}
+
+	if (!xconn->client->server_multi_channel_enabled) {
+		/*
+		 * Only deal with the client guid database
+		 * if multi-channel is enabled.
+		 */
+		return smbd_smb2_request_done(req, outbody, &outdyn);
+	}
+
+	if (xconn->smb2.client.guid_verified) {
+		/*
+		 * The connection was passed from another
+		 * smbd process.
+		 */
+		return smbd_smb2_request_done(req, outbody, &outdyn);
+	}
+
+	status = smb2srv_client_lookup_global(xconn->client,
+					      xconn->smb2.client.guid,
+					      req, &global0);
+	/*
+	 * TODO: check for races...
+	 */
+	if (NT_STATUS_EQUAL(status, NT_STATUS_OBJECTID_NOT_FOUND)) {
+		/*
+		 * This stores the new client information in
+		 * smbXsrv_client_global.tdb
+		 */
+		xconn->client->global->client_guid =
+			xconn->smb2.client.guid;
+		status = smbXsrv_client_update(xconn->client);
+		if (!NT_STATUS_IS_OK(status)) {
+			return status;
+		}
+
+		xconn->smb2.client.guid_verified = true;
+	} else if (NT_STATUS_IS_OK(status)) {
+		status = smb2srv_client_connection_pass(req,
+							global0);
 		if (!NT_STATUS_IS_OK(status)) {
 			return smbd_smb2_request_error(req, status);
 		}
 
-		xconn->smb2.client.capabilities = in_capabilities;
-		xconn->smb2.client.security_mode = in_security_mode;
-		xconn->smb2.client.guid = in_guid;
-		xconn->smb2.client.num_dialects = dialect_count;
-		xconn->smb2.client.dialects = talloc_array(xconn,
-							   uint16_t,
-							   dialect_count);
-		if (xconn->smb2.client.dialects == NULL) {
-			return smbd_smb2_request_error(req, NT_STATUS_NO_MEMORY);
-		}
-		for (c=0; c < dialect_count; c++) {
-			xconn->smb2.client.dialects[c] = SVAL(indyn, c*2);
-		}
-
-		xconn->smb2.server.capabilities = capabilities;
-		xconn->smb2.server.security_mode = security_mode;
-		xconn->smb2.server.guid = out_guid;
-		xconn->smb2.server.dialect = dialect;
-		xconn->smb2.server.max_trans = max_trans;
-		xconn->smb2.server.max_read  = max_read;
-		xconn->smb2.server.max_write = max_write;
+		smbd_server_connection_terminate(xconn,
+						 "passed connection");
+		return NT_STATUS_OBJECTID_EXISTS;
+	} else {
+		return smbd_smb2_request_error(req, status);
 	}
 
 	return smbd_smb2_request_done(req, outbody, &outdyn);

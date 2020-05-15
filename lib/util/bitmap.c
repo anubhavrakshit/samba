@@ -17,8 +17,11 @@
    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-#include "includes.h"
+#include "replace.h"
+#include <talloc.h>
 #include "lib/util/bitmap.h"
+#include "lib/util/debug.h"
+#include "lib/util/fault.h"
 
 struct bitmap {
 	unsigned int n;
@@ -71,7 +74,7 @@ bool bitmap_set(struct bitmap *bm, unsigned i)
 		      i, bm->n));
 		return false;
 	}
-	bm->b[i/32] |= (1<<(i%32));
+	bm->b[i/32] |= (1U<<(i%32));
 	return true;
 }
 
@@ -85,7 +88,7 @@ bool bitmap_clear(struct bitmap *bm, unsigned i)
 		      i, bm->n));
 		return false;
 	}
-	bm->b[i/32] &= ~(1<<(i%32));
+	bm->b[i/32] &= ~(1U<<(i%32));
 	return true;
 }
 
@@ -95,7 +98,7 @@ query a bit in a bitmap
 bool bitmap_query(struct bitmap *bm, unsigned i)
 {
 	if (i >= bm->n) return false;
-	if (bm->b[i/32] & (1<<(i%32))) {
+	if (bm->b[i/32] & (1U<<(i%32))) {
 		return true;
 	}
 	return false;

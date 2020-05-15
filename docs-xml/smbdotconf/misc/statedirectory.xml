@@ -1,7 +1,6 @@
 <samba:parameter name="state directory"
                  context="G"
                  type="string"
-                 constant="1"
                  xmlns:samba="http://www.samba.org/samba/DTD/samba-doc">
 <description>
 	<para>Usually, most of the TDB files are stored in the
@@ -13,7 +12,7 @@
 	</para>
 
 	<para> This option specifies the directory where TDB files containing
-	persistent data will be stored.
+	important persistent data will be stored.
 	</para>
 </description>
 

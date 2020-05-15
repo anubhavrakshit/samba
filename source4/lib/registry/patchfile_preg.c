@@ -23,6 +23,7 @@
 #include "lib/registry/registry.h"
 #include "system/filesys.h"
 #include "librpc/gen_ndr/winreg.h"
+#include "lib/util/sys_rw.h"
 
 struct preg_data {
 	int fd;
@@ -34,7 +35,7 @@ static WERROR preg_read_utf16(int fd, char *c)
 	uint16_t v;
 
 	if (read(fd, &v, sizeof(uint16_t)) < sizeof(uint16_t)) {
-		return WERR_GENERAL_FAILURE;
+		return WERR_GEN_FAILURE;
 	}
 	push_codepoint(c, v);
 	return WERR_OK;
@@ -47,7 +48,7 @@ static WERROR preg_write_utf16(int fd, const char *string)
 	for (i = 0; i < strlen(string); i+=size) {
 		v = next_codepoint(&string[i], &size);
 		if (write(fd, &v, sizeof(uint16_t)) < sizeof(uint16_t)) {
-			return WERR_GENERAL_FAILURE;
+			return WERR_GEN_FAILURE;
 		}
 	}
 	return WERR_OK;
@@ -71,12 +72,12 @@ static WERROR reg_preg_diff_set_value(void *_data, const char *key_name,
 	preg_write_utf16(data->fd, value_name);
 	preg_write_utf16(data->fd, ";");
 	SIVAL(&buf, 0, value_type);
-	write(data->fd, &buf, sizeof(uint32_t));
+	sys_write_v(data->fd, &buf, sizeof(uint32_t));
 	preg_write_utf16(data->fd, ";");
 	SIVAL(&buf, 0, value_data.length);
-	write(data->fd, &buf, sizeof(uint32_t));
+	sys_write_v(data->fd, &buf, sizeof(uint32_t));
 	preg_write_utf16(data->fd, ";");
-	write(data->fd, value_data.data, value_data.length);
+	sys_write_v(data->fd, value_data.data, value_data.length);
 	preg_write_utf16(data->fd, "]");
 	
 	return WERR_OK;
@@ -181,7 +182,7 @@ _PUBLIC_ WERROR reg_preg_diff_save(TALLOC_CTX *ctx, const char *filename,
 		data->fd = open(filename, O_CREAT|O_WRONLY, 0755);
 		if (data->fd < 0) {
 			DEBUG(0, ("Unable to open %s\n", filename));
-			return WERR_BADFILE;
+			return WERR_FILE_NOT_FOUND;
 		}
 	} else {
 		data->fd = STDOUT_FILENO;
@@ -189,7 +190,7 @@ _PUBLIC_ WERROR reg_preg_diff_save(TALLOC_CTX *ctx, const char *filename,
 
 	memcpy(preg_header.hdr, "PReg", sizeof(preg_header.hdr));
 	SIVAL(&preg_header.version, 0, 1);
-	write(data->fd, (uint8_t *)&preg_header, sizeof(preg_header));
+	sys_write_v(data->fd, (uint8_t *)&preg_header, sizeof(preg_header));
 
 	data->ctx = ctx;
 
@@ -220,9 +221,6 @@ _PUBLIC_ WERROR reg_preg_diff_load(int fd,
 	char *buf_ptr;
 	TALLOC_CTX *mem_ctx = talloc_init("reg_preg_diff_load");
 	WERROR ret = WERR_OK;
-	DATA_BLOB data = {NULL, 0};
-	char *key = NULL;
-	char *value_name = NULL;
 
 	buf = talloc_array(mem_ctx, char, buf_size);
 	buf_ptr = buf;
@@ -231,14 +229,14 @@ _PUBLIC_ WERROR reg_preg_diff_load(int fd,
 	if (read(fd, &preg_header, sizeof(preg_header)) != sizeof(preg_header)) {
 		DEBUG(0, ("Could not read PReg file: %s\n",
 				strerror(errno)));
-		ret = WERR_GENERAL_FAILURE;
+		ret = WERR_GEN_FAILURE;
 		goto cleanup;
 	}
 	preg_header.version = IVAL(&preg_header.version, 0);
 
 	if (strncmp(preg_header.hdr, "PReg", 4) != 0) {
 		DEBUG(0, ("This file is not a valid preg registry file\n"));
-		ret = WERR_GENERAL_FAILURE;
+		ret = WERR_GEN_FAILURE;
 		goto cleanup;
 	}
 	if (preg_header.version > 1) {
@@ -248,13 +246,16 @@ _PUBLIC_ WERROR reg_preg_diff_load(int fd,
 	/* Read the entries */
 	while(1) {
 		uint32_t value_type, length;
+		char *key = NULL;
+		char *value_name = NULL;
+		DATA_BLOB data = {NULL, 0};
 
 		if (!W_ERROR_IS_OK(preg_read_utf16(fd, buf_ptr))) {
 			break;
 		}
 		if (*buf_ptr != '[') {
 			DEBUG(0, ("Error in PReg file.\n"));
-			ret = WERR_GENERAL_FAILURE;
+			ret = WERR_GEN_FAILURE;
 			goto cleanup;
 		}
 
@@ -279,7 +280,7 @@ _PUBLIC_ WERROR reg_preg_diff_load(int fd,
 		/* Get the type */
 		if (read(fd, &value_type, sizeof(uint32_t)) < sizeof(uint32_t)) {
 			DEBUG(0, ("Error while reading PReg\n"));
-			ret = WERR_GENERAL_FAILURE;
+			ret = WERR_GEN_FAILURE;
 			goto cleanup;
 		}
 		value_type = IVAL(&value_type, 0);
@@ -289,14 +290,14 @@ _PUBLIC_ WERROR reg_preg_diff_load(int fd,
 		if (!(W_ERROR_IS_OK(preg_read_utf16(fd, buf_ptr)) &&
 		    *buf_ptr == ';') && buf_ptr-buf < buf_size) {
 			DEBUG(0, ("Error in PReg file.\n"));
-			ret = WERR_GENERAL_FAILURE;
+			ret = WERR_GEN_FAILURE;
 			goto cleanup;
 		}
 
 		/* Get data length */
 		if (read(fd, &length, sizeof(uint32_t)) < sizeof(uint32_t)) {
 			DEBUG(0, ("Error while reading PReg\n"));
-			ret = WERR_GENERAL_FAILURE;
+			ret = WERR_GEN_FAILURE;
 			goto cleanup;
 		}
 		length = IVAL(&length, 0);
@@ -306,7 +307,7 @@ _PUBLIC_ WERROR reg_preg_diff_load(int fd,
 		if (!(W_ERROR_IS_OK(preg_read_utf16(fd, buf_ptr)) &&
 		    *buf_ptr == ';') && buf_ptr-buf < buf_size) {
 			DEBUG(0, ("Error in PReg file.\n"));
-			ret = WERR_GENERAL_FAILURE;
+			ret = WERR_GEN_FAILURE;
 			goto cleanup;
 		}
 
@@ -315,7 +316,7 @@ _PUBLIC_ WERROR reg_preg_diff_load(int fd,
 		if (length < buf_size &&
 		    read(fd, buf_ptr, length) != length) {
 			DEBUG(0, ("Error while reading PReg\n"));
-			ret = WERR_GENERAL_FAILURE;
+			ret = WERR_GEN_FAILURE;
 			goto cleanup;
 		}
 		data = data_blob_talloc(mem_ctx, buf, length);
@@ -371,13 +372,13 @@ _PUBLIC_ WERROR reg_preg_diff_load(int fd,
 			callbacks->add_key(callback_data, key);
 			callbacks->set_value(callback_data, key, value_name,
 					     value_type, data);
- 		}
+		}
+		TALLOC_FREE(key);
+		TALLOC_FREE(value_name);
+		data_blob_free(&data);
 	}
 cleanup:
 	close(fd);
-	talloc_free(data.data);
-	talloc_free(key);
-	talloc_free(value_name);
-	talloc_free(buf);
+	TALLOC_FREE(mem_ctx);
 	return ret;
 }

@@ -55,6 +55,7 @@ struct acl_private {
 	uint64_t cached_schema_metadata_usn;
 	uint64_t cached_schema_loaded_usn;
 	const char **confidential_attrs;
+	bool userPassword_support;
 };
 
 struct acl_context {
@@ -177,7 +178,21 @@ static int acl_module_init(struct ldb_module *module)
 
 done:
 	talloc_free(mem_ctx);
-	return ldb_next_init(module);
+	ret = ldb_next_init(module);
+
+	if (ret != LDB_SUCCESS) {
+		return ret;
+	}
+
+	/*
+	 * Check this after the modules have be initialised so we
+	 * can actually read the backend DB.
+	 */
+	data->userPassword_support
+		= dsdb_user_password_support(module,
+					     module,
+					     NULL);
+	return ret;
 }
 
 static int acl_allowedAttributes(struct ldb_module *module,
@@ -518,7 +533,7 @@ static int acl_validate_spn_value(TALLOC_CTX *mem_ctx,
 				  const char *netbios_name,
 				  const char *ntds_guid)
 {
-	int ret;
+	int ret, princ_size;
 	krb5_context krb_ctx;
 	krb5_error_code kerr;
 	krb5_principal principal;
@@ -552,7 +567,9 @@ static int acl_validate_spn_value(TALLOC_CTX *mem_ctx,
 		return LDB_ERR_CONSTRAINT_VIOLATION;
 	}
 
-	if (krb5_princ_size(krb_ctx, principal) < 2) {
+	princ_size = krb5_princ_size(krb_ctx, principal);
+	if (princ_size < 2) {
+		DBG_WARNING("princ_size=%d\n", princ_size);
 		goto fail;
 	}
 
@@ -569,21 +586,29 @@ static int acl_validate_spn_value(TALLOC_CTX *mem_ctx,
 
 	if (serviceName) {
 		if (!is_dc) {
+			DBG_WARNING("is_dc=false, serviceName=%s,"
+				    "serviceType=%s\n", serviceName,
+				  serviceType);
 			goto fail;
 		}
 		if (strcasecmp(serviceType, "ldap") == 0) {
 			if (strcasecmp(serviceName, netbios_name) != 0 &&
 			    strcasecmp(serviceName, forest_name) != 0) {
+				DBG_WARNING("serviceName=%s\n", serviceName);
 				goto fail;
 			}
 
 		} else if (strcasecmp(serviceType, "gc") == 0) {
 			if (strcasecmp(serviceName, forest_name) != 0) {
+				DBG_WARNING("serviceName=%s\n", serviceName);
 				goto fail;
 			}
 		} else {
 			if (strcasecmp(serviceName, base_domain) != 0 &&
 			    strcasecmp(serviceName, netbios_name) != 0) {
+				DBG_WARNING("serviceType=%s, "
+					    "serviceName=%s\n",
+					    serviceType, serviceName);
 				goto fail;
 			}
 		}
@@ -591,11 +616,15 @@ static int acl_validate_spn_value(TALLOC_CTX *mem_ctx,
 	/* instanceName can be samAccountName without $ or dnsHostName
 	 * or "ntds_guid._msdcs.forest_domain for DC objects */
 	if (strlen(instanceName) == (strlen(samAccountName) - 1)
-	    && strncasecmp(instanceName, samAccountName, strlen(samAccountName) - 1) == 0) {
+	    && strncasecmp(instanceName, samAccountName,
+			   strlen(samAccountName) - 1) == 0) {
 		goto success;
-	} else if (dnsHostName != NULL && strcasecmp(instanceName, dnsHostName) == 0) {
+	}
+	if ((dnsHostName != NULL) &&
+	    (strcasecmp(instanceName, dnsHostName) == 0)) {
 		goto success;
-	} else if (is_dc) {
+	}
+	if (is_dc) {
 		const char *guid_str;
 		guid_str = talloc_asprintf(mem_ctx,"%s._msdcs.%s",
 					   ntds_guid,
@@ -608,6 +637,14 @@ static int acl_validate_spn_value(TALLOC_CTX *mem_ctx,
 fail:
 	krb5_free_principal(krb_ctx, principal);
 	krb5_free_context(krb_ctx);
+	ldb_debug_set(ldb, LDB_DEBUG_WARNING,
+		      "acl: spn validation failed for "
+		      "spn[%s] uac[0x%x] account[%s] hostname[%s] "
+		      "nbname[%s] ntds[%s] forest[%s] domain[%s]\n",
+		      spn_value, (unsigned)userAccountControl,
+		      samAccountName, dnsHostName,
+		      netbios_name, ntds_guid,
+		      forest_name, base_domain);
 	return LDB_ERR_CONSTRAINT_VIOLATION;
 
 success:
@@ -867,7 +904,7 @@ static int acl_add(struct ldb_module *module, struct ldb_request *req)
 					     &objectclass->schemaIDGUID, req);
 	if (ret != LDB_SUCCESS) {
 		ldb_asprintf_errstring(ldb_module_get_ctx(module),
-				       "acl: unable to find or validate structural objectClass on %s\n",
+				       "acl: unable to get access to %s\n",
 				       ldb_dn_get_linearized(req->op.add.message->dn));
 		return ret;
 	}
@@ -931,21 +968,97 @@ static int acl_check_self_membership(TALLOC_CTX *mem_ctx,
 	return ret;
 }
 
-static int acl_check_password_rights(TALLOC_CTX *mem_ctx,
-				     struct ldb_module *module,
-				     struct ldb_request *req,
-				     struct security_descriptor *sd,
-				     struct dom_sid *sid,
-				     const struct dsdb_class *objectclass,
-				     bool userPassword)
+static int acl_check_password_rights(
+	TALLOC_CTX *mem_ctx,
+	struct ldb_module *module,
+	struct ldb_request *req,
+	struct security_descriptor *sd,
+	struct dom_sid *sid,
+	const struct dsdb_class *objectclass,
+	bool userPassword,
+	struct  dsdb_control_password_acl_validation **control_for_response)
 {
 	int ret = LDB_SUCCESS;
 	unsigned int del_attr_cnt = 0, add_attr_cnt = 0, rep_attr_cnt = 0;
+	unsigned int del_val_cnt = 0, add_val_cnt = 0, rep_val_cnt = 0;
 	struct ldb_message_element *el;
 	struct ldb_message *msg;
+	struct ldb_control *c = NULL;
 	const char *passwordAttrs[] = { "userPassword", "clearTextPassword",
-					"unicodePwd", "dBCSPwd", NULL }, **l;
+					"unicodePwd", NULL }, **l;
 	TALLOC_CTX *tmp_ctx = talloc_new(mem_ctx);
+	struct dsdb_control_password_acl_validation *pav = NULL;
+
+	if (tmp_ctx == NULL) {
+		return LDB_ERR_OPERATIONS_ERROR;
+	}
+
+	pav = talloc_zero(req, struct dsdb_control_password_acl_validation);
+	if (pav == NULL) {
+		talloc_free(tmp_ctx);
+		return LDB_ERR_OPERATIONS_ERROR;
+	}
+	/*
+	 * Set control_for_response to pav so it can be added to the response
+	 * and be passed up to the audit_log module which uses it to identify
+	 * password reset attempts.
+	 */
+	*control_for_response = pav;
+
+	c = ldb_request_get_control(req, DSDB_CONTROL_PASSWORD_CHANGE_OID);
+	if (c != NULL) {
+		pav->pwd_reset = false;
+
+		/*
+		 * The "DSDB_CONTROL_PASSWORD_CHANGE_OID" control means that we
+		 * have a user password change and not a set as the message
+		 * looks like. In it's value blob it contains the NT and/or LM
+		 * hash of the old password specified by the user.  This control
+		 * is used by the SAMR and "kpasswd" password change mechanisms.
+		 *
+		 * This control can't be used by real LDAP clients,
+		 * the only caller is samdb_set_password_internal(),
+		 * so we don't have to strict verification of the input.
+		 */
+		ret = acl_check_extended_right(tmp_ctx,
+					       sd,
+					       acl_user_token(module),
+					       GUID_DRS_USER_CHANGE_PASSWORD,
+					       SEC_ADS_CONTROL_ACCESS,
+					       sid);
+		goto checked;
+	}
+
+	c = ldb_request_get_control(req, DSDB_CONTROL_PASSWORD_HASH_VALUES_OID);
+	if (c != NULL) {
+		pav->pwd_reset = true;
+
+		/*
+		 * The "DSDB_CONTROL_PASSWORD_HASH_VALUES_OID" control, without
+		 * "DSDB_CONTROL_PASSWORD_CHANGE_OID" control means that we
+		 * have a force password set.
+		 * This control is used by the SAMR/NETLOGON/LSA password
+		 * reset mechanisms.
+		 *
+		 * This control can't be used by real LDAP clients,
+		 * the only caller is samdb_set_password_internal(),
+		 * so we don't have to strict verification of the input.
+		 */
+		ret = acl_check_extended_right(tmp_ctx, sd, acl_user_token(module),
+					       GUID_DRS_FORCE_CHANGE_PASSWORD,
+					       SEC_ADS_CONTROL_ACCESS,
+					       sid);
+		goto checked;
+	}
+
+	el = ldb_msg_find_element(req->op.mod.message, "dBCSPwd");
+	if (el != NULL) {
+		/*
+		 * dBCSPwd is only allowed with a control.
+		 */
+		talloc_free(tmp_ctx);
+		return LDB_ERR_UNWILLING_TO_PERFORM;
+	}
 
 	msg = ldb_msg_copy_shallow(tmp_ctx, req->op.mod.message);
 	if (msg == NULL) {
@@ -959,12 +1072,15 @@ static int acl_check_password_rights(TALLOC_CTX *mem_ctx,
 		while ((el = ldb_msg_find_element(msg, *l)) != NULL) {
 			if (LDB_FLAG_MOD_TYPE(el->flags) == LDB_FLAG_MOD_DELETE) {
 				++del_attr_cnt;
+				del_val_cnt += el->num_values;
 			}
 			if (LDB_FLAG_MOD_TYPE(el->flags) == LDB_FLAG_MOD_ADD) {
 				++add_attr_cnt;
+				add_val_cnt += el->num_values;
 			}
 			if (LDB_FLAG_MOD_TYPE(el->flags) == LDB_FLAG_MOD_REPLACE) {
 				++rep_attr_cnt;
+				rep_val_cnt += el->num_values;
 			}
 			ldb_msg_remove_element(msg, el);
 		}
@@ -977,26 +1093,30 @@ static int acl_check_password_rights(TALLOC_CTX *mem_ctx,
 		return LDB_SUCCESS;
 	}
 
-	if (ldb_request_get_control(req,
-				    DSDB_CONTROL_PASSWORD_CHANGE_OID) != NULL) {
-		/* The "DSDB_CONTROL_PASSWORD_CHANGE_OID" control means that we
-		 * have a user password change and not a set as the message
-		 * looks like. In it's value blob it contains the NT and/or LM
-		 * hash of the old password specified by the user.
-		 * This control is used by the SAMR and "kpasswd" password
-		 * change mechanisms. */
-		ret = acl_check_extended_right(tmp_ctx, sd, acl_user_token(module),
-					       GUID_DRS_USER_CHANGE_PASSWORD,
-					       SEC_ADS_CONTROL_ACCESS,
-					       sid);
-	}
-	else if (rep_attr_cnt > 0 || (add_attr_cnt != del_attr_cnt)) {
+
+	if (rep_attr_cnt > 0) {
+		pav->pwd_reset = true;
+
 		ret = acl_check_extended_right(tmp_ctx, sd, acl_user_token(module),
 					       GUID_DRS_FORCE_CHANGE_PASSWORD,
 					       SEC_ADS_CONTROL_ACCESS,
 					       sid);
+		goto checked;
 	}
-	else if (add_attr_cnt == 1 && del_attr_cnt == 1) {
+
+	if (add_attr_cnt != del_attr_cnt) {
+		pav->pwd_reset = true;
+
+		ret = acl_check_extended_right(tmp_ctx, sd, acl_user_token(module),
+					       GUID_DRS_FORCE_CHANGE_PASSWORD,
+					       SEC_ADS_CONTROL_ACCESS,
+					       sid);
+		goto checked;
+	}
+
+	if (add_val_cnt == 1 && del_val_cnt == 1) {
+		pav->pwd_reset = false;
+
 		ret = acl_check_extended_right(tmp_ctx, sd, acl_user_token(module),
 					       GUID_DRS_USER_CHANGE_PASSWORD,
 					       SEC_ADS_CONTROL_ACCESS,
@@ -1005,17 +1125,152 @@ static int acl_check_password_rights(TALLOC_CTX *mem_ctx,
 		if (ret == LDB_ERR_INSUFFICIENT_ACCESS_RIGHTS) {
 			ret = LDB_ERR_CONSTRAINT_VIOLATION;
 		}
+		goto checked;
 	}
+
+	if (add_val_cnt == 1 && del_val_cnt == 0) {
+		pav->pwd_reset = true;
+
+		ret = acl_check_extended_right(tmp_ctx, sd, acl_user_token(module),
+					       GUID_DRS_FORCE_CHANGE_PASSWORD,
+					       SEC_ADS_CONTROL_ACCESS,
+					       sid);
+		/* Very strange, but we get constraint violation in this case */
+		if (ret == LDB_ERR_INSUFFICIENT_ACCESS_RIGHTS) {
+			ret = LDB_ERR_CONSTRAINT_VIOLATION;
+		}
+		goto checked;
+	}
+
+	/*
+	 * Everything else is handled by the password_hash module where it will
+	 * fail, but with the correct error code when the module is again
+	 * checking the attributes. As the change request will lack the
+	 * DSDB_CONTROL_PASSWORD_ACL_VALIDATION_OID control, we can be sure that
+	 * any modification attempt that went this way will be rejected.
+	 */
+
+	talloc_free(tmp_ctx);
+	return LDB_SUCCESS;
+
+checked:
 	if (ret != LDB_SUCCESS) {
 		dsdb_acl_debug(sd, acl_user_token(module),
 			       req->op.mod.message->dn,
 			       true,
 			       10);
+		talloc_free(tmp_ctx);
+		return ret;
 	}
-	talloc_free(tmp_ctx);
-	return ret;
+
+	ret = ldb_request_add_control(req,
+		DSDB_CONTROL_PASSWORD_ACL_VALIDATION_OID, false, pav);
+	if (ret != LDB_SUCCESS) {
+		ldb_debug(ldb_module_get_ctx(module), LDB_DEBUG_ERROR,
+			  "Unable to register ACL validation control!\n");
+		return ret;
+	}
+	return LDB_SUCCESS;
 }
 
+/*
+ * Context needed by acl_callback
+ */
+struct acl_callback_context {
+	struct ldb_request *request;
+	struct ldb_module *module;
+};
+
+/*
+ * @brief Copy the password validation control to the reply.
+ *
+ * Copy the dsdb_control_password_acl_validation control from the request,
+ * to the reply.  The control is used by the audit_log module to identify
+ * password rests.
+ *
+ * @param req the ldb request.
+ * @param ares the result, updated with the control.
+ */
+static void copy_password_acl_validation_control(
+	struct ldb_request *req,
+	struct ldb_reply *ares)
+{
+	struct ldb_control *pav_ctrl = NULL;
+	struct dsdb_control_password_acl_validation *pav = NULL;
+
+	pav_ctrl = ldb_request_get_control(
+		discard_const(req),
+		DSDB_CONTROL_PASSWORD_ACL_VALIDATION_OID);
+	if (pav_ctrl == NULL) {
+		return;
+	}
+
+	pav = talloc_get_type_abort(
+		pav_ctrl->data,
+		struct dsdb_control_password_acl_validation);
+	if (pav == NULL) {
+		return;
+	}
+	ldb_reply_add_control(
+		ares,
+		DSDB_CONTROL_PASSWORD_ACL_VALIDATION_OID,
+		false,
+		pav);
+}
+/*
+ * @brief call back function for acl_modify.
+ *
+ * Calls acl_copy to copy the dsdb_control_password_acl_validation from
+ * the request to the reply.
+ *
+ * @param req the ldb_request.
+ * @param ares the operation result.
+ *
+ * @return the LDB_STATUS
+ */
+static int acl_callback(struct ldb_request *req, struct ldb_reply *ares)
+{
+	struct acl_callback_context *ac = NULL;
+
+	ac = talloc_get_type(req->context, struct acl_callback_context);
+
+	if (!ares) {
+		return ldb_module_done(
+			ac->request,
+			NULL,
+			NULL,
+			LDB_ERR_OPERATIONS_ERROR);
+	}
+
+	/* pass on to the callback */
+	switch (ares->type) {
+	case LDB_REPLY_ENTRY:
+		return ldb_module_send_entry(
+			ac->request,
+			ares->message,
+			ares->controls);
+
+	case LDB_REPLY_REFERRAL:
+		return ldb_module_send_referral(
+			ac->request,
+			ares->referral);
+
+	case LDB_REPLY_DONE:
+		/*
+		 * Copy the ACL control from the request to the response
+		 */
+		copy_password_acl_validation_control(req, ares);
+		return ldb_module_done(
+			ac->request,
+			ares->controls,
+			ares->response,
+			ares->error);
+
+	default:
+		/* Can't happen */
+		return LDB_ERR_OPERATIONS_ERROR;
+	}
+}
 
 static int acl_modify(struct ldb_module *module, struct ldb_request *req)
 {
@@ -1030,6 +1285,7 @@ static int acl_modify(struct ldb_module *module, struct ldb_request *req)
 	struct ldb_control *as_system;
 	struct ldb_control *is_undelete;
 	bool userPassword;
+	bool password_rights_checked = false;
 	TALLOC_CTX *tmp_ctx;
 	const struct ldb_message *msg = req->op.mod.message;
 	static const char *acl_attrs[] = {
@@ -1038,6 +1294,10 @@ static int acl_modify(struct ldb_module *module, struct ldb_request *req)
 		"objectSid",
 		NULL
 	};
+	struct acl_callback_context *context = NULL;
+	struct ldb_request *new_req = NULL;
+	struct  dsdb_control_password_acl_validation *pav = NULL;
+	struct ldb_control **controls = NULL;
 
 	if (ldb_dn_is_special(msg->dn)) {
 		return ldb_next_request(module, req);
@@ -1175,16 +1435,29 @@ static int acl_modify(struct ldb_module *module, struct ldb_request *req)
 		} else if (ldb_attr_cmp("unicodePwd", el->name) == 0 ||
 			   (userPassword && ldb_attr_cmp("userPassword", el->name) == 0) ||
 			   ldb_attr_cmp("clearTextPassword", el->name) == 0) {
+			/*
+			 * Ideally we would do the acl_check_password_rights
+			 * before we checked the other attributes, i.e. in a
+			 * loop before the current one.
+			 * Have not done this as yet in order to limit the size
+			 * of the change. To limit the possibility of breaking
+			 * the ACL logic.
+			 */
+			if (password_rights_checked) {
+				continue;
+			}
 			ret = acl_check_password_rights(tmp_ctx,
 							module,
 							req,
 							sd,
 							sid,
 							objectclass,
-							userPassword);
+							userPassword,
+							&pav);
 			if (ret != LDB_SUCCESS) {
 				goto fail;
 			}
+			password_rights_checked = true;
 		} else if (ldb_attr_cmp("servicePrincipalName", el->name) == 0) {
 			ret = acl_check_spn(tmp_ctx,
 					    module,
@@ -1229,10 +1502,57 @@ static int acl_modify(struct ldb_module *module, struct ldb_request *req)
 
 success:
 	talloc_free(tmp_ctx);
-	return ldb_next_request(module, req);
+	context = talloc_zero(req, struct acl_callback_context);
+
+	if (context == NULL) {
+		return ldb_oom(ldb);
+	}
+	context->request = req;
+	context->module  = module;
+	ret = ldb_build_mod_req(
+		&new_req,
+		ldb,
+		req,
+		req->op.mod.message,
+		req->controls,
+		context,
+		acl_callback,
+		req);
+	if (ret != LDB_SUCCESS) {
+		return ret;
+	}
+	return ldb_next_request(module, new_req);
 fail:
 	talloc_free(tmp_ctx);
-	return ret;
+	/*
+	 * We copy the pav into the result, so that the password reset
+	 * logging code in audit_log can log failed password reset attempts.
+	 */
+	if (pav) {
+		struct ldb_control *control = NULL;
+
+		controls = talloc_zero_array(req, struct ldb_control *, 2);
+		if (controls == NULL) {
+			return ldb_oom(ldb);
+		}
+
+		control = talloc(controls, struct ldb_control);
+
+		if (control == NULL) {
+			return ldb_oom(ldb);
+		}
+
+		control->oid= talloc_strdup(
+			control,
+			DSDB_CONTROL_PASSWORD_ACL_VALIDATION_OID);
+		if (control->oid == NULL) {
+			return ldb_oom(ldb);
+		}
+		control->critical	= false;
+		control->data	= pav;
+		*controls = control;
+	}
+	return ldb_module_done(req, controls, NULL, ret);
 }
 
 /* similar to the modify for the time being.
@@ -1626,7 +1946,6 @@ static int acl_search_update_confidential_attrs(struct acl_context *ac,
 	}
 
 	if ((ac->schema == data->cached_schema_ptr) &&
-	    (ac->schema->loaded_usn == data->cached_schema_loaded_usn) &&
 	    (ac->schema->metadata_usn == data->cached_schema_metadata_usn))
 	{
 		return LDB_SUCCESS;
@@ -1662,7 +1981,6 @@ static int acl_search_update_confidential_attrs(struct acl_context *ac,
 	}
 
 	data->cached_schema_ptr = ac->schema;
-	data->cached_schema_loaded_usn = ac->schema->loaded_usn;
 	data->cached_schema_metadata_usn = ac->schema->metadata_usn;
 
 	return LDB_SUCCESS;
@@ -1851,9 +2169,12 @@ static int acl_search(struct ldb_module *module, struct ldb_request *req)
 		return ldb_next_request(module, req);
 	}
 
-	if (!ac->am_system) {
-		ac->userPassword = dsdb_user_password_support(module, ac, req);
+	data = talloc_get_type(ldb_module_get_private(ac->module), struct acl_private);
+	if (data == NULL) {
+		return ldb_error(ldb, LDB_ERR_OPERATIONS_ERROR,
+				 "acl_private data is missing");
 	}
+	ac->userPassword = data->userPassword_support;
 
 	ret = acl_search_update_confidential_attrs(ac, data);
 	if (ret != LDB_SUCCESS) {

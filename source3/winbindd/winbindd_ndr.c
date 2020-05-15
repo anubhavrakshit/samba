@@ -36,8 +36,6 @@ void ndr_print_winbindd_child(struct ndr_print *ndr,
 {
 	ndr_print_struct(ndr, name, "winbindd_child");
 	ndr->depth++;
-	ndr_print_ptr(ndr, "next", r->next);
-	ndr_print_ptr(ndr, "prev", r->prev);
 	ndr_print_uint32(ndr, "pid", (uint32_t)r->pid);
 #if 0
 	ndr_print_winbindd_domain(ndr, "domain", r->domain);
@@ -75,12 +73,12 @@ void ndr_print_winbindd_cm_conn(struct ndr_print *ndr,
 
 #ifdef HAVE_ADS
 extern struct winbindd_methods ads_methods;
+extern struct winbindd_methods reconnect_ads_methods;
 #endif
 extern struct winbindd_methods msrpc_methods;
 extern struct winbindd_methods builtin_passdb_methods;
 extern struct winbindd_methods sam_passdb_methods;
 extern struct winbindd_methods reconnect_methods;
-extern struct winbindd_methods cache_methods;
 
 void ndr_print_winbindd_methods(struct ndr_print *ndr,
 				const char *name,
@@ -100,6 +98,8 @@ void ndr_print_winbindd_methods(struct ndr_print *ndr,
 #ifdef HAVE_ADS
 	} else if (r == &ads_methods) {
 		ndr_print_string(ndr, name, "ads_methods");
+	} else if (r == &reconnect_ads_methods) {
+		ndr_print_string(ndr, name, "reconnect_ads_methods");
 #endif
 	} else if (r == &builtin_passdb_methods) {
 		ndr_print_string(ndr, name, "builtin_passdb_methods");
@@ -107,8 +107,6 @@ void ndr_print_winbindd_methods(struct ndr_print *ndr,
 		ndr_print_string(ndr, name, "sam_passdb_methods");
 	} else if (r == &reconnect_methods) {
 		ndr_print_string(ndr, name, "reconnect_methods");
-	} else if (r == &cache_methods) {
-		ndr_print_string(ndr, name, "cache_methods");
 	} else {
 		ndr_print_string(ndr, name, "UNKNOWN");
 	}
@@ -144,7 +142,6 @@ void ndr_print_winbindd_domain(struct ndr_print *ndr,
 	ndr_print_bool(ndr, "online", r->online);
 	ndr_print_time_t(ndr, "startup_time", r->startup_time);
 	ndr_print_bool(ndr, "startup", r->startup);
-	ndr_print_winbindd_methods(ndr, "methods", r->methods);
 	ndr_print_winbindd_methods(ndr, "backend", r->backend);
 	ndr_print_ptr(ndr, "private_data", r->private_data);
 	ndr_print_string(ndr, "dcname", r->dcname);

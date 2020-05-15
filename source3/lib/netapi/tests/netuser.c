@@ -244,7 +244,7 @@ static NET_API_STATUS test_netusermodals(struct libnetapi_ctx *ctx,
 		return status;
 	}
 
-	if (memcmp(u0, _u0, sizeof(u0) != 0)) {
+	if (memcmp(u0, _u0, sizeof(*u0)) != 0) {
 		printf("USER_MODALS_INFO_0 struct has changed!!!!\n");
 		return -1;
 	}
@@ -265,8 +265,8 @@ static NET_API_STATUS test_netusergetgroups(const char *hostname,
 	uint8_t *buffer = NULL;
 	int i;
 
-	struct GROUP_USERS_INFO_0 *i0;
-	struct GROUP_USERS_INFO_1 *i1;
+	struct GROUP_USERS_INFO_0 *i0 = NULL;
+	struct GROUP_USERS_INFO_1 *i1 = NULL;
 
 	printf("testing NetUserGetGroups level %d\n", level);
 

@@ -33,6 +33,9 @@
 #include "libcli/composite/composite.h"
 #include "libcli/security/security.h"
 
+#undef DBGC_CLASS
+#define DBGC_CLASS            DBGC_DRS_REPL
+
 /*
   update repsFrom/repsTo error information
  */
@@ -117,7 +120,7 @@ WERROR dreplsrv_schedule_partition_pull_source(struct dreplsrv_service *s,
 	 */
 	op->source_dsa	= talloc_reference(op, source);
 	if (!op->source_dsa) {
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	op->options	= options;
@@ -126,8 +129,9 @@ WERROR dreplsrv_schedule_partition_pull_source(struct dreplsrv_service *s,
 	op->callback    = callback;
 	op->cb_data	= cb_data;
 	op->schedule_time = time(NULL);
+	op->more_flags	= 0;
 
-	DLIST_ADD_END(s->ops.pending, op, struct dreplsrv_out_operation *);
+	DLIST_ADD_END(s->ops.pending, op);
 
 	return WERR_OK;
 }
@@ -198,7 +202,7 @@ void dreplsrv_run_pull_ops(struct dreplsrv_service *s)
 	struct tevent_req *subreq;
 	WERROR werr;
 
-	if (s->ops.current) {
+	if (s->ops.n_current || s->ops.current) {
 		/* if there's still one running, we're done */
 		return;
 	}
@@ -233,7 +237,7 @@ void dreplsrv_run_pull_ops(struct dreplsrv_service *s)
 
 	subreq = dreplsrv_op_pull_source_send(op, s->task->event_ctx, op);
 	if (!subreq) {
-		werr = WERR_NOMEM;
+		werr = WERR_NOT_ENOUGH_MEMORY;
 		goto failed;
 	}
 

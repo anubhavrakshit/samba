@@ -43,19 +43,22 @@ static bool client_can_access_ccache_entry(uid_t client_uid,
 	return False;
 }
 
-static NTSTATUS do_ntlm_auth_with_stored_pw(const char *username,
+static NTSTATUS do_ntlm_auth_with_stored_pw(const char *namespace,
 					    const char *domain,
+					    const char *username,
 					    const char *password,
 					    const DATA_BLOB initial_msg,
 					    const DATA_BLOB challenge_msg,
+					    TALLOC_CTX *mem_ctx,
 					    DATA_BLOB *auth_msg,
-					    uint8_t session_key[16])
+					    uint8_t session_key[16],
+					    uint8_t *new_spnego)
 {
 	NTSTATUS status;
 	struct auth_generic_state *auth_generic_state = NULL;
-	DATA_BLOB dummy_msg, reply, session_key_blob;
+	DATA_BLOB reply, session_key_blob;
 
-	status = auth_generic_client_prepare(NULL, &auth_generic_state);
+	status = auth_generic_client_prepare(mem_ctx, &auth_generic_state);
 
 	if (!NT_STATUS_IS_OK(status)) {
 		DEBUG(1, ("Could not start NTLMSSP client: %s\n",
@@ -87,29 +90,26 @@ static NTSTATUS do_ntlm_auth_with_stored_pw(const char *username,
 		goto done;
 	}
 
-	gensec_want_feature(auth_generic_state->gensec_security, GENSEC_FEATURE_SESSION_KEY);
+	if (initial_msg.length == 0) {
+		gensec_want_feature(auth_generic_state->gensec_security,
+				    GENSEC_FEATURE_SESSION_KEY);
+	}
 
-	status = auth_generic_client_start(auth_generic_state, GENSEC_OID_NTLMSSP);
+	status = auth_generic_client_start_by_name(auth_generic_state,
+						   "ntlmssp_resume_ccache");
 	if (!NT_STATUS_IS_OK(status)) {
-		DEBUG(1, ("Could not start NTLMSSP mech: %s\n",
+		DEBUG(1, ("Could not start NTLMSSP resume mech: %s\n",
 			nt_errstr(status)));
 		goto done;
 	}
 
-	/* We need to get our protocol handler into the right state. So first
-	   we ask it to generate the initial message. Actually the client has already
-	   sent its own initial message, so we're going to drop this one on the floor.
-	   The client might have sent a different message, for example with different
-	   negotiation options, but as far as I can tell this won't hurt us. (Unless
-	   the client sent a different username or domain, in which case that's their
-	   problem for telling us the wrong username or domain.)
-	   Since we have a copy of the initial message that the client sent, we could
-	   resolve any discrepancies if we had to.
-	*/
-	dummy_msg = data_blob_null;
+	/*
+	 * We inject the initial NEGOTIATE message our caller used
+	 * in order to get the state machine into the correct position.
+	 */
 	reply = data_blob_null;
 	status = gensec_update(auth_generic_state->gensec_security,
-			       talloc_tos(), dummy_msg, &reply);
+			       talloc_tos(), initial_msg, &reply);
 	data_blob_free(&reply);
 
 	if (!NT_STATUS_EQUAL(status, NT_STATUS_MORE_PROCESSING_REQUIRED)) {
@@ -120,7 +120,7 @@ static NTSTATUS do_ntlm_auth_with_stored_pw(const char *username,
 
 	/* Now we are ready to handle the server's actual response. */
 	status = gensec_update(auth_generic_state->gensec_security,
-			       NULL, challenge_msg, &reply);
+			       mem_ctx, challenge_msg, &reply);
 	if (!NT_STATUS_EQUAL(status, NT_STATUS_OK)) {
 		DEBUG(1, ("We didn't get a response to the challenge! [%s]\n",
 			nt_errstr(status)));
@@ -146,6 +146,8 @@ static NTSTATUS do_ntlm_auth_with_stored_pw(const char *username,
 	memcpy(session_key, session_key_blob.data, 16);
 	data_blob_free(&session_key_blob);
 	*auth_msg = reply;
+	*new_spnego = gensec_have_feature(auth_generic_state->gensec_security,
+					  GENSEC_FEATURE_NEW_SPNEGO);
 	status = NT_STATUS_OK;
 
 done:
@@ -178,14 +180,15 @@ static bool check_client_uid(struct winbindd_cli_state *state, uid_t uid)
 	return True;
 }
 
-void winbindd_ccache_ntlm_auth(struct winbindd_cli_state *state)
+bool winbindd_ccache_ntlm_auth(struct winbindd_cli_state *state)
 {
 	struct winbindd_domain *domain;
-	fstring name_domain, name_user;
+	fstring name_namespace, name_domain, name_user;
 	NTSTATUS result = NT_STATUS_NOT_SUPPORTED;
 	struct WINBINDD_MEMORY_CREDS *entry;
 	DATA_BLOB initial, challenge, auth;
 	uint32_t initial_blob_len, challenge_blob_len, extra_len;
+	bool ok;
 
 	/* Ensure null termination */
 	state->request->data.ccache_ntlm_auth.user[
@@ -196,12 +199,14 @@ void winbindd_ccache_ntlm_auth(struct winbindd_cli_state *state)
 
 	/* Parse domain and username */
 
-	if (!canonicalize_username(state->request->data.ccache_ntlm_auth.user,
-				name_domain, name_user)) {
+	ok = canonicalize_username(state->request->data.ccache_ntlm_auth.user,
+				   name_namespace,
+				   name_domain,
+				   name_user);
+	if (!ok) {
 		DEBUG(5,("winbindd_ccache_ntlm_auth: cannot parse domain and user from name [%s]\n",
 			state->request->data.ccache_ntlm_auth.user));
-		request_error(state);
-		return;
+		return false;
 	}
 
 	domain = find_auth_domain(state->request->flags, name_domain);
@@ -209,13 +214,11 @@ void winbindd_ccache_ntlm_auth(struct winbindd_cli_state *state)
 	if (domain == NULL) {
 		DEBUG(5,("winbindd_ccache_ntlm_auth: can't get domain [%s]\n",
 			name_domain));
-		request_error(state);
-		return;
+		return false;
 	}
 
 	if (!check_client_uid(state, state->request->data.ccache_ntlm_auth.uid)) {
-		request_error(state);
-		return;
+		return false;
 	}
 
 	/* validate blob lengths */
@@ -237,7 +240,11 @@ void winbindd_ccache_ntlm_auth(struct winbindd_cli_state *state)
 	}
 
 	/* Parse domain and username */
-	if (!parse_domain_user(state->request->data.ccache_ntlm_auth.user, name_domain, name_user)) {
+	ok = parse_domain_user(state->request->data.ccache_ntlm_auth.user,
+			       name_namespace,
+			       name_domain,
+			       name_user);
+	if (!ok) {
 		DEBUG(10,("winbindd_dual_ccache_ntlm_auth: cannot parse "
 			"domain and user from name [%s]\n",
 			state->request->data.ccache_ntlm_auth.user));
@@ -272,9 +279,16 @@ void winbindd_ccache_ntlm_auth(struct winbindd_cli_state *state)
 		state->request->data.ccache_ntlm_auth.challenge_blob_len);
 
 	result = do_ntlm_auth_with_stored_pw(
-		name_user, name_domain, entry->pass,
-		initial, challenge, &auth,
-		state->response->data.ccache_ntlm_auth.session_key);
+			name_namespace,
+			name_domain,
+			name_user,
+			entry->pass,
+			initial,
+			challenge,
+			talloc_tos(),
+			&auth,
+			state->response->data.ccache_ntlm_auth.session_key,
+			&state->response->data.ccache_ntlm_auth.new_spnego);
 
 	if (!NT_STATUS_IS_OK(result)) {
 		goto process_result;
@@ -292,18 +306,15 @@ void winbindd_ccache_ntlm_auth(struct winbindd_cli_state *state)
 	data_blob_free(&auth);
 
   process_result:
-	if (!NT_STATUS_IS_OK(result)) {
-		request_error(state);
-		return;
-	}
-	request_ok(state);
+	return NT_STATUS_IS_OK(result);
 }
 
-void winbindd_ccache_save(struct winbindd_cli_state *state)
+bool winbindd_ccache_save(struct winbindd_cli_state *state)
 {
 	struct winbindd_domain *domain;
-	fstring name_domain, name_user;
+	fstring name_namespace, name_domain, name_user;
 	NTSTATUS status;
+	bool ok;
 
 	/* Ensure null termination */
 	state->request->data.ccache_save.user[
@@ -317,13 +328,15 @@ void winbindd_ccache_save(struct winbindd_cli_state *state)
 
 	/* Parse domain and username */
 
-	if (!canonicalize_username(state->request->data.ccache_save.user,
-				   name_domain, name_user)) {
+	ok = canonicalize_username(state->request->data.ccache_save.user,
+				   name_namespace,
+				   name_domain,
+				   name_user);
+	if (!ok) {
 		DEBUG(5,("winbindd_ccache_save: cannot parse domain and user "
 			 "from name [%s]\n",
 			 state->request->data.ccache_save.user));
-		request_error(state);
-		return;
+		return false;
 	}
 
 	/*
@@ -339,13 +352,11 @@ void winbindd_ccache_save(struct winbindd_cli_state *state)
 	if (domain == NULL) {
 		DEBUG(5, ("winbindd_ccache_save: can't get domain [%s]\n",
 			  name_domain));
-		request_error(state);
-		return;
+		return false;
 	}
 
 	if (!check_client_uid(state, state->request->data.ccache_save.uid)) {
-		request_error(state);
-		return;
+		return false;
 	}
 
 	status = winbindd_add_memory_creds(
@@ -356,8 +367,7 @@ void winbindd_ccache_save(struct winbindd_cli_state *state)
 	if (!NT_STATUS_IS_OK(status)) {
 		DEBUG(1, ("winbindd_add_memory_creds failed %s\n",
 			  nt_errstr(status)));
-		request_error(state);
-		return;
+		return false;
 	}
-	request_ok(state);
+	return true;
 }

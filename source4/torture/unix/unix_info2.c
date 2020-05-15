@@ -60,7 +60,7 @@ static struct smbcli_state *connect_to_server(struct torture_context *tctx)
 	status = smbcli_full_connection(tctx, &cli, host, 
 					lpcfg_smb_ports(tctx->lp_ctx),
 					share, NULL, lpcfg_socket_options(tctx->lp_ctx),
-					cmdline_credentials, 
+					popt_get_cmdline_credentials(),
 					lpcfg_resolve_context(tctx->lp_ctx),
 					tctx->ev, &options, &session_options,
 					lpcfg_gensec_settings(tctx, tctx->lp_ctx));
@@ -297,7 +297,7 @@ static bool verify_setinfo_flags(void *mem_ctx,
 	 * that flag is in our requested mask.
 	 */
 	for (i = 0; i < 32; ++i) {
-		info2.file_flags = (1 << i);
+		info2.file_flags = ((uint32_t)1 << i);
 		info2.flags_mask = smb_fmask | info2.file_flags;
 
 		set_no_metadata_change(&info2);

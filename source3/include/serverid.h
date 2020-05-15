@@ -20,54 +20,12 @@
 #ifndef __SERVERID_H__
 #define __SERVERID_H__
 
-#include "includes.h"
-#include "lib/dbwrap/dbwrap.h"
-
-/*
- * Register a server with its unique id
- */
-bool serverid_register(const struct server_id id, uint32_t msg_flags);
-
-/*
- * De-register a server with its unique id
- */
-bool serverid_deregister(const struct server_id id);
+#include "replace.h"
+#include "librpc/gen_ndr/server_id.h"
 
 /*
  * Check existence of a server id
  */
 bool serverid_exists(const struct server_id *id);
-
-/*
- * Check existence of a list of server ids
- */
-bool serverids_exist(const struct server_id *ids, int num_ids, bool *results);
-
-/*
- * Walk the list of server_ids registered
- */
-bool serverid_traverse(int (*fn)(struct db_record *rec,
-				 const struct server_id *id,
-				 uint32_t msg_flags,
-				 void *private_data),
-		       void *private_data);
-
-/*
- * Walk the list of server_ids registered read-only
- */
-bool serverid_traverse_read(int (*fn)(const struct server_id *id,
-				      uint32_t msg_flags,
-				      void *private_data),
-			    void *private_data);
-/*
- * Ensure CLEAR_IF_FIRST works fine, to be called from the parent smbd
- */
-bool serverid_parent_init(TALLOC_CTX *mem_ctx);
-
-/*
- * Get a random unique_id and make sure that it is not
- * SERVERID_UNIQUE_ID_NOT_TO_VERIFY
- */
-uint64_t serverid_get_random_unique_id(void);
 
 #endif

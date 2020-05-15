@@ -20,82 +20,119 @@
 #ifndef _CTDBD_CONN_H
 #define _CTDBD_CONN_H
 
+#include "replace.h"
+#include "system/filesys.h"
+#include "system/network.h"
+#include "lib/dbwrap/dbwrap.h"
 #include <tdb.h>
+#include <tevent.h>
 
 struct ctdbd_connection;
 struct messaging_context;
 struct messaging_rec;
 
-NTSTATUS ctdbd_messaging_connection(TALLOC_CTX *mem_ctx,
-				    struct ctdbd_connection **pconn);
+int ctdbd_init_connection(TALLOC_CTX *mem_ctx,
+			  const char *sockname, int timeout,
+			  struct ctdbd_connection **pconn);
+int ctdbd_init_async_connection(
+	TALLOC_CTX *mem_ctx,
+	const char *sockname,
+	int timeout,
+	struct ctdbd_connection **pconn);
+int ctdbd_reinit_connection(TALLOC_CTX *mem_ctx,
+			    const char *sockname, int timeout,
+			    struct ctdbd_connection *conn);
 
 uint32_t ctdbd_vnn(const struct ctdbd_connection *conn);
-const char *lp_ctdbd_socket(void);
-
-NTSTATUS ctdbd_register_msg_ctx(struct ctdbd_connection *conn,
-				struct messaging_context *msg_ctx);
-struct messaging_context *ctdb_conn_msg_ctx(struct ctdbd_connection *conn);
 
 int ctdbd_conn_get_fd(struct ctdbd_connection *conn);
+void ctdbd_socket_readable(struct tevent_context *ev,
+			   struct ctdbd_connection *conn);
 
-NTSTATUS ctdbd_messaging_send_iov(struct ctdbd_connection *conn,
-				  uint32_t dst_vnn, uint64_t dst_srvid,
-				  const struct iovec *iov, int iovlen);
+int ctdbd_messaging_send_iov(struct ctdbd_connection *conn,
+			     uint32_t dst_vnn, uint64_t dst_srvid,
+			     const struct iovec *iov, int iovlen);
 
 bool ctdbd_process_exists(struct ctdbd_connection *conn, uint32_t vnn,
-			  pid_t pid);
-bool ctdb_processes_exist(struct ctdbd_connection *conn,
-			  const struct server_id *pids, int num_pids,
-			  bool *results);
-bool ctdb_serverids_exist_supported(struct ctdbd_connection *conn);
-bool ctdb_serverids_exist(struct ctdbd_connection *conn,
-			  const struct server_id *pids, unsigned num_pids,
-			  bool *results);
+			  pid_t pid, uint64_t unique_id);
 
 char *ctdbd_dbpath(struct ctdbd_connection *conn,
 		   TALLOC_CTX *mem_ctx, uint32_t db_id);
 
-NTSTATUS ctdbd_db_attach(struct ctdbd_connection *conn, const char *name,
-			 uint32_t *db_id, int tdb_flags);
+int ctdbd_db_attach(struct ctdbd_connection *conn, const char *name,
+		    uint32_t *db_id, bool persistent);
 
-NTSTATUS ctdbd_migrate(struct ctdbd_connection *conn, uint32_t db_id,
-		       TDB_DATA key);
+int ctdbd_migrate(struct ctdbd_connection *conn, uint32_t db_id, TDB_DATA key);
 
-NTSTATUS ctdbd_parse(struct ctdbd_connection *conn, uint32_t db_id,
-		     TDB_DATA key, bool local_copy,
-		     void (*parser)(TDB_DATA key, TDB_DATA data,
-				    void *private_data),
-		     void *private_data);
+int ctdbd_parse(struct ctdbd_connection *conn, uint32_t db_id,
+		TDB_DATA key, bool local_copy,
+		void (*parser)(TDB_DATA key, TDB_DATA data,
+			       void *private_data),
+		void *private_data);
 
-NTSTATUS ctdbd_traverse(uint32_t db_id,
-			void (*fn)(TDB_DATA key, TDB_DATA data,
-				   void *private_data),
+int ctdbd_traverse(struct ctdbd_connection *master, uint32_t db_id,
+		   void (*fn)(TDB_DATA key, TDB_DATA data,
+			      void *private_data),
+		   void *private_data);
+
+int ctdbd_register_ips(struct ctdbd_connection *conn,
+		       const struct sockaddr_storage *server,
+		       const struct sockaddr_storage *client,
+		       int (*cb)(struct tevent_context *ev,
+				 uint32_t src_vnn, uint32_t dst_vnn,
+				 uint64_t dst_srvid,
+				 const uint8_t *msg, size_t msglen,
+				 void *private_data),
+		       void *private_data);
+
+int ctdbd_control_local(struct ctdbd_connection *conn, uint32_t opcode,
+			uint64_t srvid, uint32_t flags, TDB_DATA data,
+			TALLOC_CTX *mem_ctx, TDB_DATA *outdata,
+			int32_t *cstatus);
+int ctdb_watch_us(struct ctdbd_connection *conn);
+int ctdb_unwatch(struct ctdbd_connection *conn);
+
+struct ctdb_req_message_old;
+
+int register_with_ctdbd(struct ctdbd_connection *conn, uint64_t srvid,
+			int (*cb)(struct tevent_context *ev,
+				  uint32_t src_vnn, uint32_t dst_vnn,
+				  uint64_t dst_srvid,
+				  const uint8_t *msg, size_t msglen,
+				  void *private_data),
 			void *private_data);
+int ctdbd_probe(const char *sockname, int timeout);
 
-NTSTATUS ctdbd_register_ips(struct ctdbd_connection *conn,
-			    const struct sockaddr_storage *server,
-			    const struct sockaddr_storage *client,
-			    int (*cb)(uint32_t src_vnn, uint32_t dst_vnn,
-				      uint64_t dst_srvid,
-				      const uint8_t *msg, size_t msglen,
-				      void *private_data),
-			    void *private_data);
+struct ctdb_req_header;
+void ctdbd_prep_hdr_next_reqid(
+	struct ctdbd_connection *conn, struct ctdb_req_header *hdr);
 
-NTSTATUS ctdbd_control_local(struct ctdbd_connection *conn, uint32_t opcode,
-			     uint64_t srvid, uint32_t flags, TDB_DATA data,
-			     TALLOC_CTX *mem_ctx, TDB_DATA *outdata,
-			     int *cstatus);
-NTSTATUS ctdb_watch_us(struct ctdbd_connection *conn);
-NTSTATUS ctdb_unwatch(struct ctdbd_connection *conn);
+/*
+ * Async ctdb_request. iov[0] must start with an initialized
+ * struct ctdb_req_header
+ */
+struct tevent_req *ctdbd_req_send(
+	TALLOC_CTX *mem_ctx,
+	struct tevent_context *ev,
+	struct ctdbd_connection *conn,
+	struct iovec *iov,
+	size_t num_iov);
+int ctdbd_req_recv(
+	struct tevent_req *req,
+	TALLOC_CTX *mem_ctx,
+	struct ctdb_req_header **reply);
 
-struct ctdb_req_message;
-
-NTSTATUS register_with_ctdbd(struct ctdbd_connection *conn, uint64_t srvid,
-			     int (*cb)(uint32_t src_vnn, uint32_t dst_vnn,
-				       uint64_t dst_srvid,
-				       const uint8_t *msg, size_t msglen,
-				       void *private_data),
-			     void *private_data);
-NTSTATUS ctdbd_probe(void);
+struct tevent_req *ctdbd_parse_send(TALLOC_CTX *mem_ctx,
+				    struct tevent_context *ev,
+				    struct ctdbd_connection *conn,
+				    uint32_t db_id,
+				    TDB_DATA key,
+				    bool local_copy,
+				    void (*parser)(TDB_DATA key,
+						   TDB_DATA data,
+						   void *private_data),
+				    void *private_data,
+				    enum dbwrap_req_state *req_state);
+int ctdbd_parse_recv(struct tevent_req *req);
 
 #endif /* _CTDBD_CONN_H */

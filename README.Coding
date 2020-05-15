@@ -16,15 +16,15 @@ style should never outweigh coding itself and so the guidelines
 described here are hopefully easy enough to follow as they are very
 common and supported by tools and editors.
 
-The basic style for C code, also mentioned in prog_guide4.txt, is the Linux kernel
-coding style (See Documentation/CodingStyle in the kernel source tree). This
-closely matches what most Samba developers use already anyways, with a few
-exceptions as mentioned below.
+The basic style for C code is the Linux kernel coding style (See
+Documentation/CodingStyle in the kernel source tree). This closely matches
+what most Samba developers use already anyways, with a few exceptions as
+mentioned below.
 
 The coding style for Python code is documented in PEP8,
-http://www.python.org/pep/pep8 (with spaces). 
-If you have ever worked on another free software Python project, you are
-probably already familiar with it.
+https://www.python.org/dev/peps/pep-0008/. New Python code should be compatible
+with Python 2.6, 2.7, and Python 3.4 onwards. This means using Python 3 syntax
+with the appropriate 'from __future__' imports.
 
 But to save you the trouble of reading the Linux kernel style guide, here
 are the highlights.
@@ -89,6 +89,18 @@ displaying trailing whitespace:
   " highlight overly long lines same as TODOs.
   set textwidth=80
   autocmd BufNewFile,BufRead *.c,*.h exec 'match Todo /\%>' . &textwidth . 'v.\+/'
+
+clang-format
+------------
+BasedOnStyle: LLVM
+IndentWidth: 8
+UseTab: true
+BreakBeforeBraces: Linux
+AllowShortIfStatementsOnASingleLine: false
+IndentCaseLabels: false
+BinPackParameters: false
+BinPackArguments: false
+SortIncludes: false
 
 
 =========================
@@ -189,7 +201,13 @@ characters or less with whitespace.  For example,
 The previous example is intended to illustrate alignment of function
 parameters across lines and not as encourage for gratuitous line
 splitting.  Never split a line before columns 70 - 79 unless you
-have a really good reason.  Be smart about formatting.
+have a really good reason. Be smart about formatting.
+
+One exception to the previous rule is function calls, declarations, and
+definitions. In function calls, declarations, and definitions, either the
+declaration is a one-liner, or each parameter is listed on its own
+line. The rationale is that if there are many parameters, each one
+should be on its own line to make tracking interface changes easier.
 
 
 If, switch, & Code blocks
@@ -312,6 +330,17 @@ lib/replace/, new code should adhere to the following conventions:
   * Boolean values are "true" and "false" (not True or False)
   * Exact width integers are of type [u]int[8|16|32|64]_t
 
+Most of the time a good name for a boolean variable is 'ok'. Here is an
+example we often use:
+
+	bool ok;
+
+	ok = foo();
+	if (!ok) {
+		/* do something */
+	}
+
+It makes the code more readable and is easy to debug.
 
 Typedefs
 --------
@@ -319,6 +348,39 @@ Typedefs
 Samba tries to avoid "typedef struct { .. } x_t;" so we do always try to use
 "struct x { .. };". We know there are still such typedefs in the code,
 but for new code, please don't do that anymore.
+
+Initialize pointers
+-------------------
+
+All pointer variables MUST be initialized to NULL. History has
+demonstrated that uninitialized pointer variables have lead to various
+bugs and security issues.
+
+Pointers MUST be initialized even if the assignment directly follows
+the declaration, like pointer2 in the example below, because the
+instructions sequence may change over time.
+
+Good Example:
+
+	char *pointer1 = NULL;
+	char *pointer2 = NULL;
+
+	pointer2 = some_func2();
+
+	...
+
+	pointer1 = some_func1();
+
+Bad Example:
+
+	char *pointer1;
+	char *pointer2;
+
+	pointer2 = some_func2();
+
+	...
+
+	pointer1 = some_func1();
 
 Make use of helper variables
 ----------------------------
@@ -329,7 +391,8 @@ it's also easier to use the "step" command within gdb.
 
 Good Example:
 
-	char *name;
+	char *name = NULL;
+	int ret;
 
 	name = get_some_name();
 	if (name == NULL) {
@@ -369,6 +432,22 @@ an iterator style:
 		   ... do something with opt ...
 	}
 
+Another exception: DBG messages for example printing a SID or a GUID:
+Here we don't expect any surprise from the printing functions, and the
+main reason of this guideline is to make debugging easier. That reason
+rarely exists for this particular use case, and we gain some
+efficiency because the DBG_ macros don't evaluate their arguments if
+the debuglevel is not high enough.
+
+	if (!NT_STATUS_IS_OK(status)) {
+		struct dom_sid_buf sid_buf;
+		struct GUID_txt_buf guid_buf;
+		DBG_WARNING(
+		    "objectSID [%s] for GUID [%s] invalid\n",
+		    dom_sid_str_buf(objectsid, &sid_buf),
+		    GUID_buf_string(&cache->entries[idx], &guid_buf));
+	}
+
 But in general, please try to avoid this pattern.
 
 
@@ -384,15 +463,70 @@ The only exception is the test code that depends repeated use of calls
 like CHECK_STATUS, CHECK_VAL and others.
 
 
-Function names in DEBUG statements
-----------------------------------
+Error and out logic
+-------------------
 
-Many DEBUG statements contain the name of the function they appear in. This is
-not a good idea, as this is prone to bitrot. Function names change, code
-moves, but the DEBUG statements are not adapted. Use %s and __func__ for this:
+Don't do this:
 
-Bad Example:
-	DEBUG(0, ("strstr_m: src malloc fail\n"));
+	frame = talloc_stackframe();
 
-Good Example:
-	DEBUG(0, ("%s: src malloc fail\n", __func__));
+	if (ret == LDB_SUCCESS) {
+		if (result->count == 0) {
+			ret = LDB_ERR_NO_SUCH_OBJECT;
+		} else {
+			struct ldb_message *match =
+				get_best_match(dn, result);
+			if (match == NULL) {
+				TALLOC_FREE(frame);
+				return LDB_ERR_OPERATIONS_ERROR;
+			}
+			*msg = talloc_move(mem_ctx, &match);
+		}
+	}
+
+	TALLOC_FREE(frame);
+	return ret;
+
+It should be:
+
+	frame = talloc_stackframe();
+
+	if (ret != LDB_SUCCESS) {
+		TALLOC_FREE(frame);
+		return ret;
+	}
+
+	if (result->count == 0) {
+		TALLOC_FREE(frame);
+		return LDB_ERR_NO_SUCH_OBJECT;
+	}
+
+	match = get_best_match(dn, result);
+	if (match == NULL) {
+		TALLOC_FREE(frame);
+		return LDB_ERR_OPERATIONS_ERROR;
+	}
+
+	*msg = talloc_move(mem_ctx, &match);
+	TALLOC_FREE(frame);
+	return LDB_SUCCESS;
+
+
+DEBUG statements
+----------------
+
+Use these following macros instead of DEBUG:
+
+DBG_ERR	log level 0		error conditions
+DBG_WARNING	log level 1		warning conditions
+DBG_NOTICE	log level 3		normal, but significant, condition
+DBG_INFO	log level 5		informational message
+DBG_DEBUG	log level 10		debug-level message
+
+Example usage:
+
+DBG_ERR("Memory allocation failed\n");
+DBG_DEBUG("Received %d bytes\n", count);
+
+The messages from these macros are automatically prefixed with the
+function name.

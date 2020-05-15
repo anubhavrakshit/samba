@@ -19,6 +19,7 @@
 */
 
 #include <Python.h>
+#include "python/py3compat.h"
 #include "includes.h"
 #include "system/filesys.h"
 #include <tdb.h>
@@ -32,9 +33,8 @@
 #include "lib/dbwrap/dbwrap_tdb.h"
 #include "source3/lib/xattr_tdb.h"
 
-void initxattr_tdb(void);
-
-static PyObject *py_is_xattr_supported(PyObject *self)
+static PyObject *py_is_xattr_supported(PyObject *self,
+		PyObject *Py_UNUSED(ignored))
 {
 	return Py_True;
 }
@@ -43,21 +43,25 @@ static PyObject *py_wrap_setxattr(PyObject *self, PyObject *args)
 {
 	char *filename, *attribute, *tdbname;
 	DATA_BLOB blob;
-	int blobsize;
+	Py_ssize_t blobsize;
 	int ret;
 	TALLOC_CTX *mem_ctx;
+	struct loadparm_context *lp_ctx;
 	struct db_context *eadb = NULL;
 	struct file_id id;
 	struct stat sbuf;
 
-	if (!PyArg_ParseTuple(args, "ssss#", &tdbname, &filename, &attribute, 
+	if (!PyArg_ParseTuple(args, "sss"PYARG_BYTES_LEN, &tdbname, &filename, &attribute,
 						  &blob.data, &blobsize))
 		return NULL;
 
 	blob.length = blobsize;
 	mem_ctx = talloc_new(NULL);
-	eadb = db_open_tdb(mem_ctx, py_default_loadparm_context(mem_ctx), tdbname, 50000,
-			   TDB_DEFAULT, O_RDWR|O_CREAT, 0600, DBWRAP_LOCK_ORDER_2,
+
+	lp_ctx = py_default_loadparm_context(mem_ctx);
+	eadb = db_open_tdb(mem_ctx, tdbname, 50000,
+			   lpcfg_tdb_flags(lp_ctx, TDB_DEFAULT),
+			   O_RDWR|O_CREAT, 0600, DBWRAP_LOCK_ORDER_2,
 			   DBWRAP_FLAG_NONE);
 
 	if (eadb == NULL) {
@@ -91,6 +95,7 @@ static PyObject *py_wrap_getxattr(PyObject *self, PyObject *args)
 {
 	char *filename, *attribute, *tdbname;
 	TALLOC_CTX *mem_ctx;
+	struct loadparm_context *lp_ctx;
 	DATA_BLOB blob;
 	PyObject *ret_obj;
 	int ret;
@@ -104,8 +109,10 @@ static PyObject *py_wrap_getxattr(PyObject *self, PyObject *args)
 
 	mem_ctx = talloc_new(NULL);
 
-	eadb = db_open_tdb(mem_ctx, py_default_loadparm_context(mem_ctx), tdbname, 50000,
-			   TDB_DEFAULT, O_RDWR|O_CREAT, 0600, DBWRAP_LOCK_ORDER_2,
+	lp_ctx = py_default_loadparm_context(mem_ctx);
+	eadb = db_open_tdb(mem_ctx, tdbname, 50000,
+			   lpcfg_tdb_flags(lp_ctx, TDB_DEFAULT),
+			   O_RDWR|O_CREAT, 0600, DBWRAP_LOCK_ORDER_2,
 			   DBWRAP_FLAG_NONE);
 
 	if (eadb == NULL) {
@@ -131,7 +138,7 @@ static PyObject *py_wrap_getxattr(PyObject *self, PyObject *args)
 		talloc_free(mem_ctx);
 		return NULL;
 	}
-	ret_obj = PyString_FromStringAndSize((char *)blob.data, xattr_size);
+	ret_obj = Py_BuildValue(PYARG_BYTES_LEN, blob.data, xattr_size);
 	talloc_free(mem_ctx);
 	return ret_obj;
 }
@@ -139,22 +146,32 @@ static PyObject *py_wrap_getxattr(PyObject *self, PyObject *args)
 static PyMethodDef py_xattr_methods[] = {
 	{ "wrap_getxattr", (PyCFunction)py_wrap_getxattr, METH_VARARGS,
 		"wrap_getxattr(filename,attribute) -> blob\n"
-		"Retreive given attribute on the given file." },
+		"Retrieve given attribute on the given file." },
 	{ "wrap_setxattr", (PyCFunction)py_wrap_setxattr, METH_VARARGS,
 		"wrap_setxattr(filename,attribute,value)\n"
 		"Set the given attribute to the given value on the given file." },
 	{ "is_xattr_supported", (PyCFunction)py_is_xattr_supported, METH_NOARGS,
 		"Return true if xattr are supported on this system\n"},
-	{ NULL }
+	{0}
 };
 
-void initxattr_tdb(void)
+static struct PyModuleDef moduledef = {
+    PyModuleDef_HEAD_INIT,
+    .m_name = "xattr_tdb",
+    .m_doc = "Python bindings for xattr manipulation.",
+    .m_size = -1,
+    .m_methods = py_xattr_methods,
+};
+
+MODULE_INIT_FUNC(xattr_tdb)
 {
 	PyObject *m;
 
-	m = Py_InitModule3("xattr_tdb", py_xattr_methods,
-			   "Python bindings for xattr manipulation.");
+	m = PyModule_Create(&moduledef);
+
 	if (m == NULL)
-		return;
+		return NULL;
+
+	return m;
 }
 

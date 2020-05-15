@@ -38,100 +38,261 @@ static struct {
 	NTSTATUS fnum_status, fname_status;
 	union smb_fileinfo fnum_finfo, fname_finfo;
 } levels[] = {
-	{ .name = "GETATTR",
-	  .level = RAW_FILEINFO_GETATTR,         
-	  .only_paths = 1,
-	  .only_handles = 0,
-	  .expected_ipc_access_denied = 1},
-	{  .name ="GETATTRE",                  
-	   .level = RAW_FILEINFO_GETATTRE,         
-	   .only_paths = 0, 
-	   .only_handles = 1 },
-	{  .name ="STANDARD",                  
-	   .level = RAW_FILEINFO_STANDARD, },
-	{  .name ="EA_SIZE",                 
-	   .level = RAW_FILEINFO_EA_SIZE },
-	{  .name ="ALL_EAS",                 
-	   .level = RAW_FILEINFO_ALL_EAS,
-	   .expected_ipc_fnum_status = NT_STATUS_ACCESS_DENIED,
+	{
+		.name = "GETATTR",
+		.level = RAW_FILEINFO_GETATTR,
+		.only_paths = 1,
+		.only_handles = 0,
+		.expected_ipc_access_denied = 1,
 	},
-	{  .name ="IS_NAME_VALID",          
-	   .level =  RAW_FILEINFO_IS_NAME_VALID,
-	   .only_paths =  1,
-	   .only_handles =  0 },
-	{  .name ="BASIC_INFO",            
-	   .level =  RAW_FILEINFO_BASIC_INFO },
-	{  .name ="STANDARD_INFO",         
-	   .level =  RAW_FILEINFO_STANDARD_INFO },
-	{  .name ="EA_INFO",               
-	   .level =  RAW_FILEINFO_EA_INFO },
-	{  .name ="NAME_INFO",           
-	   .level =  RAW_FILEINFO_NAME_INFO },
-	{  .name ="ALL_INFO",              
-	   .level =  RAW_FILEINFO_ALL_INFO },
-	{  .name ="ALT_NAME_INFO",        
-	   .level =  RAW_FILEINFO_ALT_NAME_INFO,
-	   .expected_ipc_fnum_status = NT_STATUS_INVALID_PARAMETER
+	{
+		.name ="GETATTRE",
+		.level = RAW_FILEINFO_GETATTRE,
+		.only_paths = 0,
+		.only_handles = 1,
 	},
-	{  .name ="STREAM_INFO",           
-	   .level =  RAW_FILEINFO_STREAM_INFO,
-	   .expected_ipc_fnum_status = NT_STATUS_INVALID_PARAMETER
+	{
+		.name ="STANDARD",
+		.level = RAW_FILEINFO_STANDARD,
 	},
-	{  .name ="COMPRESSION_INFO",        
-	   .level =  RAW_FILEINFO_COMPRESSION_INFO,
-	   .expected_ipc_fnum_status = NT_STATUS_INVALID_PARAMETER
+	{
+		.name ="EA_SIZE",
+		.level = RAW_FILEINFO_EA_SIZE,
 	},
-	{  .name ="UNIX_BASIC_INFO",         
-	   .level =  RAW_FILEINFO_UNIX_BASIC,
-	   .only_paths =  0, 
-	   .only_handles = 0, 
-	   .capability_mask = CAP_UNIX},
-	{  .name ="UNIX_LINK_INFO",          
-	   .level =  RAW_FILEINFO_UNIX_LINK, 
-	   .only_paths = 0, 
-	   .only_handles = 0, 
-	   .capability_mask = CAP_UNIX},
-	{  .name ="BASIC_INFORMATION",      
-	   .level =  RAW_FILEINFO_BASIC_INFORMATION },
-	{  .name ="STANDARD_INFORMATION",   
-	   .level =  RAW_FILEINFO_STANDARD_INFORMATION },
-	{  .name ="INTERNAL_INFORMATION",   
-	   .level =  RAW_FILEINFO_INTERNAL_INFORMATION },
-	{  .name ="EA_INFORMATION",        
-	   .level =  RAW_FILEINFO_EA_INFORMATION },
-	{ .name = "ACCESS_INFORMATION",    
-	  .level =  RAW_FILEINFO_ACCESS_INFORMATION },
-	{ .name = "NAME_INFORMATION",      
-	  .level =  RAW_FILEINFO_NAME_INFORMATION },
-	{  .name ="POSITION_INFORMATION",  
-	   .level =  RAW_FILEINFO_POSITION_INFORMATION },
-	{  .name ="MODE_INFORMATION",       
-	   .level =  RAW_FILEINFO_MODE_INFORMATION },
-	{  .name ="ALIGNMENT_INFORMATION",  
-	   .level =  RAW_FILEINFO_ALIGNMENT_INFORMATION },
-	{  .name ="ALL_INFORMATION",       
-	   .level =  RAW_FILEINFO_ALL_INFORMATION },
-	{  .name ="ALT_NAME_INFORMATION",  
-	   .level =  RAW_FILEINFO_ALT_NAME_INFORMATION,
-	   .expected_ipc_fnum_status = NT_STATUS_INVALID_PARAMETER
+	{
+		.name ="ALL_EAS",
+		.level = RAW_FILEINFO_ALL_EAS,
+		.expected_ipc_fnum_status = NT_STATUS_ACCESS_DENIED,
+		.fnum_status = NT_STATUS_SUCCESS,
+		.fname_status = NT_STATUS_SUCCESS,
+		.fnum_finfo = {
+			.generic = {
+				.level = 0,
+			},
+		},
+		.fname_finfo = {
+			.generic = {
+				.level = 0,
+			},
+		},
 	},
-	{  .name ="STREAM_INFORMATION",    
-	   .level =  RAW_FILEINFO_STREAM_INFORMATION,
-	   .expected_ipc_fnum_status = NT_STATUS_INVALID_PARAMETER
+	{
+		.name ="IS_NAME_VALID",
+		.level =  RAW_FILEINFO_IS_NAME_VALID,
+		.only_paths =  1,
+		.only_handles =  0,
 	},
-	{ .name = "COMPRESSION_INFORMATION", 
-	  .level =  RAW_FILEINFO_COMPRESSION_INFORMATION,
-	  .expected_ipc_fnum_status = NT_STATUS_INVALID_PARAMETER
+	{
+		.name ="BASIC_INFO",
+		.level =  RAW_FILEINFO_BASIC_INFO,
 	},
-	{  .name ="NETWORK_OPEN_INFORMATION",
-	   .level =  RAW_FILEINFO_NETWORK_OPEN_INFORMATION,
-	   .expected_ipc_fnum_status = NT_STATUS_INVALID_PARAMETER
+	{
+		.name ="STANDARD_INFO",
+		.level =  RAW_FILEINFO_STANDARD_INFO,
 	},
-	{ .name = "ATTRIBUTE_TAG_INFORMATION",
-	  .level =  RAW_FILEINFO_ATTRIBUTE_TAG_INFORMATION,
-	  .expected_ipc_fnum_status = NT_STATUS_INVALID_PARAMETER
+	{
+		.name ="EA_INFO",
+		.level =  RAW_FILEINFO_EA_INFO,
 	},
-	{ NULL }
+	{
+		.name ="NAME_INFO",
+		.level =  RAW_FILEINFO_NAME_INFO,
+	},
+	{
+		.name ="ALL_INFO",
+		.level =  RAW_FILEINFO_ALL_INFO,
+	},
+	{
+		.name ="ALT_NAME_INFO",
+		.level =  RAW_FILEINFO_ALT_NAME_INFO,
+		.expected_ipc_fnum_status = NT_STATUS_INVALID_PARAMETER,
+		.fnum_status = NT_STATUS_SUCCESS,
+		.fname_status = NT_STATUS_SUCCESS,
+		.fnum_finfo = {
+			.generic = {
+				.level = 0,
+			},
+		},
+		.fname_finfo = {
+			.generic = {
+				.level = 0,
+			},
+		},
+	},
+	{
+		.name ="STREAM_INFO",
+		.level =  RAW_FILEINFO_STREAM_INFO,
+		.expected_ipc_fnum_status = NT_STATUS_INVALID_PARAMETER,
+		.fnum_status = NT_STATUS_SUCCESS,
+		.fname_status = NT_STATUS_SUCCESS,
+		.fnum_finfo = {
+			.generic = {
+				.level = 0,
+			},
+		},
+		.fname_finfo = {
+			.generic = {
+				.level = 0,
+			},
+		},
+	},
+	{
+		.name ="COMPRESSION_INFO",
+		.level =  RAW_FILEINFO_COMPRESSION_INFO,
+		.expected_ipc_fnum_status = NT_STATUS_INVALID_PARAMETER,
+		.fnum_status = NT_STATUS_SUCCESS,
+		.fname_status = NT_STATUS_SUCCESS,
+		.fnum_finfo = {
+			.generic = {
+				.level = 0,
+			},
+		},
+		.fname_finfo = {
+			.generic = {
+				.level = 0,
+			},
+		},
+	},
+	{
+		.name ="UNIX_BASIC_INFO",
+		.level =  RAW_FILEINFO_UNIX_BASIC,
+		.only_paths =  0,
+		.only_handles = 0,
+		.capability_mask = CAP_UNIX,
+	},
+	{
+		.name ="UNIX_LINK_INFO",
+		.level =  RAW_FILEINFO_UNIX_LINK,
+		.only_paths = 0,
+		.only_handles = 0,
+		.capability_mask = CAP_UNIX,
+	},
+	{
+		.name ="BASIC_INFORMATION",
+		.level =  RAW_FILEINFO_BASIC_INFORMATION,
+	},
+	{
+		.name ="STANDARD_INFORMATION",
+		.level =  RAW_FILEINFO_STANDARD_INFORMATION,
+	},
+	{
+		.name ="INTERNAL_INFORMATION",
+		.level =  RAW_FILEINFO_INTERNAL_INFORMATION,
+	},
+	{
+		.name ="EA_INFORMATION",
+		.level =  RAW_FILEINFO_EA_INFORMATION,
+	},
+	{
+		.name = "ACCESS_INFORMATION",
+		.level =  RAW_FILEINFO_ACCESS_INFORMATION,
+	},
+	{
+		.name = "NAME_INFORMATION",
+		.level =  RAW_FILEINFO_NAME_INFORMATION,
+	},
+	{
+		.name ="POSITION_INFORMATION",
+		.level =  RAW_FILEINFO_POSITION_INFORMATION,
+	},
+	{
+		.name ="MODE_INFORMATION",
+		.level =  RAW_FILEINFO_MODE_INFORMATION,
+	},
+	{
+		.name ="ALIGNMENT_INFORMATION",
+		.level =  RAW_FILEINFO_ALIGNMENT_INFORMATION,
+	},
+	{
+		.name ="ALL_INFORMATION",
+		.level =  RAW_FILEINFO_ALL_INFORMATION,
+	},
+	{
+		.name ="ALT_NAME_INFORMATION",
+		.level =  RAW_FILEINFO_ALT_NAME_INFORMATION,
+		.expected_ipc_fnum_status = NT_STATUS_INVALID_PARAMETER,
+		.fnum_status = NT_STATUS_SUCCESS,
+		.fname_status = NT_STATUS_SUCCESS,
+		.fnum_finfo = {
+			.generic = {
+				.level = 0,
+			},
+		},
+		.fname_finfo = {
+			.generic = {
+				.level = 0,
+			},
+		},
+	},
+	{
+		.name ="STREAM_INFORMATION",
+		.level =  RAW_FILEINFO_STREAM_INFORMATION,
+		.expected_ipc_fnum_status = NT_STATUS_INVALID_PARAMETER,
+		.fnum_status = NT_STATUS_SUCCESS,
+		.fname_status = NT_STATUS_SUCCESS,
+		.fnum_finfo = {
+			.generic = {
+				.level = 0,
+			},
+		},
+		.fname_finfo = {
+			.generic = {
+				.level = 0,
+			},
+		},
+	},
+	{
+		.name = "COMPRESSION_INFORMATION",
+		.level =  RAW_FILEINFO_COMPRESSION_INFORMATION,
+		.expected_ipc_fnum_status = NT_STATUS_INVALID_PARAMETER,
+		.fnum_status = NT_STATUS_SUCCESS,
+		.fname_status = NT_STATUS_SUCCESS,
+		.fnum_finfo = {
+			.generic = {
+				.level = 0,
+			},
+		},
+		.fname_finfo = {
+			.generic = {
+				.level = 0,
+			},
+		},
+	},
+	{
+		.name ="NETWORK_OPEN_INFORMATION",
+		.level =  RAW_FILEINFO_NETWORK_OPEN_INFORMATION,
+		.expected_ipc_fnum_status = NT_STATUS_INVALID_PARAMETER,
+		.fnum_status = NT_STATUS_SUCCESS,
+		.fname_status = NT_STATUS_SUCCESS,
+		.fnum_finfo = {
+			.generic = {
+				.level = 0,
+			},
+		},
+		.fname_finfo = {
+			.generic = {
+				.level = 0,
+			},
+		},
+	},
+	{
+		.name = "ATTRIBUTE_TAG_INFORMATION",
+		.level =  RAW_FILEINFO_ATTRIBUTE_TAG_INFORMATION,
+		.expected_ipc_fnum_status = NT_STATUS_INVALID_PARAMETER,
+		.fnum_status = NT_STATUS_SUCCESS,
+		.fname_status = NT_STATUS_SUCCESS,
+		.fnum_finfo = {
+			.generic = {
+				.level = 0,
+			},
+		},
+		.fname_finfo = {
+			.generic = {
+				.level = 0,
+			},
+		},
+	},
+	{ .name = NULL, },
 };
 
 /*
@@ -140,7 +301,7 @@ static struct {
 static int dos_nt_time_cmp(time_t t, NTTIME nt)
 {
 	time_t t2 = nt_time_to_unix(nt);
-	if (abs(t2 - t) <= 2) return 0;
+	if (labs(t2 - t) <= 2) return 0;
 	return t2 > t ? 1 : -1;
 }
 
@@ -229,9 +390,9 @@ static bool torture_raw_qfileinfo_internals(struct torture_context *torture,
 					    int fnum, const char *fname,
 					    bool is_ipc)
 {
-	int i;
+	size_t i;
 	bool ret = true;
-	int count;
+	size_t count;
 	union smb_fileinfo *s1, *s2;	
 	NTTIME correct_time;
 	uint64_t correct_size;
@@ -333,7 +494,7 @@ static bool torture_raw_qfileinfo_internals(struct torture_context *torture,
 
 	if (count != 0) {
 		ret = false;
-		printf("%d levels failed\n", count);
+		printf("%zu levels failed\n", count);
 		if (count > 35) {
 			torture_fail(torture, "too many level failures - giving up");
 		}

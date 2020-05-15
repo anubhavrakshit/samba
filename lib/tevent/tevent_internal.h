@@ -164,12 +164,34 @@ struct tevent_req {
 		 *
 		 */
 		struct tevent_timer *timer;
+
+		/**
+		 * @brief The place where profiling data is kept
+		 */
+		struct tevent_req_profile *profile;
 	} internal;
+};
+
+struct tevent_req_profile {
+	struct tevent_req_profile *prev, *next;
+	struct tevent_req_profile *parent;
+	const char *req_name;
+	pid_t pid;
+	const char *start_location;
+	struct timeval start_time;
+	const char *stop_location;
+	struct timeval stop_time;
+	enum tevent_req_state state;
+	uint64_t user_error;
+	struct tevent_req_profile *subprofiles;
 };
 
 struct tevent_fd {
 	struct tevent_fd *prev, *next;
 	struct tevent_context *event_ctx;
+	struct tevent_wrapper_glue *wrapper;
+	bool busy;
+	bool destroyed;
 	int fd;
 	uint16_t flags; /* see TEVENT_FD_* flags */
 	tevent_fd_handler_t handler;
@@ -187,6 +209,9 @@ struct tevent_fd {
 struct tevent_timer {
 	struct tevent_timer *prev, *next;
 	struct tevent_context *event_ctx;
+	struct tevent_wrapper_glue *wrapper;
+	bool busy;
+	bool destroyed;
 	struct timeval next_event;
 	tevent_timer_handler_t handler;
 	/* this is private for the specific handler */
@@ -201,6 +226,9 @@ struct tevent_timer {
 struct tevent_immediate {
 	struct tevent_immediate *prev, *next;
 	struct tevent_context *event_ctx;
+	struct tevent_wrapper_glue *wrapper;
+	bool busy;
+	bool destroyed;
 	tevent_immediate_handler_t handler;
 	/* this is private for the specific handler */
 	void *private_data;
@@ -216,6 +244,9 @@ struct tevent_immediate {
 struct tevent_signal {
 	struct tevent_signal *prev, *next;
 	struct tevent_context *event_ctx;
+	struct tevent_wrapper_glue *wrapper;
+	bool busy;
+	bool destroyed;
 	int signum;
 	int sa_flags;
 	tevent_signal_handler_t handler;
@@ -228,6 +259,15 @@ struct tevent_signal {
 	void *additional_data;
 };
 
+struct tevent_threaded_context {
+	struct tevent_threaded_context *next, *prev;
+
+#ifdef HAVE_PTHREAD
+	pthread_mutex_t event_ctx_mutex;
+#endif
+	struct tevent_context *event_ctx;
+};
+
 struct tevent_debug_ops {
 	void (*debug)(void *context, enum tevent_debug_level level,
 		      const char *fmt, va_list ap) PRINTF_ATTRIBUTE(3,0);
@@ -237,9 +277,29 @@ struct tevent_debug_ops {
 void tevent_debug(struct tevent_context *ev, enum tevent_debug_level level,
 		  const char *fmt, ...) PRINTF_ATTRIBUTE(3,4);
 
+void tevent_abort(struct tevent_context *ev, const char *reason);
+
+void tevent_common_check_double_free(TALLOC_CTX *ptr, const char *reason);
+
 struct tevent_context {
 	/* the specific events implementation */
 	const struct tevent_ops *ops;
+
+	/*
+	 * The following three pointers are queried on every loop_once
+	 * in the order in which they appear here. Not measured, but
+	 * hopefully putting them at the top together with "ops"
+	 * should make tevent a *bit* more cache-friendly than before.
+	 */
+
+	/* list of signal events - used by common code */
+	struct tevent_signal *signal_events;
+
+	/* List of threaded job indicators */
+	struct tevent_threaded_context *threaded_contexts;
+
+	/* list of immediate events - used by common code */
+	struct tevent_immediate *immediate_events;
 
 	/* list of fd events - used by common code */
 	struct tevent_fd *fd_events;
@@ -247,18 +307,19 @@ struct tevent_context {
 	/* list of timed events - used by common code */
 	struct tevent_timer *timer_events;
 
-	/* list of immediate events - used by common code */
-	struct tevent_immediate *immediate_events;
-
-	/* list of signal events - used by common code */
-	struct tevent_signal *signal_events;
+	/* List of scheduled immediates */
+	pthread_mutex_t scheduled_mutex;
+	struct tevent_immediate *scheduled_immediates;
 
 	/* this is private for the events_ops implementation */
 	void *additional_data;
 
 	/* pipe hack used with signal handlers */
-	struct tevent_fd *pipe_fde;
-	int pipe_fds[2];
+	struct tevent_fd *wakeup_fde;
+	int wakeup_fd;		/* fd to write into */
+#ifndef HAVE_EVENT_FD
+	int wakeup_read_fd;
+#endif
 
 	/* debugging operations */
 	struct tevent_debug_ops debug_ops;
@@ -276,12 +337,28 @@ struct tevent_context {
 		void *private_data;
 	} tracing;
 
+	struct {
+		/*
+		 * This is used on the main event context
+		 */
+		struct tevent_wrapper_glue *list;
+
+		/*
+		 * This is used on the wrapper event context
+		 */
+		struct tevent_wrapper_glue *glue;
+	} wrapper;
+
 	/*
 	 * an optimization pointer into timer_events
 	 * used by used by common code via
 	 * tevent_common_add_timer_v2()
 	 */
 	struct tevent_timer *last_zero_timer;
+
+#ifdef HAVE_PTHREAD
+	struct tevent_context *prev, *next;
+#endif
 };
 
 const struct tevent_ops *tevent_find_ops_byname(const char *name);
@@ -303,6 +380,8 @@ void tevent_common_fd_set_close_fn(struct tevent_fd *fde,
 				   tevent_fd_close_fn_t close_fn);
 uint16_t tevent_common_fd_get_flags(struct tevent_fd *fde);
 void tevent_common_fd_set_flags(struct tevent_fd *fde, uint16_t flags);
+int tevent_common_invoke_fd_handler(struct tevent_fd *fde, uint16_t flags,
+				    bool *removed);
 
 struct tevent_timer *tevent_common_add_timer(struct tevent_context *ev,
 					     TALLOC_CTX *mem_ctx,
@@ -319,6 +398,9 @@ struct tevent_timer *tevent_common_add_timer_v2(struct tevent_context *ev,
 					        const char *handler_name,
 					        const char *location);
 struct timeval tevent_common_loop_timer_delay(struct tevent_context *);
+int tevent_common_invoke_timer_handler(struct tevent_timer *te,
+				       struct timeval current_time,
+				       bool *removed);
 
 void tevent_common_schedule_immediate(struct tevent_immediate *im,
 				      struct tevent_context *ev,
@@ -326,7 +408,15 @@ void tevent_common_schedule_immediate(struct tevent_immediate *im,
 				      void *private_data,
 				      const char *handler_name,
 				      const char *location);
+int tevent_common_invoke_immediate_handler(struct tevent_immediate *im,
+					   bool *removed);
 bool tevent_common_loop_immediate(struct tevent_context *ev);
+void tevent_common_threaded_activate_immediate(struct tevent_context *ev);
+
+bool tevent_common_have_events(struct tevent_context *ev);
+int tevent_common_wakeup_init(struct tevent_context *ev);
+int tevent_common_wakeup_fd(int fd);
+int tevent_common_wakeup(struct tevent_context *ev);
 
 struct tevent_signal *tevent_common_add_signal(struct tevent_context *ev,
 					       TALLOC_CTX *mem_ctx,
@@ -338,11 +428,32 @@ struct tevent_signal *tevent_common_add_signal(struct tevent_context *ev,
 					       const char *location);
 int tevent_common_check_signal(struct tevent_context *ev);
 void tevent_cleanup_pending_signal_handlers(struct tevent_signal *se);
+int tevent_common_invoke_signal_handler(struct tevent_signal *se,
+					int signum, int count, void *siginfo,
+					bool *removed);
+
+struct tevent_context *tevent_wrapper_main_ev(struct tevent_context *ev);
+
+struct tevent_wrapper_ops;
+
+struct tevent_wrapper_glue {
+	struct tevent_wrapper_glue *prev, *next;
+	struct tevent_context *wrap_ev;
+	struct tevent_context *main_ev;
+	bool busy;
+	bool destroyed;
+	const struct tevent_wrapper_ops *ops;
+	void *private_state;
+};
+
+void tevent_wrapper_push_use_internal(struct tevent_context *ev,
+				      struct tevent_wrapper_glue *wrapper);
+void tevent_wrapper_pop_use_internal(const struct tevent_context *__ev_ptr,
+				     struct tevent_wrapper_glue *wrapper);
 
 bool tevent_standard_init(void);
-bool tevent_select_init(void);
 bool tevent_poll_init(void);
-void tevent_poll_event_add_fd_internal(struct tevent_context *ev,
+bool tevent_poll_event_add_fd_internal(struct tevent_context *ev,
 				       struct tevent_fd *fde);
 bool tevent_poll_mt_init(void);
 #ifdef HAVE_EPOLL

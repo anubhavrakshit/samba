@@ -45,13 +45,7 @@
 bool dbgtext_va(const char *, va_list ap) PRINTF_ATTRIBUTE(1,0);
 bool dbgtext( const char *, ... ) PRINTF_ATTRIBUTE(1,2);
 bool dbghdrclass( int level, int cls, const char *location, const char *func);
-bool dbghdr( int level, const char *location, const char *func);
-
-/*
- * Redefine DEBUGLEVEL because so we don't have to change every source file
- * that *unnecessarily* references it.
- */
-#define DEBUGLEVEL DEBUGLEVEL_CLASS[DBGC_ALL]
+bool dbgsetclass(int level, int cls);
 
 /*
  * Define all new debug classes here. A class is represented by an entry in
@@ -89,13 +83,30 @@ bool dbghdr( int level, const char *location, const char *func);
 #define DBGC_DNS		21
 #define DBGC_LDB		22
 #define DBGC_TEVENT		23
+#define DBGC_AUTH_AUDIT		24
+#define DBGC_AUTH_AUDIT_JSON	25
+#define DBGC_KERBEROS           26
+#define DBGC_DRS_REPL           27
+#define DBGC_SMB2               28
+#define DBGC_SMB2_CREDITS       29
+#define DBGC_DSDB_AUDIT	30
+#define DBGC_DSDB_AUDIT_JSON	31
+#define DBGC_DSDB_PWD_AUDIT		32
+#define DBGC_DSDB_PWD_AUDIT_JSON	33
+#define DBGC_DSDB_TXN_AUDIT		34
+#define DBGC_DSDB_TXN_AUDIT_JSON	35
+#define DBGC_DSDB_GROUP_AUDIT	36
+#define DBGC_DSDB_GROUP_AUDIT_JSON	37
 
 /* So you can define DBGC_CLASS before including debug.h */
 #ifndef DBGC_CLASS
 #define DBGC_CLASS            0     /* override as shown above */
 #endif
 
-extern int  *DEBUGLEVEL_CLASS;
+#define DEBUGLEVEL debuglevel_get()
+
+#define debuglevel_get() debuglevel_get_class(DBGC_ALL)
+#define debuglevel_set(lvl) debuglevel_set_class(DBGC_ALL, (lvl))
 
 /* Debugging macros
  *
@@ -162,13 +173,16 @@ extern int  *DEBUGLEVEL_CLASS;
 #endif
 #endif
 
+int debuglevel_get_class(size_t idx);
+void debuglevel_set_class(size_t idx, int level);
+
 #define CHECK_DEBUGLVL( level ) \
   ( ((level) <= MAX_DEBUG_LEVEL) && \
-    unlikely(DEBUGLEVEL_CLASS[ DBGC_CLASS ] >= (level)))
+    unlikely(debuglevel_get_class(DBGC_CLASS) >= (level)))
 
 #define CHECK_DEBUGLVLC( dbgc_class, level ) \
   ( ((level) <= MAX_DEBUG_LEVEL) && \
-    unlikely(DEBUGLEVEL_CLASS[ dbgc_class ] >= (level)))
+    unlikely(debuglevel_get_class(dbgc_class) >= (level)))
 
 #define DEBUGLVL( level ) \
   ( CHECK_DEBUGLVL(level) \
@@ -180,29 +194,47 @@ extern int  *DEBUGLEVEL_CLASS;
 
 #define DEBUG( level, body ) \
   (void)( ((level) <= MAX_DEBUG_LEVEL) && \
-	  unlikely(DEBUGLEVEL_CLASS[ DBGC_CLASS ] >= (level))		\
+       unlikely(debuglevel_get_class(DBGC_CLASS) >= (level))             \
        && (dbghdrclass( level, DBGC_CLASS, __location__, __FUNCTION__ )) \
        && (dbgtext body) )
 
 #define DEBUGC( dbgc_class, level, body ) \
   (void)( ((level) <= MAX_DEBUG_LEVEL) && \
-	  unlikely(DEBUGLEVEL_CLASS[ dbgc_class ] >= (level))		\
-       && (dbghdrclass( level, DBGC_CLASS, __location__, __FUNCTION__ )) \
+       unlikely(debuglevel_get_class(dbgc_class) >= (level))             \
+       && (dbghdrclass( level, dbgc_class, __location__, __FUNCTION__ )) \
        && (dbgtext body) )
 
 #define DEBUGADD( level, body ) \
   (void)( ((level) <= MAX_DEBUG_LEVEL) && \
-	  unlikely(DEBUGLEVEL_CLASS[ DBGC_CLASS ] >= (level))	\
+       unlikely(debuglevel_get_class(DBGC_CLASS) >= (level)) \
+       && (dbgsetclass(level, DBGC_CLASS))                   \
        && (dbgtext body) )
 
 #define DEBUGADDC( dbgc_class, level, body ) \
   (void)( ((level) <= MAX_DEBUG_LEVEL) && \
-          unlikely((DEBUGLEVEL_CLASS[ dbgc_class ] >= (level))) \
+       unlikely((debuglevel_get_class(dbgc_class) >= (level))) \
+       && (dbgsetclass(level, dbgc_class))                     \
        && (dbgtext body) )
 
 /* Print a separator to the debug log. */
 #define DEBUGSEP(level)\
 	DEBUG((level),("===============================================================\n"))
+
+/* Prefix messages with the function name */
+#define DBG_PREFIX(level, body ) \
+	(void)( ((level) <= MAX_DEBUG_LEVEL) &&			\
+		unlikely(debuglevel_get_class(DBGC_CLASS) >= (level))	\
+		&& (dbghdrclass(level, DBGC_CLASS, __location__, __func__ )) \
+		&& (dbgtext("%s: ", __func__))				\
+		&& (dbgtext body) )
+
+/* Prefix messages with the function name - class specific */
+#define DBGC_PREFIX(dbgc_class, level, body ) \
+	(void)( ((level) <= MAX_DEBUG_LEVEL) &&			\
+		unlikely(debuglevel_get_class(dbgc_class) >= (level))	\
+		&& (dbghdrclass(level, dbgc_class, __location__, __func__ )) \
+		&& (dbgtext("%s: ", __func__))				\
+		&& (dbgtext body) )
 
 /*
  * Debug levels matching RFC 3164
@@ -213,11 +245,39 @@ extern int  *DEBUGLEVEL_CLASS;
 #define DBGLVL_INFO	 5	/* informational message */
 #define DBGLVL_DEBUG	10	/* debug-level message */
 
-#define DBG_ERR(...)		DEBUG(DBGLVL_ERR,	(__VA_ARGS__))
-#define DBG_WARNING(...)	DEBUG(DBGLVL_WARNING,	(__VA_ARGS__))
-#define DBG_NOTICE(...)	DEBUG(DBGLVL_NOTICE,	(__VA_ARGS__))
-#define DBG_INFO(...)		DEBUG(DBGLVL_INFO,	(__VA_ARGS__))
-#define DBG_DEBUG(...)		DEBUG(DBGLVL_DEBUG,	(__VA_ARGS__))
+#define DBG_ERR(...)		DBG_PREFIX(DBGLVL_ERR,		(__VA_ARGS__))
+#define DBG_WARNING(...)	DBG_PREFIX(DBGLVL_WARNING,	(__VA_ARGS__))
+#define DBG_NOTICE(...)		DBG_PREFIX(DBGLVL_NOTICE,	(__VA_ARGS__))
+#define DBG_INFO(...)		DBG_PREFIX(DBGLVL_INFO,		(__VA_ARGS__))
+#define DBG_DEBUG(...)		DBG_PREFIX(DBGLVL_DEBUG,	(__VA_ARGS__))
+
+#define DBGC_ERR(dbgc_class, ...)	DBGC_PREFIX(dbgc_class, \
+						DBGLVL_ERR, (__VA_ARGS__))
+#define DBGC_WARNING(dbgc_class, ...)	DBGC_PREFIX(dbgc_class, \
+						DBGLVL_WARNING,	(__VA_ARGS__))
+#define DBGC_NOTICE(dbgc_class, ...)	DBGC_PREFIX(dbgc_class, \
+						DBGLVL_NOTICE,	(__VA_ARGS__))
+#define DBGC_INFO(dbgc_class, ...)	DBGC_PREFIX(dbgc_class, \
+						DBGLVL_INFO,	(__VA_ARGS__))
+#define DBGC_DEBUG(dbgc_class, ...)	DBGC_PREFIX(dbgc_class, \
+						DBGLVL_DEBUG,	(__VA_ARGS__))
+
+#define D_ERR(...)		DEBUG(DBGLVL_ERR,	(__VA_ARGS__))
+#define D_WARNING(...)		DEBUG(DBGLVL_WARNING,	(__VA_ARGS__))
+#define D_NOTICE(...)		DEBUG(DBGLVL_NOTICE,	(__VA_ARGS__))
+#define D_INFO(...)		DEBUG(DBGLVL_INFO,	(__VA_ARGS__))
+#define D_DEBUG(...)		DEBUG(DBGLVL_DEBUG,	(__VA_ARGS__))
+
+#define DC_ERR(...)		DEBUGC(dbgc_class, \
+					DBGLVL_ERR,	(__VA_ARGS__))
+#define DC_WARNING(...)		DEBUGC(dbgc_class, \
+					DBGLVL_WARNING,	(__VA_ARGS__))
+#define DC_NOTICE(...)		DEBUGC(dbgc_class, \
+					DBGLVL_NOTICE,	(__VA_ARGS__))
+#define DC_INFO(...)		DEBUGC(dbgc_class, \
+					DBGLVL_INFO,	(__VA_ARGS__))
+#define DC_DEBUG(...)		DEBUGC(dbgc_class, \
+					DBGLVL_DEBUG,	(__VA_ARGS__))
 
 /* The following definitions come from lib/debug.c  */
 
@@ -260,7 +320,6 @@ void force_check_log_size( void );
 bool need_to_check_log_size( void );
 void check_log_size( void );
 void dbgflush( void );
-bool dbghdrclass(int level, int cls, const char *location, const char *func);
 bool debug_get_output_is_stderr(void);
 bool debug_get_output_is_stdout(void);
 void debug_schedule_reopen_logs(void);
@@ -272,5 +331,8 @@ typedef void (*debug_callback_fn)(void *private_ptr, int level, const char *msg)
    Set a callback for all debug messages.  Use in dlz_bind9 to push output to the bind logs
  */
 void debug_set_callback(void *private_ptr, debug_callback_fn fn);
+
+char *debug_get_ringbuf(void);
+size_t debug_get_ringbuf_size(void);
 
 #endif /* _SAMBA_DEBUG_H */

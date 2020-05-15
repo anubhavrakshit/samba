@@ -18,6 +18,7 @@
 */
 
 #include "dsdb/samdb/ldb_modules/partition.h"
+#include "lib/ldb-samba/ldb_wrap.h"
 #include "system/filesys.h"
 
 #define LDB_METADATA_SEQ_NUM	"SEQ_NUM"
@@ -35,6 +36,7 @@ static int partition_metadata_get_uint64(struct ldb_module *module,
 	TDB_DATA tdb_key, tdb_data;
 	char *value_str;
 	TALLOC_CTX *tmp_ctx;
+	int error = 0;
 
 	data = talloc_get_type_abort(ldb_module_get_private(module),
 				     struct partition_private_data);
@@ -72,7 +74,11 @@ static int partition_metadata_get_uint64(struct ldb_module *module,
 		return ldb_module_oom(module);
 	}
 
-	*value = strtoull(value_str, NULL, 10);
+	*value = smb_strtoull(value_str, NULL, 10, &error, SMB_STR_STANDARD);
+	if (error != 0) {
+		return ldb_module_error(module, LDB_ERR_OPERATIONS_ERROR,
+					"partition_metadata: converision failed");
+	}
 
 	SAFE_FREE(tdb_data.dptr);
 	talloc_free(tmp_ctx);
@@ -147,7 +153,7 @@ int partition_metadata_inc_schema_sequence(struct ldb_module *module)
 {
 	struct partition_private_data *data;
 	int ret;
-	uint64_t value;
+	uint64_t value = 0;
 
 	data = talloc_get_type_abort(ldb_module_get_private(module),
 				    struct partition_private_data);
@@ -185,9 +191,8 @@ static int partition_metadata_open(struct ldb_module *module, bool create)
 	TALLOC_CTX *tmp_ctx;
 	struct partition_private_data *data;
 	struct loadparm_context *lp_ctx;
-	const char *sam_name;
 	char *filename, *dirname;
-	int open_flags;
+	int open_flags, tdb_flags, ldb_flags;
 	struct stat statbuf;
 
 	data = talloc_get_type_abort(ldb_module_get_private(module),
@@ -202,15 +207,10 @@ static int partition_metadata_open(struct ldb_module *module, bool create)
 		return ldb_module_oom(module);
 	}
 
-	sam_name = (const char *)ldb_get_opaque(ldb, "ldb_url");
-	if (!sam_name) {
-		talloc_free(tmp_ctx);
-		return ldb_operr(ldb);
-	}
-	if (strncmp("tdb://", sam_name, 6) == 0) {
-		sam_name += 6;
-	}
-	filename = talloc_asprintf(tmp_ctx, "%s.d/metadata.tdb", sam_name);
+	filename = ldb_relative_path(ldb,
+				     tmp_ctx,
+				     "sam.ldb.d/metadata.tdb");
+
 	if (!filename) {
 		talloc_free(tmp_ctx);
 		return ldb_oom(ldb);
@@ -222,7 +222,9 @@ static int partition_metadata_open(struct ldb_module *module, bool create)
 
 		/* While provisioning, sam.ldb.d directory may not exist,
 		 * so create it. Ignore errors, if it already exists. */
-		dirname = talloc_asprintf(tmp_ctx, "%s.d", sam_name);
+		dirname = ldb_relative_path(ldb,
+					    tmp_ctx,
+					    "sam.ldb.d");
 		if (!dirname) {
 			talloc_free(tmp_ctx);
 			return ldb_oom(ldb);
@@ -240,9 +242,17 @@ static int partition_metadata_open(struct ldb_module *module, bool create)
 	lp_ctx = talloc_get_type_abort(ldb_get_opaque(ldb, "loadparm"),
 				       struct loadparm_context);
 
+	tdb_flags = lpcfg_tdb_flags(lp_ctx, TDB_DEFAULT|TDB_SEQNUM);
+
+	ldb_flags = ldb_module_flags(ldb);
+
+	if (ldb_flags & LDB_FLG_NOSYNC) {
+		tdb_flags |= TDB_NOSYNC;
+	}
+
 	data->metadata->db = tdb_wrap_open(
 		data->metadata, filename, 10,
-		lpcfg_tdb_flags(lp_ctx, TDB_DEFAULT), open_flags, 0660);
+		tdb_flags, open_flags, 0660);
 	if (data->metadata->db == NULL) {
 		talloc_free(tmp_ctx);
 		if (create) {
@@ -293,6 +303,10 @@ int partition_metadata_init(struct ldb_module *module)
 	data = talloc_get_type_abort(ldb_module_get_private(module),
 				     struct partition_private_data);
 
+	if (data->metadata != NULL && data->metadata->db != NULL) {
+		return LDB_SUCCESS;
+	}
+
 	data->metadata = talloc_zero(data, struct partition_metadata);
 	if (data->metadata == NULL) {
 		return ldb_module_oom(module);
@@ -300,7 +314,8 @@ int partition_metadata_init(struct ldb_module *module)
 
 	ret = partition_metadata_open(module, false);
 	if (ret == LDB_SUCCESS) {
-		goto end;
+		/* Great, we got the DB open */
+		return LDB_SUCCESS;
 	}
 
 	/* metadata.tdb does not exist, create it */
@@ -314,18 +329,10 @@ int partition_metadata_init(struct ldb_module *module)
 				       "Migrating partition metadata: "
 				       "create of metadata.tdb gave: %s\n",
 				       ldb_errstring(ldb_module_get_ctx(module)));
-		talloc_free(data->metadata);
-		data->metadata = NULL;
-		goto end;
+		TALLOC_FREE(data->metadata);
+		return ret;
 	}
 
-	ret = partition_metadata_set_sequence_number(module);
-	if (ret != LDB_SUCCESS) {
-		talloc_free(data->metadata);
-		data->metadata = NULL;
-	}
-
-end:
 	return ret;
 }
 
@@ -335,10 +342,35 @@ end:
  */
 int partition_metadata_sequence_number(struct ldb_module *module, uint64_t *value)
 {
-	return partition_metadata_get_uint64(module,
-					     LDB_METADATA_SEQ_NUM,
-					     value,
-					     0);
+
+	/* We have to lock all the databases as otherwise we can
+	 * return a sequence number that is higher than the DB values
+	 * that we can see, as those transactions close after the
+	 * metadata.tdb transaction closes */
+	int ret = partition_read_lock(module);
+	if (ret != LDB_SUCCESS) {
+		return ret;
+	}
+
+	/*
+	 * This means we will give a 0 until the first write
+	 * tranaction, which is actually pretty reasonable.
+	 *
+	 * All modern databases will have the metadata.tdb from
+	 * the time of the first transaction in provision anyway.
+	 */
+	ret = partition_metadata_get_uint64(module,
+					    LDB_METADATA_SEQ_NUM,
+					    value,
+					    0);
+	if (ret == LDB_SUCCESS) {
+		ret = partition_read_unlock(module);
+	} else {
+		/* Don't overwrite the error code */
+		partition_read_unlock(module);
+	}
+	return ret;
+
 }
 
 
@@ -367,9 +399,90 @@ int partition_metadata_sequence_number_increment(struct ldb_module *module, uint
 		return ret;
 	}
 
+	if (*value == 0) {
+		/*
+		 * We are in a transaction now, so we can get the
+		 * sequence number from the partitions.
+		 */
+		ret = partition_metadata_set_sequence_number(module);
+		if (ret != LDB_SUCCESS) {
+			return ret;
+		}
+
+		ret = partition_metadata_get_uint64(module,
+						    LDB_METADATA_SEQ_NUM,
+						    value, 0);
+		if (ret != LDB_SUCCESS) {
+			return ret;
+		}
+	}
+
 	(*value)++;
 	ret = partition_metadata_set_uint64(module, LDB_METADATA_SEQ_NUM, *value, false);
 	return ret;
+}
+/*
+  lock the database for read - use by partition_lock_read
+*/
+int partition_metadata_read_lock(struct ldb_module *module)
+{
+	struct partition_private_data *data
+		= talloc_get_type_abort(ldb_module_get_private(module),
+					struct partition_private_data);
+	struct tdb_context *tdb = NULL;
+	int tdb_ret = 0;
+	int ret;
+
+	if (!data || !data->metadata || !data->metadata->db) {
+		return ldb_module_error(module, LDB_ERR_OPERATIONS_ERROR,
+					"partition_metadata: metadata not initialized");
+	}
+	tdb = data->metadata->db->tdb;
+
+	if (tdb_transaction_active(tdb) == false &&
+	    data->metadata->read_lock_count == 0) {
+		tdb_ret = tdb_lockall_read(tdb);
+	}
+	if (tdb_ret == 0) {
+		data->metadata->read_lock_count++;
+		return LDB_SUCCESS;
+	} else {
+		/* Sadly we can't call ltdb_err_map(tdb_error(tdb)); */
+		ret = LDB_ERR_BUSY;
+	}
+	ldb_debug_set(ldb_module_get_ctx(module),
+		      LDB_DEBUG_FATAL,
+		      "Failure during partition_metadata_read_lock(): %s",
+		      tdb_errorstr(tdb));
+	return ret;
+}
+
+/*
+  unlock the database after a partition_metadata_lock_read()
+*/
+int partition_metadata_read_unlock(struct ldb_module *module)
+{
+	struct partition_private_data *data
+		= talloc_get_type_abort(ldb_module_get_private(module),
+					struct partition_private_data);
+	struct tdb_context *tdb = NULL;
+
+	data = talloc_get_type_abort(ldb_module_get_private(module),
+				     struct partition_private_data);
+	if (!data || !data->metadata || !data->metadata->db) {
+		return ldb_module_error(module, LDB_ERR_OPERATIONS_ERROR,
+					"partition_metadata: metadata not initialized");
+	}
+	tdb = data->metadata->db->tdb;
+
+	if (!tdb_transaction_active(tdb) &&
+	    data->metadata->read_lock_count == 1) {
+		tdb_unlockall_read(tdb);
+		data->metadata->read_lock_count--;
+		return 0;
+	}
+	data->metadata->read_lock_count--;
+	return 0;
 }
 
 

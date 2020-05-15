@@ -22,7 +22,7 @@
 */
 
 #include "includes.h"
-#include "popt_common.h"
+#include "popt_common_cmdline.h"
 #include "rpc_client/cli_pipe.h"
 #include "../librpc/gen_ndr/ndr_lsa.h"
 #include "rpc_client/cli_lsarpc.h"
@@ -44,7 +44,6 @@ static struct cli_state *cli_ipc;
 static struct rpc_pipe_client *global_pipe_hnd;
 static struct policy_handle pol;
 static bool got_policy_hnd;
-static struct user_auth_info *smbcquotas_auth_info;
 
 static struct cli_state *connect_one(const char *share);
 
@@ -236,7 +235,7 @@ static const char *quota_str_static(uint64_t val, bool special, bool _numeric)
 {
 	const char *result;
 
-	if (!_numeric&&special&&(val == SMB_NTQUOTAS_NO_LIMIT)) {
+	if (!_numeric && special && val == 0) {
 		return "NO LIMIT";
 	}
 	result = talloc_asprintf(talloc_tos(), "%"PRIu64, val);
@@ -339,6 +338,7 @@ static int do_quota(struct cli_state *cli,
 	uint32_t fs_attrs = 0;
 	uint16_t quota_fnum = 0;
 	SMB_NTQUOTA_LIST *qtl = NULL;
+	TALLOC_CTX *qtl_ctx = NULL;
 	SMB_NTQUOTA_STRUCT qt;
 	NTSTATUS status;
 
@@ -386,8 +386,21 @@ static int do_quota(struct cli_state *cli,
 					break;
 				case QUOTA_SETLIM:
 					pqt->sid = qt.sid;
+					if ((qtl_ctx = talloc_init(
+						 "SMB_USER_QUOTA_SET")) ==
+					    NULL) {
+						return -1;
+					}
+
+					if (!add_record_to_ntquota_list(
+						qtl_ctx, pqt, &qtl)) {
+						TALLOC_FREE(qtl_ctx);
+						return -1;
+					}
+
 					status = cli_set_user_quota(
-						cli, quota_fnum, pqt);
+					    cli, quota_fnum, qtl);
+					free_ntquota_list(&qtl);
 					if (!NT_STATUS_IS_OK(status)) {
 						d_printf("%s cli_set_user_quota %s\n",
 							 nt_errstr(status),
@@ -408,9 +421,9 @@ static int do_quota(struct cli_state *cli,
 					status = cli_list_user_quota(
 						cli, quota_fnum, &qtl);
 					if (!NT_STATUS_IS_OK(status)) {
-						d_printf("%s cli_set_user_quota %s\n",
-							 nt_errstr(status),
-							 username_str);
+						d_printf(
+						    "%s cli_list_user_quota\n",
+						    nt_errstr(status));
 						return -1;
 					}
 					dump_ntquota_list(&qtl,verbose,numeric,SidToString);
@@ -509,36 +522,35 @@ static struct cli_state *connect_one(const char *share)
 	NTSTATUS nt_status;
 	uint32_t flags = 0;
 
-	if (get_cmdline_auth_info_use_machine_account(smbcquotas_auth_info) &&
-	    !set_cmdline_auth_info_machine_account_creds(smbcquotas_auth_info)) {
-		return NULL;
-	}
-
-	if (get_cmdline_auth_info_use_kerberos(smbcquotas_auth_info)) {
+	if (get_cmdline_auth_info_use_kerberos(popt_get_cmdline_auth_info())) {
 		flags |= CLI_FULL_CONNECTION_USE_KERBEROS |
 			 CLI_FULL_CONNECTION_FALLBACK_AFTER_KERBEROS;
 
 	}
 
-	set_cmdline_auth_info_getpass(smbcquotas_auth_info);
-
 	nt_status = cli_full_connection(&c, lp_netbios_name(), server,
 					    NULL, 0,
 					    share, "?????",
-					    get_cmdline_auth_info_username(smbcquotas_auth_info),
-					    lp_workgroup(),
-					    get_cmdline_auth_info_password(smbcquotas_auth_info),
+					    get_cmdline_auth_info_username(
+						popt_get_cmdline_auth_info()),
+					    get_cmdline_auth_info_domain(
+						popt_get_cmdline_auth_info()),
+					    get_cmdline_auth_info_password(
+						popt_get_cmdline_auth_info()),
 					    flags,
-					    get_cmdline_auth_info_signing_state(smbcquotas_auth_info));
+					    get_cmdline_auth_info_signing_state(
+						popt_get_cmdline_auth_info()));
 	if (!NT_STATUS_IS_OK(nt_status)) {
 		DEBUG(0,("cli_full_connection failed! (%s)\n", nt_errstr(nt_status)));
 		return NULL;
 	}
 
-	if (get_cmdline_auth_info_smb_encrypt(smbcquotas_auth_info)) {
+	if (get_cmdline_auth_info_smb_encrypt(popt_get_cmdline_auth_info())) {
 		nt_status = cli_cm_force_encryption(c,
-					get_cmdline_auth_info_username(smbcquotas_auth_info),
-					get_cmdline_auth_info_password(smbcquotas_auth_info),
+					get_cmdline_auth_info_username(
+						popt_get_cmdline_auth_info()),
+					get_cmdline_auth_info_password(
+						popt_get_cmdline_auth_info()),
 					lp_workgroup(),
 					share);
 		if (!NT_STATUS_IS_OK(nt_status)) {
@@ -573,20 +585,80 @@ int main(int argc, char *argv[])
 	poptContext pc;
 	struct poptOption long_options[] = {
 		POPT_AUTOHELP
-		{ "user", 'u', POPT_ARG_STRING, NULL, 'u', "Show quotas for user", "user" },
-		{ "list", 'L', POPT_ARG_NONE, NULL, 'L', "List user quotas" },
-		{ "fs", 'F', POPT_ARG_NONE, NULL, 'F', "Show filesystem quotas" },
-		{ "set", 'S', POPT_ARG_STRING, NULL, 'S', "Set acls\n\
-SETSTRING:\n\
-UQLIM:<username>/<softlimit>/<hardlimit> for user quotas\n\
-FSQLIM:<softlimit>/<hardlimit> for filesystem defaults\n\
-FSQFLAGS:QUOTA_ENABLED/DENY_DISK/LOG_SOFTLIMIT/LOG_HARD_LIMIT", "SETSTRING" },
-		{ "numeric", 'n', POPT_ARG_NONE, NULL, 'n', "Don't resolve sids or limits to names" },
-		{ "verbose", 'v', POPT_ARG_NONE, NULL, 'v', "be verbose" },
-		{ "test-args", 't', POPT_ARG_NONE, NULL, 't', "Test arguments"},
+		{
+			.longName   = "user",
+			.shortName  = 'u',
+			.argInfo    = POPT_ARG_STRING,
+			.arg        = NULL,
+			.val        = 'u',
+			.descrip    = "Show quotas for user",
+			.argDescrip = "USER",
+		},
+		{
+			.longName   = "list",
+			.shortName  = 'L',
+			.argInfo    = POPT_ARG_NONE,
+			.arg        = NULL,
+			.val        = 'L',
+			.descrip    = "List user quotas",
+		},
+		{
+			.longName   = "fs",
+			.shortName  = 'F',
+			.argInfo    = POPT_ARG_NONE,
+			.arg        = NULL,
+			.val        = 'F',
+			.descrip    = "Show filesystem quotas",
+		},
+		{
+			.longName   = "set",
+			.shortName  = 'S',
+			.argInfo    = POPT_ARG_STRING,
+			.arg        = NULL,
+			.val        = 'S',
+			.descrip    = "Set acls\n"
+				      "SETSTRING:\n"
+				      "UQLIM:<username>/<softlimit>/<hardlimit> for user quotas\n"
+				      "FSQLIM:<softlimit>/<hardlimit> for filesystem defaults\n"
+				      "FSQFLAGS:QUOTA_ENABLED/DENY_DISK/LOG_SOFTLIMIT/LOG_HARD_LIMIT",
+			.argDescrip = "SETSTRING",
+		},
+		{
+			.longName   = "numeric",
+			.shortName  = 'n',
+			.argInfo    = POPT_ARG_NONE,
+			.arg        = NULL,
+			.val        = 'n',
+			.descrip    = "Don't resolve sids or limits to names",
+		},
+		{
+			.longName   = "verbose",
+			.shortName  = 'v',
+			.argInfo    = POPT_ARG_NONE,
+			.arg        = NULL,
+			.val        = 'v',
+			.descrip    = "be verbose",
+		},
+		{
+			.longName   = "test-args",
+			.shortName  = 't',
+			.argInfo    = POPT_ARG_NONE,
+			.arg        = NULL,
+			.val        = 't',
+			.descrip    = "Test arguments"
+		},
+		{
+			.longName   = "max-protocol",
+			.shortName  = 'm',
+			.argInfo    = POPT_ARG_STRING,
+			.arg        = NULL,
+			.val        = 'm',
+			.descrip    = "Set the max protocol level",
+			.argDescrip = "LEVEL"
+		},
 		POPT_COMMON_SAMBA
 		POPT_COMMON_CREDENTIALS
-		{ NULL }
+		POPT_TABLEEND
 	};
 
 	smb_init_locale();
@@ -600,15 +672,6 @@ FSQFLAGS:QUOTA_ENABLED/DENY_DISK/LOG_SOFTLIMIT/LOG_HARD_LIMIT", "SETSTRING" },
 	setlinebuf(stdout);
 
 	fault_setup();
-
-	lp_load_global(get_dyn_CONFIGFILE());
-	load_interfaces();
-
-	smbcquotas_auth_info = user_auth_info_init(frame);
-	if (smbcquotas_auth_info == NULL) {
-		exit(1);
-	}
-	popt_common_set_auth_info(smbcquotas_auth_info);
 
 	pc = poptGetContext("smbcquotas", argc, argv_const, long_options, 0);
 
@@ -665,6 +728,10 @@ FSQFLAGS:QUOTA_ENABLED/DENY_DISK/LOG_SOFTLIMIT/LOG_HARD_LIMIT", "SETSTRING" },
 			}
 			todo = SET_QUOTA;
 			break;
+		case 'm':
+			lp_set_cmdline("client max protocol",
+				       poptGetOptArg(pc));
+			break;
 		}
 	}
 
@@ -673,7 +740,8 @@ FSQFLAGS:QUOTA_ENABLED/DENY_DISK/LOG_SOFTLIMIT/LOG_HARD_LIMIT", "SETSTRING" },
 
 	if (!fix_user) {
 		username_str = talloc_strdup(
-			frame, get_cmdline_auth_info_username(smbcquotas_auth_info));
+			frame, get_cmdline_auth_info_username(
+				popt_get_cmdline_auth_info()));
 		if (!username_str) {
 			exit(EXIT_PARSE_ERROR);
 		}
@@ -702,8 +770,8 @@ FSQFLAGS:QUOTA_ENABLED/DENY_DISK/LOG_SOFTLIMIT/LOG_HARD_LIMIT", "SETSTRING" },
 		exit(EXIT_PARSE_ERROR);
 	}
 	share = strchr_m(server,'\\');
-	if (!share) {
-		printf("Invalid argument: %s\n", share);
+	if (share == NULL) {
+		printf("Invalid argument\n");
 		exit(EXIT_PARSE_ERROR);
 	}
 
@@ -723,6 +791,7 @@ FSQFLAGS:QUOTA_ENABLED/DENY_DISK/LOG_SOFTLIMIT/LOG_HARD_LIMIT", "SETSTRING" },
 			exit(EXIT_FAILED);
 		}
 	} else {
+		popt_free_cmdline_auth_info();
 		exit(EXIT_OK);
 	}
 
@@ -747,6 +816,7 @@ FSQFLAGS:QUOTA_ENABLED/DENY_DISK/LOG_SOFTLIMIT/LOG_HARD_LIMIT", "SETSTRING" },
 			break;
 	}
 
+	popt_free_cmdline_auth_info();
 	talloc_free(frame);
 
 	return result;

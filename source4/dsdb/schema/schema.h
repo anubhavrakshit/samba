@@ -192,6 +192,12 @@ struct dsdb_class {
 	} tmp;
 };
 
+enum schema_set_enum {
+	SCHEMA_MEMORY_ONLY = 0,
+	SCHEMA_WRITE = 1,
+	SCHEMA_COMPARE = 2,
+};
+
 /**
  * data stored in schemaInfo attribute
  */
@@ -212,10 +218,7 @@ struct dsdb_schema {
 	 * this is the content of the schemaInfo attribute of the
 	 * Schema-Partition head object.
 	 */
-	const char *schema_info;
-
-	/* We can also tell the schema version from the USN on the partition */
-	uint64_t loaded_usn;
+	struct dsdb_schema_info *schema_info;
 
 	struct dsdb_attribute *attributes;
 	struct dsdb_class *classes;
@@ -251,8 +254,6 @@ struct dsdb_schema {
 	/* Was this schema loaded from ldb (if so, then we will reload it when we detect a change in ldb) */
 	bool refresh_in_progress;
 	time_t ts_last_change;
-	time_t last_refresh;
-	time_t refresh_interval;
 	/* This 'opaque' is stored in the metadata and is used to check if the currently
 	 * loaded schema needs a reload because another process has signaled that it has been
 	 * requested to reload the schema (either due through DRS or via the schemaUpdateNow).
@@ -261,7 +262,66 @@ struct dsdb_schema {
 
 	/* Should the syntax handlers in this case handle all incoming OIDs automatically, assigning them as an OID if no text name is known? */
 	bool relax_OID_conversions;
+
+	/*
+	 * we're currently trying to construct a working_schema
+	 * in order to replicate the schema partition.
+	 *
+	 * We use this in order to avoid temporary failure DEBUG messages
+	 */
+	bool resolving_in_progress;
 };
+
+#define DSDB_SCHEMA_COMMON_ATTRS			\
+	        "objectClass",				\
+		"cn",				        \
+		"lDAPDisplayName",			\
+		"schemaIDGUID",				\
+		"objectGUID",				\
+		"systemFlags",				\
+		"schemaFlagsEx",			\
+		"msDs-Schema-Extensions",		\
+		"showInAdvancedViewOnly",		\
+		"adminDisplayName",			\
+		"adminDescription",			\
+		"isDefunct",				\
+		"systemOnly"
+
+#define DSDB_SCHEMA_ATTR_ATTRS				\
+	        "attributeID",				\
+		"msDS-IntId",				\
+		"mAPIID",				\
+		"attributeSecurityGUID",		\
+		"searchFlags",				\
+		"isMemberOfPartialAttributeSet",	\
+		"linkID",				\
+		"attributeSyntax",			\
+		"oMSyntax",				\
+		"oMObjectClass",			\
+		"isSingleValued",			\
+		"rangeLower",				\
+		"rangeUpper",				\
+		"extendedCharsAllowed",			\
+		"classDisplayName",			\
+		"isEphemeral"
+
+#define DSDB_SCHEMA_CLASS_ATTRS				\
+                "governsID",				\
+		"objectClassCategory",			\
+		"rDNAttID",				\
+		"defaultObjectCategory",		\
+		"subClassOf",				\
+		"systemAuxiliaryClass",			\
+		"auxiliaryClass",			\
+		"systemMustContain",			\
+		"systemMayContain",			\
+		"mustContain",				\
+		"mayContain",				\
+		"systemPossSuperiors",			\
+		"possSuperiors",			\
+		"defaultSecurityDescriptor",		\
+		"classDisplayName",			\
+		"defaultHidingValue"
 
 enum dsdb_attr_list_query {
 	DSDB_SCHEMA_ALL_MAY,

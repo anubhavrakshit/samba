@@ -56,7 +56,16 @@ _PUBLIC_ enum ndr_err_code ndr_pull_dnsp_name(struct ndr_pull *ndr, int ndr_flag
 		uint8_t sublen, newlen;
 		NDR_CHECK(ndr_pull_uint8(ndr, ndr_flags, &sublen));
 		newlen = total_len + sublen;
+		if (newlen < total_len) {
+			return ndr_pull_error(ndr, NDR_ERR_RANGE,
+					      "Failed to pull dnsp_name");
+		}
 		if (i != count-1) {
+			if (newlen == UINT8_MAX) {
+				return ndr_pull_error(
+					ndr, NDR_ERR_RANGE,
+					"Failed to pull dnsp_name");
+			}
 			newlen++; /* for the '.' */
 		}
 		ret = talloc_realloc(ndr->current_mem_ctx, ret, char, newlen);
@@ -97,8 +106,18 @@ enum ndr_err_code ndr_push_dnsp_name(struct ndr_push *ndr, int ndr_flags, const 
 	}
 	total_len = strlen(name) + 1;
 
-	/* cope with names ending in '.' */
-	if (name[strlen(name)-1] != '.') {
+	/*
+	 * cope with names ending in '.'
+	 */
+	if (name[0] == '\0') {
+		/*
+		 * Don't access name[-1] for the "" input, which has
+		 * the same meaning as a lone '.'.
+		 *
+		 * This allows a round-trip of a dnsRecord from
+		 * Windows of a MX record of '.'
+		 */
+	} else if (name[strlen(name)-1] != '.') {
 		total_len++;
 		count++;
 	}
@@ -139,10 +158,6 @@ _PUBLIC_ enum ndr_err_code ndr_pull_dnsp_string(struct ndr_pull *ndr, int ndr_fl
 
 	NDR_CHECK(ndr_pull_uint8(ndr, ndr_flags, &len));
 
-	ret = talloc_strdup(ndr->current_mem_ctx, "");
-	if (!ret) {
-		return ndr_pull_error(ndr, NDR_ERR_ALLOC, "Failed to pull dnsp_string");
-	}
 	ret = talloc_zero_array(ndr->current_mem_ctx, char, len + 1);
 	if (!ret) {
 		return ndr_pull_error(ndr, NDR_ERR_ALLOC, "Failed to pull dnsp_string");
@@ -220,5 +235,29 @@ enum ndr_err_code ndr_push_dnsp_string_list(struct ndr_push *ndr, int ndr_flags,
 	for (i=0; i<list->count; i++) {
 		NDR_CHECK(ndr_push_dnsp_string(ndr, ndr_flags, list->str[i]));
 	}
+	return NDR_ERR_SUCCESS;
+}
+
+enum ndr_err_code ndr_dnsp_string_list_copy(TALLOC_CTX *mem_ctx,
+					    const struct dnsp_string_list *src,
+					    struct dnsp_string_list *dst)
+{
+	size_t i;
+
+	dst->count = 0;
+	dst->str = talloc_zero_array(mem_ctx, const char *, src->count);
+	if (dst->str == NULL) {
+		return NDR_ERR_ALLOC;
+	}
+
+	for (i = 0; i < src->count; i++) {
+		dst->str[i] = talloc_strdup(dst->str, src->str[i]);
+		if (dst->str[i] == NULL) {
+			TALLOC_FREE(dst->str);
+			return NDR_ERR_ALLOC;
+		}
+	}
+
+	dst->count = src->count;
 	return NDR_ERR_SUCCESS;
 }

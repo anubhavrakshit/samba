@@ -18,13 +18,57 @@
    along with this program; if not, see <http://www.gnu.org/licenses/>.
 */
 
-#include "includes.h"
-#include "tdb.h"
+#include "replace.h"
 #include "system/network.h"
 #include "system/filesys.h"
-#include "../include/ctdb_private.h"
+
+#include <tdb.h>
+
 #include "lib/tdb_wrap/tdb_wrap.h"
 #include "lib/util/dlinklist.h"
+#include "lib/util/debug.h"
+
+#include "ctdb_private.h"
+
+#include "common/common.h"
+#include "common/logging.h"
+
+
+/*
+ * Calculate tdb flags based on databse type
+ */
+int ctdb_db_tdb_flags(uint8_t db_flags, bool with_valgrind, bool with_mutex)
+{
+	int tdb_flags = 0;
+
+	if (db_flags & CTDB_DB_FLAGS_PERSISTENT) {
+		tdb_flags = TDB_DEFAULT;
+
+	} else if (db_flags & CTDB_DB_FLAGS_REPLICATED) {
+		tdb_flags = TDB_NOSYNC |
+			    TDB_CLEAR_IF_FIRST |
+			    TDB_INCOMPATIBLE_HASH;
+
+	} else {
+		tdb_flags = TDB_NOSYNC |
+			    TDB_CLEAR_IF_FIRST |
+			    TDB_INCOMPATIBLE_HASH;
+
+#ifdef TDB_MUTEX_LOCKING
+		if (with_mutex && tdb_runtime_check_for_robust_mutexes()) {
+			tdb_flags |= TDB_MUTEX_LOCKING;
+		}
+#endif
+
+	}
+
+	tdb_flags |= TDB_DISALLOW_NESTING;
+	if (with_valgrind) {
+		tdb_flags |= TDB_NOMMAP;
+	}
+
+	return tdb_flags;
+}
 
 /*
   find an attached ctdb_db handle given a name
@@ -40,6 +84,61 @@ struct ctdb_db_context *ctdb_db_handle(struct ctdb_context *ctdb, const char *na
 	return NULL;
 }
 
+bool ctdb_db_persistent(struct ctdb_db_context *ctdb_db)
+{
+	if (ctdb_db->db_flags & CTDB_DB_FLAGS_PERSISTENT) {
+		return true;
+	}
+	return false;
+}
+
+bool ctdb_db_replicated(struct ctdb_db_context *ctdb_db)
+{
+	if (ctdb_db->db_flags & CTDB_DB_FLAGS_REPLICATED) {
+		return true;
+	}
+	return false;
+}
+
+bool ctdb_db_volatile(struct ctdb_db_context *ctdb_db)
+{
+	if ((ctdb_db->db_flags & CTDB_DB_FLAGS_PERSISTENT) ||
+	    (ctdb_db->db_flags & CTDB_DB_FLAGS_REPLICATED)) {
+		return false;
+	}
+	return true;
+}
+
+bool ctdb_db_readonly(struct ctdb_db_context *ctdb_db)
+{
+	if (ctdb_db->db_flags & CTDB_DB_FLAGS_READONLY) {
+		return true;
+	}
+	return false;
+}
+
+void ctdb_db_set_readonly(struct ctdb_db_context *ctdb_db)
+{
+	ctdb_db->db_flags |= CTDB_DB_FLAGS_READONLY;
+}
+
+void ctdb_db_reset_readonly(struct ctdb_db_context *ctdb_db)
+{
+	ctdb_db->db_flags &= ~CTDB_DB_FLAGS_READONLY;
+}
+
+bool ctdb_db_sticky(struct ctdb_db_context *ctdb_db)
+{
+	if (ctdb_db->db_flags & CTDB_DB_FLAGS_STICKY) {
+		return true;
+	}
+	return false;
+}
+
+void ctdb_db_set_sticky(struct ctdb_db_context *ctdb_db)
+{
+	ctdb_db->db_flags |= CTDB_DB_FLAGS_STICKY;
+}
 
 /*
   return the lmaster given a key
@@ -68,93 +167,100 @@ static void ltdb_initial_header(struct ctdb_db_context *ctdb_db,
 	header->flags = CTDB_REC_FLAG_AUTOMATIC;
 }
 
+struct ctdb_ltdb_fetch_state {
+	struct ctdb_ltdb_header *header;
+	TALLOC_CTX *mem_ctx;
+	TDB_DATA *data;
+	int ret;
+	bool found;
+};
+
+static int ctdb_ltdb_fetch_fn(TDB_DATA key, TDB_DATA data, void *private_data)
+{
+	struct ctdb_ltdb_fetch_state *state = private_data;
+	struct ctdb_ltdb_header *header = state->header;
+	TDB_DATA *dstdata = state->data;
+
+	if (data.dsize < sizeof(*header)) {
+		return 0;
+	}
+
+	state->found = true;
+	memcpy(header, data.dptr, sizeof(*header));
+
+	if (dstdata != NULL) {
+		dstdata->dsize = data.dsize - sizeof(struct ctdb_ltdb_header);
+		dstdata->dptr = talloc_memdup(
+			state->mem_ctx,
+			data.dptr + sizeof(struct ctdb_ltdb_header),
+			dstdata->dsize);
+		if (dstdata->dptr == NULL) {
+			state->ret = -1;
+		}
+	}
+
+	return 0;
+}
 
 /*
   fetch a record from the ltdb, separating out the header information
   and returning the body of the record. A valid (initial) header is
   returned if the record is not present
 */
-int ctdb_ltdb_fetch(struct ctdb_db_context *ctdb_db, 
-		    TDB_DATA key, struct ctdb_ltdb_header *header, 
+int ctdb_ltdb_fetch(struct ctdb_db_context *ctdb_db,
+		    TDB_DATA key, struct ctdb_ltdb_header *header,
 		    TALLOC_CTX *mem_ctx, TDB_DATA *data)
 {
-	TDB_DATA rec;
 	struct ctdb_context *ctdb = ctdb_db->ctdb;
+	struct ctdb_ltdb_fetch_state state = {
+		.header = header,
+		.mem_ctx = mem_ctx,
+		.data = data,
+		.found = false,
+	};
+	int ret;
 
-	rec = tdb_fetch(ctdb_db->ltdb->tdb, key);
-	if (rec.dsize < sizeof(*header)) {
-		/* return an initial header */
-		if (rec.dptr) free(rec.dptr);
-		if (ctdb->vnn_map == NULL) {
-			/* called from the client */
-			ZERO_STRUCTP(data);
-			header->dmaster = (uint32_t)-1;
+	ret = tdb_parse_record(
+		ctdb_db->ltdb->tdb, key, ctdb_ltdb_fetch_fn, &state);
+
+	if (ret == -1) {
+		enum TDB_ERROR err = tdb_error(ctdb_db->ltdb->tdb);
+		if (err != TDB_ERR_NOEXIST) {
 			return -1;
 		}
-		ltdb_initial_header(ctdb_db, key, header);
-		if (data) {
-			*data = tdb_null;
-		}
-		if (ctdb_db->persistent || header->dmaster == ctdb_db->ctdb->pnn) {
-			if (ctdb_ltdb_store(ctdb_db, key, header, tdb_null) != 0) {
-				DEBUG(DEBUG_NOTICE,
-				      (__location__ "failed to store initial header\n"));
-			}
-		}
+	}
+
+	if (state.ret != 0) {
+		DBG_DEBUG("ctdb_ltdb_fetch_fn failed\n");
+		return state.ret;
+	}
+
+	if (state.found) {
 		return 0;
 	}
 
-	*header = *(struct ctdb_ltdb_header *)rec.dptr;
-
-	if (data) {
-		data->dsize = rec.dsize - sizeof(struct ctdb_ltdb_header);
-		data->dptr = talloc_memdup(mem_ctx, 
-					   sizeof(struct ctdb_ltdb_header)+rec.dptr,
-					   data->dsize);
+	if (data != NULL) {
+		*data = tdb_null;
 	}
 
-	free(rec.dptr);
-	if (data) {
-		CTDB_NO_MEMORY(ctdb, data->dptr);
-	}
-
-	return 0;
-}
-
-/*
-  fetch a record from the ltdb, separating out the header information
-  and returning the body of the record.
-  if the record does not exist, *header will be NULL
-  and data = {0, NULL}
-*/
-int ctdb_ltdb_fetch_with_header(struct ctdb_db_context *ctdb_db, 
-		    TDB_DATA key, struct ctdb_ltdb_header *header, 
-		    TALLOC_CTX *mem_ctx, TDB_DATA *data)
-{
-	TDB_DATA rec;
-
-	rec = tdb_fetch(ctdb_db->ltdb->tdb, key);
-	if (rec.dsize < sizeof(*header)) {
-		free(rec.dptr);
-
-		data->dsize = 0;
-		data->dptr = NULL;
+	if (ctdb->vnn_map == NULL) {
+		/* called from the client */
+		header->dmaster = (uint32_t)-1;
 		return -1;
 	}
 
-	*header = *(struct ctdb_ltdb_header *)rec.dptr;
-	if (data) {
-		data->dsize = rec.dsize - sizeof(struct ctdb_ltdb_header);
-		data->dptr = talloc_memdup(mem_ctx, 
-					   sizeof(struct ctdb_ltdb_header)+rec.dptr,
-					   data->dsize);
-	}
+	ltdb_initial_header(ctdb_db, key, header);
+	if (ctdb_db_persistent(ctdb_db) ||
+	    header->dmaster == ctdb_db->ctdb->pnn) {
 
-	free(rec.dptr);
+		ret = ctdb_ltdb_store(ctdb_db, key, header, tdb_null);
+		if (ret != 0) {
+			DBG_NOTICE("failed to store initial header\n");
+		}
+	}
 
 	return 0;
 }
-
 
 /*
   write a record to a normal database
@@ -163,56 +269,41 @@ int ctdb_ltdb_store(struct ctdb_db_context *ctdb_db, TDB_DATA key,
 		    struct ctdb_ltdb_header *header, TDB_DATA data)
 {
 	struct ctdb_context *ctdb = ctdb_db->ctdb;
-	TDB_DATA rec;
+	TDB_DATA rec[2];
+	uint32_t hsize = sizeof(struct ctdb_ltdb_header);
 	int ret;
-	bool seqnum_suppressed = false;
 
 	if (ctdb_db->ctdb_ltdb_store_fn) {
 		return ctdb_db->ctdb_ltdb_store_fn(ctdb_db, key, header, data);
 	}
 
 	if (ctdb->flags & CTDB_FLAG_TORTURE) {
-		struct ctdb_ltdb_header *h2;
-		rec = tdb_fetch(ctdb_db->ltdb->tdb, key);
-		h2 = (struct ctdb_ltdb_header *)rec.dptr;
-		if (rec.dptr && rec.dsize >= sizeof(h2) && h2->rsn > header->rsn) {
-			DEBUG(DEBUG_CRIT,("RSN regression! %llu %llu\n",
-				 (unsigned long long)h2->rsn, (unsigned long long)header->rsn));
-		}
-		if (rec.dptr) free(rec.dptr);
-	}
-
-	rec.dsize = sizeof(*header) + data.dsize;
-	rec.dptr = talloc_size(ctdb, rec.dsize);
-	CTDB_NO_MEMORY(ctdb, rec.dptr);
-
-	memcpy(rec.dptr, header, sizeof(*header));
-	memcpy(rec.dptr + sizeof(*header), data.dptr, data.dsize);
-
-	/* Databases with seqnum updates enabled only get their seqnum
-	   changes when/if we modify the data */
-	if (ctdb_db->seqnum_update != NULL) {
 		TDB_DATA old;
-		old = tdb_fetch(ctdb_db->ltdb->tdb, key);
+		struct ctdb_ltdb_header *h2;
 
-		if ( (old.dsize == rec.dsize)
-		&& !memcmp(old.dptr+sizeof(struct ctdb_ltdb_header),
-			  rec.dptr+sizeof(struct ctdb_ltdb_header),
-			  rec.dsize-sizeof(struct ctdb_ltdb_header)) ) {
-			tdb_remove_flags(ctdb_db->ltdb->tdb, TDB_SEQNUM);
-			seqnum_suppressed = true;
+		old = tdb_fetch(ctdb_db->ltdb->tdb, key);
+		h2 = (struct ctdb_ltdb_header *)old.dptr;
+		if (old.dptr != NULL && old.dsize >= hsize &&
+		    h2->rsn > header->rsn) {
+			DEBUG(DEBUG_ERR,
+			      ("RSN regression! %"PRIu64" %"PRIu64"\n",
+			       h2->rsn, header->rsn));
 		}
-		if (old.dptr) free(old.dptr);
+		if (old.dptr != NULL) {
+			free(old.dptr);
+		}
 	}
-	ret = tdb_store(ctdb_db->ltdb->tdb, key, rec, TDB_REPLACE);
+
+	rec[0].dsize = hsize;
+	rec[0].dptr = (uint8_t *)header;
+
+	rec[1].dsize = data.dsize;
+	rec[1].dptr = data.dptr;
+
+	ret = tdb_storev(ctdb_db->ltdb->tdb, key, rec, 2, TDB_REPLACE);
 	if (ret != 0) {
 		DEBUG(DEBUG_ERR, (__location__ " Failed to store dynamic data\n"));
 	}
-	if (seqnum_suppressed) {
-		tdb_add_flags(ctdb_db->ltdb->tdb, TDB_SEQNUM);
-	}
-
-	talloc_free(rec.dptr);
 
 	return ret;
 }
@@ -243,8 +334,10 @@ int ctdb_ltdb_unlock(struct ctdb_db_context *ctdb_db, TDB_DATA key)
 */
 int ctdb_ltdb_delete(struct ctdb_db_context *ctdb_db, TDB_DATA key)
 {
-	if (ctdb_db->persistent != 0) {
-		DEBUG(DEBUG_ERR,("Trying to delete emty record in persistent database\n"));
+	if (! ctdb_db_volatile(ctdb_db)) {
+		DEBUG(DEBUG_WARNING,
+		      ("Ignored deletion of empty record from "
+		       "non-volatile database\n"));
 		return 0;
 	}
 	if (tdb_delete(ctdb_db->ltdb->tdb, key) != 0) {
@@ -256,8 +349,8 @@ int ctdb_ltdb_delete(struct ctdb_db_context *ctdb_db, TDB_DATA key)
 
 int ctdb_trackingdb_add_pnn(struct ctdb_context *ctdb, TDB_DATA *data, uint32_t pnn)
 {
-	int byte_pos = pnn / 8;
-	int bit_mask   = 1 << (pnn % 8);
+	unsigned int byte_pos = pnn / 8;
+	unsigned char bit_mask = 1 << (pnn % 8);
 
 	if (byte_pos + 1 > data->dsize) {
 		char *buf;
@@ -282,10 +375,10 @@ int ctdb_trackingdb_add_pnn(struct ctdb_context *ctdb, TDB_DATA *data, uint32_t 
 
 void ctdb_trackingdb_traverse(struct ctdb_context *ctdb, TDB_DATA data, ctdb_trackingdb_cb cb, void *private_data)
 {
-	int i;
+	unsigned int i;
 
 	for(i = 0; i < data.dsize; i++) {
-		int j;
+		unsigned int j;
 
 		for (j=0; j<8; j++) {
 			int mask = 1<<j;

@@ -27,7 +27,7 @@
 #include "param/share.h"
 #include "param/param.h"
 
-NTSTATUS share_ldb_init(void);
+NTSTATUS share_ldb_init(TALLOC_CTX *);
 
 static NTSTATUS sldb_init(TALLOC_CTX *mem_ctx, const struct share_ops *ops, 
 			  struct tevent_context *ev_ctx,
@@ -445,7 +445,7 @@ static NTSTATUS sldb_set(struct share_context *ctx, const char *name, struct sha
 	TALLOC_CTX *tmp_ctx;
 	NTSTATUS ret;
 	bool do_rename = false;
-	char *newname;
+	char *newname = NULL;
 	int err, i;
 
 	if (!name) {
@@ -598,7 +598,7 @@ static const struct share_ops ops = {
 	.remove = sldb_remove
 };
 
-NTSTATUS share_ldb_init(void)
+NTSTATUS share_ldb_init(TALLOC_CTX *ctx)
 {
 	return share_register(&ops);
 }

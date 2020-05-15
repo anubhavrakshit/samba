@@ -22,6 +22,8 @@
 */
 
 #include "includes.h"
+#include <tevent.h>
+#include "lib/util/tevent_ntstatus.h"
 #include "lib/events/events.h"
 #include "system/kerberos.h"
 #include "system/gssapi.h"
@@ -50,7 +52,7 @@ gss_OID_desc spnego_mech_oid_desc =
 #define gss_mech_spnego (&spnego_mech_oid_desc)
 #endif
 
-_PUBLIC_ NTSTATUS gensec_gssapi_init(void);
+_PUBLIC_ NTSTATUS gensec_gssapi_init(TALLOC_CTX *);
 
 static size_t gensec_gssapi_max_input_size(struct gensec_security *gensec_security);
 static size_t gensec_gssapi_max_wrapped_size(struct gensec_security *gensec_security);
@@ -83,11 +85,63 @@ static int gensec_gssapi_destructor(struct gensec_gssapi_state *gensec_gssapi_st
 	return 0;
 }
 
+static NTSTATUS gensec_gssapi_setup_server_principal(TALLOC_CTX *mem_ctx,
+						     const char *target_principal,
+						     const char *service,
+						     const char *hostname,
+						     const char *realm,
+						     const gss_OID mech,
+						     char **pserver_principal,
+						     gss_name_t *pserver_name)
+{
+	char *server_principal = NULL;
+	gss_buffer_desc name_token;
+	gss_OID name_type;
+	OM_uint32 maj_stat, min_stat = 0;
+
+	if (target_principal != NULL) {
+		server_principal = talloc_strdup(mem_ctx, target_principal);
+		name_type = GSS_C_NULL_OID;
+	} else {
+		server_principal = talloc_asprintf(mem_ctx,
+						   "%s/%s@%s",
+						   service, hostname, realm);
+		name_type = GSS_C_NT_USER_NAME;
+	}
+	if (server_principal == NULL) {
+		return NT_STATUS_NO_MEMORY;
+	}
+
+	name_token.value = (uint8_t *)server_principal;
+	name_token.length = strlen(server_principal);
+
+	maj_stat = gss_import_name(&min_stat,
+				   &name_token,
+				   name_type,
+				   pserver_name);
+	if (maj_stat) {
+		DBG_WARNING("GSS Import name of %s failed: %s\n",
+			    server_principal,
+			    gssapi_error_string(mem_ctx,
+						maj_stat,
+						min_stat,
+						mech));
+		TALLOC_FREE(server_principal);
+		return NT_STATUS_INVALID_PARAMETER;
+	}
+
+	*pserver_principal = server_principal;
+
+	return NT_STATUS_OK;
+}
+
 static NTSTATUS gensec_gssapi_start(struct gensec_security *gensec_security)
 {
 	struct gensec_gssapi_state *gensec_gssapi_state;
 	krb5_error_code ret;
+#ifdef SAMBA4_USES_HEIMDAL
 	const char *realm;
+#endif
 
 	gensec_gssapi_state = talloc_zero(gensec_security, struct gensec_gssapi_state);
 	if (!gensec_gssapi_state) {
@@ -113,7 +167,7 @@ static NTSTATUS gensec_gssapi_start(struct gensec_security *gensec_security)
 	if (gensec_setting_bool(gensec_security->settings, "gensec_gssapi", "mutual", true)) {
 		gensec_gssapi_state->gss_want_flags |= GSS_C_MUTUAL_FLAG;
 	}
-	if (gensec_setting_bool(gensec_security->settings, "gensec_gssapi", "delegation", true)) {
+	if (gensec_setting_bool(gensec_security->settings, "gensec_gssapi", "delegation", false)) {
 		gensec_gssapi_state->gss_want_flags |= GSS_C_DELEG_FLAG;
 	}
 	if (gensec_setting_bool(gensec_security->settings, "gensec_gssapi", "replay", true)) {
@@ -123,6 +177,9 @@ static NTSTATUS gensec_gssapi_start(struct gensec_security *gensec_security)
 		gensec_gssapi_state->gss_want_flags |= GSS_C_SEQUENCE_FLAG;
 	}
 
+	if (gensec_security->want_features & GENSEC_FEATURE_SESSION_KEY) {
+		gensec_gssapi_state->gss_want_flags |= GSS_C_INTEG_FLAG;
+	}
 	if (gensec_security->want_features & GENSEC_FEATURE_SIGN) {
 		gensec_gssapi_state->gss_want_flags |= GSS_C_INTEG_FLAG;
 	}
@@ -185,7 +242,7 @@ static NTSTATUS gensec_gssapi_start(struct gensec_security *gensec_security)
 	}
 
 	/* don't do DNS lookups of any kind, it might/will fail for a netbios name */
-	ret = gsskrb5_set_dns_canonicalize(gensec_setting_bool(gensec_security->settings, "krb5", "set_dns_canonicalize", false));
+	ret = gsskrb5_set_dns_canonicalize(false);
 	if (ret) {
 		DEBUG(1,("gensec_gssapi_start: gsskrb5_set_dns_canonicalize failed\n"));
 		talloc_free(gensec_gssapi_state);
@@ -219,7 +276,7 @@ static NTSTATUS gensec_gssapi_server_start(struct gensec_security *gensec_securi
 		ret = cli_credentials_get_server_gss_creds(machine_account, 
 							   gensec_security->settings->lp_ctx, &gcc);
 		if (ret) {
-			DEBUG(1, ("Aquiring acceptor credentials failed: %s\n", 
+			DEBUG(1, ("Acquiring acceptor credentials failed: %s\n",
 				  error_message(ret)));
 			return NT_STATUS_CANT_ACCESS_DOMAIN_INFO;
 		}
@@ -302,10 +359,15 @@ static NTSTATUS gensec_gssapi_client_start(struct gensec_security *gensec_securi
 	struct gensec_gssapi_state *gensec_gssapi_state;
 	struct cli_credentials *creds = gensec_get_credentials(gensec_security);
 	NTSTATUS nt_status;
-	gss_buffer_desc name_token;
-	gss_OID name_type;
-	OM_uint32 maj_stat, min_stat;
+	const char *target_principal = NULL;
 	const char *hostname = gensec_get_target_hostname(gensec_security);
+	const char *service = gensec_get_target_service(gensec_security);
+	const char *realm = cli_credentials_get_realm(creds);
+
+	target_principal = gensec_get_target_principal(gensec_security);
+	if (target_principal != NULL) {
+		goto do_start;
+	}
 
 	if (!hostname) {
 		DEBUG(3, ("No hostname for target computer passed in, cannot use kerberos for this connection\n"));
@@ -320,6 +382,18 @@ static NTSTATUS gensec_gssapi_client_start(struct gensec_security *gensec_securi
 		return NT_STATUS_INVALID_PARAMETER;
 	}
 
+	if (realm == NULL) {
+		char *cred_name = cli_credentials_get_unparsed_name(creds,
+								gensec_security);
+		DEBUG(3, ("cli_credentials(%s) without realm, "
+			  "cannot use kerberos for this connection %s/%s\n",
+			  cred_name, service, hostname));
+		TALLOC_FREE(cred_name);
+		return NT_STATUS_INVALID_PARAMETER;
+	}
+
+do_start:
+
 	nt_status = gensec_gssapi_start(gensec_security);
 	if (!NT_STATUS_IS_OK(nt_status)) {
 		return nt_status;
@@ -329,31 +403,6 @@ static NTSTATUS gensec_gssapi_client_start(struct gensec_security *gensec_securi
 
 	if (cli_credentials_get_impersonate_principal(creds)) {
 		gensec_gssapi_state->gss_want_flags &= ~(GSS_C_DELEG_FLAG|GSS_C_DELEG_POLICY_FLAG);
-	}
-
-	gensec_gssapi_state->target_principal = gensec_get_target_principal(gensec_security);
-	if (gensec_gssapi_state->target_principal) {
-		name_type = GSS_C_NULL_OID;
-	} else {
-		gensec_gssapi_state->target_principal = talloc_asprintf(gensec_gssapi_state, "%s/%s@%s",
-					    gensec_get_target_service(gensec_security), 
-					    hostname, lpcfg_realm(gensec_security->settings->lp_ctx));
-
-		name_type = GSS_C_NT_USER_NAME;
-	}
-	name_token.value  = discard_const_p(uint8_t, gensec_gssapi_state->target_principal);
-	name_token.length = strlen(gensec_gssapi_state->target_principal);
-
-
-	maj_stat = gss_import_name (&min_stat,
-				    &name_token,
-				    name_type,
-				    &gensec_gssapi_state->server_name);
-	if (maj_stat) {
-		DEBUG(2, ("GSS Import name of %s failed: %s\n",
-			  (char *)name_token.value,
-			  gssapi_error_string(gensec_gssapi_state, maj_stat, min_stat, gensec_gssapi_state->gss_oid)));
-		return NT_STATUS_INVALID_PARAMETER;
 	}
 
 	return NT_STATUS_OK;
@@ -372,31 +421,22 @@ static NTSTATUS gensec_gssapi_sasl_client_start(struct gensec_security *gensec_s
 	return nt_status;
 }
 
-
-/**
- * Next state function for the GSSAPI GENSEC mechanism
- * 
- * @param gensec_gssapi_state GSSAPI State
- * @param out_mem_ctx The TALLOC_CTX for *out to be allocated on
- * @param in The request, as a DATA_BLOB
- * @param out The reply, as an talloc()ed DATA_BLOB, on *out_mem_ctx
- * @return Error, MORE_PROCESSING_REQUIRED if a reply is sent, 
- *                or NT_STATUS_OK if the user is authenticated. 
- */
-
-static NTSTATUS gensec_gssapi_update(struct gensec_security *gensec_security, 
-				     TALLOC_CTX *out_mem_ctx,
-				     struct tevent_context *ev,
-				     const DATA_BLOB in, DATA_BLOB *out)
+static NTSTATUS gensec_gssapi_update_internal(struct gensec_security *gensec_security,
+					      TALLOC_CTX *out_mem_ctx,
+					      struct tevent_context *ev,
+					      const DATA_BLOB in, DATA_BLOB *out)
 {
 	struct gensec_gssapi_state *gensec_gssapi_state
 		= talloc_get_type(gensec_security->private_data, struct gensec_gssapi_state);
-	NTSTATUS nt_status = NT_STATUS_LOGON_FAILURE;
+	NTSTATUS nt_status;
 	OM_uint32 maj_stat, min_stat;
 	OM_uint32 min_stat2;
 	gss_buffer_desc input_token = { 0, NULL };
 	gss_buffer_desc output_token = { 0, NULL };
-
+	struct cli_credentials *cli_creds = gensec_get_credentials(gensec_security);
+	const char *target_principal = gensec_get_target_principal(gensec_security);
+	const char *hostname = gensec_get_target_hostname(gensec_security);
+	const char *service = gensec_get_target_service(gensec_security);
 	gss_OID gss_oid_p = NULL;
 	OM_uint32 time_req = 0;
 	OM_uint32 time_rec = 0;
@@ -415,10 +455,13 @@ static NTSTATUS gensec_gssapi_update(struct gensec_security *gensec_security,
 		switch (gensec_security->gensec_role) {
 		case GENSEC_CLIENT:
 		{
+			const char *client_realm = NULL;
 #ifdef SAMBA4_USES_HEIMDAL
 			struct gsskrb5_send_to_kdc send_to_kdc;
-#endif
 			krb5_error_code ret;
+#else
+			bool fallback = false;
+#endif
 
 			nt_status = gensec_gssapi_client_creds(gensec_security, ev);
 			if (!NT_STATUS_IS_OK(nt_status)) {
@@ -435,6 +478,132 @@ static NTSTATUS gensec_gssapi_update(struct gensec_security *gensec_security,
 				return NT_STATUS_INTERNAL_ERROR;
 			}
 #endif
+
+			/*
+			 * With credentials for
+			 * administrator@FOREST1.EXAMPLE.COM this patch changes
+			 * the target_principal for the ldap service of host
+			 * dc2.forest2.example.com from
+			 *
+			 *   ldap/dc2.forest2.example.com@FOREST1.EXAMPLE.COM
+			 *
+			 * to
+			 *
+			 *   ldap/dc2.forest2.example.com@FOREST2.EXAMPLE.COM
+			 *
+			 * Typically
+			 * ldap/dc2.forest2.example.com@FOREST1.EXAMPLE.COM
+			 * should be used in order to allow the KDC of
+			 * FOREST1.EXAMPLE.COM to generate a referral ticket
+			 * for krbtgt/FOREST2.EXAMPLE.COM@FOREST1.EXAMPLE.COM.
+			 *
+			 * The problem is that KDCs only return such referral
+			 * tickets if there's a forest trust between
+			 * FOREST1.EXAMPLE.COM and FOREST2.EXAMPLE.COM. If
+			 * there's only an external domain trust between
+			 * FOREST1.EXAMPLE.COM and FOREST2.EXAMPLE.COM the KDC
+			 * of FOREST1.EXAMPLE.COM will respond with
+			 * S_PRINCIPAL_UNKNOWN when being asked for
+			 * ldap/dc2.forest2.example.com@FOREST1.EXAMPLE.COM.
+			 *
+			 * In the case of an external trust the client can
+			 * still ask explicitly for
+			 * krbtgt/FOREST2.EXAMPLE.COM@FOREST1.EXAMPLE.COM and
+			 * the KDC of FOREST1.EXAMPLE.COM will generate it.
+			 *
+			 * From there the client can use the
+			 * krbtgt/FOREST2.EXAMPLE.COM@FOREST1.EXAMPLE.COM
+			 * ticket and ask a KDC of FOREST2.EXAMPLE.COM for a
+			 * service ticket for
+			 * ldap/dc2.forest2.example.com@FOREST2.EXAMPLE.COM.
+			 *
+			 * With Heimdal we'll get the fallback on
+			 * S_PRINCIPAL_UNKNOWN behavior when we pass
+			 * ldap/dc2.forest2.example.com@FOREST2.EXAMPLE.COM as
+			 * target principal. As _krb5_get_cred_kdc_any() first
+			 * calls get_cred_kdc_referral() (which always starts
+			 * with the client realm) and falls back to
+			 * get_cred_kdc_capath() (which starts with the given
+			 * realm).
+			 *
+			 * MIT krb5 only tries the given realm of the target
+			 * principal, if we want to autodetect support for
+			 * transitive forest trusts, would have to do the
+			 * fallback ourself.
+			 */
+			client_realm = cli_credentials_get_realm(cli_creds);
+#ifndef SAMBA4_USES_HEIMDAL
+			if (gensec_gssapi_state->server_name == NULL) {
+				nt_status = gensec_gssapi_setup_server_principal(gensec_gssapi_state,
+										 target_principal,
+										 service,
+										 hostname,
+										 client_realm,
+										 gensec_gssapi_state->gss_oid,
+										 &gensec_gssapi_state->target_principal,
+										 &gensec_gssapi_state->server_name);
+				if (!NT_STATUS_IS_OK(nt_status)) {
+					return nt_status;
+				}
+
+				maj_stat = gss_init_sec_context(&min_stat,
+								gensec_gssapi_state->client_cred->creds,
+								&gensec_gssapi_state->gssapi_context,
+								gensec_gssapi_state->server_name,
+								gensec_gssapi_state->gss_oid,
+								gensec_gssapi_state->gss_want_flags,
+								time_req,
+								gensec_gssapi_state->input_chan_bindings,
+								&input_token,
+								&gss_oid_p,
+								&output_token,
+								&gensec_gssapi_state->gss_got_flags, /* ret flags */
+								&time_rec);
+				if (maj_stat != GSS_S_FAILURE) {
+					goto init_sec_context_done;
+				}
+				if (min_stat != (OM_uint32)KRB5KDC_ERR_S_PRINCIPAL_UNKNOWN) {
+					goto init_sec_context_done;
+				}
+				if (target_principal != NULL) {
+					goto init_sec_context_done;
+				}
+
+				fallback = true;
+				TALLOC_FREE(gensec_gssapi_state->target_principal);
+				gss_release_name(&min_stat2, &gensec_gssapi_state->server_name);
+			}
+#endif /* !SAMBA4_USES_HEIMDAL */
+			if (gensec_gssapi_state->server_name == NULL) {
+				const char *server_realm = NULL;
+
+				server_realm = smb_krb5_get_realm_from_hostname(gensec_gssapi_state,
+										hostname,
+										client_realm);
+				if (server_realm == NULL) {
+					return NT_STATUS_NO_MEMORY;
+				}
+
+#ifndef SAMBA4_USES_HEIMDAL
+				if (fallback &&
+				    strequal(client_realm, server_realm)) {
+					goto init_sec_context_done;
+				}
+#endif /* !SAMBA4_USES_HEIMDAL */
+
+				nt_status = gensec_gssapi_setup_server_principal(gensec_gssapi_state,
+										 target_principal,
+										 service,
+										 hostname,
+										 server_realm,
+										 gensec_gssapi_state->gss_oid,
+										 &gensec_gssapi_state->target_principal,
+										 &gensec_gssapi_state->server_name);
+				if (!NT_STATUS_IS_OK(nt_status)) {
+					return nt_status;
+				}
+			}
+
 			maj_stat = gss_init_sec_context(&min_stat, 
 							gensec_gssapi_state->client_cred->creds,
 							&gensec_gssapi_state->gssapi_context, 
@@ -448,6 +617,9 @@ static NTSTATUS gensec_gssapi_update(struct gensec_security *gensec_security,
 							&output_token, 
 							&gensec_gssapi_state->gss_got_flags, /* ret flags */
 							&time_rec);
+			goto init_sec_context_done;
+			/* JUMP! */
+init_sec_context_done:
 			if (gss_oid_p) {
 				gensec_gssapi_state->gss_oid = gss_oid_p;
 			}
@@ -533,11 +705,7 @@ static NTSTATUS gensec_gssapi_update(struct gensec_security *gensec_security,
 			OM_uint32 lifetime = 0;
 			gss_cred_usage_t usage;
 			const char *role = NULL;
-			DEBUG(0, ("GSS %s Update(krb5)(%d) Update failed, credentials expired during GSSAPI handshake!\n",
-				  role,
-				  gensec_gssapi_state->gss_exchange_count));
 
-			
 			switch (gensec_security->gensec_role) {
 			case GENSEC_CLIENT:
 				creds = gensec_gssapi_state->client_cred->creds;
@@ -548,6 +716,11 @@ static NTSTATUS gensec_gssapi_update(struct gensec_security *gensec_security,
 				role = "server";
 				break;
 			}
+
+			DBG_ERR("GSS %s Update(krb5)(%d) failed, credentials "
+				"expired during GSSAPI handshake!\n",
+				role,
+				gensec_gssapi_state->gss_exchange_count);
 
 			maj_stat = gss_inquire_cred(&min_stat, 
 						    creds,
@@ -864,6 +1037,65 @@ static NTSTATUS gensec_gssapi_update(struct gensec_security *gensec_security,
 	default:
 		return NT_STATUS_INVALID_PARAMETER;
 	}
+}
+
+struct gensec_gssapi_update_state {
+	NTSTATUS status;
+	DATA_BLOB out;
+};
+
+static struct tevent_req *gensec_gssapi_update_send(TALLOC_CTX *mem_ctx,
+						    struct tevent_context *ev,
+						    struct gensec_security *gensec_security,
+						    const DATA_BLOB in)
+{
+	struct tevent_req *req = NULL;
+	struct gensec_gssapi_update_state *state = NULL;
+	NTSTATUS status;
+
+	req = tevent_req_create(mem_ctx, &state,
+				struct gensec_gssapi_update_state);
+	if (req == NULL) {
+		return NULL;
+	}
+
+	status = gensec_gssapi_update_internal(gensec_security,
+					       state, ev, in,
+					       &state->out);
+	state->status = status;
+	if (NT_STATUS_EQUAL(status, NT_STATUS_MORE_PROCESSING_REQUIRED)) {
+		tevent_req_done(req);
+		return tevent_req_post(req, ev);
+	}
+	if (tevent_req_nterror(req, status)) {
+		return tevent_req_post(req, ev);
+	}
+
+	tevent_req_done(req);
+	return tevent_req_post(req, ev);
+}
+
+static NTSTATUS gensec_gssapi_update_recv(struct tevent_req *req,
+					  TALLOC_CTX *out_mem_ctx,
+					  DATA_BLOB *out)
+{
+	struct gensec_gssapi_update_state *state =
+		tevent_req_data(req,
+		struct gensec_gssapi_update_state);
+	NTSTATUS status;
+
+	*out = data_blob_null;
+
+	if (tevent_req_is_nterror(req, &status)) {
+		tevent_req_received(req);
+		return status;
+	}
+
+	*out = state->out;
+	talloc_steal(out_mem_ctx, state->out.data);
+	status = state->status;
+	tevent_req_received(req);
+	return status;
 }
 
 static NTSTATUS gensec_gssapi_wrap(struct gensec_security *gensec_security, 
@@ -1195,15 +1427,7 @@ static bool gensec_gssapi_have_feature(struct gensec_security *gensec_security,
 		return true;
 	}
 	if (feature & GENSEC_FEATURE_SIGN_PKT_HEADER) {
-		if (gensec_security->want_features & GENSEC_FEATURE_SEAL) {
-			return true;
-		}
-
-		if (gensec_security->want_features & GENSEC_FEATURE_SIGN) {
-			return true;
-		}
-
-		return false;
+		return true;
 	}
 	return false;
 }
@@ -1309,16 +1533,18 @@ static NTSTATUS gensec_gssapi_session_info(struct gensec_security *gensec_securi
 		const char *error_string;
 
 		DEBUG(10, ("gensec_gssapi: delegated credentials supplied by client\n"));
-		session_info->credentials = cli_credentials_init(session_info);
-		if (!session_info->credentials) {
+
+		/*
+		 * Create anonymous credentials for now.
+		 *
+		 * We will update them with the provided client gss creds.
+		 */
+		session_info->credentials = cli_credentials_init_anon(session_info);
+		if (session_info->credentials == NULL) {
 			talloc_free(tmp_ctx);
 			return NT_STATUS_NO_MEMORY;
 		}
 
-		cli_credentials_set_conf(session_info->credentials, gensec_security->settings->lp_ctx);
-		/* Just so we don't segfault trying to get at a username */
-		cli_credentials_set_anonymous(session_info->credentials);
-		
 		ret = cli_credentials_set_client_gss_creds(session_info->credentials, 
 							   gensec_security->settings->lp_ctx,
 							   gensec_gssapi_state->delegated_cred_handle,
@@ -1356,11 +1582,24 @@ static size_t gensec_gssapi_sig_size(struct gensec_security *gensec_security, si
 
 	sig_size = gssapi_get_sig_size(gensec_gssapi_state->gssapi_context,
 				       gensec_gssapi_state->gss_oid,
-				       gensec_gssapi_state->gss_want_flags,
+				       gensec_gssapi_state->gss_got_flags,
 				       data_size);
 
 	gensec_gssapi_state->sig_size = sig_size;
 	return gensec_gssapi_state->sig_size;
+}
+
+static const char *gensec_gssapi_final_auth_type(struct gensec_security *gensec_security)
+{
+	struct gensec_gssapi_state *gensec_gssapi_state
+		= talloc_get_type(gensec_security->private_data, struct gensec_gssapi_state);
+	/* Only return the string for GSSAPI/Krb5 */
+	if (smb_gss_oid_equal(gensec_gssapi_state->gss_oid,
+			      gss_mech_krb5)) {
+		return GENSEC_FINAL_AUTH_TYPE_KRB5;
+	} else {
+		return "gensec_gssapi: UNKNOWN MECH";
+	}
 }
 
 static const char *gensec_gssapi_krb5_oids[] = { 
@@ -1383,7 +1622,8 @@ static const struct gensec_security_ops gensec_gssapi_spnego_security_ops = {
 	.client_start   = gensec_gssapi_client_start,
 	.server_start   = gensec_gssapi_server_start,
 	.magic  	= gensec_magic_check_krb5_oid,
-	.update 	= gensec_gssapi_update,
+	.update_send	= gensec_gssapi_update_send,
+	.update_recv	= gensec_gssapi_update_recv,
 	.session_key	= gensec_gssapi_session_key,
 	.session_info	= gensec_gssapi_session_info,
 	.sign_packet	= gensec_gssapi_sign_packet,
@@ -1396,6 +1636,7 @@ static const struct gensec_security_ops gensec_gssapi_spnego_security_ops = {
 	.unwrap         = gensec_gssapi_unwrap,
 	.have_feature   = gensec_gssapi_have_feature,
 	.expire_time    = gensec_gssapi_expire_time,
+	.final_auth_type = gensec_gssapi_final_auth_type,
 	.enabled        = false,
 	.kerberos       = true,
 	.priority       = GENSEC_GSSAPI
@@ -1409,7 +1650,8 @@ static const struct gensec_security_ops gensec_gssapi_krb5_security_ops = {
 	.client_start   = gensec_gssapi_client_start,
 	.server_start   = gensec_gssapi_server_start,
 	.magic  	= gensec_magic_check_krb5_oid,
-	.update 	= gensec_gssapi_update,
+	.update_send	= gensec_gssapi_update_send,
+	.update_recv	= gensec_gssapi_update_recv,
 	.session_key	= gensec_gssapi_session_key,
 	.session_info	= gensec_gssapi_session_info,
 	.sig_size	= gensec_gssapi_sig_size,
@@ -1423,6 +1665,7 @@ static const struct gensec_security_ops gensec_gssapi_krb5_security_ops = {
 	.unwrap         = gensec_gssapi_unwrap,
 	.have_feature   = gensec_gssapi_have_feature,
 	.expire_time    = gensec_gssapi_expire_time,
+	.final_auth_type = gensec_gssapi_final_auth_type,
 	.enabled        = true,
 	.kerberos       = true,
 	.priority       = GENSEC_GSSAPI
@@ -1434,7 +1677,8 @@ static const struct gensec_security_ops gensec_gssapi_sasl_krb5_security_ops = {
 	.sasl_name        = "GSSAPI",
 	.client_start     = gensec_gssapi_sasl_client_start,
 	.server_start     = gensec_gssapi_sasl_server_start,
-	.update 	  = gensec_gssapi_update,
+	.update_send      = gensec_gssapi_update_send,
+	.update_recv      = gensec_gssapi_update_recv,
 	.session_key	  = gensec_gssapi_session_key,
 	.session_info	  = gensec_gssapi_session_info,
 	.max_input_size	  = gensec_gssapi_max_input_size,
@@ -1443,30 +1687,31 @@ static const struct gensec_security_ops gensec_gssapi_sasl_krb5_security_ops = {
 	.unwrap           = gensec_gssapi_unwrap,
 	.have_feature     = gensec_gssapi_have_feature,
 	.expire_time      = gensec_gssapi_expire_time,
+	.final_auth_type = gensec_gssapi_final_auth_type,
 	.enabled          = true,
 	.kerberos         = true,
 	.priority         = GENSEC_GSSAPI
 };
 
-_PUBLIC_ NTSTATUS gensec_gssapi_init(void)
+_PUBLIC_ NTSTATUS gensec_gssapi_init(TALLOC_CTX *ctx)
 {
 	NTSTATUS ret;
 
-	ret = gensec_register(&gensec_gssapi_spnego_security_ops);
+	ret = gensec_register(ctx, &gensec_gssapi_spnego_security_ops);
 	if (!NT_STATUS_IS_OK(ret)) {
 		DEBUG(0,("Failed to register '%s' gensec backend!\n",
 			gensec_gssapi_spnego_security_ops.name));
 		return ret;
 	}
 
-	ret = gensec_register(&gensec_gssapi_krb5_security_ops);
+	ret = gensec_register(ctx, &gensec_gssapi_krb5_security_ops);
 	if (!NT_STATUS_IS_OK(ret)) {
 		DEBUG(0,("Failed to register '%s' gensec backend!\n",
 			gensec_gssapi_krb5_security_ops.name));
 		return ret;
 	}
 
-	ret = gensec_register(&gensec_gssapi_sasl_krb5_security_ops);
+	ret = gensec_register(ctx, &gensec_gssapi_sasl_krb5_security_ops);
 	if (!NT_STATUS_IS_OK(ret)) {
 		DEBUG(0,("Failed to register '%s' gensec backend!\n",
 			gensec_gssapi_sasl_krb5_security_ops.name));

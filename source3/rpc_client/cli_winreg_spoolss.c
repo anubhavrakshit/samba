@@ -34,6 +34,7 @@
 
 #define TOP_LEVEL_PRINT_KEY "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Print"
 #define TOP_LEVEL_PRINT_PRINTERS_KEY TOP_LEVEL_PRINT_KEY "\\Printers"
+#define TOP_LEVEL_PRINT_PACKAGEINSTALLATION_KEY TOP_LEVEL_PRINT_KEY "\\PackageInstallation"
 #define TOP_LEVEL_CONTROL_KEY "SYSTEM\\CurrentControlSet\\Control\\Print"
 #define TOP_LEVEL_CONTROL_FORMS_KEY TOP_LEVEL_CONTROL_KEY "\\Forms"
 
@@ -251,7 +252,7 @@ static WERROR winreg_printer_openkey(TALLOC_CTX *mem_ctx,
 		keyname = talloc_strdup(mem_ctx, path);
 	}
 	if (keyname == NULL) {
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	ZERO_STRUCT(wkey);
@@ -315,6 +316,165 @@ static WERROR winreg_printer_openkey(TALLOC_CTX *mem_ctx,
 	return WERR_OK;
 }
 
+static WERROR winreg_printer_open_core_driver(TALLOC_CTX *mem_ctx,
+					      struct dcerpc_binding_handle *binding_handle,
+					      const char *architecture,
+					      const char *key,
+					      uint32_t access_mask,
+					      struct policy_handle *hive_handle,
+					      struct policy_handle *key_handle)
+{
+	struct winreg_String wkey, wkeyclass;
+	NTSTATUS status;
+	WERROR result = WERR_OK;
+	WERROR ignore;
+	enum winreg_CreateAction action = REG_ACTION_NONE;
+	const char *path;
+
+	status = dcerpc_winreg_OpenHKLM(binding_handle,
+					mem_ctx,
+					NULL,
+					access_mask,
+					hive_handle,
+					&result);
+	if (!NT_STATUS_IS_OK(status)) {
+		DEBUG(0,("winreg_printer_open_core_driver: Could not open HKLM hive: %s\n",
+			  nt_errstr(status)));
+		return ntstatus_to_werror(status);
+	}
+	if (!W_ERROR_IS_OK(result)) {
+		DEBUG(0,("winreg_printer_open_core_driver: Could not open HKLM hive: %s\n",
+			  win_errstr(result)));
+		return result;
+	}
+
+	ZERO_STRUCT(wkey);
+	wkey.name = TOP_LEVEL_PRINT_PACKAGEINSTALLATION_KEY;
+
+	ZERO_STRUCT(wkeyclass);
+	wkeyclass.name = "";
+
+	status = dcerpc_winreg_CreateKey(binding_handle,
+					 mem_ctx,
+					 hive_handle,
+					 wkey,
+					 wkeyclass,
+					 0,
+					 access_mask,
+					 NULL,
+					 key_handle,
+					 &action,
+					 &result);
+	if (!NT_STATUS_IS_OK(status)) {
+		result = ntstatus_to_werror(status);
+	}
+	if (!W_ERROR_IS_OK(result)) {
+		goto done;
+	}
+
+	dcerpc_winreg_CloseKey(binding_handle, mem_ctx, key_handle, &ignore);
+
+	path = talloc_asprintf(mem_ctx, "%s\\%s",
+					TOP_LEVEL_PRINT_PACKAGEINSTALLATION_KEY,
+					architecture);
+	if (path == NULL) {
+		result = WERR_NOT_ENOUGH_MEMORY;
+		goto done;
+	}
+
+	wkey.name = path;
+
+	status = dcerpc_winreg_CreateKey(binding_handle,
+					 mem_ctx,
+					 hive_handle,
+					 wkey,
+					 wkeyclass,
+					 0,
+					 access_mask,
+					 NULL,
+					 key_handle,
+					 &action,
+					 &result);
+	if (!NT_STATUS_IS_OK(status)) {
+		result = ntstatus_to_werror(status);
+	}
+	if (!W_ERROR_IS_OK(result)) {
+		goto done;
+	}
+
+	dcerpc_winreg_CloseKey(binding_handle, mem_ctx, key_handle, &ignore);
+
+	path = talloc_asprintf(mem_ctx, "%s\\%s\\CorePrinterDrivers",
+					TOP_LEVEL_PRINT_PACKAGEINSTALLATION_KEY,
+					architecture);
+	if (path == NULL) {
+		result = WERR_NOT_ENOUGH_MEMORY;
+		goto done;
+	}
+
+	wkey.name = path;
+
+	status = dcerpc_winreg_CreateKey(binding_handle,
+					 mem_ctx,
+					 hive_handle,
+					 wkey,
+					 wkeyclass,
+					 0,
+					 access_mask,
+					 NULL,
+					 key_handle,
+					 &action,
+					 &result);
+	if (!NT_STATUS_IS_OK(status)) {
+		result = ntstatus_to_werror(status);
+	}
+	if (!W_ERROR_IS_OK(result)) {
+		goto done;
+	}
+
+	dcerpc_winreg_CloseKey(binding_handle, mem_ctx, key_handle, &ignore);
+
+	path = talloc_asprintf(mem_ctx, "%s\\%s\\CorePrinterDrivers\\%s",
+					TOP_LEVEL_PRINT_PACKAGEINSTALLATION_KEY,
+					architecture,
+					key);
+	if (path == NULL) {
+		result = WERR_NOT_ENOUGH_MEMORY;
+		goto done;
+	}
+
+	wkey.name = path;
+
+	status = dcerpc_winreg_CreateKey(binding_handle,
+					 mem_ctx,
+					 hive_handle,
+					 wkey,
+					 wkeyclass,
+					 0,
+					 access_mask,
+					 NULL,
+					 key_handle,
+					 &action,
+					 &result);
+	if (!NT_STATUS_IS_OK(status)) {
+		result = ntstatus_to_werror(status);
+	}
+	if (!W_ERROR_IS_OK(result)) {
+		goto done;
+	}
+
+ done:
+	if (is_valid_policy_hnd(hive_handle)) {
+		dcerpc_winreg_CloseKey(binding_handle,
+				       mem_ctx,
+				       hive_handle,
+				       &ignore);
+	}
+	ZERO_STRUCTP(hive_handle);
+
+	return result;
+}
+
 /**
  * @brief Create the registry keyname for the given printer.
  *
@@ -345,7 +505,7 @@ static WERROR winreg_printer_opendriver(TALLOC_CTX *mem_ctx,
 				   TOP_LEVEL_CONTROL_KEY,
 				   architecture, version);
 	if (!key_name) {
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	result = winreg_printer_openkey(mem_ctx,
@@ -397,13 +557,13 @@ static WERROR winreg_enumval_to_sz(TALLOC_CTX *mem_ctx,
 	if (v->data_length == 0) {
 		*_str = talloc_strdup(mem_ctx, EMPTY_STRING);
 		if (*_str == NULL) {
-			return WERR_NOMEM;
+			return WERR_NOT_ENOUGH_MEMORY;
 		}
 		return WERR_OK;
 	}
 
 	if (!pull_reg_sz(mem_ctx, v->data, _str)) {
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	return WERR_OK;
@@ -426,14 +586,14 @@ static WERROR winreg_enumval_to_multi_sz(TALLOC_CTX *mem_ctx,
 	if (v->data_length == 0) {
 		*array = talloc_array(mem_ctx, const char *, 1);
 		if (*array == NULL) {
-			return WERR_NOMEM;
+			return WERR_NOT_ENOUGH_MEMORY;
 		}
 		*array[0] = NULL;
 		return WERR_OK;
 	}
 
 	if (!pull_reg_multi_sz(mem_ctx, v->data, array)) {
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	return WERR_OK;
@@ -465,12 +625,12 @@ static WERROR winreg_printer_write_date(TALLOC_CTX *mem_ctx,
 				      tm->tm_mon + 1, tm->tm_mday, tm->tm_year + 1900);
 	}
 	if (!str) {
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	wvalue.name = value;
 	if (!push_reg_sz(mem_ctx, &blob, str)) {
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 	status = dcerpc_winreg_SetValue(winreg_handle,
 					mem_ctx,
@@ -493,26 +653,12 @@ static WERROR winreg_printer_write_date(TALLOC_CTX *mem_ctx,
 
 static WERROR winreg_printer_date_to_NTTIME(const char *str, NTTIME *data)
 {
-	struct tm tm;
-	time_t t;
+	bool ok;
 
-	if (strequal(str, "01/01/1601")) {
-		*data = 0;
-		return WERR_OK;
-	}
-
-	ZERO_STRUCT(tm);
-
-	if (sscanf(str, "%d/%d/%d",
-		   &tm.tm_mon, &tm.tm_mday, &tm.tm_year) != 3) {
+	ok = spoolss_timestr_to_NTTIME(str, data);
+	if (!ok) {
 		return WERR_INVALID_PARAMETER;
 	}
-	tm.tm_mon -= 1;
-	tm.tm_year -= 1900;
-	tm.tm_isdst = -1;
-
-	t = mktime(&tm);
-	unix_to_nt_time(data, t);
 
 	return WERR_OK;
 }
@@ -529,20 +675,21 @@ static WERROR winreg_printer_write_ver(TALLOC_CTX *mem_ctx,
 	NTSTATUS status;
 	char *str;
 
-	/* FIXME: check format is right,
-	 *	this needs to be something like: 6.1.7600.16385 */
+	/*
+	 * this needs to be something like: 6.1.7600.16385
+	 */
 	str = talloc_asprintf(mem_ctx, "%u.%u.%u.%u",
 			      (unsigned)((data >> 48) & 0xFFFF),
 			      (unsigned)((data >> 32) & 0xFFFF),
 			      (unsigned)((data >> 16) & 0xFFFF),
 			      (unsigned)(data & 0xFFFF));
 	if (!str) {
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	wvalue.name = value;
 	if (!push_reg_sz(mem_ctx, &blob, str)) {
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 	status = dcerpc_winreg_SetValue(winreg_handle,
 					mem_ctx,
@@ -563,18 +710,14 @@ static WERROR winreg_printer_write_ver(TALLOC_CTX *mem_ctx,
 	return result;
 }
 
-static WERROR winreg_printer_ver_to_dword(const char *str, uint64_t *data)
+static WERROR winreg_printer_ver_to_qword(const char *str, uint64_t *data)
 {
-	unsigned int v1, v2, v3, v4;
+	bool ok;
 
-	if (sscanf(str, "%u.%u.%u.%u", &v1, &v2, &v3, &v4) != 4) {
+	ok = spoolss_driver_version_to_qword(str, data);
+	if (!ok) {
 		return WERR_INVALID_PARAMETER;
 	}
-
-	*data = ((uint64_t)(v1 & 0xFFFF) << 48) +
-		((uint64_t)(v2 & 0xFFFF) << 32) +
-		((uint64_t)(v3 & 0xFFFF) << 16) +
-		(uint64_t)(v2 & 0xFFFF);
 
 	return WERR_OK;
 }
@@ -602,13 +745,13 @@ WERROR winreg_create_printer(TALLOC_CTX *mem_ctx,
 
 	tmp_ctx = talloc_stackframe();
 	if (tmp_ctx == NULL) {
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	path = winreg_printer_data_keyname(tmp_ctx, sharename);
 	if (path == NULL) {
 		TALLOC_FREE(tmp_ctx);
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	ZERO_STRUCT(hive_hnd);
@@ -625,7 +768,7 @@ WERROR winreg_create_printer(TALLOC_CTX *mem_ctx,
 	if (W_ERROR_IS_OK(result)) {
 		DEBUG(2, ("winreg_create_printer: Skipping, %s already exists\n", path));
 		goto done;
-	} else if (W_ERROR_EQUAL(result, WERR_BADFILE)) {
+	} else if (W_ERROR_EQUAL(result, WERR_FILE_NOT_FOUND)) {
 		DEBUG(2, ("winreg_create_printer: Creating default values in %s\n", path));
 	} else if (!W_ERROR_IS_OK(result)) {
 		DEBUG(0, ("winreg_create_printer: Could not open key %s: %s\n",
@@ -669,7 +812,7 @@ WERROR winreg_create_printer(TALLOC_CTX *mem_ctx,
 
 		wkey.name = talloc_asprintf(tmp_ctx, "%s\\%s", path, subkeys[i]);
 		if (wkey.name == NULL) {
-			result = WERR_NOMEM;
+			result = WERR_NOT_ENOUGH_MEMORY;
 			goto done;
 		}
 
@@ -738,7 +881,7 @@ WERROR winreg_create_printer(TALLOC_CTX *mem_ctx,
 				longname = talloc_strdup(tmp_ctx, lp_netbios_name());
 			}
 			if (longname == NULL) {
-				result = WERR_NOMEM;
+				result = WERR_NOT_ENOUGH_MEMORY;
 				goto done;
 			}
 
@@ -758,7 +901,7 @@ WERROR winreg_create_printer(TALLOC_CTX *mem_ctx,
 			uncname = talloc_asprintf(tmp_ctx, "\\\\%s\\%s",
 						  longname, sharename);
 			if (uncname == NULL) {
-				result = WERR_NOMEM;
+				result = WERR_NOT_ENOUGH_MEMORY;
 				goto done;
 			}
 
@@ -847,13 +990,13 @@ WERROR winreg_create_printer(TALLOC_CTX *mem_ctx,
 	}
 	info2 = talloc_zero(tmp_ctx, struct spoolss_SetPrinterInfo2);
 	if (info2 == NULL) {
-		result = WERR_NOMEM;
+		result = WERR_NOT_ENOUGH_MEMORY;
 		goto done;
 	}
 
 	info2->printername = sharename;
 	if (info2->printername == NULL) {
-		result = WERR_NOMEM;
+		result = WERR_NOT_ENOUGH_MEMORY;
 		goto done;
 	}
 	info2_mask |= SPOOLSS_PRINTER_INFO_PRINTERNAME;
@@ -940,13 +1083,13 @@ WERROR winreg_update_printer(TALLOC_CTX *mem_ctx,
 
 	tmp_ctx = talloc_stackframe();
 	if (tmp_ctx == NULL) {
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	path = winreg_printer_data_keyname(tmp_ctx, sharename);
 	if (path == NULL) {
 		TALLOC_FREE(tmp_ctx);
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	ZERO_STRUCT(hive_hnd);
@@ -1059,7 +1202,7 @@ WERROR winreg_update_printer(TALLOC_CTX *mem_ctx,
 		}
 
 		if (devmode->size != (ndr_size_spoolss_DeviceMode(devmode, 0) - devmode->__driverextra_length)) {
-			result = WERR_INVALID_PARAM;
+			result = WERR_INVALID_PARAMETER;
 			goto done;
 		}
 
@@ -1067,7 +1210,7 @@ WERROR winreg_update_printer(TALLOC_CTX *mem_ctx,
 				(ndr_push_flags_fn_t) ndr_push_spoolss_DeviceMode);
 		if (!NDR_ERR_CODE_IS_SUCCESS(ndr_err)) {
 			DEBUG(0, ("winreg_update_printer: Failed to marshall device mode\n"));
-			result = WERR_NOMEM;
+			result = WERR_NOT_ENOUGH_MEMORY;
 			goto done;
 		}
 
@@ -1354,13 +1497,13 @@ WERROR winreg_get_printer(TALLOC_CTX *mem_ctx,
 
 	tmp_ctx = talloc_stackframe();
 	if (tmp_ctx == NULL) {
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	path = winreg_printer_data_keyname(tmp_ctx, printer);
 	if (path == NULL) {
 		TALLOC_FREE(tmp_ctx);
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	result = winreg_printer_openkey(tmp_ctx,
@@ -1397,7 +1540,7 @@ WERROR winreg_get_printer(TALLOC_CTX *mem_ctx,
 
 	info2 = talloc_zero(tmp_ctx, struct spoolss_PrinterInfo2);
 	if (info2 == NULL) {
-		result = WERR_NOMEM;
+		result = WERR_NOT_ENOUGH_MEMORY;
 		goto done;
 	}
 
@@ -1548,7 +1691,7 @@ WERROR winreg_get_printer(TALLOC_CTX *mem_ctx,
 	if (W_ERROR_IS_OK(result)) {
 		info2->devmode = talloc_zero(info2, struct spoolss_DeviceMode);
 		if (info2->devmode == NULL) {
-			result = WERR_NOMEM;
+			result = WERR_NOT_ENOUGH_MEMORY;
 			goto done;
 		}
 		ndr_err = ndr_pull_struct_blob(&blob,
@@ -1557,7 +1700,7 @@ WERROR winreg_get_printer(TALLOC_CTX *mem_ctx,
 					       (ndr_pull_flags_fn_t) ndr_pull_spoolss_DeviceMode);
 		if (!NDR_ERR_CODE_IS_SUCCESS(ndr_err)) {
 			DEBUG(0, ("winreg_get_printer: Failed to unmarshall device mode\n"));
-			result = WERR_NOMEM;
+			result = WERR_NOT_ENOUGH_MEMORY;
 			goto done;
 		}
 	}
@@ -1605,15 +1748,15 @@ done:
 	return result;
 }
 
-WERROR winreg_get_printer_secdesc(TALLOC_CTX *mem_ctx,
-				  struct dcerpc_binding_handle *winreg_handle,
-				  const char *sharename,
-				  struct spoolss_security_descriptor **psecdesc)
+static WERROR winreg_get_secdesc(TALLOC_CTX *mem_ctx,
+				 struct dcerpc_binding_handle *winreg_handle,
+				 const char *path,
+				 const char *attribute,
+				 struct spoolss_security_descriptor **psecdesc)
 {
 	struct spoolss_security_descriptor *secdesc;
 	uint32_t access_mask = SEC_FLAG_MAXIMUM_ALLOWED;
 	struct policy_handle hive_hnd, key_hnd;
-	const char *path;
 	TALLOC_CTX *tmp_ctx;
 	NTSTATUS status;
 	WERROR result;
@@ -1621,13 +1764,7 @@ WERROR winreg_get_printer_secdesc(TALLOC_CTX *mem_ctx,
 
 	tmp_ctx = talloc_stackframe();
 	if (tmp_ctx == NULL) {
-		return WERR_NOMEM;
-	}
-
-	path = winreg_printer_data_keyname(tmp_ctx, sharename);
-	if (path == NULL) {
-		talloc_free(tmp_ctx);
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	ZERO_STRUCT(hive_hnd);
@@ -1642,7 +1779,7 @@ WERROR winreg_get_printer_secdesc(TALLOC_CTX *mem_ctx,
 					&hive_hnd,
 					&key_hnd);
 	if (!W_ERROR_IS_OK(result)) {
-		if (W_ERROR_EQUAL(result, WERR_BADFILE)) {
+		if (W_ERROR_EQUAL(result, WERR_FILE_NOT_FOUND)) {
 			goto create_default;
 		}
 		goto done;
@@ -1651,14 +1788,14 @@ WERROR winreg_get_printer_secdesc(TALLOC_CTX *mem_ctx,
 	status = dcerpc_winreg_query_sd(tmp_ctx,
 					winreg_handle,
 					&key_hnd,
-					"Security",
+					attribute,
 					&secdesc,
 					&result);
 	if (!NT_STATUS_IS_OK(status)) {
 		result = ntstatus_to_werror(status);
 	}
 	if (!W_ERROR_IS_OK(result)) {
-		if (W_ERROR_EQUAL(result, WERR_BADFILE)) {
+		if (W_ERROR_EQUAL(result, WERR_FILE_NOT_FOUND)) {
 
 			if (is_valid_policy_hnd(&key_hnd)) {
 				dcerpc_winreg_CloseKey(winreg_handle,
@@ -1728,7 +1865,7 @@ create_default:
 						    &size);
 
 			if (new_secdesc == NULL) {
-				result = WERR_NOMEM;
+				result = WERR_NOT_ENOUGH_MEMORY;
 				goto done;
 			}
 
@@ -1740,7 +1877,7 @@ create_default:
 	status = dcerpc_winreg_set_sd(tmp_ctx,
 					  winreg_handle,
 					  &key_hnd,
-					  "Security",
+					  attribute,
 					  secdesc,
 					  &result);
 	if (!NT_STATUS_IS_OK(status)) {
@@ -1767,16 +1904,48 @@ done:
 	return result;
 }
 
-WERROR winreg_set_printer_secdesc(TALLOC_CTX *mem_ctx,
+WERROR winreg_get_printer_secdesc(TALLOC_CTX *mem_ctx,
 				  struct dcerpc_binding_handle *winreg_handle,
 				  const char *sharename,
-				  const struct spoolss_security_descriptor *secdesc)
+				  struct spoolss_security_descriptor **psecdesc)
+{
+	WERROR result;
+	char *path;
+
+	path = winreg_printer_data_keyname(mem_ctx, sharename);
+	if (path == NULL) {
+		return WERR_NOT_ENOUGH_MEMORY;
+	}
+
+	result = winreg_get_secdesc(mem_ctx, winreg_handle,
+				    path,
+				    "Security",
+				    psecdesc);
+	talloc_free(path);
+
+	return result;
+}
+
+WERROR winreg_get_printserver_secdesc(TALLOC_CTX *mem_ctx,
+				      struct dcerpc_binding_handle *winreg_handle,
+				      struct spoolss_security_descriptor **psecdesc)
+{
+	return winreg_get_secdesc(mem_ctx, winreg_handle,
+				  TOP_LEVEL_CONTROL_KEY,
+				  "ServerSecurityDescriptor",
+				  psecdesc);
+}
+
+static WERROR winreg_set_secdesc(TALLOC_CTX *mem_ctx,
+				 struct dcerpc_binding_handle *winreg_handle,
+				 const char *path,
+				 const char *attribute,
+				 const struct spoolss_security_descriptor *secdesc)
 {
 	const struct spoolss_security_descriptor *new_secdesc = secdesc;
 	struct spoolss_security_descriptor *old_secdesc;
 	uint32_t access_mask = SEC_FLAG_MAXIMUM_ALLOWED;
 	struct policy_handle hive_hnd, key_hnd;
-	const char *path;
 	TALLOC_CTX *tmp_ctx;
 	NTSTATUS status;
 	WERROR result;
@@ -1784,13 +1953,7 @@ WERROR winreg_set_printer_secdesc(TALLOC_CTX *mem_ctx,
 
 	tmp_ctx = talloc_stackframe();
 	if (tmp_ctx == NULL) {
-		return WERR_NOMEM;
-	}
-
-	path = winreg_printer_data_keyname(tmp_ctx, sharename);
-	if (path == NULL) {
-		talloc_free(tmp_ctx);
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	/*
@@ -1804,10 +1967,11 @@ WERROR winreg_set_printer_secdesc(TALLOC_CTX *mem_ctx,
 		struct security_acl *dacl, *sacl;
 		size_t size;
 
-		result = winreg_get_printer_secdesc(tmp_ctx,
-						    winreg_handle,
-						    sharename,
-						    &old_secdesc);
+		result = winreg_get_secdesc(tmp_ctx,
+					    winreg_handle,
+					    path,
+					    attribute,
+					    &old_secdesc);
 		if (!W_ERROR_IS_OK(result)) {
 			talloc_free(tmp_ctx);
 			return result;
@@ -1841,7 +2005,7 @@ WERROR winreg_set_printer_secdesc(TALLOC_CTX *mem_ctx,
 					    &size);
 		if (new_secdesc == NULL) {
 			talloc_free(tmp_ctx);
-			return WERR_NOMEM;
+			return WERR_NOT_ENOUGH_MEMORY;
 		}
 	}
 
@@ -1863,7 +2027,7 @@ WERROR winreg_set_printer_secdesc(TALLOC_CTX *mem_ctx,
 	status = dcerpc_winreg_set_sd(tmp_ctx,
 				      winreg_handle,
 				      &key_hnd,
-				      "Security",
+				      attribute,
 				      new_secdesc,
 				      &result);
 	if (!NT_STATUS_IS_OK(status)) {
@@ -1880,6 +2044,37 @@ done:
 
 	talloc_free(tmp_ctx);
 	return result;
+}
+
+WERROR winreg_set_printer_secdesc(TALLOC_CTX *mem_ctx,
+				  struct dcerpc_binding_handle *winreg_handle,
+				  const char *sharename,
+				  const struct spoolss_security_descriptor *secdesc)
+{
+	char *path;
+	WERROR result;
+
+	path = winreg_printer_data_keyname(mem_ctx, sharename);
+	if (path == NULL) {
+		return WERR_NOT_ENOUGH_MEMORY;
+	}
+
+	result = winreg_set_secdesc(mem_ctx, winreg_handle,
+				    path,
+				    "Security", secdesc);
+	talloc_free(path);
+
+	return result;
+}
+
+WERROR winreg_set_printserver_secdesc(TALLOC_CTX *mem_ctx,
+				      struct dcerpc_binding_handle *winreg_handle,
+				      const struct spoolss_security_descriptor *secdesc)
+{
+	return winreg_set_secdesc(mem_ctx, winreg_handle,
+				  TOP_LEVEL_CONTROL_KEY,
+				  "ServerSecurityDescriptor",
+				  secdesc);
 }
 
 /* Set printer data over the winreg pipe. */
@@ -1903,13 +2098,13 @@ WERROR winreg_set_printer_dataex(TALLOC_CTX *mem_ctx,
 
 	tmp_ctx = talloc_stackframe();
 	if (tmp_ctx == NULL) {
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	path = winreg_printer_data_keyname(tmp_ctx, printer);
 	if (path == NULL) {
 		TALLOC_FREE(tmp_ctx);
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	ZERO_STRUCT(hive_hnd);
@@ -1983,13 +2178,13 @@ WERROR winreg_get_printer_dataex(TALLOC_CTX *mem_ctx,
 
 	tmp_ctx = talloc_stackframe();
 	if (tmp_ctx == NULL) {
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	path = winreg_printer_data_keyname(tmp_ctx, printer);
 	if (path == NULL) {
 		TALLOC_FREE(tmp_ctx);
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	ZERO_STRUCT(hive_hnd);
@@ -2039,7 +2234,7 @@ WERROR winreg_get_printer_dataex(TALLOC_CTX *mem_ctx,
 
 	data_in = (uint8_t *) TALLOC(tmp_ctx, data_in_size);
 	if (data_in == NULL) {
-		result = WERR_NOMEM;
+		result = WERR_NOT_ENOUGH_MEMORY;
 		goto done;
 	}
 	value_len = 0;
@@ -2110,13 +2305,13 @@ WERROR winreg_enum_printer_dataex(TALLOC_CTX *mem_ctx,
 
 	tmp_ctx = talloc_stackframe();
 	if (tmp_ctx == NULL) {
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	path = winreg_printer_data_keyname(tmp_ctx, printer);
 	if (path == NULL) {
 		TALLOC_FREE(tmp_ctx);
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	result = winreg_printer_openkey(tmp_ctx,
@@ -2153,7 +2348,7 @@ WERROR winreg_enum_printer_dataex(TALLOC_CTX *mem_ctx,
 
 	enum_values = talloc_array(tmp_ctx, struct spoolss_PrinterEnumValues, num_values);
 	if (enum_values == NULL){
-		result = WERR_NOMEM;
+		result = WERR_NOT_ENOUGH_MEMORY;
 		DEBUG(0, ("winreg_enum_printer_dataex: Could not enumerate values in %s: %s\n",
 			  key, win_errstr(result)));
 		goto done;
@@ -2211,13 +2406,13 @@ WERROR winreg_delete_printer_dataex(TALLOC_CTX *mem_ctx,
 
 	tmp_ctx = talloc_stackframe();
 	if (tmp_ctx == NULL) {
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	path = winreg_printer_data_keyname(tmp_ctx, printer);
 	if (path == NULL) {
 		TALLOC_FREE(tmp_ctx);
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	ZERO_STRUCT(hive_hnd);
@@ -2283,13 +2478,13 @@ WERROR winreg_enum_printer_key(TALLOC_CTX *mem_ctx,
 
 	tmp_ctx = talloc_stackframe();
 	if (tmp_ctx == NULL) {
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	path = winreg_printer_data_keyname(tmp_ctx, printer);
 	if (path == NULL) {
 		TALLOC_FREE(tmp_ctx);
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	ZERO_STRUCT(hive_hnd);
@@ -2359,13 +2554,13 @@ WERROR winreg_delete_printer_key(TALLOC_CTX *mem_ctx,
 
 	tmp_ctx = talloc_stackframe();
 	if (tmp_ctx == NULL) {
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	path = winreg_printer_data_keyname(tmp_ctx, printer);
 	if (path == NULL) {
 		TALLOC_FREE(tmp_ctx);
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	result = winreg_printer_openkey(tmp_ctx,
@@ -2378,7 +2573,7 @@ WERROR winreg_delete_printer_key(TALLOC_CTX *mem_ctx,
 					&key_hnd);
 	if (!W_ERROR_IS_OK(result)) {
 		/* key doesn't exist */
-		if (W_ERROR_EQUAL(result, WERR_BADFILE)) {
+		if (W_ERROR_EQUAL(result, WERR_FILE_NOT_FOUND)) {
 			result = WERR_OK;
 			goto done;
 		}
@@ -2400,7 +2595,7 @@ WERROR winreg_delete_printer_key(TALLOC_CTX *mem_ctx,
 					  path,
 					  key);
 		if (keyname == NULL) {
-			result = WERR_NOMEM;
+			result = WERR_NOT_ENOUGH_MEMORY;
 			goto done;
 		}
 	}
@@ -2451,13 +2646,13 @@ WERROR winreg_printer_update_changeid(TALLOC_CTX *mem_ctx,
 
 	tmp_ctx = talloc_stackframe();
 	if (tmp_ctx == NULL) {
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	path = winreg_printer_data_keyname(tmp_ctx, printer);
 	if (path == NULL) {
 		TALLOC_FREE(tmp_ctx);
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	ZERO_STRUCT(hive_hnd);
@@ -2519,13 +2714,13 @@ WERROR winreg_printer_get_changeid(TALLOC_CTX *mem_ctx,
 
 	tmp_ctx = talloc_stackframe();
 	if (tmp_ctx == NULL) {
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	path = winreg_printer_data_keyname(tmp_ctx, printer);
 	if (path == NULL) {
 		TALLOC_FREE(tmp_ctx);
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	ZERO_STRUCT(hive_hnd);
@@ -2602,7 +2797,7 @@ WERROR winreg_printer_addform1(TALLOC_CTX *mem_ctx,
 
 	tmp_ctx = talloc_stackframe();
 	if (tmp_ctx == NULL) {
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	ZERO_STRUCT(hive_hnd);
@@ -2699,7 +2894,7 @@ WERROR winreg_printer_enumforms1(TALLOC_CTX *mem_ctx,
 
 	tmp_ctx = talloc_stackframe();
 	if (tmp_ctx == NULL) {
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	ZERO_STRUCT(hive_hnd);
@@ -2715,7 +2910,7 @@ WERROR winreg_printer_enumforms1(TALLOC_CTX *mem_ctx,
 					&key_hnd);
 	if (!W_ERROR_IS_OK(result)) {
 		/* key doesn't exist */
-		if (W_ERROR_EQUAL(result, WERR_BADFILE)) {
+		if (W_ERROR_EQUAL(result, WERR_FILE_NOT_FOUND)) {
 			result = WERR_OK;
 			goto done;
 		}
@@ -2747,7 +2942,7 @@ WERROR winreg_printer_enumforms1(TALLOC_CTX *mem_ctx,
 					struct spoolss_PrinterEnumValues,
 					num_values);
 	if (enum_values == NULL){
-		result = WERR_NOMEM;
+		result = WERR_NOT_ENOUGH_MEMORY;
 		goto done;
 	}
 
@@ -2770,7 +2965,7 @@ WERROR winreg_printer_enumforms1(TALLOC_CTX *mem_ctx,
 
 	info = talloc_array(tmp_ctx, union spoolss_FormInfo, num_builtin + num_values);
 	if (info == NULL) {
-		result = WERR_NOMEM;
+		result = WERR_NOT_ENOUGH_MEMORY;
 		goto done;
 	}
 
@@ -2790,7 +2985,7 @@ WERROR winreg_printer_enumforms1(TALLOC_CTX *mem_ctx,
 
 		val.info1.form_name = talloc_strdup(info, enum_values[i].value_name);
 		if (val.info1.form_name == NULL) {
-			result = WERR_NOMEM;
+			result = WERR_NOT_ENOUGH_MEMORY;
 			goto done;
 		}
 
@@ -2846,7 +3041,7 @@ WERROR winreg_printer_deleteform1(TALLOC_CTX *mem_ctx,
 
 	tmp_ctx = talloc_stackframe();
 	if (tmp_ctx == NULL) {
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	ZERO_STRUCT(hive_hnd);
@@ -2863,7 +3058,7 @@ WERROR winreg_printer_deleteform1(TALLOC_CTX *mem_ctx,
 	if (!W_ERROR_IS_OK(result)) {
 		DEBUG(0, ("winreg_printer_deleteform1: Could not open key %s: %s\n",
 			  TOP_LEVEL_CONTROL_FORMS_KEY, win_errstr(result)));
-		if (W_ERROR_EQUAL(result, WERR_BADFILE)) {
+		if (W_ERROR_EQUAL(result, WERR_FILE_NOT_FOUND)) {
 			result = WERR_INVALID_FORM_NAME;
 		}
 		goto done;
@@ -2883,7 +3078,7 @@ WERROR winreg_printer_deleteform1(TALLOC_CTX *mem_ctx,
 		goto done;
 	}
 
-	if (W_ERROR_EQUAL(result, WERR_BADFILE)) {
+	if (W_ERROR_EQUAL(result, WERR_FILE_NOT_FOUND)) {
 		result = WERR_INVALID_FORM_NAME;
 	}
 
@@ -2917,14 +3112,14 @@ WERROR winreg_printer_setform1(TALLOC_CTX *mem_ctx,
 
 	for (i = 0; i < num_builtin; i++) {
 		if (strequal(builtin_forms1[i].form_name, form->form_name)) {
-			result = WERR_INVALID_PARAM;
+			result = WERR_INVALID_PARAMETER;
 			goto done;
 		}
 	}
 
 	tmp_ctx = talloc_stackframe();
 	if (tmp_ctx == NULL) {
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	ZERO_STRUCT(hive_hnd);
@@ -3026,7 +3221,7 @@ WERROR winreg_printer_getform1(TALLOC_CTX *mem_ctx,
 
 	tmp_ctx = talloc_stackframe();
 	if (tmp_ctx == NULL) {
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	ZERO_STRUCT(hive_hnd);
@@ -3074,7 +3269,7 @@ WERROR winreg_printer_getform1(TALLOC_CTX *mem_ctx,
 
 	data_in = (uint8_t *) TALLOC(tmp_ctx, data_in_size);
 	if (data_in == NULL) {
-		result = WERR_NOMEM;
+		result = WERR_NOT_ENOUGH_MEMORY;
 		goto done;
 	}
 	value_len = 0;
@@ -3100,7 +3295,7 @@ WERROR winreg_printer_getform1(TALLOC_CTX *mem_ctx,
 
 	r->form_name = talloc_strdup(mem_ctx, form_name);
 	if (r->form_name == NULL) {
-		result = WERR_NOMEM;
+		result = WERR_NOT_ENOUGH_MEMORY;
 		goto done;
 	}
 
@@ -3150,7 +3345,7 @@ WERROR winreg_add_driver(TALLOC_CTX *mem_ctx,
 
 	tmp_ctx = talloc_stackframe();
 	if (tmp_ctx == NULL) {
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	result = winreg_printer_opendriver(tmp_ctx,
@@ -3491,7 +3686,7 @@ WERROR winreg_get_driver(TALLOC_CTX *mem_ctx,
 
 	tmp_ctx = talloc_stackframe();
 	if (tmp_ctx == NULL) {
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	if (driver_version == DRIVER_ANY_VERSION) {
@@ -3557,7 +3752,7 @@ WERROR winreg_get_driver(TALLOC_CTX *mem_ctx,
 					struct spoolss_PrinterEnumValues,
 					num_values);
 	if (enum_values == NULL){
-		result = WERR_NOMEM;
+		result = WERR_NOT_ENOUGH_MEMORY;
 		goto done;
 	}
 
@@ -3574,19 +3769,19 @@ WERROR winreg_get_driver(TALLOC_CTX *mem_ctx,
 
 	info8 = talloc_zero(tmp_ctx, struct spoolss_DriverInfo8);
 	if (info8 == NULL) {
-		result = WERR_NOMEM;
+		result = WERR_NOT_ENOUGH_MEMORY;
 		goto done;
 	}
 
 	info8->driver_name = talloc_strdup(info8, driver_name);
 	if (info8->driver_name == NULL) {
-		result = WERR_NOMEM;
+		result = WERR_NOT_ENOUGH_MEMORY;
 		goto done;
 	}
 
 	info8->architecture = talloc_strdup(info8, architecture);
 	if (info8->architecture == NULL) {
-		result = WERR_NOMEM;
+		result = WERR_NOT_ENOUGH_MEMORY;
 		goto done;
 	}
 
@@ -3659,7 +3854,7 @@ WERROR winreg_get_driver(TALLOC_CTX *mem_ctx,
 					      "DriverVersion",
 					      &tmp_str);
 		if (W_ERROR_IS_OK(result)) {
-			result = winreg_printer_ver_to_dword(tmp_str,
+			result = winreg_printer_ver_to_qword(tmp_str,
 						&info8->driver_version);
 		}
 		CHECK_ERROR(result);
@@ -3727,7 +3922,7 @@ WERROR winreg_get_driver(TALLOC_CTX *mem_ctx,
 					      "MinInboxDriverVerVersion",
 					      &tmp_str);
 		if (W_ERROR_IS_OK(result)) {
-			result = winreg_printer_ver_to_dword(tmp_str,
+			result = winreg_printer_ver_to_qword(tmp_str,
 					&info8->min_inbox_driver_ver_version);
 		}
 		CHECK_ERROR(result);
@@ -3775,7 +3970,7 @@ WERROR winreg_del_driver(TALLOC_CTX *mem_ctx,
 
 	tmp_ctx = talloc_stackframe();
 	if (tmp_ctx == NULL) {
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	/* test that the key exists */
@@ -3789,7 +3984,7 @@ WERROR winreg_del_driver(TALLOC_CTX *mem_ctx,
 					   &key_hnd);
 	if (!W_ERROR_IS_OK(result)) {
 		/* key doesn't exist */
-		if (W_ERROR_EQUAL(result, WERR_BADFILE)) {
+		if (W_ERROR_EQUAL(result, WERR_FILE_NOT_FOUND)) {
 			result = WERR_OK;
 			goto done;
 		}
@@ -3812,7 +4007,7 @@ WERROR winreg_del_driver(TALLOC_CTX *mem_ctx,
 				   info8->architecture, version,
 				   info8->driver_name);
 	if (key_name == NULL) {
-		result = WERR_NOMEM;
+		result = WERR_NOT_ENOUGH_MEMORY;
 		goto done;
 	}
 
@@ -3878,7 +4073,7 @@ WERROR winreg_get_driver_list(TALLOC_CTX *mem_ctx,
 
 	tmp_ctx = talloc_stackframe();
 	if (tmp_ctx == NULL) {
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	/* use NULL for the driver name so we open the key that is
@@ -3916,6 +4111,574 @@ WERROR winreg_get_driver_list(TALLOC_CTX *mem_ctx,
 	}
 
 	*drivers_p = talloc_steal(mem_ctx, drivers);
+
+	result = WERR_OK;
+done:
+	if (winreg_handle != NULL) {
+		WERROR ignore;
+
+		if (is_valid_policy_hnd(&key_hnd)) {
+			dcerpc_winreg_CloseKey(winreg_handle, tmp_ctx, &key_hnd, &ignore);
+		}
+		if (is_valid_policy_hnd(&hive_hnd)) {
+			dcerpc_winreg_CloseKey(winreg_handle, tmp_ctx, &hive_hnd, &ignore);
+		}
+	}
+
+	TALLOC_FREE(tmp_ctx);
+	return result;
+}
+
+WERROR winreg_get_core_driver(TALLOC_CTX *mem_ctx,
+			      struct dcerpc_binding_handle *winreg_handle,
+			      const char *architecture,
+			      const struct GUID *core_driver_guid,
+			      struct spoolss_CorePrinterDriver **_core_printer_driver)
+{
+	uint32_t access_mask = SEC_FLAG_MAXIMUM_ALLOWED;
+	struct policy_handle hive_hnd, key_hnd;
+	struct spoolss_CorePrinterDriver *c;
+	struct spoolss_PrinterEnumValues *enum_values = NULL;
+	struct spoolss_PrinterEnumValues *v;
+	uint32_t num_values = 0;
+	TALLOC_CTX *tmp_ctx;
+	WERROR result;
+	NTSTATUS status;
+	const char *path;
+	const char *guid_str;
+	uint32_t i;
+	const char **enum_names = NULL;
+	enum winreg_Type *enum_types = NULL;
+	DATA_BLOB *enum_data_blobs = NULL;
+
+	ZERO_STRUCT(hive_hnd);
+	ZERO_STRUCT(key_hnd);
+
+	tmp_ctx = talloc_stackframe();
+	if (tmp_ctx == NULL) {
+		return WERR_NOT_ENOUGH_MEMORY;
+	}
+
+	path = talloc_asprintf(tmp_ctx, "%s\\%s\\CorePrinterDrivers",
+					TOP_LEVEL_PRINT_PACKAGEINSTALLATION_KEY,
+					architecture);
+	if (path == NULL) {
+		result = WERR_NOT_ENOUGH_MEMORY;
+		goto done;
+	}
+
+	guid_str = GUID_string2(tmp_ctx, core_driver_guid);
+	if (guid_str == NULL) {
+		result = WERR_NOT_ENOUGH_MEMORY;
+		goto done;
+	}
+
+	result = winreg_printer_openkey(tmp_ctx,
+					winreg_handle,
+					path,
+					guid_str, /* key */
+					false,
+					access_mask,
+					&hive_hnd,
+					&key_hnd);
+
+	if (!W_ERROR_IS_OK(result)) {
+		DEBUG(5, ("winreg_get_core_driver: "
+			  "Could not open core driver key (%s,%s): %s\n",
+			  guid_str, architecture, win_errstr(result)));
+		goto done;
+	}
+
+	status = dcerpc_winreg_enumvals(tmp_ctx,
+				        winreg_handle,
+				        &key_hnd,
+				        &num_values,
+				        &enum_names,
+					&enum_types,
+					&enum_data_blobs,
+					&result);
+	if (!NT_STATUS_IS_OK(status)){
+		result = ntstatus_to_werror(status);
+	}
+
+	if (!W_ERROR_IS_OK(result)) {
+		DEBUG(0, ("winreg_get_core_driver: "
+			  "Could not enumerate values for (%s,%s): %s\n",
+			  guid_str, architecture, win_errstr(result)));
+		goto done;
+	}
+
+	enum_values = talloc_zero_array(tmp_ctx,
+					struct spoolss_PrinterEnumValues,
+					num_values);
+	if (enum_values == NULL){
+		result = WERR_NOT_ENOUGH_MEMORY;
+		goto done;
+	}
+
+	for (i = 0; i < num_values; i++){
+		enum_values[i].value_name = enum_names[i];
+		enum_values[i].value_name_len = strlen_m_term(enum_names[i]) * 2;
+		enum_values[i].type = enum_types[i];
+		enum_values[i].data_length = enum_data_blobs[i].length;
+		enum_values[i].data = NULL;
+		if (enum_values[i].data_length != 0){
+			enum_values[i].data = &enum_data_blobs[i];
+		}
+	}
+
+	c = talloc_zero(tmp_ctx, struct spoolss_CorePrinterDriver);
+	if (c == NULL) {
+		result = WERR_NOT_ENOUGH_MEMORY;
+		goto done;
+	}
+
+	c->core_driver_guid = *core_driver_guid;
+
+	result = WERR_OK;
+
+	for (i = 0; i < num_values; i++) {
+		const char *tmp_str;
+
+		v = &enum_values[i];
+
+		result = winreg_enumval_to_sz(c, v,
+					      "InfPath",
+					      &c->szPackageID);
+		CHECK_ERROR(result);
+
+		result = winreg_enumval_to_sz(c, v,
+					      "DriverDate",
+					      &tmp_str);
+		if (W_ERROR_IS_OK(result)) {
+			result = winreg_printer_date_to_NTTIME(tmp_str,
+						&c->driver_date);
+		}
+		CHECK_ERROR(result);
+
+		result = winreg_enumval_to_sz(c, v,
+					      "DriverVersion",
+					      &tmp_str);
+		if (W_ERROR_IS_OK(result)) {
+			result = winreg_printer_ver_to_qword(tmp_str,
+						&c->driver_version);
+		}
+		CHECK_ERROR(result);
+	}
+
+	if (!W_ERROR_IS_OK(result)) {
+		DEBUG(0, ("winreg_enumval_to_TYPE() failed "
+			  "for %s: %s\n", v->value_name,
+			  win_errstr(result)));
+		goto done;
+	}
+
+	*_core_printer_driver = talloc_steal(mem_ctx, c);
+	result = WERR_OK;
+done:
+	if (winreg_handle != NULL) {
+		WERROR ignore;
+
+		if (is_valid_policy_hnd(&key_hnd)) {
+			dcerpc_winreg_CloseKey(winreg_handle, tmp_ctx, &key_hnd, &ignore);
+		}
+		if (is_valid_policy_hnd(&hive_hnd)) {
+			dcerpc_winreg_CloseKey(winreg_handle, tmp_ctx, &hive_hnd, &ignore);
+		}
+	}
+
+	TALLOC_FREE(tmp_ctx);
+	return result;
+}
+
+WERROR winreg_add_core_driver(TALLOC_CTX *mem_ctx,
+			      struct dcerpc_binding_handle *winreg_handle,
+			      const char *architecture,
+			      const struct spoolss_CorePrinterDriver *r)
+{
+	uint32_t access_mask = SEC_FLAG_MAXIMUM_ALLOWED;
+	struct policy_handle hive_hnd, key_hnd;
+	TALLOC_CTX *tmp_ctx = NULL;
+	NTSTATUS status;
+	WERROR result;
+	const char *guid_str;
+
+	ZERO_STRUCT(hive_hnd);
+	ZERO_STRUCT(key_hnd);
+
+	tmp_ctx = talloc_stackframe();
+	if (tmp_ctx == NULL) {
+		return WERR_NOT_ENOUGH_MEMORY;
+	}
+
+	guid_str = GUID_string2(tmp_ctx, &r->core_driver_guid);
+	if (guid_str == NULL) {
+		result = WERR_NOT_ENOUGH_MEMORY;
+		goto done;
+	}
+
+	result = winreg_printer_open_core_driver(tmp_ctx,
+						 winreg_handle,
+						 architecture,
+						 guid_str,
+						 access_mask,
+						 &hive_hnd,
+						 &key_hnd);
+	if (!W_ERROR_IS_OK(result)) {
+		DEBUG(0, ("winreg_add_core_driver: "
+			  "Could not open core driver key (%s,%s): %s\n",
+			  guid_str, architecture, win_errstr(result)));
+		goto done;
+	}
+
+	result = winreg_printer_write_date(tmp_ctx, winreg_handle,
+					   &key_hnd, "DriverDate",
+					   r->driver_date);
+	if (!W_ERROR_IS_OK(result)) {
+		goto done;
+	}
+
+	result = winreg_printer_write_ver(tmp_ctx, winreg_handle,
+					  &key_hnd, "DriverVersion",
+					  r->driver_version);
+	if (!W_ERROR_IS_OK(result)) {
+		goto done;
+	}
+
+	status = dcerpc_winreg_set_sz(tmp_ctx,
+				      winreg_handle,
+				      &key_hnd,
+				      "InfPath",
+				      r->szPackageID,
+				      &result);
+	if (!NT_STATUS_IS_OK(status)) {
+		result = ntstatus_to_werror(status);
+	}
+	if (!W_ERROR_IS_OK(result)) {
+		goto done;
+	}
+
+	result = WERR_OK;
+done:
+	if (winreg_handle != NULL) {
+		WERROR ignore;
+
+		if (is_valid_policy_hnd(&key_hnd)) {
+			dcerpc_winreg_CloseKey(winreg_handle, tmp_ctx, &key_hnd, &ignore);
+		}
+		if (is_valid_policy_hnd(&hive_hnd)) {
+			dcerpc_winreg_CloseKey(winreg_handle, tmp_ctx, &hive_hnd, &ignore);
+		}
+	}
+
+	TALLOC_FREE(tmp_ctx);
+	return result;
+}
+
+WERROR winreg_add_driver_package(TALLOC_CTX *mem_ctx,
+				 struct dcerpc_binding_handle *winreg_handle,
+				 const char *package_id,
+				 const char *architecture,
+				 const char *driver_store_path,
+				 const char *cab_path)
+{
+	uint32_t access_mask = SEC_FLAG_MAXIMUM_ALLOWED;
+	struct policy_handle hive_hnd, key_hnd;
+	TALLOC_CTX *tmp_ctx = NULL;
+	NTSTATUS status;
+	WERROR result;
+	const char *path;
+
+	ZERO_STRUCT(hive_hnd);
+	ZERO_STRUCT(key_hnd);
+
+	tmp_ctx = talloc_stackframe();
+	if (tmp_ctx == NULL) {
+		return WERR_NOT_ENOUGH_MEMORY;
+	}
+
+	path = talloc_asprintf(tmp_ctx, "%s\\%s\\DriverPackages",
+					TOP_LEVEL_PRINT_PACKAGEINSTALLATION_KEY,
+					architecture);
+	if (path == NULL) {
+		result = WERR_NOT_ENOUGH_MEMORY;
+		goto done;
+	}
+
+	result = winreg_printer_openkey(tmp_ctx,
+					winreg_handle,
+					path,
+					package_id, /* key */
+					true,
+					access_mask,
+					&hive_hnd,
+					&key_hnd);
+
+	if (!W_ERROR_IS_OK(result)) {
+		DEBUG(0, ("winreg_add_driver_package: "
+			  "Could not open driver package key (%s,%s): %s\n",
+			  package_id, architecture, win_errstr(result)));
+		goto done;
+	}
+
+	status = dcerpc_winreg_set_sz(tmp_ctx,
+				      winreg_handle,
+				      &key_hnd,
+				      "CabPath",
+				      cab_path,
+				      &result);
+	if (!NT_STATUS_IS_OK(status)) {
+		result = ntstatus_to_werror(status);
+	}
+	if (!W_ERROR_IS_OK(result)) {
+		goto done;
+	}
+
+	status = dcerpc_winreg_set_sz(tmp_ctx,
+				      winreg_handle,
+				      &key_hnd,
+				      "DriverStorePath",
+				      driver_store_path,
+				      &result);
+	if (!NT_STATUS_IS_OK(status)) {
+		result = ntstatus_to_werror(status);
+	}
+	if (!W_ERROR_IS_OK(result)) {
+		goto done;
+	}
+
+	result = WERR_OK;
+done:
+	if (winreg_handle != NULL) {
+		WERROR ignore;
+
+		if (is_valid_policy_hnd(&key_hnd)) {
+			dcerpc_winreg_CloseKey(winreg_handle, tmp_ctx, &key_hnd, &ignore);
+		}
+		if (is_valid_policy_hnd(&hive_hnd)) {
+			dcerpc_winreg_CloseKey(winreg_handle, tmp_ctx, &hive_hnd, &ignore);
+		}
+	}
+
+	TALLOC_FREE(tmp_ctx);
+	return result;
+}
+
+WERROR winreg_get_driver_package(TALLOC_CTX *mem_ctx,
+				 struct dcerpc_binding_handle *winreg_handle,
+				 const char *package_id,
+				 const char *architecture,
+				 const char **driver_store_path,
+				 const char **cab_path)
+{
+	uint32_t access_mask = SEC_FLAG_MAXIMUM_ALLOWED;
+	struct policy_handle hive_hnd, key_hnd;
+	struct spoolss_PrinterEnumValues *enum_values = NULL;
+	struct spoolss_PrinterEnumValues *v;
+	uint32_t num_values = 0;
+	TALLOC_CTX *tmp_ctx;
+	WERROR result;
+	NTSTATUS status;
+	const char *path;
+	uint32_t i;
+	const char **enum_names = NULL;
+	enum winreg_Type *enum_types = NULL;
+	DATA_BLOB *enum_data_blobs = NULL;
+
+	ZERO_STRUCT(hive_hnd);
+	ZERO_STRUCT(key_hnd);
+
+	tmp_ctx = talloc_stackframe();
+	if (tmp_ctx == NULL) {
+		return WERR_NOT_ENOUGH_MEMORY;
+	}
+
+	path = talloc_asprintf(tmp_ctx, "%s\\%s\\DriverPackages",
+					TOP_LEVEL_PRINT_PACKAGEINSTALLATION_KEY,
+					architecture);
+	if (path == NULL) {
+		result = WERR_NOT_ENOUGH_MEMORY;
+		goto done;
+	}
+
+	result = winreg_printer_openkey(tmp_ctx,
+					winreg_handle,
+					path,
+					package_id, /* key */
+					false,
+					access_mask,
+					&hive_hnd,
+					&key_hnd);
+
+	if (!W_ERROR_IS_OK(result)) {
+		DEBUG(5, ("winreg_get_driver_package: "
+			  "Could not open driver package key (%s,%s): %s\n",
+			  package_id, architecture, win_errstr(result)));
+		goto done;
+	}
+
+	status = dcerpc_winreg_enumvals(tmp_ctx,
+				        winreg_handle,
+				        &key_hnd,
+				        &num_values,
+				        &enum_names,
+					&enum_types,
+					&enum_data_blobs,
+					&result);
+	if (!NT_STATUS_IS_OK(status)){
+		result = ntstatus_to_werror(status);
+	}
+
+	if (!W_ERROR_IS_OK(result)) {
+		DEBUG(0, ("winreg_get_driver_package: "
+			  "Could not enumerate values for (%s,%s): %s\n",
+			  package_id, architecture, win_errstr(result)));
+		goto done;
+	}
+
+	enum_values = talloc_zero_array(tmp_ctx,
+					struct spoolss_PrinterEnumValues,
+					num_values);
+	if (enum_values == NULL){
+		result = WERR_NOT_ENOUGH_MEMORY;
+		goto done;
+	}
+
+	for (i = 0; i < num_values; i++){
+		enum_values[i].value_name = enum_names[i];
+		enum_values[i].value_name_len = strlen_m_term(enum_names[i]) * 2;
+		enum_values[i].type = enum_types[i];
+		enum_values[i].data_length = enum_data_blobs[i].length;
+		enum_values[i].data = NULL;
+		if (enum_values[i].data_length != 0){
+			enum_values[i].data = &enum_data_blobs[i];
+		}
+	}
+
+	result = WERR_OK;
+
+	for (i = 0; i < num_values; i++) {
+
+		v = &enum_values[i];
+
+		result = winreg_enumval_to_sz(mem_ctx, v,
+					      "CabPath",
+					      cab_path);
+		CHECK_ERROR(result);
+
+		result = winreg_enumval_to_sz(mem_ctx, v,
+					      "DriverStorePath",
+					      driver_store_path);
+		CHECK_ERROR(result);
+	}
+
+	if (!W_ERROR_IS_OK(result)) {
+		DEBUG(0, ("winreg_enumval_to_TYPE() failed "
+			  "for %s: %s\n", v->value_name,
+			  win_errstr(result)));
+		goto done;
+	}
+
+	result = WERR_OK;
+done:
+	if (winreg_handle != NULL) {
+		WERROR ignore;
+
+		if (is_valid_policy_hnd(&key_hnd)) {
+			dcerpc_winreg_CloseKey(winreg_handle, tmp_ctx, &key_hnd, &ignore);
+		}
+		if (is_valid_policy_hnd(&hive_hnd)) {
+			dcerpc_winreg_CloseKey(winreg_handle, tmp_ctx, &hive_hnd, &ignore);
+		}
+	}
+
+	TALLOC_FREE(tmp_ctx);
+	return result;
+}
+
+WERROR winreg_del_driver_package(TALLOC_CTX *mem_ctx,
+				 struct dcerpc_binding_handle *winreg_handle,
+				 const char *package_id,
+				 const char *architecture)
+{
+	uint32_t access_mask = SEC_FLAG_MAXIMUM_ALLOWED;
+	struct policy_handle hive_hnd, key_hnd;
+	TALLOC_CTX *tmp_ctx;
+	WERROR result;
+	NTSTATUS status;
+	const char *path;
+
+	ZERO_STRUCT(hive_hnd);
+	ZERO_STRUCT(key_hnd);
+
+	tmp_ctx = talloc_stackframe();
+	if (tmp_ctx == NULL) {
+		return WERR_NOT_ENOUGH_MEMORY;
+	}
+
+	path = talloc_asprintf(tmp_ctx, "%s\\%s\\DriverPackages",
+					TOP_LEVEL_PRINT_PACKAGEINSTALLATION_KEY,
+					architecture);
+	if (path == NULL) {
+		result = WERR_NOT_ENOUGH_MEMORY;
+		goto done;
+	}
+
+	result = winreg_printer_openkey(tmp_ctx,
+					winreg_handle,
+					path,
+					package_id, /* key */
+					false,
+					access_mask,
+					&hive_hnd,
+					&key_hnd);
+	if (!W_ERROR_IS_OK(result)) {
+		/* key doesn't exist */
+		if (W_ERROR_EQUAL(result, WERR_FILE_NOT_FOUND)) {
+			result = WERR_OK;
+			goto done;
+		}
+
+		DEBUG(5, ("winreg_del_driver_package: "
+			  "Could not open driver package key (%s,%s): %s\n",
+			  package_id, architecture, win_errstr(result)));
+		goto done;
+	}
+
+
+	if (is_valid_policy_hnd(&key_hnd)) {
+		dcerpc_winreg_CloseKey(winreg_handle, tmp_ctx, &key_hnd, &result);
+	}
+
+	path = talloc_asprintf(tmp_ctx, "%s\\%s\\DriverPackages\\%s",
+					TOP_LEVEL_PRINT_PACKAGEINSTALLATION_KEY,
+					architecture,
+					package_id);
+	if (path == NULL) {
+		result = WERR_NOT_ENOUGH_MEMORY;
+		goto done;
+	}
+
+	status = dcerpc_winreg_delete_subkeys_recursive(tmp_ctx,
+							winreg_handle,
+							&hive_hnd,
+							access_mask,
+							path,
+							&result);
+	if (!NT_STATUS_IS_OK(status)) {
+		result = ntstatus_to_werror(status);
+		DEBUG(5, ("winreg_del_driver_package: "
+			  "Could not delete driver package key (%s,%s): %s\n",
+			  package_id, architecture, nt_errstr(status)));
+		goto done;
+	}
+
+	if (!W_ERROR_IS_OK(result)) {
+		DEBUG(5, ("winreg_del_driver_package: "
+			  "Could not delete driver package key (%s,%s): %s\n",
+			  package_id, architecture, win_errstr(result)));
+		goto done;
+	}
 
 	result = WERR_OK;
 done:

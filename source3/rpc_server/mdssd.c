@@ -20,11 +20,8 @@
  */
 
 #include "includes.h"
-#include "serverid.h"
 #include "messages.h"
 #include "ntdomain.h"
-
-#include "lib/util/util_process.h"
 
 #include "lib/id_cache.h"
 
@@ -32,13 +29,16 @@
 #include "lib/server_prefork.h"
 #include "lib/server_prefork_util.h"
 #include "librpc/rpc/dcerpc_ep.h"
+#include "librpc/rpc/dcesrv_core.h"
 
 #include "rpc_server/rpc_server.h"
+#include "rpc_server/rpc_service_setup.h"
 #include "rpc_server/rpc_ep_register.h"
 #include "rpc_server/rpc_sock_helper.h"
+#include "rpc_server/rpc_modules.h"
 
-#include "librpc/gen_ndr/srv_mdssvc.h"
 #include "rpc_server/mdssvc/srv_mdssvc_nt.h"
+#include "rpc_server/mdssd.h"
 
 #undef DBGC_CLASS
 #define DBGC_CLASS DBGC_RPC_SRV
@@ -59,9 +59,6 @@ static struct pf_daemon_config default_pf_mdssd_cfg = {
 	.child_min_life = 60 /* 1 minute minimum life time */
 };
 static struct pf_daemon_config pf_mdssd_cfg = { 0 };
-
-void start_mdssd(struct tevent_context *ev_ctx,
-		 struct messaging_context *msg_ctx);
 
 static void mdssd_smb_conf_updated(struct messaging_context *msg,
 				   void *private_data,
@@ -93,10 +90,7 @@ static void mdssd_sig_term_handler(struct tevent_context *ev,
 				   void *siginfo,
 				   void *private_data)
 {
-	rpc_mdssvc_shutdown();
-
-	DEBUG(0, ("termination signal\n"));
-	exit(0);
+	exit_server_cleanly("termination signal");
 }
 
 static void mdssd_setup_sig_term_handler(struct tevent_context *ev_ctx)
@@ -109,8 +103,7 @@ static void mdssd_setup_sig_term_handler(struct tevent_context *ev_ctx)
 			       mdssd_sig_term_handler,
 			       NULL);
 	if (!se) {
-		DEBUG(0, ("failed to setup SIGTERM handler\n"));
-		exit(1);
+		exit_server("failed to setup SIGTERM handler");
 	}
 }
 
@@ -202,17 +195,15 @@ static bool mdssd_child_init(struct tevent_context *ev_ctx,
 			     struct pf_worker_data *pf)
 {
 	NTSTATUS status;
-	struct messaging_context *msg_ctx = server_messaging_context();
+	struct messaging_context *msg_ctx = global_messaging_context();
 	bool ok;
 
 	status = reinit_after_fork(msg_ctx, ev_ctx,
-				   true);
+				   true, "mdssd-child");
 	if (!NT_STATUS_IS_OK(status)) {
 		DEBUG(0,("reinit_after_fork() failed\n"));
 		smb_panic("reinit_after_fork() failed");
 	}
-
-	prctl_set_comment("mdssd-child");
 
 	mdssd_child_id = child_id;
 	reopen_logs();
@@ -222,22 +213,10 @@ static bool mdssd_child_init(struct tevent_context *ev_ctx,
 		return false;
 	}
 
-	if (!serverid_register(messaging_server_id(msg_ctx),
-			       FLAG_MSG_GENERAL)) {
-		return false;
-	}
-
 	messaging_register(msg_ctx, ev_ctx,
 			   MSG_SMB_CONF_UPDATED, mdssd_smb_conf_updated);
 	messaging_register(msg_ctx, ev_ctx,
 			   MSG_PREFORK_PARENT_EVENT, parent_ping);
-
-	status = rpc_mdssvc_init(NULL);
-	if (!NT_STATUS_IS_OK(status)) {
-		DEBUG(0, ("Failed to intialize RPC: %s\n",
-			  nt_errstr(status)));
-		return false;
-	}
 
 	return true;
 }
@@ -245,9 +224,10 @@ static bool mdssd_child_init(struct tevent_context *ev_ctx,
 struct mdssd_children_data {
 	struct tevent_context *ev_ctx;
 	struct messaging_context *msg_ctx;
+	struct dcesrv_context *dce_ctx;
 	struct pf_worker_data *pf;
 	int listen_fd_size;
-	int *listen_fds;
+	struct pf_listen_fd *listen_fds;
 };
 
 static void mdssd_next_client(void *pvt);
@@ -257,12 +237,15 @@ static int mdssd_children_main(struct tevent_context *ev_ctx,
 			       struct pf_worker_data *pf,
 			       int child_id,
 			       int listen_fd_size,
-			       int *listen_fds,
+			       struct pf_listen_fd *listen_fds,
 			       void *private_data)
 {
 	struct mdssd_children_data *data;
 	bool ok;
 	int ret = 0;
+	struct dcesrv_context *dce_ctx = NULL;
+
+	dce_ctx = talloc_get_type_abort(private_data, struct dcesrv_context);
 
 	ok = mdssd_child_init(ev_ctx, child_id, pf);
 	if (!ok) {
@@ -276,6 +259,7 @@ static int mdssd_children_main(struct tevent_context *ev_ctx,
 	data->pf = pf;
 	data->ev_ctx = ev_ctx;
 	data->msg_ctx = msg_ctx;
+	data->dce_ctx = dce_ctx;
 	data->listen_fd_size = listen_fd_size;
 	data->listen_fds = listen_fds;
 
@@ -295,7 +279,7 @@ static int mdssd_children_main(struct tevent_context *ev_ctx,
 	return ret;
 }
 
-static void mdssd_client_terminated(void *pvt)
+static void mdssd_client_terminated(struct dcesrv_connection *conn, void *pvt)
 {
 	struct mdssd_children_data *data;
 
@@ -356,6 +340,11 @@ static void mdssd_handle_client(struct tevent_req *req)
 	TALLOC_CTX *tmp_ctx;
 	struct tsocket_address *srv_addr;
 	struct tsocket_address *cli_addr;
+	void *listen_fd_data = NULL;
+	struct dcesrv_endpoint *ep = NULL;
+	enum dcerpc_transport_t transport;
+	dcerpc_ncacn_termination_fn term_fn = NULL;
+	void *term_fn_data = NULL;
 
 	client = tevent_req_callback_data(req, struct mdssd_new_client);
 	data = client->data;
@@ -369,6 +358,7 @@ static void mdssd_handle_client(struct tevent_req *req)
 	rc = prefork_listen_recv(req,
 				 tmp_ctx,
 				 &sd,
+				 &listen_fd_data,
 				 &srv_addr,
 				 &cli_addr);
 
@@ -380,63 +370,30 @@ static void mdssd_handle_client(struct tevent_req *req)
 		goto done;
 	}
 
+	ep = talloc_get_type_abort(listen_fd_data, struct dcesrv_endpoint);
+	transport = dcerpc_binding_get_transport(ep->ep_description);
+	if (transport == NCACN_NP) {
+		term_fn = mdssd_client_terminated;
+		term_fn_data = data;
+	}
+
 	/* Warn parent that our status changed */
 	messaging_send(data->msg_ctx, parent_id,
 			MSG_PREFORK_CHILD_EVENT, &ping);
 
-	DEBUG(2, ("mdssd preforked child %d got client connection!\n",
-		  (int)(data->pf->pid)));
+	DBG_INFO("MDSSD preforked child %d got client connection on '%s'\n",
+		  (int)(data->pf->pid), dcerpc_binding_string(tmp_ctx,
+			  ep->ep_description));
 
-	if (tsocket_address_is_inet(srv_addr, "ip")) {
-		DEBUG(3, ("Got a tcpip client connection from %s on inteface %s\n",
-			   tsocket_address_string(cli_addr, tmp_ctx),
-			   tsocket_address_string(srv_addr, tmp_ctx)));
-
-		dcerpc_ncacn_accept(data->ev_ctx,
-				    data->msg_ctx,
-				    NCACN_IP_TCP,
-				    "IP",
-				    cli_addr,
-				    srv_addr,
-				    sd,
-				    NULL);
-	} else if (tsocket_address_is_unix(srv_addr)) {
-		const char *p;
-		const char *b;
-
-		p = tsocket_address_unix_path(srv_addr, tmp_ctx);
-		if (p == NULL) {
-			talloc_free(tmp_ctx);
-			return;
-		}
-
-		b = strrchr(p, '/');
-		if (b != NULL) {
-			b++;
-		} else {
-			b = p;
-		}
-
-		if (strstr(p, "/np/")) {
-			named_pipe_accept_function(data->ev_ctx,
-						   data->msg_ctx,
-						   b,
-						   sd,
-						   mdssd_client_terminated,
-						   data);
-		} else {
-			dcerpc_ncacn_accept(data->ev_ctx,
-					    data->msg_ctx,
-					    NCALRPC,
-					    b,
-					    cli_addr,
-					    srv_addr,
-					    sd,
-					    NULL);
-		}
-	} else {
-		DEBUG(0, ("ERROR: Unsupported socket!\n"));
-	}
+	dcerpc_ncacn_accept(data->ev_ctx,
+			    data->msg_ctx,
+			    data->dce_ctx,
+			    ep,
+			    cli_addr,
+			    srv_addr,
+			    sd,
+			    term_fn,
+			    term_fn_data);
 
 done:
 	talloc_free(tmp_ctx);
@@ -535,114 +492,84 @@ static void mdssd_check_children(struct tevent_context *ev_ctx,
  * start it up
  */
 
-static bool mdssd_create_sockets(struct tevent_context *ev_ctx,
-				 struct messaging_context *msg_ctx,
-				 int *listen_fd,
-				 int *listen_fd_size)
+static NTSTATUS mdssd_create_sockets(struct tevent_context *ev_ctx,
+				     struct messaging_context *msg_ctx,
+				     struct dcesrv_context *dce_ctx,
+				     struct pf_listen_fd *listen_fd,
+				     int *listen_fd_size)
 {
-	struct dcerpc_binding_vector *v, *v_orig;
-	TALLOC_CTX *tmp_ctx;
 	NTSTATUS status;
 	int fd = -1;
 	int rc;
-	bool ok = false;
+	int i;
+	struct dcesrv_endpoint *e = NULL;
 
-	tmp_ctx = talloc_stackframe();
-	if (tmp_ctx == NULL) {
-		return false;
+	DBG_INFO("Initializing DCE/RPC connection endpoints\n");
+
+	for (e = dce_ctx->endpoint_list; e; e = e->next) {
+		status = dcesrv_create_endpoint_sockets(ev_ctx,
+							msg_ctx,
+							dce_ctx,
+							e,
+							listen_fd,
+							listen_fd_size);
+		if (!NT_STATUS_IS_OK(status)) {
+			char *ep_string = dcerpc_binding_string(
+					dce_ctx, e->ep_description);
+			DBG_ERR("Failed to create endpoint '%s': %s\n",
+				ep_string, nt_errstr(status));
+			TALLOC_FREE(ep_string);
+			goto done;
+		}
 	}
 
-	status = dcerpc_binding_vector_new(tmp_ctx, &v_orig);
-	if (!NT_STATUS_IS_OK(status)) {
-		goto done;
+	for (i = 0; i < *listen_fd_size; i++) {
+		rc = listen(listen_fd[i].fd, pf_mdssd_cfg.max_allowed_clients);
+		if (rc == -1) {
+			char *ep_string = dcerpc_binding_string(
+					dce_ctx, e->ep_description);
+			DBG_ERR("Failed to listen on endpoint '%s': %s\n",
+				ep_string, strerror(errno));
+			status = map_nt_error_from_unix(errno);
+			TALLOC_FREE(ep_string);
+			goto done;
+		}
 	}
 
-	/* mdssvc */
-	fd = create_named_pipe_socket("mdssvc");
-	if (fd < 0) {
-		goto done;
+	for (e = dce_ctx->endpoint_list; e; e = e->next) {
+		struct dcesrv_if_list *ifl = NULL;
+		for (ifl = e->interface_list; ifl; ifl = ifl->next) {
+			status = rpc_ep_register(ev_ctx,
+						 msg_ctx,
+						 dce_ctx,
+						 ifl->iface);
+			if (!NT_STATUS_IS_OK(status)) {
+				DBG_ERR("Failed to register interface in "
+					"endpoint mapper: %s",
+					nt_errstr(status));
+				goto done;
+			}
+		}
 	}
 
-	rc = listen(fd, pf_mdssd_cfg.max_allowed_clients);
-	if (rc == -1) {
-		goto done;
-	}
-	listen_fd[*listen_fd_size] = fd;
-	(*listen_fd_size)++;
-
-	fd = create_dcerpc_ncalrpc_socket("mdssvc");
-	if (fd < 0) {
-		goto done;
-	}
-
-	rc = listen(fd, pf_mdssd_cfg.max_allowed_clients);
-	if (rc == -1) {
-		goto done;
-	}
-	listen_fd[*listen_fd_size] = fd;
-	(*listen_fd_size)++;
-	fd = -1;
-
-	v = dcerpc_binding_vector_dup(tmp_ctx, v_orig);
-	if (v == NULL) {
-		goto done;
-	}
-
-	status = dcerpc_binding_vector_replace_iface(&ndr_table_mdssvc, v);
-	if (!NT_STATUS_IS_OK(status)) {
-		goto done;
-	}
-
-	status = dcerpc_binding_vector_add_np_default(&ndr_table_mdssvc, v);
-	if (!NT_STATUS_IS_OK(status)) {
-		goto done;
-	}
-
-	status = dcerpc_binding_vector_add_unix(&ndr_table_mdssvc, v, "mdssvc");
-	if (!NT_STATUS_IS_OK(status)) {
-		goto done;
-	}
-
-	ok = true;
+	status = NT_STATUS_OK;
 done:
 	if (fd != -1) {
 		close(fd);
 	}
-	talloc_free(tmp_ctx);
-	return ok;
-}
-
-static bool mdssvc_init_cb(void *ptr)
-{
-	struct messaging_context *msg_ctx =
-		talloc_get_type_abort(ptr, struct messaging_context);
-	bool ok;
-
-	ok = init_service_mdssvc(msg_ctx);
-	if (!ok) {
-		return false;
-	}
-
-	return true;
-}
-
-static bool mdssvc_shutdown_cb(void *ptr)
-{
-	shutdown_service_mdssvc();
-
-	return true;
+	return status;
 }
 
 void start_mdssd(struct tevent_context *ev_ctx,
-		 struct messaging_context *msg_ctx)
+		 struct messaging_context *msg_ctx,
+		 struct dcesrv_context *dce_ctx)
 {
 	NTSTATUS status;
-	int listen_fd[MDSSD_MAX_SOCKETS];
+	struct pf_listen_fd listen_fd[MDSSD_MAX_SOCKETS];
 	int listen_fd_size = 0;
 	pid_t pid;
 	int rc;
 	bool ok;
-	struct rpc_srv_callbacks mdssvc_cb;
 
 	DEBUG(1, ("Forking Metadata Service Daemon\n"));
 
@@ -671,15 +598,12 @@ void start_mdssd(struct tevent_context *ev_ctx,
 		return;
 	}
 
-	status = reinit_after_fork(msg_ctx,
-				   ev_ctx,
-				   true);
+	status = smbd_reinit_after_fork(msg_ctx, ev_ctx, true, "mdssd-master");
 	if (!NT_STATUS_IS_OK(status)) {
 		DEBUG(0,("reinit_after_fork() failed\n"));
 		smb_panic("reinit_after_fork() failed");
 	}
 
-	prctl_set_comment("mdssd-master");
 	reopen_logs();
 
 	/* save the parent process id so the children can use it later */
@@ -695,8 +619,41 @@ void start_mdssd(struct tevent_context *ev_ctx,
 	BlockSignals(false, SIGTERM);
 	BlockSignals(false, SIGHUP);
 
-	ok = mdssd_create_sockets(ev_ctx, msg_ctx, listen_fd, &listen_fd_size);
+	/* The module setup function will register the endpoint server,
+	 * necessary to setup the endpoints below. It is not possible to
+	 * register it here because MDS service is built as a module.
+	 */
+	ok = setup_rpc_module(ev_ctx, msg_ctx, "mdssvc");
 	if (!ok) {
+		DBG_ERR("Failed to setup DCE/RPC module\n");
+		exit(1);
+	}
+
+	DBG_INFO("Reinitializing DCE/RPC server context\n");
+
+	status = dcesrv_reinit_context(dce_ctx);
+	if (!NT_STATUS_IS_OK(status)) {
+		DBG_ERR("Failed to reinit DCE/RPC context: %s\n",
+			nt_errstr(status));
+		exit(1);
+	}
+
+	DBG_INFO("Initializing DCE/RPC registered endpoint servers\n");
+
+	/* Init ep servers */
+	status = dcesrv_init_ep_server(dce_ctx, "mdssvc");
+	if (!NT_STATUS_IS_OK(status)) {
+		DBG_ERR("Failed to init DCE/RPC endpoint server: %s\n",
+			nt_errstr(status));
+		exit(1);
+	}
+
+	status = mdssd_create_sockets(ev_ctx,
+				      msg_ctx,
+				      dce_ctx,
+				      listen_fd,
+				      &listen_fd_size);
+	if (!NT_STATUS_IS_OK(status)) {
 		exit(1);
 	}
 
@@ -709,14 +666,9 @@ void start_mdssd(struct tevent_context *ev_ctx,
 				 pf_mdssd_cfg.min_children,
 				 pf_mdssd_cfg.max_children,
 				 &mdssd_children_main,
-				 NULL,
+				 dce_ctx,
 				 &mdssd_pool);
 	if (!ok) {
-		exit(1);
-	}
-
-	if (!serverid_register(messaging_server_id(msg_ctx),
-			       FLAG_MSG_GENERAL)) {
 		exit(1);
 	}
 
@@ -726,15 +678,6 @@ void start_mdssd(struct tevent_context *ev_ctx,
 			   mdssd_smb_conf_updated);
 	messaging_register(msg_ctx, ev_ctx,
 			   MSG_PREFORK_CHILD_EVENT, child_ping);
-
-	mdssvc_cb.init         = mdssvc_init_cb;
-	mdssvc_cb.shutdown     = mdssvc_shutdown_cb;
-	mdssvc_cb.private_data = msg_ctx;
-
-	status = rpc_mdssvc_init(&mdssvc_cb);
-	if (!NT_STATUS_IS_OK(status)) {
-		exit(1);
-	}
 
 	ok = mdssd_setup_children_monitor(ev_ctx, msg_ctx);
 	if (!ok) {

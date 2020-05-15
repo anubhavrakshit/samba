@@ -19,6 +19,7 @@
 
 #include <Python.h>
 #include "includes.h"
+#include "python/py3compat.h"
 #include "policy.h"
 #include "libcli/util/pyerrors.h"
 
@@ -51,14 +52,21 @@ static PyObject *py_get_gpo_flags(PyObject *self, PyObject *args)
 
 	py_ret = PyList_New(0);
 	for (i = 0; ret[i]; i++) {
-		PyObject *item = PyString_FromString(ret[i]);
+		int res = 0;
+		PyObject *item = PyUnicode_FromString(ret[i]);
 		if (item == NULL) {
 			talloc_free(mem_ctx);
 			Py_DECREF(py_ret);
 			PyErr_NoMemory();
 			return NULL;
 		}
-		PyList_Append(py_ret, item);
+		res = PyList_Append(py_ret, item);
+		Py_CLEAR(item);
+		if (res == -1) {
+			Py_DECREF(py_ret);
+			talloc_free(mem_ctx);
+			return NULL;
+		}
 	}
 
 	talloc_free(mem_ctx);
@@ -93,14 +101,21 @@ static PyObject *py_get_gplink_options(PyObject *self, PyObject *args)
 
 	py_ret = PyList_New(0);
 	for (i = 0; ret[i]; i++) {
-		PyObject *item = PyString_FromString(ret[i]);
+		int res = 0;
+		PyObject *item = PyUnicode_FromString(ret[i]);
 		if (item == NULL) {
 			talloc_free(mem_ctx);
 			Py_DECREF(py_ret);
 			PyErr_NoMemory();
 			return NULL;
 		}
-		PyList_Append(py_ret, item);
+		res = PyList_Append(py_ret, item);
+		Py_CLEAR(item);
+		if (res == -1) {
+			Py_DECREF(py_ret);
+			talloc_free(mem_ctx);
+			return NULL;
+		}
 	}
 
 	talloc_free(mem_ctx);
@@ -128,23 +143,32 @@ static PyMethodDef py_policy_methods[] = {
 		"get_gplink_options(options) -> list" },
 	{ "ads_to_dir_access_mask", (PyCFunction)py_ads_to_dir_access_mask, METH_VARARGS,
 		"ads_to_dir_access_mask(access_mask) -> dir_mask" },
-	{ NULL }
+	{0}
 };
 
-void initpolicy(void)
-{
-	PyObject *m;
+static struct PyModuleDef moduledef = {
+    PyModuleDef_HEAD_INIT,
+    .m_name = "policy",
+    .m_doc = "(Group) Policy manipulation",
+    .m_size = -1,
+    .m_methods = py_policy_methods,
+};
 
-	m = Py_InitModule3("policy", py_policy_methods, "(Group) Policy manipulation");
+MODULE_INIT_FUNC(policy)
+{
+	PyObject *m = NULL;
+
+	m = PyModule_Create(&moduledef);
 	if (!m)
-		return;
+		return m;
 
 	PyModule_AddObject(m, "GPO_FLAG_USER_DISABLE",
-					   PyInt_FromLong(GPO_FLAG_USER_DISABLE));
+					   PyLong_FromLong(GPO_FLAG_USER_DISABLE));
 	PyModule_AddObject(m, "GPO_MACHINE_USER_DISABLE",
-					   PyInt_FromLong(GPO_FLAG_MACHINE_DISABLE));
+					   PyLong_FromLong(GPO_FLAG_MACHINE_DISABLE));
 	PyModule_AddObject(m, "GPLINK_OPT_DISABLE",
-					   PyInt_FromLong(GPLINK_OPT_DISABLE ));
+					   PyLong_FromLong(GPLINK_OPT_DISABLE ));
 	PyModule_AddObject(m, "GPLINK_OPT_ENFORCE ",
-					   PyInt_FromLong(GPLINK_OPT_ENFORCE ));
+					   PyLong_FromLong(GPLINK_OPT_ENFORCE ));
+	return m;
 }

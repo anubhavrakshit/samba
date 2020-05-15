@@ -39,13 +39,7 @@
 
 /* attribute recognised by some compilers to avoid 'unused' warnings */
 #ifndef SWIGUNUSED
-# if defined(__GNUC__)
-#   if !(defined(__cplusplus)) || (__GNUC__ > 3 || (__GNUC__ == 3 && __GNUC_MINOR__ >= 4))
-#     define SWIGUNUSED __attribute__ ((__unused__)) 
-#   else
-#     define SWIGUNUSED
-#   endif
-# elif defined(__ICC)
+# ifdef HAVE___ATTRIBUTE__
 #   define SWIGUNUSED __attribute__ ((__unused__)) 
 # else
 #   define SWIGUNUSED 
@@ -239,7 +233,7 @@
    swig errors code.
 
    Finally, if the SWIG_CASTRANK_MODE is enabled, the result code
-   allows to return the 'cast rank', for example, if you have this
+   allows one to return the 'cast rank', for example, if you have this
 
        int food(double)
        int fooi(int);
@@ -2676,8 +2670,8 @@ SWIG_AsVal_double (PyObject *obj, double *val)
   if (PyFloat_Check(obj)) {
     if (val) *val = PyFloat_AsDouble(obj);
     return SWIG_OK;
-  } else if (PyInt_Check(obj)) {
-    if (val) *val = PyInt_AsLong(obj);
+  } else if (PyLong_Check(obj)) {
+    if (val) *val = PyLong_AsLong(obj);
     return SWIG_OK;
   } else if (PyLong_Check(obj)) {
     double v = PyLong_AsDouble(obj);
@@ -2752,8 +2746,8 @@ SWIG_CanCastAsInteger(double *d, double min, double max) {
 SWIGINTERN int
 SWIG_AsVal_unsigned_SS_long (PyObject *obj, unsigned long *val) 
 {
-  if (PyInt_Check(obj)) {
-    long v = PyInt_AsLong(obj);
+  if (PyLong_Check(obj)) {
+    long v = PyLong_AsLong(obj);
     if (v >= 0) {
       if (val) *val = v;
       return SWIG_OK;
@@ -2809,14 +2803,14 @@ SWIG_AsVal_unsigned_SS_int (PyObject * obj, unsigned int *val)
 }
 
 
-  #define SWIG_From_long   PyInt_FromLong 
+  #define SWIG_From_long   PyLong_FromLong 
 
 
 SWIGINTERNINLINE PyObject* 
 SWIG_From_unsigned_SS_long  (unsigned long value)
 {
   return (value > LONG_MAX) ?
-    PyLong_FromUnsignedLong(value) : PyInt_FromLong((long)(value)); 
+    PyLong_FromUnsignedLong(value) : PyLong_FromLong((long)(value)); 
 }
 
 
@@ -2830,8 +2824,8 @@ SWIG_From_unsigned_SS_int  (unsigned int value)
 SWIGINTERN int
 SWIG_AsVal_long (PyObject *obj, long* val)
 {
-  if (PyInt_Check(obj)) {
-    if (val) *val = PyInt_AsLong(obj);
+  if (PyLong_Check(obj)) {
+    if (val) *val = PyLong_AsLong(obj);
     return SWIG_OK;
   } else if (PyLong_Check(obj)) {
     long v = PyLong_AsLong(obj);
@@ -2845,7 +2839,7 @@ SWIG_AsVal_long (PyObject *obj, long* val)
 #ifdef SWIG_PYTHON_CAST_MODE
   {
     int dispatch = 0;
-    long v = PyInt_AsLong(obj);
+    long v = PyLong_AsLong(obj);
     if (!PyErr_Occurred()) {
       if (val) *val = v;
       return SWIG_AddCast(SWIG_OK);
@@ -3613,8 +3607,8 @@ SWIGINTERN PyObject *_wrap_IEnumWbemClassObject_SmartNext(PyObject *SWIGUNUSEDPA
   {
     if (PyLong_Check(obj2))
     arg4 = PyLong_AsUnsignedLong(obj2);
-    else if (PyInt_Check(obj2))
-    arg4 = PyInt_AsLong(obj2);
+    else if (PyLong_Check(obj2))
+    arg4 = PyLong_AsLong(obj2);
     else {
       PyErr_SetString(PyExc_TypeError,"Expected a long or an int");
       return NULL;
@@ -3788,7 +3782,7 @@ static swig_const_info swig_const_table[] = {
  * array with the correct data and linking the correct swig_cast_info
  * structures together.
  *
- * The generated swig_type_info structures are assigned staticly to an initial 
+ * The generated swig_type_info structures are assigned statically to an initial 
  * array. We just loop through that array, and handle each type individually.
  * First we lookup if this type has been already loaded, and if so, use the
  * loaded structure instead of the generated one. Then we have to fill in the

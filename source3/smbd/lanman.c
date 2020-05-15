@@ -97,6 +97,8 @@ static int CopyExpanded(connection_struct *conn,
 			int snum, char **dst, char *src, int *p_space_remaining)
 {
 	TALLOC_CTX *ctx = talloc_tos();
+	const struct loadparm_substitution *lp_sub =
+		loadparm_s3_global_substitution();
 	char *buf = NULL;
 	int l;
 
@@ -110,13 +112,13 @@ static int CopyExpanded(connection_struct *conn,
 		*p_space_remaining = 0;
 		return 0;
 	}
-	buf = talloc_string_sub(ctx, buf,"%S", lp_servicename(ctx, snum));
+	buf = talloc_string_sub(ctx, buf,"%S", lp_servicename(ctx, lp_sub, snum));
 	if (!buf) {
 		*p_space_remaining = 0;
 		return 0;
 	}
-	buf = talloc_sub_advanced(ctx,
-				  lp_servicename(ctx, SNUM(conn)),
+	buf = talloc_sub_full(ctx,
+				  lp_servicename(ctx, lp_sub, SNUM(conn)),
 				conn->session_info->unix_info->unix_name,
 				conn->connectpath,
 				conn->session_info->unix_token->gid,
@@ -154,6 +156,8 @@ static int CopyAndAdvance(char **dst, char *src, int *n)
 static int StrlenExpanded(connection_struct *conn, int snum, char *s)
 {
 	TALLOC_CTX *ctx = talloc_tos();
+	const struct loadparm_substitution *lp_sub =
+		loadparm_s3_global_substitution();
 	char *buf = NULL;
 	if (!s) {
 		return 0;
@@ -162,12 +166,12 @@ static int StrlenExpanded(connection_struct *conn, int snum, char *s)
 	if (!buf) {
 		return 0;
 	}
-	buf = talloc_string_sub(ctx,buf,"%S",lp_servicename(ctx, snum));
+	buf = talloc_string_sub(ctx,buf,"%S",lp_servicename(ctx, lp_sub, snum));
 	if (!buf) {
 		return 0;
 	}
-	buf = talloc_sub_advanced(ctx,
-				  lp_servicename(ctx, SNUM(conn)),
+	buf = talloc_sub_full(ctx,
+				  lp_servicename(ctx, lp_sub, SNUM(conn)),
 				conn->session_info->unix_info->unix_name,
 				conn->connectpath,
 				conn->session_info->unix_token->gid,
@@ -364,7 +368,7 @@ static int package(struct pack_desc *p, ...)
 			{
 				char *s = va_arg(args,char*);
 				if (p->buflen >= needed) {
-					StrnCpy(p->structbuf,s?s:"",needed-1);
+					strlcpy(p->structbuf,s?s:"",needed);
 				}
 			}
 			break;
@@ -827,14 +831,15 @@ static bool api_DosPrintQGetInfo(struct smbd_server_connection *sconn,
 	ZERO_STRUCT(handle);
 
 	if (QueueName == NULL || (strlen(QueueName) < 1)) {
-		desc.errcode = W_ERROR_V(WERR_INVALID_PARAM);
+		desc.errcode = W_ERROR_V(WERR_INVALID_PARAMETER);
 		goto out;
 	}
 
-	status = rpc_pipe_open_interface(conn,
+	status = rpc_pipe_open_interface(mem_ctx,
 					 &ndr_table_spoolss,
 					 conn->session_info,
 					 conn->sconn->remote_address,
+					 conn->sconn->local_address,
 					 conn->sconn->msg_ctx,
 					 &cli);
 	if (!NT_STATUS_IS_OK(status)) {
@@ -1028,10 +1033,11 @@ static bool api_DosPrintQEnum(struct smbd_server_connection *sconn,
 		return(True);
 	}
 
-	status = rpc_pipe_open_interface(conn,
+	status = rpc_pipe_open_interface(mem_ctx,
 					 &ndr_table_spoolss,
 					 conn->session_info,
 					 conn->sconn->remote_address,
+					 conn->sconn->local_address,
 					 conn->sconn->msg_ctx,
 					 &cli);
 	if (!NT_STATUS_IS_OK(status)) {
@@ -1226,7 +1232,7 @@ static int get_session_info(uint32_t servertype,
 	char **lines;
 	bool local_list_only;
 	int i;
-	char *slist_cache_path = cache_path(SERVER_LIST);
+	char *slist_cache_path = cache_path(talloc_tos(), SERVER_LIST);
 	if (slist_cache_path == NULL) {
 		return 0;
 	}
@@ -1886,6 +1892,8 @@ static int fill_share_info(connection_struct *conn, int snum, int uLevel,
  			   char** buf, int* buflen,
  			   char** stringbuf, int* stringspace, char* baseaddr)
 {
+	const struct loadparm_substitution *lp_sub =
+		loadparm_s3_global_substitution();
 	int struct_len;
 	char* p;
 	char* p2;
@@ -1913,10 +1921,10 @@ static int fill_share_info(connection_struct *conn, int snum, int uLevel,
 		len = 0;
 
 		if (uLevel > 0) {
-			len += StrlenExpanded(conn,snum,lp_comment(talloc_tos(), snum));
+			len += StrlenExpanded(conn,snum,lp_comment(talloc_tos(), lp_sub, snum));
 		}
 		if (uLevel > 1) {
-			len += strlen(lp_path(talloc_tos(), snum)) + 1;
+			len += strlen(lp_path(talloc_tos(), lp_sub, snum)) + 1;
 		}
 		if (buflen) {
 			*buflen = struct_len;
@@ -1945,7 +1953,7 @@ static int fill_share_info(connection_struct *conn, int snum, int uLevel,
 		baseaddr = p;
 	}
 
-	push_ascii(p,lp_servicename(talloc_tos(), snum),13, STR_TERMINATE);
+	push_ascii(p,lp_servicename(talloc_tos(), lp_sub, snum),13, STR_TERMINATE);
 
 	if (uLevel > 0) {
 		int type;
@@ -1960,7 +1968,7 @@ static int fill_share_info(connection_struct *conn, int snum, int uLevel,
 		}
 		SSVAL(p,14,type);		/* device type */
 		SIVAL(p,16,PTR_DIFF(p2,baseaddr));
-		len += CopyExpanded(conn,snum,&p2,lp_comment(talloc_tos(),snum),&l2);
+		len += CopyExpanded(conn,snum,&p2,lp_comment(talloc_tos(), lp_sub, snum),&l2);
 	}
 
 	if (uLevel > 1) {
@@ -1968,7 +1976,7 @@ static int fill_share_info(connection_struct *conn, int snum, int uLevel,
 		SSVALS(p,22,-1);		/* max uses */
 		SSVAL(p,24,1); /* current uses */
 		SIVAL(p,26,PTR_DIFF(p2,baseaddr)); /* local pathname */
-		len += CopyAndAdvance(&p2,lp_path(talloc_tos(),snum),&l2);
+		len += CopyAndAdvance(&p2,lp_path(talloc_tos(),lp_sub, snum),&l2);
 		memset(p+30,0,SHPWLEN+2); /* passwd (reserved), pad field */
 	}
 
@@ -2072,6 +2080,8 @@ static bool api_RNetShareEnum(struct smbd_server_connection *sconn,
 				int               *rdata_len,
 				int               *rparam_len )
 {
+	const struct loadparm_substitution *lp_sub =
+		loadparm_s3_global_substitution();
 	char *str1 = get_safe_str_ptr(param,tpscnt,param,2);
 	char *str2 = skip_string(param,tpscnt,str1);
 	char *p = skip_string(param,tpscnt,str2);
@@ -2098,7 +2108,7 @@ static bool api_RNetShareEnum(struct smbd_server_connection *sconn,
 
 	/* Ensure all the usershares are loaded. */
 	become_root();
-	delete_and_reload_printers(sconn->ev_ctx, sconn->msg_ctx);
+	delete_and_reload_printers();
 	load_registry_shares();
 	count = load_usershare_shares(NULL, connections_snum_used);
 	unbecome_root();
@@ -2109,7 +2119,7 @@ static bool api_RNetShareEnum(struct smbd_server_connection *sconn,
 		if (!(lp_browseable(i) && lp_snum_ok(i))) {
 			continue;
 		}
-		push_ascii_fstring(servicename_dos, lp_servicename(talloc_tos(), i));
+		push_ascii_fstring(servicename_dos, lp_servicename(talloc_tos(), lp_sub, i));
 		/* Maximum name length = 13. */
 		if( lp_browseable( i ) && lp_snum_ok( i ) && (strlen(servicename_dos) < 13)) {
 			total++;
@@ -2142,7 +2152,7 @@ static bool api_RNetShareEnum(struct smbd_server_connection *sconn,
 		}
 
 		push_ascii_fstring(servicename_dos,
-				   lp_servicename(talloc_tos(), i));
+				   lp_servicename(talloc_tos(), lp_sub, i));
 		if (lp_browseable(i) && lp_snum_ok(i) && (strlen(servicename_dos) < 13)) {
 			if (fill_share_info( conn,i,uLevel,&p,&f_len,&p2,&s_len,*rdata ) < 0) {
 				break;
@@ -2266,6 +2276,7 @@ static bool api_RNetShareAdd(struct smbd_server_connection *sconn,
 	status = rpc_pipe_open_interface(mem_ctx, &ndr_table_srvsvc,
 					conn->session_info,
 					conn->sconn->remote_address,
+					conn->sconn->local_address,
 					conn->sconn->msg_ctx,
 					&cli);
 	if (!NT_STATUS_IS_OK(status)) {
@@ -2377,7 +2388,7 @@ static bool api_RNetGroupEnum(struct smbd_server_connection *sconn,
 	status = rpc_pipe_open_interface(
 		talloc_tos(), &ndr_table_samr,
 		conn->session_info, conn->sconn->remote_address,
-		conn->sconn->msg_ctx, &samr_pipe);
+		conn->sconn->local_address, conn->sconn->msg_ctx, &samr_pipe);
 	if (!NT_STATUS_IS_OK(status)) {
 		DEBUG(0, ("api_RNetUserEnum: Could not connect to samr: %s\n",
 			  nt_errstr(status)));
@@ -2583,7 +2594,7 @@ static bool api_NetUserGetGroups(struct smbd_server_connection *sconn,
 	status = rpc_pipe_open_interface(
 		talloc_tos(), &ndr_table_samr,
 		conn->session_info, conn->sconn->remote_address,
-		conn->sconn->msg_ctx, &samr_pipe);
+		conn->sconn->local_address, conn->sconn->msg_ctx, &samr_pipe);
 	if (!NT_STATUS_IS_OK(status)) {
 		DEBUG(0, ("api_RNetUserEnum: Could not connect to samr: %s\n",
 			  nt_errstr(status)));
@@ -2783,7 +2794,7 @@ static bool api_RNetUserEnum(struct smbd_server_connection *sconn,
 	status = rpc_pipe_open_interface(
 		talloc_tos(), &ndr_table_samr,
 		conn->session_info, conn->sconn->remote_address,
-		conn->sconn->msg_ctx, &samr_pipe);
+		conn->sconn->local_address, conn->sconn->msg_ctx, &samr_pipe);
 	if (!NT_STATUS_IS_OK(status)) {
 		DEBUG(0, ("api_RNetUserEnum: Could not connect to samr: %s\n",
 			  nt_errstr(status)));
@@ -3031,13 +3042,13 @@ static bool api_SamOEMChangePassword(struct smbd_server_connection *sconn,
 	DEBUG(3,("api_SamOEMChangePassword: Change password for <%s>\n",user));
 
 	if (tdscnt != 532) {
-		errcode = W_ERROR_V(WERR_INVALID_PARAM);
+		errcode = W_ERROR_V(WERR_INVALID_PARAMETER);
 		goto out;
 	}
 
 	bufsize = get_safe_SVAL(param,tpscnt,p,0,-1);
 	if (bufsize != 532) {
-		errcode = W_ERROR_V(WERR_INVALID_PARAM);
+		errcode = W_ERROR_V(WERR_INVALID_PARAMETER);
 		goto out;
 	}
 
@@ -3047,6 +3058,7 @@ static bool api_SamOEMChangePassword(struct smbd_server_connection *sconn,
 	status = rpc_pipe_open_interface(mem_ctx, &ndr_table_samr,
 					conn->session_info,
 					conn->sconn->remote_address,
+					conn->sconn->local_address,
 					conn->sconn->msg_ctx,
 					&cli);
 	if (!NT_STATUS_IS_OK(status)) {
@@ -3140,10 +3152,11 @@ static bool api_RDosPrintJobDel(struct smbd_server_connection *sconn,
 
 	ZERO_STRUCT(handle);
 
-	status = rpc_pipe_open_interface(conn,
+	status = rpc_pipe_open_interface(mem_ctx,
 					 &ndr_table_spoolss,
 					 conn->session_info,
 					 conn->sconn->remote_address,
+					 conn->sconn->local_address,
 					 conn->sconn->msg_ctx,
 					 &cli);
 	if (!NT_STATUS_IS_OK(status)) {
@@ -3268,10 +3281,11 @@ static bool api_WPrintQueueCtrl(struct smbd_server_connection *sconn,
 
 	ZERO_STRUCT(handle);
 
-	status = rpc_pipe_open_interface(conn,
+	status = rpc_pipe_open_interface(mem_ctx,
 					 &ndr_table_spoolss,
 					 conn->session_info,
 					 conn->sconn->remote_address,
+					 conn->sconn->local_address,
 					 conn->sconn->msg_ctx,
 					 &cli);
 	if (!NT_STATUS_IS_OK(status)) {
@@ -3450,10 +3464,11 @@ static bool api_PrintJobInfo(struct smbd_server_connection *sconn,
 
 	ZERO_STRUCT(handle);
 
-	status = rpc_pipe_open_interface(conn,
+	status = rpc_pipe_open_interface(mem_ctx,
 					 &ndr_table_spoolss,
 					 conn->session_info,
 					 conn->sconn->remote_address,
+					 conn->sconn->local_address,
 					 conn->sconn->msg_ctx,
 					 &cli);
 	if (!NT_STATUS_IS_OK(status)) {
@@ -3631,6 +3646,7 @@ static bool api_RNetServerGetInfo(struct smbd_server_connection *sconn,
 	status = rpc_pipe_open_interface(mem_ctx, &ndr_table_srvsvc,
 					conn->session_info,
 					conn->sconn->remote_address,
+					conn->sconn->local_address,
 					conn->sconn->msg_ctx,
 					&cli);
 	if (!NT_STATUS_IS_OK(status)) {
@@ -3657,7 +3673,7 @@ static bool api_RNetServerGetInfo(struct smbd_server_connection *sconn,
 	}
 
 	if (info.info101 == NULL) {
-		errcode = W_ERROR_V(WERR_INVALID_PARAM);
+		errcode = W_ERROR_V(WERR_INVALID_PARAMETER);
 		goto out;
 	}
 
@@ -4013,7 +4029,7 @@ static bool api_RNetUserGetInfo(struct smbd_server_connection *sconn,
 	struct lsa_String names;
 	struct samr_Ids rids;
 	struct samr_Ids types;
-	int errcode = W_ERROR_V(WERR_USER_NOT_FOUND);
+	int errcode = W_ERROR_V(WERR_NERR_USERNOTFOUND);
 	uint32_t rid;
 	union samr_UserInfo *info;
 	struct dcerpc_binding_handle *b = NULL;
@@ -4067,6 +4083,7 @@ static bool api_RNetUserGetInfo(struct smbd_server_connection *sconn,
 	status = rpc_pipe_open_interface(mem_ctx, &ndr_table_samr,
 					conn->session_info,
 					conn->sconn->remote_address,
+					conn->sconn->local_address,
 					conn->sconn->msg_ctx,
 					&cli);
 	if (!NT_STATUS_IS_OK(status)) {
@@ -4148,11 +4165,11 @@ static bool api_RNetUserGetInfo(struct smbd_server_connection *sconn,
 		goto out;
 	}
 	if (rids.count != types.count) {
-		errcode = W_ERROR_V(WERR_INVALID_PARAM);
+		errcode = W_ERROR_V(WERR_INVALID_PARAMETER);
 		goto out;
 	}
 	if (types.ids[0] != SID_NAME_USER) {
-		errcode = W_ERROR_V(WERR_INVALID_PARAM);
+		errcode = W_ERROR_V(WERR_INVALID_PARAMETER);
 		goto out;
 	}
 
@@ -4398,19 +4415,23 @@ static bool api_WWkstaUserLogon(struct smbd_server_connection *sconn,
 	int uLevel;
 	struct pack_desc desc;
 	char* name;
-		/* With share level security vuid will always be zero.
-		   Don't depend on vuser being non-null !!. JRA */
-	struct user_struct *vuser = get_valid_user_struct(sconn, vuid);
+	struct auth_session_info *si = NULL;
+	NTSTATUS status;
+
+	status = smbXsrv_session_info_lookup(conn->sconn->client,
+					     vuid,
+					     &si);
+	if (!NT_STATUS_IS_OK(status)) {
+		return false;
+	}
 
 	if (!str1 || !str2 || !p) {
 		return False;
 	}
 
-	if(vuser != NULL) {
-		DEBUG(3,("  Username of UID %d is %s\n",
-			 (int)vuser->session_info->unix_token->uid,
-			 vuser->session_info->unix_info->unix_name));
-	}
+	DBG_INFO("Username of UID %ju is %s\n",
+		 (uintmax_t)si->unix_token->uid,
+		 si->unix_info->unix_name);
 
 	uLevel = get_safe_SVAL(param,tpscnt,p,0,-1);
 	name = get_safe_str_ptr(param,tpscnt,p,2);
@@ -4470,9 +4491,7 @@ static bool api_WWkstaUserLogon(struct smbd_server_connection *sconn,
 		}
 
 		PACKS(&desc,"z",lp_workgroup());/* domain */
-		PACKS(&desc,"z", vuser ?
-		      vuser->session_info->info->logon_script
-			: ""); /* script path */
+		PACKS(&desc,"z", si->info->logon_script); /* script path */
 		PACKI(&desc,"D",0x00000000);		/* reserved */
 	}
 
@@ -4592,10 +4611,11 @@ static bool api_WPrintJobGetInfo(struct smbd_server_connection *sconn,
 
 	ZERO_STRUCT(handle);
 
-	status = rpc_pipe_open_interface(conn,
+	status = rpc_pipe_open_interface(mem_ctx,
 					 &ndr_table_spoolss,
 					 conn->session_info,
 					 conn->sconn->remote_address,
+					 conn->sconn->local_address,
 					 conn->sconn->msg_ctx,
 					 &cli);
 	if (!NT_STATUS_IS_OK(status)) {
@@ -4734,10 +4754,11 @@ static bool api_WPrintJobEnumerate(struct smbd_server_connection *sconn,
 
 	ZERO_STRUCT(handle);
 
-	status = rpc_pipe_open_interface(conn,
+	status = rpc_pipe_open_interface(mem_ctx,
 					 &ndr_table_spoolss,
 					 conn->session_info,
 					 conn->sconn->remote_address,
+					 conn->sconn->local_address,
 					 conn->sconn->msg_ctx,
 					 &cli);
 	if (!NT_STATUS_IS_OK(status)) {
@@ -4934,10 +4955,11 @@ static bool api_WPrintDestGetInfo(struct smbd_server_connection *sconn,
 
 	ZERO_STRUCT(handle);
 
-	status = rpc_pipe_open_interface(conn,
+	status = rpc_pipe_open_interface(mem_ctx,
 					 &ndr_table_spoolss,
 					 conn->session_info,
 					 conn->sconn->remote_address,
+					 conn->sconn->local_address,
 					 conn->sconn->msg_ctx,
 					 &cli);
 	if (!NT_STATUS_IS_OK(status)) {
@@ -5066,10 +5088,11 @@ static bool api_WPrintDestEnum(struct smbd_server_connection *sconn,
 
 	queuecnt = 0;
 
-	status = rpc_pipe_open_interface(conn,
+	status = rpc_pipe_open_interface(mem_ctx,
 					 &ndr_table_spoolss,
 					 conn->session_info,
 					 conn->sconn->remote_address,
+					 conn->sconn->local_address,
 					 conn->sconn->msg_ctx,
 					 &cli);
 	if (!NT_STATUS_IS_OK(status)) {
@@ -5377,10 +5400,11 @@ static bool api_RNetSessionEnum(struct smbd_server_connection *sconn,
 		return False;
 	}
 
-	status = rpc_pipe_open_interface(conn,
+	status = rpc_pipe_open_interface(mem_ctx,
 					 &ndr_table_srvsvc,
 					 conn->session_info,
 					 conn->sconn->remote_address,
+					 conn->sconn->local_address,
 					 conn->sconn->msg_ctx,
 					 &cli);
 	if (!NT_STATUS_IS_OK(status)) {
@@ -5394,7 +5418,7 @@ static bool api_RNetSessionEnum(struct smbd_server_connection *sconn,
 	info_ctr.level = 1;
 	info_ctr.ctr.ctr1 = talloc_zero(talloc_tos(), struct srvsvc_NetSessCtr1);
 	if (info_ctr.ctr.ctr1 == NULL) {
-		desc.errcode = W_ERROR_V(WERR_NOMEM);
+		desc.errcode = W_ERROR_V(WERR_NOT_ENOUGH_MEMORY);
 		goto out;
 	}
 
@@ -5530,44 +5554,183 @@ static const struct {
 			int,int,char **,char **,int *,int *);
 	bool auth_user;		/* Deny anonymous access? */
 } api_commands[] = {
-	{"RNetShareEnum",	RAP_WshareEnum,		api_RNetShareEnum, True},
-	{"RNetShareGetInfo",	RAP_WshareGetInfo,	api_RNetShareGetInfo},
-	{"RNetShareAdd",	RAP_WshareAdd,		api_RNetShareAdd},
-	{"RNetSessionEnum",	RAP_WsessionEnum,	api_RNetSessionEnum, True},
-	{"RNetServerGetInfo",	RAP_WserverGetInfo,	api_RNetServerGetInfo},
-	{"RNetGroupEnum",	RAP_WGroupEnum,		api_RNetGroupEnum, True},
-	{"RNetGroupGetUsers", RAP_WGroupGetUsers,	api_RNetGroupGetUsers, True},
-	{"RNetUserEnum", 	RAP_WUserEnum,		api_RNetUserEnum, True},
-	{"RNetUserGetInfo",	RAP_WUserGetInfo,	api_RNetUserGetInfo},
-	{"NetUserGetGroups",	RAP_WUserGetGroups,	api_NetUserGetGroups},
-	{"NetWkstaGetInfo",	RAP_WWkstaGetInfo,	api_NetWkstaGetInfo},
-	{"DosPrintQEnum",	RAP_WPrintQEnum,	api_DosPrintQEnum, True},
-	{"DosPrintQGetInfo",	RAP_WPrintQGetInfo,	api_DosPrintQGetInfo},
-	{"WPrintQueuePause",  RAP_WPrintQPause,	api_WPrintQueueCtrl},
-	{"WPrintQueueResume", RAP_WPrintQContinue,	api_WPrintQueueCtrl},
-	{"WPrintJobEnumerate",RAP_WPrintJobEnum,	api_WPrintJobEnumerate},
-	{"WPrintJobGetInfo",	RAP_WPrintJobGetInfo,	api_WPrintJobGetInfo},
-	{"RDosPrintJobDel",	RAP_WPrintJobDel,	api_RDosPrintJobDel},
-	{"RDosPrintJobPause",	RAP_WPrintJobPause,	api_RDosPrintJobDel},
-	{"RDosPrintJobResume",RAP_WPrintJobContinue,	api_RDosPrintJobDel},
-	{"WPrintDestEnum",	RAP_WPrintDestEnum,	api_WPrintDestEnum},
-	{"WPrintDestGetInfo",	RAP_WPrintDestGetInfo,	api_WPrintDestGetInfo},
-	{"NetRemoteTOD",	RAP_NetRemoteTOD,	api_NetRemoteTOD},
-	{"WPrintQueuePurge",	RAP_WPrintQPurge,	api_WPrintQueueCtrl},
-	{"NetServerEnum2",	RAP_NetServerEnum2,	api_RNetServerEnum2}, /* anon OK */
-	{"NetServerEnum3",	RAP_NetServerEnum3,	api_RNetServerEnum3}, /* anon OK */
-	{"WAccessGetUserPerms",RAP_WAccessGetUserPerms,api_WAccessGetUserPerms},
-	{"WWkstaUserLogon",	RAP_WWkstaUserLogon,	api_WWkstaUserLogon},
-	{"PrintJobInfo",	RAP_WPrintJobSetInfo,	api_PrintJobInfo},
-	{"WPrintDriverEnum",	RAP_WPrintDriverEnum,	api_WPrintDriverEnum},
-	{"WPrintQProcEnum",	RAP_WPrintQProcessorEnum,api_WPrintQProcEnum},
-	{"WPrintPortEnum",	RAP_WPrintPortEnum,	api_WPrintPortEnum},
-	{"SamOEMChangePassword",RAP_SamOEMChgPasswordUser2_P,api_SamOEMChangePassword}, /* anon OK */
-	{NULL,		-1,	api_Unsupported}
-	/*  The following RAP calls are not implemented by Samba:
-
-	RAP_WFileEnum2 - anon not OK
-	*/
+	{
+		.name = "RNetShareEnum",
+		.id = RAP_WshareEnum,
+		.fn = api_RNetShareEnum,
+		.auth_user = true,
+	},
+	{
+		.name = "RNetShareGetInfo",
+		.id = RAP_WshareGetInfo,
+		.fn = api_RNetShareGetInfo
+	},
+	{
+		.name = "RNetShareAdd",
+		.id = RAP_WshareAdd,
+		.fn = api_RNetShareAdd
+	},
+	{
+		.name = "RNetSessionEnum",
+		.id = RAP_WsessionEnum,
+		.fn = api_RNetSessionEnum,
+		.auth_user = true,
+	},
+	{
+		.name = "RNetServerGetInfo",
+		.id = RAP_WserverGetInfo,
+		.fn = api_RNetServerGetInfo
+	},
+	{
+		.name = "RNetGroupEnum",
+		.id = RAP_WGroupEnum,
+		.fn = api_RNetGroupEnum, True
+	},
+	{
+		.name = "RNetGroupGetUsers",
+		.id = RAP_WGroupGetUsers,
+		.fn = api_RNetGroupGetUsers,
+		.auth_user = true},
+	{
+		.name = "RNetUserEnum",
+		.id = RAP_WUserEnum,
+		.fn = api_RNetUserEnum,
+		.auth_user = true,
+	},
+	{
+		.name = "RNetUserGetInfo",
+		.id = RAP_WUserGetInfo,
+		.fn = api_RNetUserGetInfo
+	},
+	{
+		.name = "NetUserGetGroups",
+		.id = RAP_WUserGetGroups,
+		.fn = api_NetUserGetGroups
+	},
+	{
+		.name = "NetWkstaGetInfo",
+		.id = RAP_WWkstaGetInfo,
+		.fn = api_NetWkstaGetInfo
+	},
+	{
+		.name = "DosPrintQEnum",
+		.id = RAP_WPrintQEnum,
+		.fn = api_DosPrintQEnum,
+		.auth_user = true,
+	},
+	{
+		.name = "DosPrintQGetInfo",
+		.id = RAP_WPrintQGetInfo,
+		.fn = api_DosPrintQGetInfo
+	},
+	{
+		.name = "WPrintQueuePause",
+		.id = RAP_WPrintQPause,
+		.fn = api_WPrintQueueCtrl
+	},
+	{
+		.name = "WPrintQueueResume",
+		.id = RAP_WPrintQContinue,
+		.fn = api_WPrintQueueCtrl
+	},
+	{
+		.name = "WPrintJobEnumerate",
+		.id = RAP_WPrintJobEnum,
+		.fn = api_WPrintJobEnumerate
+	},
+	{
+		.name = "WPrintJobGetInfo",
+		.id = RAP_WPrintJobGetInfo,
+		.fn = api_WPrintJobGetInfo
+	},
+	{
+		.name = "RDosPrintJobDel",
+		.id = RAP_WPrintJobDel,
+		.fn = api_RDosPrintJobDel
+	},
+	{
+		.name = "RDosPrintJobPause",
+		.id = RAP_WPrintJobPause,
+		.fn = api_RDosPrintJobDel
+	},
+	{
+		.name = "RDosPrintJobResume",
+		.id = RAP_WPrintJobContinue,
+		.fn = api_RDosPrintJobDel
+	},
+	{
+		.name = "WPrintDestEnum",
+		.id = RAP_WPrintDestEnum,
+		.fn = api_WPrintDestEnum
+	},
+	{
+		.name = "WPrintDestGetInfo",
+		.id = RAP_WPrintDestGetInfo,
+		.fn = api_WPrintDestGetInfo
+	},
+	{
+		.name = "NetRemoteTOD",
+		.id = RAP_NetRemoteTOD,
+		.fn = api_NetRemoteTOD
+	},
+	{
+		.name = "WPrintQueuePurge",
+		.id = RAP_WPrintQPurge,
+		.fn = api_WPrintQueueCtrl
+	},
+	{
+		.name = "NetServerEnum2",
+		.id = RAP_NetServerEnum2,
+		.fn = api_RNetServerEnum2
+	}, /* anon OK */
+	{
+		.name = "NetServerEnum3",
+		.id = RAP_NetServerEnum3,
+		.fn = api_RNetServerEnum3
+	}, /* anon OK */
+	{
+		.name = "WAccessGetUserPerms",
+		.id = RAP_WAccessGetUserPerms,
+		.fn = api_WAccessGetUserPerms
+	},
+	{
+		.name = "WWkstaUserLogon",
+		.id = RAP_WWkstaUserLogon,
+		.fn = api_WWkstaUserLogon
+	},
+	{
+		.name = "PrintJobInfo",
+		.id = RAP_WPrintJobSetInfo,
+		.fn = api_PrintJobInfo
+	},
+	{
+		.name = "WPrintDriverEnum",
+		.id = RAP_WPrintDriverEnum,
+		.fn = api_WPrintDriverEnum
+	},
+	{
+		.name = "WPrintQProcEnum",
+		.id = RAP_WPrintQProcessorEnum,
+		.fn = api_WPrintQProcEnum
+	},
+	{
+		.name = "WPrintPortEnum",
+		.id = RAP_WPrintPortEnum,
+		.fn = api_WPrintPortEnum
+	},
+	{
+		.name = "SamOEMChangePassword",
+		.id = RAP_SamOEMChgPasswordUser2_P,
+		.fn = api_SamOEMChangePassword
+	}, /* anon OK */
+	{
+		.name = NULL,
+		.id   = -1,
+		.fn   = api_Unsupported}
+	/*
+	 * The following RAP calls are not implemented by Samba:
+	 *   RAP_WFileEnum2 - anon not OK
+	 */
 };
 
 
@@ -5629,9 +5792,18 @@ void api_reply(connection_struct *conn, uint64_t vuid,
 	/* Check whether this api call can be done anonymously */
 
 	if (api_commands[i].auth_user && lp_restrict_anonymous()) {
-		struct user_struct *user = get_valid_user_struct(req->sconn, vuid);
+		struct auth_session_info *si = NULL;
+		NTSTATUS status;
 
-		if (!user || security_session_user_level(user->session_info, NULL) < SECURITY_USER) {
+		status = smbXsrv_session_info_lookup(conn->sconn->client,
+						     vuid,
+						     &si);
+		if (!NT_STATUS_IS_OK(status)) {
+			reply_nterror(req, NT_STATUS_ACCESS_DENIED);
+			return;
+		}
+
+		if (security_session_user_level(si, NULL) < SECURITY_USER) {
 			reply_nterror(req, NT_STATUS_ACCESS_DENIED);
 			return;
 		}

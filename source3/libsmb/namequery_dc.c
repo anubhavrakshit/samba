@@ -23,6 +23,7 @@
 
 
 #include "includes.h"
+#include "libsmb/namequery.h"
 #include "libads/sitename_cache.h"
 #include "ads.h"
 #include "../librpc/gen_ndr/nbt.h"
@@ -32,7 +33,7 @@
  Is this our primary domain ?
 **********************************************************************/
 
-#ifdef HAVE_KRB5
+#ifdef HAVE_ADS
 static bool is_our_primary_domain(const char *domain)
 {
 	int role = lp_server_role();
@@ -68,7 +69,7 @@ static bool ads_dc_name(const char *domain,
 
 	/* Try this 3 times then give up. */
 	for( i =0 ; i < 3; i++) {
-		ads = ads_init(realm, domain, NULL);
+		ads = ads_init(realm, domain, NULL, ADS_SASL_PLAIN);
 		if (!ads) {
 			TALLOC_FREE(sitename);
 			return False;

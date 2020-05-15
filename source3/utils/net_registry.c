@@ -37,6 +37,7 @@
 #include "../libcli/registry/util_reg.h"
 #include "passdb/machine_sid.h"
 #include "net_registry_check.h"
+#include "lib/util/util_tdb.h"
 
 /*
  *
@@ -59,7 +60,7 @@ static WERROR open_hive(TALLOC_CTX *ctx, const char *path,
 	TALLOC_CTX *tmp_ctx = talloc_stackframe();
 
 	if ((hive == NULL) || (subkeyname == NULL)) {
-		werr = WERR_INVALID_PARAM;
+		werr = WERR_INVALID_PARAMETER;
 		goto done;
 	}
 
@@ -69,7 +70,7 @@ static WERROR open_hive(TALLOC_CTX *ctx, const char *path,
 	}
 	*subkeyname = talloc_strdup(ctx, tmp_subkeyname);
 	if (*subkeyname == NULL) {
-		werr = WERR_NOMEM;
+		werr = WERR_NOT_ENOUGH_MEMORY;
 		goto done;
 	}
 
@@ -100,7 +101,7 @@ static WERROR open_key(TALLOC_CTX *ctx, const char *path,
 	TALLOC_CTX *tmp_ctx = talloc_stackframe();
 
 	if ((path == NULL) || (key == NULL)) {
-		return WERR_INVALID_PARAM;
+		return WERR_INVALID_PARAMETER;
 	}
 
 	werr = open_hive(tmp_ctx, path, desired_access, &hive, &subkey_name);
@@ -366,7 +367,7 @@ static int net_registry_deletekey_internal(struct net_context *c, int argc,
 		werr = reg_deletekey(hivekey, subkeyname);
 	}
 	if (!W_ERROR_IS_OK(werr) &&
-	    !(c->opt_force && W_ERROR_EQUAL(werr, WERR_BADFILE)))
+	    !(c->opt_force && W_ERROR_EQUAL(werr, WERR_FILE_NOT_FOUND)))
 	{
 		d_fprintf(stderr, "reg_deletekey %s: %s\n", _("failed"),
 			  win_errstr(werr));
@@ -508,7 +509,14 @@ static int net_registry_setvalue(struct net_context *c, int argc,
 	}
 
 	if (strequal(argv[2], "dword")) {
-		uint32_t v = strtoul(argv[3], NULL, 10);
+		int error = 0;
+		uint32_t v;
+
+		v = smb_strtoul(argv[3], NULL, 10, &error, SMB_STR_STANDARD);
+		if (error != 0) {
+			goto done;
+		}
+
 		value.type = REG_DWORD;
 		value.data = data_blob_talloc(ctx, NULL, 4);
 		SIVAL(value.data.data, 0, v);
@@ -560,34 +568,68 @@ done:
 	return ret;
 }
 
-struct net_registry_increment_state {
-	const char *keyname;
-	const char *valuename;
+static int net_registry_increment(struct net_context *c, int argc,
+				  const char **argv)
+{
+	TDB_DATA lock_key = string_term_tdb_data("registry_increment_lock");
+	struct g_lock_ctx *ctx = NULL;
+	const char *keyname = NULL;
+	struct registry_key *key = NULL;
+	const char *valuename = NULL;
+	struct registry_value *value = NULL;
+	uint32_t v;
 	uint32_t increment;
 	uint32_t newvalue;
+	NTSTATUS status;
 	WERROR werr;
-};
+	int ret = -1;
 
-static void net_registry_increment_fn(void *private_data)
-{
-	struct net_registry_increment_state *state =
-		(struct net_registry_increment_state *)private_data;
-	struct registry_value *value;
-	struct registry_key *key = NULL;
-	uint32_t v;
-
-	state->werr = open_key(talloc_tos(), state->keyname,
-			       REG_KEY_READ|REG_KEY_WRITE, &key);
-	if (!W_ERROR_IS_OK(state->werr)) {
-		d_fprintf(stderr, _("open_key failed: %s\n"),
-			  win_errstr(state->werr));
+	if (argc < 2 || c->display_usage) {
+		d_fprintf(stderr, "%s\n%s",
+			  _("Usage:"),
+			  _("net registry increment <key> <valuename> "
+			    "[<increment>]\n"));
 		goto done;
 	}
 
-	state->werr = reg_queryvalue(key, key, state->valuename, &value);
-	if (!W_ERROR_IS_OK(state->werr)) {
+	keyname = argv[0];
+	valuename = argv[1];
+
+	increment = 1;
+	if (argc == 3) {
+		int error = 0;
+
+		increment = smb_strtoul(
+			argv[2], NULL, 10, &error, SMB_STR_STANDARD);
+		if (error != 0) {
+			goto done;
+		}
+	}
+
+	ctx = g_lock_ctx_init(c, c->msg_ctx);
+	if (ctx == NULL) {
+		d_fprintf(stderr, _("g_lock_ctx_init failed\n"));
+		goto done;
+	}
+
+	status = g_lock_lock(ctx, lock_key, G_LOCK_WRITE, timeval_set(600, 0));
+	if (!NT_STATUS_IS_OK(status)) {
+		d_fprintf(stderr, _("g_lock_lock failed: %s\n"),
+			  nt_errstr(status));
+		goto done;
+	}
+
+	werr = open_key(c, keyname, REG_KEY_READ|REG_KEY_WRITE, &key);
+	if (!W_ERROR_IS_OK(werr)) {
+		d_fprintf(stderr, _("open_key failed: %s\n"),
+			  win_errstr(werr));
+		goto done;
+	}
+
+	werr = reg_queryvalue(key, key, valuename, &value);
+	if (!W_ERROR_IS_OK(werr)) {
 		d_fprintf(stderr, _("reg_queryvalue failed: %s\n"),
-			  win_errstr(state->werr));
+			  win_errstr(werr));
 		goto done;
 	}
 
@@ -603,65 +645,34 @@ static void net_registry_increment_fn(void *private_data)
 	}
 
 	v = IVAL(value->data.data, 0);
-	v += state->increment;
-	state->newvalue = v;
+	v += increment;
+	newvalue = v;
 
 	SIVAL(value->data.data, 0, v);
 
-	state->werr = reg_setvalue(key, state->valuename, value);
-	if (!W_ERROR_IS_OK(state->werr)) {
+	werr = reg_setvalue(key, valuename, value);
+	if (!W_ERROR_IS_OK(werr)) {
 		d_fprintf(stderr, _("reg_setvalue failed: %s\n"),
-			  win_errstr(state->werr));
+			  win_errstr(werr));
 		goto done;
 	}
 
-done:
-	TALLOC_FREE(key);
-	return;
-}
-
-static int net_registry_increment(struct net_context *c, int argc,
-				  const char **argv)
-{
-	struct net_registry_increment_state state;
-	NTSTATUS status;
-	int ret = -1;
-
-	if (argc < 2 || c->display_usage) {
-		d_fprintf(stderr, "%s\n%s",
-			  _("Usage:"),
-			  _("net registry increment <key> <valuename> "
-			    "[<increment>]\n"));
-		goto done;
-	}
-
-	state.keyname = argv[0];
-	state.valuename = argv[1];
-
-	state.increment = 1;
-	if (argc == 3) {
-		state.increment = strtoul(argv[2], NULL, 10);
-	}
-
-	status = g_lock_do("registry_increment_lock", G_LOCK_WRITE,
-			   timeval_set(600, 0),
-			   net_registry_increment_fn, &state);
-	if (!NT_STATUS_IS_OK(status)) {
-		d_fprintf(stderr, _("g_lock_do failed: %s\n"),
-			  nt_errstr(status));
-		goto done;
-	}
-	if (!W_ERROR_IS_OK(state.werr)) {
+	if (!W_ERROR_IS_OK(werr)) {
 		d_fprintf(stderr, _("increment failed: %s\n"),
-			  win_errstr(state.werr));
+			  win_errstr(werr));
 		goto done;
 	}
 
-	d_printf(_("%u\n"), (unsigned)state.newvalue);
+	g_lock_unlock(ctx, lock_key);
+
+	d_printf(_("%"PRIu32"\n"), newvalue);
 
 	ret = 0;
 
 done:
+	TALLOC_FREE(value);
+	TALLOC_FREE(key);
+	TALLOC_FREE(ctx);
 	return ret;
 }
 
@@ -720,13 +731,13 @@ static WERROR net_registry_getsd_internal(struct net_context *c,
 
 	if (sd == NULL) {
 		d_fprintf(stderr, _("internal error: invalid argument\n"));
-		werr = WERR_INVALID_PARAM;
+		werr = WERR_INVALID_PARAMETER;
 		goto done;
 	}
 
 	if (strlen(keyname) == 0) {
 		d_fprintf(stderr, _("error: zero length key name given\n"));
-		werr = WERR_INVALID_PARAM;
+		werr = WERR_INVALID_PARAMETER;
 		goto done;
 	}
 
@@ -835,7 +846,7 @@ static WERROR net_registry_setsd_internal(struct net_context *c,
 
 	if (strlen(keyname) == 0) {
 		d_fprintf(stderr, _("error: zero length key name given\n"));
-		werr = WERR_INVALID_PARAM;
+		werr = WERR_INVALID_PARAMETER;
 		goto done;
 	}
 
@@ -1004,7 +1015,7 @@ static WERROR import_create_val (struct import_ctx *ctx,
 	WERROR werr;
 
 	if (parent == NULL) {
-		return WERR_INVALID_PARAM;
+		return WERR_INVALID_PARAMETER;
 	}
 
 	werr = reg_setvalue(parent, name, value);
@@ -1021,7 +1032,7 @@ static WERROR import_delete_val (struct import_ctx *ctx,
 	WERROR werr;
 
 	if (parent == NULL) {
-		return WERR_INVALID_PARAM;
+		return WERR_INVALID_PARAMETER;
 	}
 
 	werr = reg_deletevalue(parent, name);
@@ -1110,7 +1121,7 @@ static WERROR precheck_delete_key(struct precheck_ctx *ctx,
 		d_printf("Precheck: key [%s\\%s] should not exist\n",
 			 parent->key->name, name);
 		werr = WERR_FILE_EXISTS;
-	} else if (W_ERROR_EQUAL(werr, WERR_BADFILE)) {
+	} else if (W_ERROR_EQUAL(werr, WERR_FILE_NOT_FOUND)) {
 		werr = WERR_OK;
 	} else {
 		d_printf("Precheck: openkey [%s\\%s] failed: %s\n",
@@ -1165,7 +1176,7 @@ static WERROR precheck_delete_val(struct precheck_ctx *ctx,
 		d_printf("Precheck: value \"%s\" of key [%s] should not exist\n",
 			 name, parent->key->name);
 		werr = WERR_FILE_EXISTS;
-	} else if (W_ERROR_EQUAL(werr, WERR_BADFILE)) {
+	} else if (W_ERROR_EQUAL(werr, WERR_FILE_NOT_FOUND)) {
 		werr = WERR_OK;
 	} else {
 		printf("Precheck: queryvalue \"%s\" of key [%s] failed: %s\n",
@@ -1511,7 +1522,7 @@ static int net_registry_check(struct net_context *c, int argc,
 	} else if (argc > 0) {
 		dbfile = talloc_strdup(talloc_tos(), argv[0]);
 	} else {
-		dbfile = state_path("registry.tdb");
+		dbfile = state_path(talloc_tos(), "registry.tdb");
 	}
 	if (dbfile == NULL) {
 		return -1;

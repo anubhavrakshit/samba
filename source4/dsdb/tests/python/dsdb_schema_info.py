@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 #
 # Unix SMB/CIFS implementation.
@@ -34,7 +33,6 @@ import samba.tests
 
 from ldb import SCOPE_BASE, LdbError
 
-import samba.tests
 import samba.dcerpc.drsuapi
 from samba.dcerpc.drsblobs import schemaInfoBlob
 from samba.ndr import ndr_unpack
@@ -51,12 +49,12 @@ class SchemaInfoTestCase(samba.tests.TestCase):
 
         # connect SamDB if we haven't yet
         if self.sam_db is None:
-            ldb_url = samba.tests.env_get_var_value("DC_SERVER")
+            ldb_url = "ldap://%s" % samba.tests.env_get_var_value("DC_SERVER")
             SchemaInfoTestCase.sam_db = samba.tests.connect_samdb(ldb_url)
 
         # fetch rootDSE
         res = self.sam_db.search(base="", expression="", scope=SCOPE_BASE, attrs=["*"])
-        self.assertEquals(len(res), 1)
+        self.assertEqual(len(res), 1)
         self.schema_dn = res[0]["schemaNamingContext"][0]
         self.base_dn = res[0]["defaultNamingContext"][0]
         self.forest_level = int(res[0]["forestFunctionality"][0])
@@ -104,7 +102,7 @@ schemaUpdateNow: 1
         obj_dn = "CN=%s,%s" % (obj_name, self.schema_dn)
         return (obj_name, obj_ldap_name, obj_dn)
 
-    def _make_attr_ldif(self, attr_name, attr_dn):
+    def _make_attr_ldif(self, attr_name, attr_dn, sub_oid):
         ldif = """
 dn: """ + attr_dn + """
 objectClass: top
@@ -112,7 +110,7 @@ objectClass: attributeSchema
 adminDescription: """ + attr_name + """
 adminDisplayName: """ + attr_name + """
 cn: """ + attr_name + """
-attributeId: 1.2.840.""" + str(random.randint(1,100000)) + """.1.5.9940
+attributeId: 1.3.6.1.4.1.7165.4.6.1.7.%d.""" % sub_oid + str(random.randint(1, 100000)) + """
 attributeSyntax: 2.5.5.12
 omSyntax: 64
 instanceType: 4
@@ -127,7 +125,7 @@ systemOnly: FALSE
 
         # create names for an attribute to add
         (attr_name, attr_ldap_name, attr_dn) = self._make_obj_names("schemaInfo-Attr-")
-        ldif = self._make_attr_ldif(attr_name, attr_dn)
+        ldif = self._make_attr_ldif(attr_name, attr_dn, 1)
 
         # add the new attribute
         self.sam_db.add_ldif(ldif)
@@ -140,16 +138,16 @@ systemOnly: FALSE
         attr_dn_new = attr_dn.replace(attr_name, attr_name + "-NEW")
         try:
             self.sam_db.rename(attr_dn, attr_dn_new)
-        except LdbError, (num, _):
-            self.fail("failed to change lDAPDisplayName for %s: %s" % (attr_name, _))
+        except LdbError as e:
+            (num, _) = e.args
+            self.fail("failed to change CN for %s: %s" % (attr_name, _))
 
         # compare resulting schemaInfo
         schi_after = self._getSchemaInfo()
         self._checkSchemaInfo(schi_before, schi_after)
         pass
 
-
-    def _make_class_ldif(self, class_name, class_dn):
+    def _make_class_ldif(self, class_name, class_dn, sub_oid):
         ldif = """
 dn: """ + class_dn + """
 objectClass: top
@@ -157,7 +155,7 @@ objectClass: classSchema
 adminDescription: """ + class_name + """
 adminDisplayName: """ + class_name + """
 cn: """ + class_name + """
-governsId: 1.2.840.""" + str(random.randint(1,100000)) + """.1.5.9939
+governsId: 1.3.6.1.4.1.7165.4.6.2.7.%d.""" % sub_oid + str(random.randint(1, 100000)) + """
 instanceType: 4
 objectClassCategory: 1
 subClassOf: organizationalPerson
@@ -167,16 +165,17 @@ systemOnly: FALSE
 """
         return ldif
 
-    def test_AddModifyClass(self):
+    def test_AddModifyClass(self, controls=[], class_pre="schemaInfo-Class-"):
         # get initial schemaInfo
         schi_before = self._getSchemaInfo()
 
         # create names for a Class to add
-        (class_name, class_ldap_name, class_dn) = self._make_obj_names("schemaInfo-Class-")
-        ldif = self._make_class_ldif(class_name, class_dn)
+        (class_name, class_ldap_name, class_dn) =\
+                self._make_obj_names(class_pre)
+        ldif = self._make_class_ldif(class_name, class_dn, 1)
 
         # add the new Class
-        self.sam_db.add_ldif(ldif)
+        self.sam_db.add_ldif(ldif, controls=controls)
         self._ldap_schemaUpdateNow()
         # compare resulting schemaInfo
         schi_after = self._getSchemaInfo()
@@ -185,11 +184,17 @@ systemOnly: FALSE
         # rename the Class
         class_dn_new = class_dn.replace(class_name, class_name + "-NEW")
         try:
-            self.sam_db.rename(class_dn, class_dn_new)
-        except LdbError, (num, _):
-            self.fail("failed to change lDAPDisplayName for %s: %s" % (class_name, _))
+            self.sam_db.rename(class_dn, class_dn_new, controls=controls)
+        except LdbError as e1:
+            (num, _) = e1.args
+            self.fail("failed to change CN for %s: %s" % (class_name, _))
 
         # compare resulting schemaInfo
         schi_after = self._getSchemaInfo()
         self._checkSchemaInfo(schi_before, schi_after)
 
+    def test_AddModifyClassLocalRelaxed(self):
+        lp = self.get_loadparm()
+        self.sam_db = samba.tests.connect_samdb(lp.samdb_url())
+        self.test_AddModifyClass(controls=["relax:0"],
+                                 class_pre="schemaInfo-Relaxed-")

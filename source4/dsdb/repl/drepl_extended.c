@@ -31,6 +31,9 @@
 #include "dsdb/repl/drepl_service.h"
 #include "param/param.h"
 
+#undef DBGC_CLASS
+#define DBGC_CLASS            DBGC_DRS_REPL
+
 
 /*
   create the role owner source dsa structure
@@ -58,18 +61,18 @@ static WERROR drepl_create_extended_source_dsa(struct dreplsrv_service *service,
 	sdsa->partition = talloc_zero(sdsa, struct dreplsrv_partition);
 	if (!sdsa->partition) {
 		talloc_free(sdsa);
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	sdsa->partition->dn = ldb_dn_copy(sdsa->partition, nc_dn);
 	if (!sdsa->partition->dn) {
 		talloc_free(sdsa);
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 	sdsa->partition->nc.dn = ldb_dn_alloc_linearized(sdsa->partition, nc_dn);
 	if (!sdsa->partition->nc.dn) {
 		talloc_free(sdsa);
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 	ret = dsdb_find_guid_by_dn(ldb, nc_dn, &sdsa->partition->nc.guid);
 	if (ret != LDB_SUCCESS) {
@@ -91,7 +94,7 @@ static WERROR drepl_create_extended_source_dsa(struct dreplsrv_service *service,
 	sdsa->repsFrom1->other_info = talloc_zero(sdsa, struct repsFromTo1OtherInfo);
 	if (!sdsa->repsFrom1->other_info) {
 		talloc_free(sdsa);
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	sdsa->repsFrom1->other_info->dns_name = samdb_ntds_msdcs_dns_name(ldb,
@@ -99,7 +102,7 @@ static WERROR drepl_create_extended_source_dsa(struct dreplsrv_service *service,
 									  &sdsa->repsFrom1->source_dsa_obj_guid);
 	if (!sdsa->repsFrom1->other_info->dns_name) {
 		talloc_free(sdsa);
-		return WERR_NOMEM;
+		return WERR_NOT_ENOUGH_MEMORY;
 	}
 
 	werr = dreplsrv_out_connection_attach(service, sdsa->repsFrom1, &sdsa->conn);

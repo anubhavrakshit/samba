@@ -17,11 +17,12 @@
 
 """Tests for samba.netcmd."""
 
-from cStringIO import StringIO
+from samba.compat import StringIO
 from samba.netcmd import Command
 from samba.netcmd.testparm import cmd_testparm
 from samba.netcmd.main import cmd_sambatool
 import samba.tests
+
 
 class NetCmdTestCase(samba.tests.TestCase):
 
@@ -29,30 +30,29 @@ class NetCmdTestCase(samba.tests.TestCase):
         cmd = cmd_klass(outf=StringIO(), errf=StringIO())
         try:
             retval = cmd._run(cmd_klass.__name__, *args)
-        except Exception, e:
+        except Exception as e:
             cmd.show_command_error(e)
             retval = 1
-        self.assertEquals(retcode, retval)
+        self.assertEqual(retcode, retval)
         return cmd.outf.getvalue(), cmd.errf.getvalue()
 
     def iter_all_subcommands(self):
-        todo = []
-        todo.extend(cmd_sambatool.subcommands.items())
+        todo = list(cmd_sambatool.subcommands.items())
         while todo:
             (path, cmd) = todo.pop()
             yield path, cmd
             subcmds = getattr(cmd, "subcommands", {})
             todo.extend([(path + " " + k, v) for (k, v) in
-                subcmds.iteritems()])
+                         subcmds.items()])
 
 
 class TestParmTests(NetCmdTestCase):
 
     def test_no_client_ip(self):
         out, err = self.run_netcmd(cmd_testparm, ["--client-name=foo"],
-            retcode=-1)
-        self.assertEquals("", out)
-        self.assertEquals(
+                                   retcode=-1)
+        self.assertEqual("", out)
+        self.assertEqual(
             "ERROR: Both a DNS name and an IP address are "
             "required for the host access check\n", err)
 
@@ -62,12 +62,12 @@ class CommandTests(NetCmdTestCase):
     def test_description(self):
         class cmd_foo(Command):
             """Mydescription"""
-        self.assertEquals("Mydescription", cmd_foo().short_description)
+        self.assertEqual("Mydescription", cmd_foo().short_description)
 
     def test_name(self):
         class cmd_foo(Command):
             pass
-        self.assertEquals("foo", cmd_foo().name)
+        self.assertEqual("foo", cmd_foo().name)
 
     def test_synopsis_everywhere(self):
         missing = []
@@ -76,7 +76,7 @@ class CommandTests(NetCmdTestCase):
                 missing.append(path)
         if missing:
             self.fail("The following commands do not have a synopsis set: %r" %
-                    missing)
+                      missing)
 
     def test_short_description_everywhere(self):
         missing = []
@@ -87,4 +87,4 @@ class CommandTests(NetCmdTestCase):
             return
         self.fail(
             "The following commands do not have a short description set: %r" %
-                missing)
+            missing)

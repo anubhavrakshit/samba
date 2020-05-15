@@ -23,9 +23,15 @@
 */
 
 #include "includes.h"
+
+#undef DBGC_CLASS
+#define DBGC_CLASS DBGC_AUTH
+
 #ifdef HAVE_KRB5
 
 #include "librpc/gen_ndr/ndr_krb5pac.h"
+#include "librpc/gen_ndr/auth.h"
+#include "auth/common_auth.h"
 #include "auth/kerberos/pac_utils.h"
 
 krb5_error_code check_pac_checksum(DATA_BLOB pac_data,
@@ -38,6 +44,28 @@ krb5_error_code check_pac_checksum(DATA_BLOB pac_data,
 	krb5_keyusage usage = 0;
 	krb5_boolean checksum_valid = false;
 	krb5_data input;
+
+	switch (sig->type) {
+	case CKSUMTYPE_HMAC_MD5:
+		/* ignores the key type */
+		break;
+	case CKSUMTYPE_HMAC_SHA1_96_AES_256:
+		if (KRB5_KEY_TYPE(keyblock) != ENCTYPE_AES256_CTS_HMAC_SHA1_96) {
+			return EINVAL;
+		}
+		/* ok */
+		break;
+	case CKSUMTYPE_HMAC_SHA1_96_AES_128:
+		if (KRB5_KEY_TYPE(keyblock) != ENCTYPE_AES128_CTS_HMAC_SHA1_96) {
+			return EINVAL;
+		}
+		/* ok */
+		break;
+	default:
+		DEBUG(2,("check_pac_checksum: Checksum Type %d is not supported\n",
+			(int)sig->type));
+		return EINVAL;
+	}
 
 #ifdef HAVE_CHECKSUM_IN_KRB5_CHECKSUM /* Heimdal */
 	cksum.cksumtype	= (krb5_cksumtype)sig->type;
@@ -438,6 +466,89 @@ NTSTATUS kerberos_pac_logon_info(TALLOC_CTX *mem_ctx,
 		return NT_STATUS_INVALID_PARAMETER;
 	}
 	return NT_STATUS_OK;
+}
+
+static NTSTATUS auth4_context_fetch_PAC_DATA_CTR(
+				struct auth4_context *auth_ctx,
+				TALLOC_CTX *mem_ctx,
+				struct smb_krb5_context *smb_krb5_context,
+				DATA_BLOB *pac_blob,
+				const char *princ_name,
+				const struct tsocket_address *remote_address,
+				uint32_t session_info_flags,
+				struct auth_session_info **session_info)
+{
+	struct PAC_DATA_CTR *pac_data_ctr = NULL;
+	NTSTATUS status;
+
+	if (pac_blob == NULL) {
+		return NT_STATUS_NO_IMPERSONATION_TOKEN;
+	}
+
+	pac_data_ctr = talloc_zero(mem_ctx, struct PAC_DATA_CTR);
+	if (pac_data_ctr == NULL) {
+		status = NT_STATUS_NO_MEMORY;
+		goto fail;
+	}
+
+	status = kerberos_decode_pac(pac_data_ctr,
+				     *pac_blob,
+				     NULL,
+				     NULL,
+				     NULL,
+				     NULL,
+				     0,
+				     &pac_data_ctr->pac_data);
+	if (!NT_STATUS_IS_OK(status)) {
+		goto fail;
+	}
+
+	pac_data_ctr->pac_blob = data_blob_talloc(pac_data_ctr,
+						  pac_blob->data,
+						  pac_blob->length);
+	if (pac_data_ctr->pac_blob.length != pac_blob->length) {
+		status = NT_STATUS_NO_MEMORY;
+		goto fail;
+	}
+
+	*session_info = talloc_zero(mem_ctx, struct auth_session_info);
+	if (*session_info == NULL) {
+		status = NT_STATUS_NO_MEMORY;
+		goto fail;
+	}
+
+	TALLOC_FREE(auth_ctx->private_data);
+	auth_ctx->private_data = talloc_move(auth_ctx, &pac_data_ctr);
+
+	return NT_STATUS_OK;
+
+fail:
+	TALLOC_FREE(pac_data_ctr);
+
+	return status;
+}
+
+struct auth4_context *auth4_context_for_PAC_DATA_CTR(TALLOC_CTX *mem_ctx)
+{
+	struct auth4_context *auth_ctx = NULL;
+
+	auth_ctx = talloc_zero(mem_ctx, struct auth4_context);
+	if (auth_ctx == NULL) {
+		return NULL;
+	}
+	auth_ctx->generate_session_info_pac = auth4_context_fetch_PAC_DATA_CTR;
+
+	return auth_ctx;
+}
+
+struct PAC_DATA_CTR *auth4_context_get_PAC_DATA_CTR(struct auth4_context *auth_ctx,
+						    TALLOC_CTX *mem_ctx)
+{
+	struct PAC_DATA_CTR *p = NULL;
+	SMB_ASSERT(auth_ctx->generate_session_info_pac == auth4_context_fetch_PAC_DATA_CTR);
+	p = talloc_get_type_abort(auth_ctx->private_data, struct PAC_DATA_CTR);
+	auth_ctx->private_data = NULL;
+	return talloc_move(mem_ctx, &p);
 }
 
 #endif

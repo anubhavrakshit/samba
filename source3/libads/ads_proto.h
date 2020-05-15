@@ -32,6 +32,12 @@
 #ifndef _LIBADS_ADS_PROTO_H_
 #define _LIBADS_ADS_PROTO_H_
 
+enum ads_sasl_state_e {
+	ADS_SASL_PLAIN = 0,
+	ADS_SASL_SIGN,
+	ADS_SASL_SEAL,
+};
+
 /* The following definitions come from libads/ads_struct.c  */
 
 char *ads_build_path(const char *realm, const char *sep, const char *field, int reverse);
@@ -39,7 +45,8 @@ char *ads_build_dn(const char *realm);
 char *ads_build_domain(const char *dn);
 ADS_STRUCT *ads_init(const char *realm,
 		     const char *workgroup,
-		     const char *ldap_server);
+		     const char *ldap_server,
+		     enum ads_sasl_state_e sasl_state);
 bool ads_set_sasl_wrap_flags(ADS_STRUCT *ads, int flags);
 void ads_destroy(ADS_STRUCT **ads);
 
@@ -49,10 +56,18 @@ void ads_disp_sd(ADS_STRUCT *ads, TALLOC_CTX *mem_ctx, struct security_descripto
 
 /* The following definitions come from libads/kerberos_keytab.c  */
 
-int ads_keytab_add_entry(ADS_STRUCT *ads, const char *srvPrinc);
+int ads_keytab_add_entry(ADS_STRUCT *ads, const char *srvPrinc,
+			 bool update_ads);
 int ads_keytab_flush(ADS_STRUCT *ads);
 int ads_keytab_create_default(ADS_STRUCT *ads);
 int ads_keytab_list(const char *keytab_name);
+
+/* The following definitions come from libads/net_ads_setspn.c  */
+bool ads_setspn_list(ADS_STRUCT *ads, const char *machine);
+bool ads_setspn_add(ADS_STRUCT *ads, const char *machine_name,
+		    const char * spn);
+bool ads_setspn_delete(ADS_STRUCT *ads, const char *machine_name,
+		       const char * spn);
 
 /* The following definitions come from libads/krb5_errs.c  */
 
@@ -66,7 +81,6 @@ bool ads_sitename_match(ADS_STRUCT *ads);
 bool ads_closest_dc(ADS_STRUCT *ads);
 ADS_STATUS ads_connect(ADS_STRUCT *ads);
 ADS_STATUS ads_connect_user_creds(ADS_STRUCT *ads);
-ADS_STATUS ads_connect_gc(ADS_STRUCT *ads);
 void ads_disconnect(ADS_STRUCT *ads);
 ADS_STATUS ads_do_search_all_fn(ADS_STRUCT *ads, const char *bind_path,
 				int scope, const char *expr, const char **attrs,
@@ -96,10 +110,14 @@ ADS_STATUS ads_get_service_principal_names(TALLOC_CTX *mem_ctx,
 					   char ***spn_array,
 					   size_t *num_spns);
 ADS_STATUS ads_clear_service_principal_names(ADS_STRUCT *ads, const char *machine_name);
-ADS_STATUS ads_add_service_principal_name(ADS_STRUCT *ads, const char *machine_name,
-                                          const char *my_fqdn, const char *spn);
-ADS_STATUS ads_create_machine_acct(ADS_STRUCT *ads, const char *machine_name,
-                                   const char *org_unit);
+ADS_STATUS ads_add_service_principal_names(ADS_STRUCT *ads, const char *machine_name,
+                                          const char **spns);
+ADS_STATUS ads_create_machine_acct(ADS_STRUCT *ads,
+				   const char *machine_name,
+				   const char *machine_password,
+				   const char *org_unit,
+				   uint32_t etype_list,
+				   const char *dns_domain_name);
 ADS_STATUS ads_move_machine_acct(ADS_STRUCT *ads, const char *machine_name,
                                  const char *org_unit, bool *moved);
 int ads_count_replies(ADS_STRUCT *ads, void *res);
@@ -120,7 +138,7 @@ ADS_STATUS ads_get_sid_from_extended_dn(TALLOC_CTX *mem_ctx,
 					struct dom_sid *sid);
 char* ads_get_dnshostname( ADS_STRUCT *ads, TALLOC_CTX *ctx, const char *machine_name );
 char* ads_get_upn( ADS_STRUCT *ads, TALLOC_CTX *ctx, const char *machine_name );
-char* ads_get_samaccountname( ADS_STRUCT *ads, TALLOC_CTX *ctx, const char *machine_name );
+bool ads_has_samaccountname( ADS_STRUCT *ads, TALLOC_CTX *ctx, const char *machine_name );
 ADS_STATUS ads_join_realm(ADS_STRUCT *ads, const char *machine_name,
 			uint32_t account_type, const char *org_unit);
 ADS_STATUS ads_leave_realm(ADS_STRUCT *ads, const char *hostname);
@@ -181,15 +199,25 @@ ADS_STATUS ads_sasl_bind(ADS_STRUCT *ads);
 
 /* The following definitions come from libads/sasl_wrapping.c  */
 
-ADS_STATUS ads_setup_sasl_wrapping(ADS_STRUCT *ads,
+ADS_STATUS ads_setup_sasl_wrapping(struct ads_saslwrap *wrap, LDAP *ld,
 				   const struct ads_saslwrap_ops *ops,
 				   void *private_data);
-ADS_STATUS ads_setup_sasl_wrapping(ADS_STRUCT *ads,
-				   const struct ads_saslwrap_ops *ops,
-				   void *private_data);
+void ndr_print_ads_saslwrap_struct(struct ndr_print *ndr,
+				   const char *name,
+				   const struct ads_saslwrap *r);
 
 /* The following definitions come from libads/util.c  */
 
 ADS_STATUS ads_change_trust_account_password(ADS_STRUCT *ads, char *host_principal);
+
+struct spn_struct {
+	const char *serviceclass;
+	const char *servicename;
+	const char *host;
+	int32_t port;
+};
+
+/* parse a windows style SPN, returns NULL if parsing fails */
+struct spn_struct *parse_spn(TALLOC_CTX *ctx, const char *srvprinc);
 
 #endif /* _LIBADS_ADS_PROTO_H_ */

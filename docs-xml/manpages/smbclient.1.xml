@@ -7,7 +7,7 @@
 	<manvolnum>1</manvolnum>
 	<refmiscinfo class="source">Samba</refmiscinfo>
 	<refmiscinfo class="manual">User Commands</refmiscinfo>
-	<refmiscinfo class="version">4.3</refmiscinfo>
+	<refmiscinfo class="version">&doc.version;</refmiscinfo>
 </refmeta>
 
 
@@ -69,7 +69,7 @@
 		<arg choice="opt">-R &lt;name resolve order&gt;</arg>
 		<arg choice="opt">-s &lt;smb config file&gt;</arg>
 		<arg choice="opt">-t &lt;per-operation timeout in seconds&gt;</arg>
-		<arg choice="opt">-T&lt;c|x&gt;IXFqgbNan</arg>
+		<arg choice="opt">-T&lt;c|x&gt;IXFvgbNan</arg>
 		<arg choice="opt">-k</arg>
 	</cmdsynopsis>
 </refsynopsisdiv>
@@ -261,9 +261,9 @@
 		<listitem><para>This allows the user to select the
 		highest SMB protocol level that smbclient will use to
 		connect to the server. By default this is set to
-		NT1, which is the highest available SMB1 protocol.
-		To connect using SMB2 or SMB3 protocol, use the
-		strings SMB2 or SMB3 respectively. Note that to connect
+		highest available SMB3 protocol version.
+		To connect using SMB2 or SMB1 protocol, use the
+		strings SMB2 or NT1 respectively. Note that to connect
 		to a Windows 2012 server with encrypted transport selecting
 		a max-protocol of SMB3 is required.
 		</para></listitem>
@@ -369,6 +369,13 @@
 			file. This flag is mutually exclusive with the
 			<parameter>x</parameter> flag. </para></listitem>
 
+			<listitem><para><parameter>n</parameter> - In
+			combination with the <parameter>c</parameter>
+			flag, do not actually create the archive,
+			instead perform a dry run that attempts
+			everything that involved in creation other than
+			writing the file.</para></listitem>
+
 			<listitem><para><parameter>x</parameter> - Extract (restore) a local
 			tar file back to a share. Unless the -D option is given, the tar
 			files will be restored from the top level of the share. Must be
@@ -406,8 +413,9 @@
 			files that have the archive bit set. Useful only with the
 			<parameter>c</parameter> flag. </para></listitem>
 
-			<listitem><para><parameter>q</parameter> - Quiet. Keeps tar from printing
-			diagnostics as it works.  This is the same as tarmode quiet.
+			<listitem><para><parameter>v</parameter> - Verbose. Makes tar
+			print out the files being processed. By default tar is not verbose.
+			This is the same as tarmode verbose.
 			</para></listitem>
 
 			<listitem><para><parameter>r</parameter> - Use wildcard
@@ -652,6 +660,16 @@
 		<listitem><para>The client will request that the server attempt
 		to delete all files matching <replaceable>mask</replaceable> from the current working
 		directory on the server. </para></listitem>
+		</varlistentry>
+
+		<varlistentry>
+		<term>deltree &lt;mask&gt;</term>
+		<listitem><para>The client will request that the server attempt
+		to delete all files and directories matching <replaceable>mask</replaceable> from the current working
+		directory on the server. Note this will recursively delete files and directories within
+		the directories selected even without the recurse command being set. If any of the delete
+		requests fail the command will stop processing at that point, leaving files and directories
+		not yet processed untouched. This is by design.</para></listitem>
 		</varlistentry>
 
 		<varlistentry>
@@ -924,6 +942,14 @@
 		</varlistentry>
 
 		<varlistentry>
+		<term>posix_whoami</term>
+		<listitem><para>Query the remote server for the user token using the CIFS UNIX
+		extensions WHOAMI call. Prints out the guest status, user, group, group list and
+		sid list that the remote server is using on behalf of the logged on user.
+		</para></listitem>
+		</varlistentry>
+
+		<varlistentry>
 		<term>print &lt;file name&gt;</term>
 		<listitem><para>Print the specified file from the local machine
 		through a printable service on the server. </para></listitem>
@@ -992,10 +1018,13 @@
 		</varlistentry>
 
 		<varlistentry>
-		<term>rename &lt;old filename&gt; &lt;new filename&gt;</term>
+		<term>rename &lt;old filename&gt; &lt;new filename&gt; [-f]</term>
 		<listitem><para>Rename files in the current working directory on the
 		server from <replaceable>old filename</replaceable> to
-		<replaceable>new filename</replaceable>. </para></listitem>
+		<replaceable>new filename</replaceable>. The optional
+		-f switch allows for superseding the destination file,
+		if it exists. This is supported by NT1 protocol dialect
+		and SMB2 protocol family.</para></listitem>
 		</varlistentry>
 
 		<varlistentry>
@@ -1074,7 +1103,7 @@
 		</varlistentry>
 
 		<varlistentry>
-		<term>tarmode &lt;full|inc|reset|noreset|system|nosystem|hidden|nohidden&gt;</term>
+		<term>tarmode &lt;full|inc|reset|noreset|system|nosystem|hidden|nohidden|verbose|noverbose&gt;</term>
 		<listitem><para>Changes tar's behavior with regard to DOS
 		attributes. There are 4 modes which can be turned on or
 		off.</para>
@@ -1154,6 +1183,14 @@
 		</para></listitem>
 		</varlistentry>
 
+		<varlistentry>
+		<term>utimes &lt;filename&gt; &lt;create time&gt; &lt;access time&gt; &lt;write time&gt; &lt;
+		change time&gt;</term>
+		<listitem><para>Changes the timestamps on a file by name.
+		Times should be specified in the format [YY]YY:MM:DD-HH:MM:SS or -1 for no change.
+		</para></listitem>
+		</varlistentry>
+
 	</variablelist>
 </refsect1>
 
@@ -1187,12 +1224,6 @@
 	the password of the person using the client.  This information is
 	used only if the protocol level is high enough to support
 	session-level passwords. </para>
-
-	<para>The variable <envar>LIBSMB_PROG</envar> may contain
-	the path, executed with system(), which the client should connect
-		to instead of connecting to a server.  This functionality is primarily
-		intended as a development aid, and works best when using a LMHOSTS
-		file</para>
 </refsect1>
 
 
@@ -1237,7 +1268,7 @@
 <refsect1>
 	<title>VERSION</title>
 
-	<para>This man page is correct for version 3.2 of the Samba suite.</para>
+	<para>This man page is part of version &doc.version; of the Samba suite.</para>
 </refsect1>
 
 
@@ -1248,14 +1279,6 @@
 	were created by Andrew Tridgell. Samba is now developed
 	by the Samba Team as an Open Source project similar
 	to the way the Linux kernel is developed.</para>
-
-	<para>The original Samba man pages were written by Karl Auer.
-	The man page sources were converted to YODL format (another
-	excellent piece of Open Source software, available at <ulink url="ftp://ftp.icce.rug.nl/pub/unix/">
-	ftp://ftp.icce.rug.nl/pub/unix/</ulink>) and updated for the Samba 2.0
-	release by Jeremy Allison.	The conversion to DocBook for
-	Samba 2.2 was done by Gerald Carter. The conversion to DocBook XML 4.2 for Samba 3.0
-	was done by Alexander Bokovoy.</para>
 </refsect1>
 
 </refentry>

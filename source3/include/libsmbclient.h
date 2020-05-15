@@ -78,6 +78,7 @@ extern "C" {
 #include <sys/statvfs.h>
 #include <stdint.h>
 #include <fcntl.h>
+#include <time.h>
 #include <utime.h>
 
 #define SMBC_BASE_FD        10000 /* smallest file descriptor returned */
@@ -128,6 +129,60 @@ struct smbc_dirent
 	 */
 	char name[1];
 };
+
+/**@ingroup structure
+ * Structure that represents all attributes of a directory entry.
+ *
+ */
+struct libsmb_file_info
+{
+	/**
+	 * Size of file
+	 */
+	uint64_t size;
+	/**
+	 * DOS attributes of file
+	 */
+	uint16_t attrs;
+	/**
+	 * User ID of file
+	 */
+	uid_t uid;
+	/**
+	 * Group ID of file
+	 */
+	gid_t gid;
+	/**
+	 * Birth/Create time of file (if supported by system)
+	 * Otherwise the value will be 0
+	 */
+	struct timespec btime_ts;
+	/**
+	 * Modified time for the file
+	 */
+	struct timespec mtime_ts;
+	/**
+	 * Access time for the file
+	 */
+	struct timespec atime_ts;
+	/**
+	 * Change time for the file
+	 */
+	struct timespec ctime_ts;
+	/**
+	 * Name of file
+	 */
+	char *name;
+	/**
+	 * Short name of file
+	 */
+	char *short_name;
+};
+
+/*
+ * Logging callback function
+ */
+typedef void (*smbc_debug_callback_fn)(void *private_ptr, int level, const char *msg);
 
 /*
  * Flags for smbc_setxattr()
@@ -470,28 +525,40 @@ smbc_getDebug(SMBCCTX *c);
 void
 smbc_setDebug(SMBCCTX *c, int debug);
 
+/**
+ * set log callback function to capture logs from libsmbclient, this
+ * is applied at global level
+ */
+void
+smbc_setLogCallback(SMBCCTX *c, void *private_ptr,
+		    smbc_debug_callback_fn fn);
+
+/** set configuration file, this is applied at global level */
+int
+smbc_setConfiguration(SMBCCTX *c, const char *file);
+
 /** Get the netbios name used for making connections */
-char *
+const char *
 smbc_getNetbiosName(SMBCCTX *c);
 
 /** Set the netbios name used for making connections */
 void
-smbc_setNetbiosName(SMBCCTX *c, char * netbios_name);
+smbc_setNetbiosName(SMBCCTX *c, const char *netbios_name);
 
 /** Get the workgroup used for making connections */
-char *
+const char *
 smbc_getWorkgroup(SMBCCTX *c);
 
 /** Set the workgroup used for making connections */
-void smbc_setWorkgroup(SMBCCTX *c, char * workgroup);
+void smbc_setWorkgroup(SMBCCTX *c, const char *workgroup);
 
 /** Get the username used for making connections */
-char *
+const char *
 smbc_getUser(SMBCCTX *c);
 
 /** Set the username used for making connections */
 void
-smbc_setUser(SMBCCTX *c, char * user);
+smbc_setUser(SMBCCTX *c, const char *user);
 
 /**
  * Get the timeout used for waiting on connections and response data
@@ -765,7 +832,24 @@ smbc_getOptionUseNTHash(SMBCCTX *c);
 void
 smbc_setOptionUseNTHash(SMBCCTX *c, smbc_bool b);
 
-
+/**
+ * @brief Set the 'client min protocol' and the 'client max protocol'.
+ *
+ * IMPORTANT: This overrrides the values 'client min protocol' and 'client max
+ * protocol' set in the smb.conf file!
+ *
+ * @param[in]  c  The smbc context to use.
+ *
+ * @param[in]  min_proto  The minimal protocol to use or NULL for leaving it
+ *                        untouched.
+ *
+ * @param[in]  max_proto  The maximum protocol to use or NULL for leaving it
+ *                        untouched.
+ *
+ * @returns true for success, false otherwise
+ */
+smbc_bool
+smbc_setOptionProtocols(SMBCCTX *c, const char *min_proto, const char *max_proto);
 
 /*************************************
  * Getters and setters for FUNCTIONS *
@@ -957,6 +1041,17 @@ typedef struct smbc_dirent * (*smbc_readdir_fn)(SMBCCTX *c,
                                                 SMBCFILE *dir);
 smbc_readdir_fn smbc_getFunctionReaddir(SMBCCTX *c);
 void smbc_setFunctionReaddir(SMBCCTX *c, smbc_readdir_fn fn);
+
+typedef const struct libsmb_file_info * (*smbc_readdirplus_fn)(SMBCCTX *c,
+                                                               SMBCFILE *dir);
+smbc_readdirplus_fn smbc_getFunctionReaddirPlus(SMBCCTX *c);
+void smbc_setFunctionReaddirPlus(SMBCCTX *c, smbc_readdirplus_fn fn);
+
+typedef const struct libsmb_file_info * (*smbc_readdirplus2_fn)(SMBCCTX *c,
+					SMBCFILE *dir,
+					struct stat *st);
+smbc_readdirplus2_fn smbc_getFunctionReaddirPlus2(SMBCCTX *c);
+void smbc_setFunctionReaddirPlus2(SMBCCTX *c, smbc_readdirplus2_fn fn);
 
 typedef int (*smbc_getdents_fn)(SMBCCTX *c,
                                 SMBCFILE *dir,
@@ -1552,6 +1647,39 @@ int smbc_getdents(unsigned int dh, struct smbc_dirent *dirp, int count);
  */
 struct smbc_dirent* smbc_readdir(unsigned int dh);
 
+/**@ingroup directory
+ * Works similar as smbc_readdir() but returns more information about file.
+ *
+ * @param dh        Valid directory as returned by smbc_opendir()
+ *
+ * @return          A const pointer to a libsmb_file_info structure,
+ *                  or NULL if an error occurs or end-of-directory is reached:
+ *                  - EBADF Invalid directory handle
+ *                  - EINVAL smbc_init() failed or has not been called
+ *
+ * @see             smbc_open(), smbc_readdir()
+ */
+const struct libsmb_file_info *smbc_readdirplus(unsigned int dh);
+
+/**@ingroup directory
+ * Works similar as smbc_readdirplus() as well as fills up stat structure if
+ * provided.
+ *
+ * @param dh        Valid directory as returned by smbc_opendir()
+ *
+ * @param stat      Pointer to stat structure which will receive the
+ *                  information. If this pointer is null the call
+ *                  is identical to smbc_readdirplus.
+ *
+ * @return          A const pointer to a libsmb_file_info structure,
+ *                  or NULL if an error occurs or end-of-directory is reached:
+ *                  - EBADF Invalid directory handle
+ *                  - EINVAL smbc_init() failed or has not been called
+ *
+ * @see             smbc_open(), smbc_readdir(), smbc_readdirplus2()
+ */
+const struct libsmb_file_info *smbc_readdirplus2(unsigned int dh,
+					struct stat *st);
 
 /**@ingroup directory
  * Get the current directory offset.
@@ -2579,7 +2707,7 @@ int smbc_listxattr(const char *url,
  *                            extended attributes
  *
  * @note            This function always returns all attribute names supported
- *                  by NT file systems, regardless of wether the referenced
+ *                  by NT file systems, regardless of whether the referenced
  *                  file system supports extended attributes (e.g. a Windows
  *                  2000 machine supports extended attributes if NTFS is used,
  *                  but not if FAT is used, and Windows 98 doesn't support
@@ -2614,7 +2742,7 @@ int smbc_llistxattr(const char *url,
  *                            extended attributes
  *
  * @note            This function always returns all attribute names supported
- *                  by NT file systems, regardless of wether the referenced
+ *                  by NT file systems, regardless of whether the referenced
  *                  file system supports extended attributes (e.g. a Windows
  *                  2000 machine supports extended attributes if NTFS is used,
  *                  but not if FAT is used, and Windows 98 doesn't support
@@ -3001,6 +3129,8 @@ struct _SMBCCTX
         smbc_opendir_fn                 opendir DEPRECATED_SMBC_INTERFACE;
         smbc_closedir_fn                closedir DEPRECATED_SMBC_INTERFACE;
         smbc_readdir_fn                 readdir DEPRECATED_SMBC_INTERFACE;
+        smbc_readdirplus_fn             readdirplus DEPRECATED_SMBC_INTERFACE;
+	smbc_readdirplus2_fn            readdirplus2 DEPRECATED_SMBC_INTERFACE;
         smbc_getdents_fn                getdents DEPRECATED_SMBC_INTERFACE;
         smbc_mkdir_fn                   mkdir DEPRECATED_SMBC_INTERFACE;
         smbc_rmdir_fn                   rmdir DEPRECATED_SMBC_INTERFACE;

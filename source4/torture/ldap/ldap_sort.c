@@ -62,7 +62,7 @@ bool torture_ldap_sort(struct torture_context *torture)
 
 	ldb = ldb_wrap_connect(torture, torture->ev, torture->lp_ctx, url,
 						 NULL,
-						 cmdline_credentials,
+						 popt_get_cmdline_credentials(),
 						 0);
 	torture_assert(torture, ldb, "Failed to make LDB connection to target");
 
@@ -99,6 +99,7 @@ bool torture_ldap_sort(struct torture_context *torture)
 		for (i=0;i<ctx->count;i++) {
 			msg = ctx->msgs[i];
 			elem = ldb_msg_find_element(msg,"cn");
+			torture_assert_not_null(torture, elem, "msg lacks CN");
 			cur = elem->values;
 			torture_comment(torture, "cn: %s\n",cur->data);
 			if (prev != NULL)

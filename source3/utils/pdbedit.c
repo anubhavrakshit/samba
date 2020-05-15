@@ -25,6 +25,8 @@
 #include "../librpc/gen_ndr/samr.h"
 #include "../libcli/security/security.h"
 #include "passdb.h"
+#include "cmdline_contexts.h"
+#include "passwd_proto.h"
 
 #define BIT_BACKEND	0x00000004
 #define BIT_VERBOSE	0x00000008
@@ -55,9 +57,10 @@
 #define BIT_LOGONHOURS	0x10000000
 #define BIT_KICKOFFTIME	0x20000000
 #define BIT_DESCRIPTION 0x40000000
+#define BIT_PWSETNTHASH 0x80000000
 
 #define MASK_ALWAYS_GOOD	0x0000001F
-#define MASK_USER_GOOD		0x60405FE0
+#define MASK_USER_GOOD		0xE0405FE0
 
 static int get_sid_from_cli_string(struct dom_sid *sid, const char *str_sid)
 {
@@ -266,14 +269,15 @@ static int print_sam_info (struct samu *sam_pwent, bool verbosity, bool smbpwdst
 	if (verbosity) {
 		char temp[44];
 		const uint8_t *hours;
+		struct dom_sid_buf buf;
 
 		printf ("Unix username:        %s\n", pdb_get_username(sam_pwent));
 		printf ("NT username:          %s\n", pdb_get_nt_username(sam_pwent));
 		printf ("Account Flags:        %s\n", pdb_encode_acct_ctrl(pdb_get_acct_ctrl(sam_pwent), NEW_PW_FORMAT_SPACE_PADDED_LEN));
 		printf ("User SID:             %s\n",
-			sid_string_tos(pdb_get_user_sid(sam_pwent)));
+			dom_sid_str_buf(pdb_get_user_sid(sam_pwent), &buf));
 		printf ("Primary Group SID:    %s\n",
-			sid_string_tos(pdb_get_group_sid(sam_pwent)));
+			dom_sid_str_buf(pdb_get_group_sid(sam_pwent), &buf));
 		printf ("Full Name:            %s\n", pdb_get_fullname(sam_pwent));
 		printf ("Home Directory:       %s\n", pdb_get_homedir(sam_pwent));
 		printf ("HomeDir Drive:        %s\n", pdb_get_dir_drive(sam_pwent));
@@ -317,6 +321,12 @@ static int print_sam_info (struct samu *sam_pwent, bool verbosity, bool smbpwdst
 		hours = pdb_get_hours(sam_pwent);
 		pdb_sethexhours(temp, hours);
 		printf ("Logon hours         : %s\n", temp);
+		if (smbpwdstyle){
+			pdb_sethexpwd(temp, pdb_get_lanman_passwd(sam_pwent), pdb_get_acct_ctrl(sam_pwent));
+			printf ("LM hash             : %s\n", temp);
+			pdb_sethexpwd(temp, pdb_get_nt_passwd(sam_pwent), pdb_get_acct_ctrl(sam_pwent));
+			printf ("NT hash             : %s\n", temp);
+		}	
 
 	} else if (smbpwdstyle) {
 		char lm_passwd[33];
@@ -499,7 +509,7 @@ static int set_user_info(const char *username, const char *fullname,
 			 const char *profile, const char *account_control,
 			 const char *user_sid, const char *user_domain,
 			 const bool badpw, const bool hours,
-			 const char *kickoff_time)
+			 const char *kickoff_time, const char *str_hex_pwd)
 {
 	bool updated_autolock = False, updated_badpw = False;
 	struct samu *sam_pwent;
@@ -585,13 +595,18 @@ static int set_user_info(const char *username, const char *fullname,
 	}
 
 	if (kickoff_time) {
-		char *endptr;
 		time_t value = get_time_t_max();
 
 		if (strcmp(kickoff_time, "never") != 0) {
-			uint32_t num = strtoul(kickoff_time, &endptr, 10);
+			int error = 0;
+			uint32_t num;
 
-			if ((endptr == kickoff_time) || (endptr[0] != '\0')) {
+			num = smb_strtoul(kickoff_time,
+					  NULL,
+					  10,
+					  &error,
+					  SMB_STR_FULL_STR_CONV);
+			if (error != 0) {
 				fprintf(stderr, "Failed to parse kickoff time\n");
 				return -1;
 			}
@@ -601,9 +616,33 @@ static int set_user_info(const char *username, const char *fullname,
 
 		pdb_set_kickoff_time(sam_pwent, value, PDB_CHANGED);
 	}
+	if (str_hex_pwd) {
+		unsigned char  new_nt_p16[NT_HASH_LEN];
+	        if(strlen(str_hex_pwd) != (NT_HASH_LEN *2)){
+			fprintf(stderr, "Invalid hash\n");
+			return -1;
+		}
+					 
+		pdb_gethexpwd(str_hex_pwd, new_nt_p16);
+		
+		if (!pdb_set_nt_passwd (sam_pwent, new_nt_p16 , PDB_CHANGED)) {
+			fprintf(stderr, "Failed to set password from nt-hash\n");
+			return -1;
+		}	
+
+		if (!pdb_set_pass_last_set_time (sam_pwent, time(NULL), PDB_CHANGED)){
+			fprintf(stderr, "Failed to set last password set time\n");
+			return -1;
+		}	
+		if (!pdb_update_history(sam_pwent, new_nt_p16)){
+			fprintf(stderr, "Failed to update password history\n");
+			return -1;
+		}
+	}
 
 	if (NT_STATUS_IS_OK(pdb_update_sam_account(sam_pwent))) {
-		print_user_info(username, True, False);
+		
+		print_user_info(username, True, (str_hex_pwd != NULL ));
 	} else {
 		fprintf (stderr, "Unable to modify entry!\n");
 		TALLOC_FREE(sam_pwent);
@@ -719,7 +758,7 @@ static int new_user(const char *username, const char *fullname,
 	NTSTATUS status;
 	struct dom_sid u_sid;
 	int flags;
-	int ret;
+	int ret = -1;
 
 	tosctx = talloc_tos();
 	if (!tosctx) {
@@ -735,10 +774,14 @@ static int new_user(const char *username, const char *fullname,
 	}
 
 	pwd1 = get_pass( "new password:", stdin_get);
-	pwd2 = get_pass( "retype new password:", stdin_get);
-	if (!pwd1 || !pwd2) {
+	if (pwd1 == NULL) {
 		fprintf(stderr, "Failed to read passwords.\n");
-		return -1;
+		goto done;
+	}
+	pwd2 = get_pass( "retype new password:", stdin_get);
+	if (pwd2 == NULL) {
+		fprintf(stderr, "Failed to read passwords.\n");
+		goto done;
 	}
 	ret = strcmp(pwd1, pwd2);
 	if (ret != 0) {
@@ -1021,6 +1064,7 @@ int main(int argc, const char **argv)
 	static int pw_from_stdin = False;
 	struct pdb_methods *bin, *bout;
 	static char *kickoff_time = NULL;
+	static char *str_hex_pwd = NULL;
 	TALLOC_CTX *frame = talloc_stackframe();
 	NTSTATUS status;
 	poptContext pc;
@@ -1058,6 +1102,7 @@ int main(int argc, const char **argv)
 		{"time-format", 0, POPT_ARG_STRING, &pwd_time_format, 0, "The time format for time parameters", NULL },
 		{"password-from-stdin", 't', POPT_ARG_NONE, &pw_from_stdin, 0, "get password from standard in", NULL},
 		{"kickoff-time", 'K', POPT_ARG_STRING, &kickoff_time, 0, "set the kickoff time", NULL},
+		{"set-nt-hash", 0, POPT_ARG_STRING, &str_hex_pwd, 0, "set password from nt-hash", NULL},
 		POPT_COMMON_SAMBA
 		POPT_TABLEEND
 	};
@@ -1118,7 +1163,9 @@ int main(int argc, const char **argv)
 			(badpw_reset ? BIT_BADPWRESET : 0) +
 			(hours_reset ? BIT_LOGONHOURS : 0) +
 			(kickoff_time ? BIT_KICKOFFTIME : 0) +
+			(str_hex_pwd ? BIT_PWSETNTHASH : 0 ) +
 			(acct_desc ? BIT_DESCRIPTION : 0);
+			
 
 	if (setparms & BIT_BACKEND) {
 		/* HACK: set the global passdb backend by overwriting globals.
@@ -1138,6 +1185,7 @@ int main(int argc, const char **argv)
 	checkparms = setparms & ~MASK_ALWAYS_GOOD;
 
 	if (checkparms & BIT_FIX_INIT) {
+		poptFreeContext(pc);
 		return fix_users_list();
 	}
 
@@ -1193,6 +1241,8 @@ int main(int argc, const char **argv)
 	if (((checkparms & BIT_IMPORT) ||
 	     (checkparms & BIT_EXPORT)) &&
 	    !(checkparms & ~(BIT_IMPORT +BIT_EXPORT +BIT_USER))) {
+
+		poptFreeContext(pc);
 
 		if (backend_in) {
 			status = make_pdb_method_name(&bin, backend_in);
@@ -1251,9 +1301,11 @@ int main(int argc, const char **argv)
 	/* list users operations */
 	if (checkparms & BIT_LIST) {
 		if (!(checkparms & ~BIT_LIST)) {
+			poptFreeContext(pc);
 			return print_users_list(verbose, spstyle);
 		}
 		if (!(checkparms & ~(BIT_USER + BIT_LIST))) {
+			poptFreeContext(pc);
 			return print_user_info(user_name, verbose, spstyle);
 		}
 	}
@@ -1278,12 +1330,14 @@ int main(int argc, const char **argv)
 		/* check use of -u option */
 		if (!(checkparms & BIT_USER)) {
 			fprintf (stderr, "Username not specified! (use -u option)\n");
+			poptFreeContext(pc);
 			return -1;
 		}
 
 		/* account creation operations */
 		if (!(checkparms & ~(BIT_CREATE + BIT_USER + BIT_MACHINE))) {
-		       	if (checkparms & BIT_MACHINE) {
+			poptFreeContext(pc);
+			if (checkparms & BIT_MACHINE) {
 				return new_machine(user_name, machine_sid);
 			} else {
 				return new_user(user_name, full_name,
@@ -1295,7 +1349,8 @@ int main(int argc, const char **argv)
 
 		/* account deletion operations */
 		if (!(checkparms & ~(BIT_DELETE + BIT_USER + BIT_MACHINE))) {
-		       	if (checkparms & BIT_MACHINE) {
+			poptFreeContext(pc);
+			if (checkparms & BIT_MACHINE) {
 				return delete_machine_entry(user_name);
 			} else {
 				return delete_user_entry(user_name);
@@ -1304,6 +1359,7 @@ int main(int argc, const char **argv)
 
 		/* account modification operations */
 		if (!(checkparms & ~(BIT_MODIFY + BIT_USER + BIT_MACHINE))) {
+			poptFreeContext(pc);
 			if (checkparms & BIT_MACHINE) {
 				return set_machine_info(user_name,
 							account_control,
@@ -1315,7 +1371,7 @@ int main(int argc, const char **argv)
 						     profile_path, account_control,
 						     user_sid, user_domain,
 						     badpw_reset, hours_reset,
-						     kickoff_time);
+						     kickoff_time, str_hex_pwd);
 			}
 		}
 	}
@@ -1325,6 +1381,7 @@ int main(int argc, const char **argv)
 	}
 	poptPrintHelp(pc, stderr, 0);
 
+	poptFreeContext(pc);
 	TALLOC_FREE(frame);
 	return 1;
 }

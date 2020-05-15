@@ -33,47 +33,6 @@
 #undef DBGC_CLASS
 #define DBGC_CLASS DBGC_DNS
 
-bool dns_name_match(const char *zone, const char *name, size_t *host_part_len)
-{
-	size_t zl = strlen(zone);
-	size_t nl = strlen(name);
-	ssize_t zi, ni;
-	static const size_t fixup = 'a' - 'A';
-
-	if (zl > nl) {
-		return false;
-	}
-
-	for (zi = zl, ni = nl; zi >= 0; zi--, ni--) {
-		char zc = zone[zi];
-		char nc = name[ni];
-
-		/* convert to lower case */
-		if (zc >= 'A' && zc <= 'Z') {
-			zc += fixup;
-		}
-		if (nc >= 'A' && nc <= 'Z') {
-			nc += fixup;
-		}
-
-		if (zc != nc) {
-			return false;
-		}
-	}
-
-	if (ni >= 0) {
-		if (name[ni] != '.') {
-			return false;
-		}
-
-		ni--;
-	}
-
-	*host_part_len = ni+1;
-
-	return true;
-}
-
 /* Names are equal if they match and there's nothing left over */
 bool dns_name_equal(const char *name1, const char *name2)
 {
@@ -148,6 +107,10 @@ bool dns_records_match(struct dnsp_DnssrvRpcRecord *rec1,
 	return false;
 }
 
+/*
+ * Lookup a DNS record, performing an exact match.
+ * i.e. DNS wild card records are not considered.
+ */
 WERROR dns_lookup_records(struct dns_server *dns,
 			  TALLOC_CTX *mem_ctx,
 			  struct ldb_dn *dn,
@@ -156,6 +119,20 @@ WERROR dns_lookup_records(struct dns_server *dns,
 {
 	return dns_common_lookup(dns->samdb, mem_ctx, dn,
 				 records, rec_count, NULL);
+}
+
+/*
+ * Lookup a DNS record, will match DNS wild card records if an exact match
+ * is not found.
+ */
+WERROR dns_lookup_records_wildcard(struct dns_server *dns,
+			  TALLOC_CTX *mem_ctx,
+			  struct ldb_dn *dn,
+			  struct dnsp_DnssrvRpcRecord **records,
+			  uint16_t *rec_count)
+{
+	return dns_common_wildcard_lookup(dns->samdb, mem_ctx, dn,
+				 records, rec_count);
 }
 
 WERROR dns_replace_records(struct dns_server *dns,
@@ -171,8 +148,8 @@ WERROR dns_replace_records(struct dns_server *dns,
 				  needs_add, dwSerial, records, rec_count);
 }
 
-bool dns_authorative_for_zone(struct dns_server *dns,
-			      const char *name)
+bool dns_authoritative_for_zone(struct dns_server *dns,
+				const char *name)
 {
 	const struct dns_server_zone *z;
 	size_t host_part_len = 0;
@@ -218,70 +195,9 @@ const char *dns_get_authoritative_zone(struct dns_server *dns,
 WERROR dns_name2dn(struct dns_server *dns,
 		   TALLOC_CTX *mem_ctx,
 		   const char *name,
-		   struct ldb_dn **_dn)
+		   struct ldb_dn **dn)
 {
-	struct ldb_dn *base;
-	struct ldb_dn *dn;
-	const struct dns_server_zone *z;
-	size_t host_part_len = 0;
-
-	if (name == NULL) {
-		return DNS_ERR(FORMAT_ERROR);
-	}
-
-	/*TODO: Check if 'name' is a valid DNS name */
-
-	if (strcmp(name, "") == 0) {
-		base = ldb_get_default_basedn(dns->samdb);
-		dn = ldb_dn_copy(mem_ctx, base);
-		ldb_dn_add_child_fmt(dn, "DC=@,DC=RootDNSServers,CN=MicrosoftDNS,CN=System");
-		*_dn = dn;
-		return WERR_OK;
-	}
-
-	for (z = dns->zones; z != NULL; z = z->next) {
-		bool match;
-
-		match = dns_name_match(z->name, name, &host_part_len);
-		if (match) {
-			break;
-		}
-	}
-
-	if (z == NULL) {
-		return DNS_ERR(NAME_ERROR);
-	}
-
-	if (host_part_len == 0) {
-		dn = ldb_dn_copy(mem_ctx, z->dn);
-		ldb_dn_add_child_fmt(dn, "DC=@");
-		*_dn = dn;
-		return WERR_OK;
-	}
-
-	dn = ldb_dn_copy(mem_ctx, z->dn);
-	ldb_dn_add_child_fmt(dn, "DC=%*.*s", (int)host_part_len, (int)host_part_len, name);
-	*_dn = dn;
-	return WERR_OK;
+	return dns_common_name2dn(dns->samdb, dns->zones,
+				  mem_ctx, name, dn);
 }
 
-WERROR dns_generate_options(struct dns_server *dns,
-			    TALLOC_CTX *mem_ctx,
-			    struct dns_res_rec **options)
-{
-	struct dns_res_rec *o;
-
-	o = talloc_zero(mem_ctx, struct dns_res_rec);
-	if (o == NULL) {
-		return WERR_NOMEM;
-	}
-	o->name = '\0';
-	o->rr_type = DNS_QTYPE_OPT;
-	/* This is ugly, but RFC2671 wants the payload size in this field */
-	o->rr_class = (enum dns_qclass) dns->max_payload;
-	o->ttl = 0;
-	o->length = 0;
-
-	*options = o;
-	return WERR_OK;
-}

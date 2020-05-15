@@ -23,6 +23,9 @@
 #include "torture/ndr/proto.h"
 #include "torture/auth/proto.h"
 #include "../lib/crypto/test_proto.h"
+#ifndef HAVE_GNUTLS_AES_CMAC
+#include "../lib/crypto/aes_cmac_test_proto.h"
+#endif
 #include "lib/registry/tests/proto.h"
 #include "lib/replace/replace-testsuite.h"
 
@@ -39,8 +42,12 @@
 	torture_local_util_str, 
 	torture_local_util_time, 
 	torture_local_util_data_blob, 
+	torture_local_util_binsearch,
 	torture_local_util_asn1,
 	torture_local_util_anonymous_shared,
+	torture_local_util_strv,
+	torture_local_util_strv_util,
+	torture_local_util,
 	torture_local_idtree, 
 	torture_local_dlinklist,
 	torture_local_genrand, 
@@ -60,6 +67,7 @@
 	torture_local_string_case,
 	torture_local_compression,
 	torture_local_event, 
+	torture_local_tevent_req,
 	torture_local_torture,
 	torture_local_dbspeed, 
 	torture_local_credentials,
@@ -70,39 +78,36 @@
 	torture_local_verif_trailer,
 	torture_local_nss,
 	torture_local_fsrvp,
+	torture_local_util_str_escape,
+	torture_local_tfork,
+	torture_local_mdspkt,
 	NULL
 };
 
-NTSTATUS torture_local_init(void)
+NTSTATUS torture_local_init(TALLOC_CTX *ctx)
 {
 	int i;
 	struct torture_suite *suite = torture_suite_create(
-		talloc_autofree_context(), "local");
+		ctx, "local");
 	
 	torture_suite_add_simple_test(suite, "talloc", torture_local_talloc);
 	torture_suite_add_simple_test(suite, "replace", torture_local_replace);
 	
 	torture_suite_add_simple_test(suite, 
 				      "crypto.md4", torture_local_crypto_md4);
-	torture_suite_add_simple_test(suite, "crypto.md5", 
-				      torture_local_crypto_md5);
-	torture_suite_add_simple_test(suite, "crypto.hmacmd5", 
-				      torture_local_crypto_hmacmd5);
+#ifndef HAVE_GNUTLS_AES_CMAC
 	torture_suite_add_simple_test(suite, "crypto.aes_cmac_128",
 				      torture_local_crypto_aes_cmac_128);
-	torture_suite_add_simple_test(suite, "crypto.aes_ccm_128",
-				      torture_local_crypto_aes_ccm_128);
-	torture_suite_add_simple_test(suite, "crypto.aes_gcm_128",
-				      torture_local_crypto_aes_gcm_128);
+#endif
 
 	for (i = 0; suite_generators[i]; i++)
 		torture_suite_add_suite(suite,
-					suite_generators[i](talloc_autofree_context()));
+					suite_generators[i](ctx));
 	
 	suite->description = talloc_strdup(suite, 
 					   "Local, Samba-specific tests");
 
-	torture_register_suite(suite);
+	torture_register_suite(ctx, suite);
 
 	return NT_STATUS_OK;
 }

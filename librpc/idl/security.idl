@@ -278,12 +278,28 @@ interface security
 	const string SID_BUILTIN_EVENT_LOG_READERS	= "S-1-5-32-573";
 	const string SID_BUILTIN_CERT_SERV_DCOM_ACCESS	= "S-1-5-32-574";
 
+	/* UID/GID mapping Samba style */
+	const string SID_SAMBA_UNIX_USER_OWNER		= "S-1-22-1";
+	const string SID_SAMBA_UNIX_GROUP_OWNER		= "S-1-22-2";
+
 	/* SECURITY_NT_SERVICE */
 	const string NAME_NT_SERVICE            = "NT SERVICE";
 
 	const string SID_NT_NT_SERVICE          = "S-1-5-80";
 	const string SID_NT_TRUSTED_INSTALLER =
 		"S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
+
+	const string SID_AUTHENTICATION_AUTHORITY_ASSERTED_IDENTITY = "S-1-18-1";
+	const string SID_SERVICE_ASSERTED_IDENTITY = "S-1-18-2";
+
+	/*
+	 * http://technet.microsoft.com/en-us/library/hh509017(v=ws.10).aspx
+	 */
+	const string SID_NT_NFS_SUBSYSTEM         = "S-1-5-88";
+	const string SID_NT_NFS_USER              = "S-1-5-88-1";
+	const string SID_NT_NFS_GROUP             = "S-1-5-88-2";
+	const string SID_NT_NFS_MASK              = "S-1-5-88-3";
+	const string SID_NT_NFS_OTHERS            = "S-1-5-88-4";
 
 	/* well-known domain RIDs */
 	const int DOMAIN_RID_LOGON                   = 9;
@@ -576,18 +592,23 @@ interface security
 		[relative] security_acl *dacl; /* user (discretionary) ACL */
 	} security_descriptor;
 
-	[nopython] void decode_security_descriptor (
-		[in] security_descriptor sd
-		);
-
 	typedef [public] struct {
 		[range(0,0x40000),value(ndr_size_security_descriptor(sd,ndr->flags))] uint32 sd_size;
 		[subcontext(4)] security_descriptor *sd;
 	} sec_desc_buf;
 
-	[nopython] void decode_sec_desc_buf (
-		[in] sec_desc_buf sd_buf
-		);
+	/* Group attributes, used to be samr_GroupAttrs */
+	typedef [public,bitmap32bit] bitmap {
+		SE_GROUP_MANDATORY		= 0x00000001,
+		SE_GROUP_ENABLED_BY_DEFAULT	= 0x00000002,
+		SE_GROUP_ENABLED		= 0x00000004,
+		SE_GROUP_OWNER			= 0x00000008,
+		SE_GROUP_USE_FOR_DENY_ONLY	= 0x00000010,
+		SE_GROUP_INTEGRITY		= 0x00000020,
+		SE_GROUP_INTEGRITY_ENABLED	= 0x00000040,
+		SE_GROUP_RESOURCE		= 0x20000000,
+		SE_GROUP_LOGON_ID		= 0xC0000000
+	} security_GroupAttrs;
 
 	/* This is not yet sent over the network, but is simply defined in IDL */
 	typedef [public] struct {
@@ -597,10 +618,6 @@ interface security
 		lsa_SystemAccessModeFlags rights_mask;
 	} security_token;
 
-	[nopython] void decode_security_token (
-		[in] security_token token
-		);
-
 	/* This is not yet sent over the network, but is simply defined in IDL */
 	typedef [public] struct {
 		uid_t uid;
@@ -608,10 +625,6 @@ interface security
 		uint32 ngroups;
 		[size_is(ngroups)] gid_t groups[*];
 	} security_unix_token;
-
-	[nopython] void decode_security_unix_token (
-		[in] security_unix_token unix_token
-		);
 
 	/* bits that determine which parts of a security descriptor
 	   are being queried/set */
@@ -647,6 +660,15 @@ interface security
 		SECINFO_SCOPE		|
 		SECINFO_BACKUP 		|
 		0);
+
+	/*
+	 * See [MS-KILE] 2.2.5 LSAP_TOKEN_INFO_INTEGRITY
+	 */
+	typedef [public,gensize,flag(NDR_PAHEX)] struct {
+		uint32 Flags;
+		uint32 TokenIL;
+		uint8 MachineId[32];
+	} LSAP_TOKEN_INFO_INTEGRITY;
 
 	/*
 	 * See [MS-KILE] 2.2.6 Supported Encryption Types Bit Flags
@@ -696,7 +718,7 @@ interface security
 	                                              = "05c74c5e-4deb-43b4-bd9f-86664c2a7fd5";
         const string GUID_DRS_DS_INSTALL_REPLICA      = "9923a32a-3607-11d2-b9be-0000f87a36b2";
 	const string GUID_DRS_REANIMATE_TOMBSTONE     = "45ec5156-db7e-47bb-b53f-dbeb2d03c40f";
-
+	const string GUID_DRS_ALLOWED_TO_AUTHENTICATE = "68b1d179-0d15-4D4F-ab71-46152e79a7bc";
 
 	/***************************************************************/
 	/* validated writes guids */

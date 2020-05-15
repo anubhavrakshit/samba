@@ -169,16 +169,6 @@ const struct dsdb_class *dsdb_class_by_lDAPDisplayName_ldb_val(const struct dsdb
 	return c;
 }
 
-const struct dsdb_class *dsdb_class_by_cn(const struct dsdb_schema *schema,
-					  const char *cn)
-{
-	struct dsdb_class *c;
-	if (!cn) return NULL;
-	BINARY_ARRAY_SEARCH_P(schema->classes_by_cn,
-			      schema->num_classes, cn, cn, strcasecmp, c);
-	return c;
-}
-
 const struct dsdb_class *dsdb_class_by_cn_ldb_val(const struct dsdb_schema *schema,
 						  const struct ldb_val *cn)
 {
@@ -225,12 +215,14 @@ WERROR dsdb_linked_attribute_lDAPDisplayName_list(const struct dsdb_schema *sche
 		
 		attr_list = talloc_realloc(mem_ctx, attr_list, const char *, i+2);
 		if (!attr_list) {
-			return WERR_NOMEM;
+			return WERR_NOT_ENOUGH_MEMORY;
 		}
 		attr_list[i] = cur->lDAPDisplayName;
 		i++;
 	}
-	attr_list[i] = NULL;
+	if (attr_list != NULL && attr_list[i] != NULL) {
+		attr_list[i] = NULL;
+	}
 	*attr_list_ret = attr_list;
 	return WERR_OK;
 }
@@ -240,18 +232,19 @@ const char **merge_attr_list(TALLOC_CTX *mem_ctx,
 {
 	const char **ret_attrs;
 	unsigned int i;
-	size_t new_len, orig_len = str_list_length(attrs);
-	if (!new_attrs) {
+	size_t new_len, new_attr_len, orig_len = str_list_length(attrs);
+	if (new_attrs == NULL || new_attrs[0] == NULL) {
 		return attrs;
 	}
+	new_attr_len = str_list_length(new_attrs);
 
-	ret_attrs = talloc_realloc(mem_ctx, 
-				   attrs, const char *, orig_len + str_list_length(new_attrs) + 1);
+	ret_attrs = talloc_realloc(mem_ctx,
+				   attrs, const char *, orig_len + new_attr_len + 1);
 	if (ret_attrs) {
-		for (i=0; i < str_list_length(new_attrs); i++) {
+		for (i = 0; i < new_attr_len; i++) {
 			ret_attrs[orig_len + i] = new_attrs[i];
 		}
-		new_len = orig_len + str_list_length(new_attrs);
+		new_len = orig_len + new_attr_len;
 
 		ret_attrs[new_len] = NULL;
 	}
@@ -530,7 +523,7 @@ int dsdb_sort_objectClass_attr(struct ldb_context *ldb,
 
 		/* Don't add top to list, we will do that later */
 		if (ldb_attr_cmp("top", current->objectclass->lDAPDisplayName) != 0) {
-			DLIST_ADD_END(unsorted, current, struct class_list *);
+			DLIST_ADD_END(unsorted, current);
 		}
 	}
 
@@ -538,7 +531,7 @@ int dsdb_sort_objectClass_attr(struct ldb_context *ldb,
 	/* Add top here, to prevent duplicates */
 	current = talloc(tmp_mem_ctx, struct class_list);
 	current->objectclass = dsdb_class_by_lDAPDisplayName(schema, "top");
-	DLIST_ADD_END(sorted, current, struct class_list *);
+	DLIST_ADD_END(sorted, current);
 
 	/* For each object: find parent chain */
 	for (current = unsorted; current != NULL; current = current->next) {
@@ -554,7 +547,7 @@ int dsdb_sort_objectClass_attr(struct ldb_context *ldb,
 
 		new_parent = talloc(tmp_mem_ctx, struct class_list);
 		new_parent->objectclass = dsdb_class_by_lDAPDisplayName(schema, current->objectclass->subClassOf);
-		DLIST_ADD_END(unsorted, new_parent, struct class_list *);
+		DLIST_ADD_END(unsorted, new_parent);
 	}
 
 	/* For each object: order by hierarchy */
@@ -582,7 +575,7 @@ int dsdb_sort_objectClass_attr(struct ldb_context *ldb,
 
 		if (current_lowest != NULL) {
 			DLIST_REMOVE(unsorted,current_lowest);
-			DLIST_ADD_END(sorted,current_lowest, struct class_list *);
+			DLIST_ADD_END(sorted,current_lowest);
 		}
 	}
 

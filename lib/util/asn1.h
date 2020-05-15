@@ -1,18 +1,18 @@
-/* 
-   Unix SMB/CIFS implementation.   
+/*
+   Unix SMB/CIFS implementation.
    simple ASN1 code
    Copyright (C) Andrew Tridgell 2001
-   
+
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
    the Free Software Foundation; either version 3 of the License, or
    (at your option) any later version.
-   
+
    This program is distributed in the hope that it will be useful,
    but WITHOUT ANY WARRANTY; without even the implied warranty of
    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
    GNU General Public License for more details.
-   
+
    You should have received a copy of the GNU General Public License
    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
@@ -20,20 +20,13 @@
 #ifndef _ASN_1_H
 #define _ASN_1_H
 
-struct nesting {
-	off_t start;
-	size_t taglen; /* for parsing */
-	struct nesting *next;
-};
+#include "replace.h"
+#include <talloc.h>
+#include "lib/util/data_blob.h"
 
-struct asn1_data {
-	uint8_t *data;
-	size_t length;
-	off_t ofs;
-	struct nesting *nesting;
-	bool has_error;
-};
 
+struct nesting;
+struct asn1_data;
 typedef struct asn1_data ASN1_DATA;
 
 #define ASN1_APPLICATION(x) ((x)+0x60)
@@ -52,8 +45,19 @@ typedef struct asn1_data ASN1_DATA;
 
 #define ASN1_MAX_OIDS 20
 
-struct asn1_data *asn1_init(TALLOC_CTX *mem_ctx);
+/*
+ * The maximum permitted depth for an ASN.1 parse tree, the limit is chosen
+ * to align with the value for windows. Note that this value will trigger
+ * ASAN stack overflow errors.
+ */
+#define ASN1_MAX_TREE_DEPTH 512
+
+struct asn1_data *asn1_init(TALLOC_CTX *mem_ctx, unsigned max_depth);
 void asn1_free(struct asn1_data *data);
+bool asn1_has_error(const struct asn1_data *data);
+void asn1_set_error(struct asn1_data *data);
+bool asn1_has_nesting(const struct asn1_data *data);
+off_t asn1_current_ofs(const struct asn1_data *data);
 bool asn1_write(struct asn1_data *data, const void *p, int len);
 bool asn1_write_uint8(struct asn1_data *data, uint8_t v);
 bool asn1_push_tag(struct asn1_data *data, uint8_t tag);
@@ -79,7 +83,6 @@ bool asn1_peek(struct asn1_data *data, void *p, int len);
 bool asn1_read(struct asn1_data *data, void *p, int len);
 bool asn1_read_uint8(struct asn1_data *data, uint8_t *v);
 bool asn1_peek_uint8(struct asn1_data *data, uint8_t *v);
-bool asn1_peek_tag_needed_size(struct asn1_data *data, uint8_t tag, size_t *size);
 bool asn1_peek_tag(struct asn1_data *data, uint8_t tag);
 bool asn1_start_tag(struct asn1_data *data, uint8_t tag);
 bool asn1_end_tag(struct asn1_data *data);
@@ -91,7 +94,7 @@ bool asn1_check_OID(struct asn1_data *data, const char *OID);
 bool asn1_read_LDAPString(struct asn1_data *data, TALLOC_CTX *mem_ctx, char **s);
 bool asn1_read_GeneralString(struct asn1_data *data, TALLOC_CTX *mem_ctx, char **s);
 bool asn1_read_OctetString(struct asn1_data *data, TALLOC_CTX *mem_ctx, DATA_BLOB *blob);
-bool asn1_read_ContextSimple(struct asn1_data *data, uint8_t num, DATA_BLOB *blob);
+bool asn1_read_ContextSimple(struct asn1_data *data, TALLOC_CTX *mem_ctx, uint8_t num, DATA_BLOB *blob);
 bool asn1_read_implicit_Integer(struct asn1_data *data, int *i);
 bool asn1_read_Integer(struct asn1_data *data, int *i);
 bool asn1_read_BitString(struct asn1_data *data, TALLOC_CTX *mem_ctx, DATA_BLOB *blob, uint8_t *padding);
@@ -99,8 +102,10 @@ bool asn1_read_enumerated(struct asn1_data *data, int *v);
 bool asn1_check_enumerated(struct asn1_data *data, int v);
 bool asn1_write_enumerated(struct asn1_data *data, uint8_t v);
 bool asn1_blob(const struct asn1_data *asn1, DATA_BLOB *blob);
+bool asn1_extract_blob(struct asn1_data *asn1, TALLOC_CTX *mem_ctx,
+		       DATA_BLOB *pblob);
 void asn1_load_nocopy(struct asn1_data *data, uint8_t *buf, size_t len);
-NTSTATUS asn1_full_tag(DATA_BLOB blob, uint8_t tag, size_t *packet_size);
-NTSTATUS asn1_peek_full_tag(DATA_BLOB blob, uint8_t tag, size_t *packet_size);
+int asn1_peek_full_tag(DATA_BLOB blob, uint8_t tag, size_t *packet_size);
+size_t asn1_get_length(const struct asn1_data *asn1);
 
 #endif /* _ASN_1_H */

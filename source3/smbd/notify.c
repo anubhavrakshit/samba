@@ -33,9 +33,17 @@ struct notify_change_event {
 
 struct notify_change_buf {
 	/*
+	 * Filters for reinitializing after notifyd has been restarted
+	 */
+	uint32_t filter;
+	uint32_t subdir_filter;
+
+	/*
 	 * If no requests are pending, changes are queued here. Simple array,
 	 * we only append.
 	 */
+
+	uint32_t max_buffer_size;
 
 	/*
 	 * num_changes == -1 means that we have got a catch-all change, when
@@ -138,6 +146,7 @@ static bool notify_marshall_changes(int num_changes,
 		struct notify_change_event *c;
 		struct FILE_NOTIFY_INFORMATION m;
 		DATA_BLOB blob;
+		uint16_t pad = 0;
 
 		/* Coalesce any identical records. */
 		while (i+1 < num_changes &&
@@ -151,11 +160,22 @@ static bool notify_marshall_changes(int num_changes,
 		m.FileName1 = c->name;
 		m.FileNameLength = strlen_m(c->name)*2;
 		m.Action = c->action;
-		m.NextEntryOffset = (i == num_changes-1) ? 0 : ndr_size_FILE_NOTIFY_INFORMATION(&m, 0);
+
+		m._pad = data_blob_null;
 
 		/*
 		 * Offset to next entry, only if there is one
 		 */
+
+		if (i == (num_changes-1)) {
+			m.NextEntryOffset = 0;
+		} else {
+			if ((m.FileNameLength % 4) == 2) {
+				m._pad = data_blob_const(&pad, 2);
+			}
+			m.NextEntryOffset =
+				ndr_size_FILE_NOTIFY_INFORMATION(&m, 0);
+		}
 
 		ndr_err = ndr_push_struct_blob(&blob, talloc_tos(), &m,
 			(ndr_push_flags_fn_t)ndr_push_FILE_NOTIFY_INFORMATION);
@@ -206,10 +226,12 @@ void change_notify_reply(struct smb_request *req,
 		return;
 	}
 
-	if (max_param == 0 || notify_buf == NULL) {
+	if (notify_buf == NULL) {
 		reply_fn(req, NT_STATUS_OK, NULL, 0);
 		return;
 	}
+
+	max_param = MIN(max_param, notify_buf->max_buffer_size);
 
 	if (!notify_marshall_changes(notify_buf->num_changes, max_param,
 					notify_buf->changes, &blob)) {
@@ -228,20 +250,43 @@ void change_notify_reply(struct smb_request *req,
 	notify_buf->num_changes = 0;
 }
 
-static void notify_callback(void *private_data, struct timespec when,
-			    const struct notify_event *e)
+struct notify_fsp_state {
+	struct files_struct *notified_fsp;
+	struct timespec when;
+	const struct notify_event *e;
+};
+
+static struct files_struct *notify_fsp_cb(struct files_struct *fsp,
+					  void *private_data)
 {
-	files_struct *fsp = (files_struct *)private_data;
-	DEBUG(10, ("notify_callback called for %s\n", fsp_str_dbg(fsp)));
-	notify_fsp(fsp, when, e->action, e->path);
+	struct notify_fsp_state *state = private_data;
+
+	if (fsp == state->notified_fsp) {
+		DBG_DEBUG("notify_callback called for %s\n", fsp_str_dbg(fsp));
+		notify_fsp(fsp, state->when, state->e->action, state->e->path);
+		return fsp;
+	}
+
+	return NULL;
 }
 
-NTSTATUS change_notify_create(struct files_struct *fsp, uint32_t filter,
+void notify_callback(struct smbd_server_connection *sconn,
+		     void *private_data, struct timespec when,
+		     const struct notify_event *e)
+{
+	struct notify_fsp_state state = {
+		.notified_fsp = private_data, .when = when, .e = e
+	};
+	files_forall(sconn, notify_fsp_cb, &state);
+}
+
+NTSTATUS change_notify_create(struct files_struct *fsp,
+			      uint32_t max_buffer_size,
+			      uint32_t filter,
 			      bool recursive)
 {
-	char *fullpath;
-	size_t len;
-	uint32_t subdir_filter;
+	size_t len = fsp_fullbasepath(fsp, NULL, 0);
+	char fullpath[len+1];
 	NTSTATUS status = NT_STATUS_NOT_IMPLEMENTED;
 
 	if (fsp->notify != NULL) {
@@ -254,33 +299,26 @@ NTSTATUS change_notify_create(struct files_struct *fsp, uint32_t filter,
 		DEBUG(0, ("talloc failed\n"));
 		return NT_STATUS_NO_MEMORY;
 	}
+	fsp->notify->filter = filter;
+	fsp->notify->subdir_filter = recursive ? filter : 0;
+	fsp->notify->max_buffer_size = max_buffer_size;
 
-	/* Do notify operations on the base_name. */
-	fullpath = talloc_asprintf(
-		talloc_tos(), "%s/%s", fsp->conn->connectpath,
-		fsp->fsp_name->base_name);
-	if (fullpath == NULL) {
-		DEBUG(0, ("talloc_asprintf failed\n"));
-		TALLOC_FREE(fsp->notify);
-		return NT_STATUS_NO_MEMORY;
-	}
+	fsp_fullbasepath(fsp, fullpath, sizeof(fullpath));
 
 	/*
 	 * Avoid /. at the end of the path name. notify can't deal with it.
 	 */
-	len = strlen(fullpath);
 	if (len > 1 && fullpath[len-1] == '.' && fullpath[len-2] == '/') {
 		fullpath[len-2] = '\0';
 	}
 
-	subdir_filter = recursive ? filter : 0;
-
-	if ((filter != 0) || (subdir_filter != 0)) {
+	if ((fsp->notify->filter != 0) ||
+	    (fsp->notify->subdir_filter != 0)) {
 		status = notify_add(fsp->conn->sconn->notify_ctx,
-				    fullpath, filter, subdir_filter,
-				    notify_callback, fsp);
+				    fullpath, fsp->notify->filter,
+				    fsp->notify->subdir_filter, fsp);
 	}
-	TALLOC_FREE(fullpath);
+
 	return status;
 }
 
@@ -315,8 +353,7 @@ NTSTATUS change_notify_add_request(struct smb_request *req,
 	request->reply_fn = reply_fn;
 	request->backend_data = NULL;
 
-	DLIST_ADD_END(fsp->notify->requests, request,
-		      struct notify_change_request *);
+	DLIST_ADD_END(fsp->notify->requests, request);
 
 	map->mid = request->req->mid;
 	DLIST_ADD(sconn->smb1.notify_mid_maps, map);
@@ -361,12 +398,21 @@ static void smbd_notify_cancel_by_map(struct notify_mid_map *map)
 	NTSTATUS notify_status = NT_STATUS_CANCELLED;
 
 	if (smb2req != NULL) {
+		NTSTATUS sstatus;
+
 		if (smb2req->session == NULL) {
-			notify_status = STATUS_NOTIFY_CLEANUP;
-		} else if (!NT_STATUS_IS_OK(smb2req->session->status)) {
-			notify_status = STATUS_NOTIFY_CLEANUP;
+			sstatus = NT_STATUS_USER_SESSION_DELETED;
+		} else {
+			sstatus = smb2req->session->status;
 		}
-		if (smb2req->tcon == NULL) {
+
+		if (NT_STATUS_EQUAL(sstatus, NT_STATUS_NETWORK_SESSION_EXPIRED)) {
+			sstatus = NT_STATUS_OK;
+		}
+
+		if (!NT_STATUS_IS_OK(sstatus)) {
+			notify_status = STATUS_NOTIFY_CLEANUP;
+		} else if (smb2req->tcon == NULL) {
 			notify_status = STATUS_NOTIFY_CLEANUP;
 		} else if (!NT_STATUS_IS_OK(smb2req->tcon->status)) {
 			notify_status = STATUS_NOTIFY_CLEANUP;
@@ -382,7 +428,7 @@ static void smbd_notify_cancel_by_map(struct notify_mid_map *map)
  Delete entries by mid from the change notify pending queue. Always send reply.
 *****************************************************************************/
 
-void remove_pending_change_notify_requests_by_mid(
+bool remove_pending_change_notify_requests_by_mid(
 	struct smbd_server_connection *sconn, uint64_t mid)
 {
 	struct notify_mid_map *map;
@@ -394,10 +440,11 @@ void remove_pending_change_notify_requests_by_mid(
 	}
 
 	if (map == NULL) {
-		return;
+		return false;
 	}
 
 	smbd_notify_cancel_by_map(map);
+	return true;
 }
 
 void smbd_notify_cancel_by_smbreq(const struct smb_request *smbreq)
@@ -458,6 +505,56 @@ void smbd_notify_cancel_deleted(struct messaging_context *msg,
 
 done:
 	TALLOC_FREE(fid);
+}
+
+static struct files_struct *smbd_notifyd_reregister(struct files_struct *fsp,
+						    void *private_data)
+{
+	DBG_DEBUG("reregister %s\n", fsp->fsp_name->base_name);
+
+	if ((fsp->conn->sconn->notify_ctx != NULL) &&
+	    (fsp->notify != NULL) &&
+	    ((fsp->notify->filter != 0) ||
+	     (fsp->notify->subdir_filter != 0))) {
+		size_t len = fsp_fullbasepath(fsp, NULL, 0);
+		char fullpath[len+1];
+
+		NTSTATUS status;
+
+		fsp_fullbasepath(fsp, fullpath, sizeof(fullpath));
+		if (len > 1 && fullpath[len-1] == '.' &&
+		    fullpath[len-2] == '/') {
+			fullpath[len-2] = '\0';
+		}
+
+		status = notify_add(fsp->conn->sconn->notify_ctx,
+				    fullpath, fsp->notify->filter,
+				    fsp->notify->subdir_filter, fsp);
+		if (!NT_STATUS_IS_OK(status)) {
+			DBG_DEBUG("notify_add failed: %s\n",
+				  nt_errstr(status));
+		}
+	}
+	return NULL;
+}
+
+void smbd_notifyd_restarted(struct messaging_context *msg,
+			    void *private_data, uint32_t msg_type,
+			    struct server_id server_id, DATA_BLOB *data)
+{
+	struct smbd_server_connection *sconn = talloc_get_type_abort(
+		private_data, struct smbd_server_connection);
+
+	TALLOC_FREE(sconn->notify_ctx);
+
+	sconn->notify_ctx = notify_init(sconn, sconn->msg_ctx,
+					sconn, notify_callback);
+	if (sconn->notify_ctx == NULL) {
+		DBG_DEBUG("notify_init failed\n");
+		return;
+	}
+
+	files_forall(sconn, smbd_notifyd_reregister, sconn->notify_ctx);
 }
 
 /****************************************************************************

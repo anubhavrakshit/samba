@@ -98,7 +98,9 @@ bool ads_parse_gp_ext(TALLOC_CTX *mem_ctx,
 		for (k = 0; ext_strings[k] != NULL; k++) {
 			/* no op */
 		}
-
+		if (k == 0) {
+			goto parse_error;
+		}
 		q = ext_strings[0];
 
 		if (q[0] == '{') {
@@ -295,7 +297,7 @@ ADS_STATUS ads_add_gpo_link(ADS_STRUCT *ads,
 	const char *gp_link, *gp_link_new;
 	ADS_MODLIST mods;
 
-	/* although ADS allows to set anything here, we better check here if
+	/* although ADS allows one to set anything here, we better check here if
 	 * the gpo_dn is sane */
 
 	if (!strnequal(gpo_dn, "LDAP://CN={", strlen("LDAP://CN={")) != 0) {
@@ -424,24 +426,30 @@ ADS_STATUS ads_delete_gpo_link(ADS_STRUCT *ads,
 	ADS_ERROR_HAVE_NO_MEMORY(gpo->ds_path);
 
 	if (!ads_pull_uint32(ads, res, "versionNumber", &gpo->version)) {
-		return ADS_ERROR(LDAP_NO_MEMORY);
+		return ADS_ERROR(LDAP_NO_SUCH_ATTRIBUTE);
 	}
 
 	if (!ads_pull_uint32(ads, res, "flags", &gpo->options)) {
-		return ADS_ERROR(LDAP_NO_MEMORY);
+		return ADS_ERROR(LDAP_NO_SUCH_ATTRIBUTE);
 	}
 
 	gpo->file_sys_path = ads_pull_string(ads, mem_ctx, res,
 		"gPCFileSysPath");
-	ADS_ERROR_HAVE_NO_MEMORY(gpo->file_sys_path);
+	if (gpo->file_sys_path == NULL) {
+		return ADS_ERROR(LDAP_NO_SUCH_ATTRIBUTE);
+	}
 
 	gpo->display_name = ads_pull_string(ads, mem_ctx, res,
 		"displayName");
-	ADS_ERROR_HAVE_NO_MEMORY(gpo->display_name);
+	if (gpo->display_name == NULL) {
+		return ADS_ERROR(LDAP_NO_SUCH_ATTRIBUTE);
+	}
 
 	gpo->name = ads_pull_string(ads, mem_ctx, res,
 		"name");
-	ADS_ERROR_HAVE_NO_MEMORY(gpo->name);
+	if (gpo->name == NULL) {
+		return ADS_ERROR(LDAP_NO_SUCH_ATTRIBUTE);
+	}
 
 	gpo->machine_extensions = ads_pull_string(ads, mem_ctx, res,
 		"gPCMachineExtensionNames");
@@ -450,7 +458,9 @@ ADS_STATUS ads_delete_gpo_link(ADS_STRUCT *ads,
 
 	ads_pull_sd(ads, mem_ctx, res, "ntSecurityDescriptor",
 		&gpo->security_descriptor);
-	ADS_ERROR_HAVE_NO_MEMORY(gpo->security_descriptor);
+	if (gpo->security_descriptor == NULL) {
+		return ADS_ERROR(LDAP_NO_SUCH_ATTRIBUTE);
+	}
 
 	return ADS_ERROR(LDAP_SUCCESS);
 }
@@ -466,7 +476,7 @@ ADS_STATUS ads_get_gpo(ADS_STRUCT *ads,
 		       const char *guid_name,
 		       struct GROUP_POLICY_OBJECT *gpo)
 {
-	ADS_STATUS status;
+	ADS_STATUS status = ADS_ERROR(LDAP_NO_SUCH_OBJECT);
 	LDAPMessage *res = NULL;
 	char *dn;
 	const char *filter;
@@ -546,6 +556,7 @@ ADS_STATUS ads_get_gpo(ADS_STRUCT *ads,
 static ADS_STATUS add_gplink_to_gpo_list(ADS_STRUCT *ads,
 					 TALLOC_CTX *mem_ctx,
 					 struct GROUP_POLICY_OBJECT **gpo_list,
+					 struct GROUP_POLICY_OBJECT **forced_gpo_list,
 					 const char *link_dn,
 					 struct GP_LINK *gp_link,
 					 enum GPO_LINK_TYPE link_type,
@@ -553,11 +564,20 @@ static ADS_STATUS add_gplink_to_gpo_list(ADS_STRUCT *ads,
 					 const struct security_token *token)
 {
 	ADS_STATUS status;
-	int i;
+	uint32_t count;
 
-	for (i = 0; i < gp_link->num_links; i++) {
-
+	/*
+	 * Note: DLIST_ADD pushes to the front,
+	 * so loop from last to first to get the
+	 * order right.
+	 */
+	for (count = gp_link->num_links; count > 0; count--) {
+		/* NB. Index into arrays is one less than counter. */
+		uint32_t i = count - 1;
+		struct GROUP_POLICY_OBJECT **target_list = NULL;
 		struct GROUP_POLICY_OBJECT *new_gpo = NULL;
+		bool is_forced =
+			(gp_link->link_opts[i] & GPO_LINK_OPT_ENFORCED) != 0;
 
 		if (gp_link->link_opts[i] & GPO_LINK_OPT_DISABLED) {
 			DEBUG(10,("skipping disabled GPO\n"));
@@ -566,7 +586,7 @@ static ADS_STATUS add_gplink_to_gpo_list(ADS_STRUCT *ads,
 
 		if (only_add_forced_gpos) {
 
-			if (!(gp_link->link_opts[i] & GPO_LINK_OPT_ENFORCED)) {
+			if (!is_forced) {
 				DEBUG(10,("skipping nonenforced GPO link "
 					"because GPOPTIONS_BLOCK_INHERITANCE "
 					"has been set\n"));
@@ -586,6 +606,13 @@ static ADS_STATUS add_gplink_to_gpo_list(ADS_STRUCT *ads,
 		if (!ADS_ERR_OK(status)) {
 			DEBUG(10,("failed to get gpo: %s\n",
 				gp_link->link_names[i]));
+			if ((status.error_type == ENUM_ADS_ERROR_LDAP) &&
+			    (status.err.rc == LDAP_NO_SUCH_ATTRIBUTE)) {
+				DEBUG(10,("skipping empty gpo: %s\n",
+					gp_link->link_names[i]));
+				talloc_free(new_gpo);
+				continue;
+			}
 			return status;
 		}
 
@@ -602,7 +629,8 @@ static ADS_STATUS add_gplink_to_gpo_list(ADS_STRUCT *ads,
 		new_gpo->link = link_dn;
 		new_gpo->link_type = link_type;
 
-		DLIST_ADD(*gpo_list, new_gpo);
+		target_list = is_forced ? forced_gpo_list : gpo_list;
+		DLIST_ADD(*target_list, new_gpo);
 
 		DEBUG(10,("add_gplink_to_gplist: added GPLINK #%d %s "
 			"to GPO list\n", i, gp_link->link_names[i]));
@@ -662,10 +690,13 @@ ADS_STATUS ads_get_sid_token(ADS_STRUCT *ads,
 		}
 	}
 
-	new_token = create_local_nt_token(mem_ctx, &object_sid, false,
-					  num_token_sids, token_sids);
-	ADS_ERROR_HAVE_NO_MEMORY(new_token);
-
+	status = ADS_ERROR_NT(create_local_nt_token(mem_ctx, 
+					  &object_sid, false,
+					  num_token_sids, token_sids, &new_token));
+	if (!ADS_ERR_OK(status)) {
+		return status;
+	}
+	
 	*token = new_token;
 
 	security_token_debug(DBGC_CLASS, 5, *token);
@@ -701,17 +732,28 @@ static ADS_STATUS add_local_policy_to_gpo_list(TALLOC_CTX *mem_ctx,
 }
 
 /****************************************************************
- get the full list of GROUP_POLICY_OBJECTs for a given dn
+ Get the full list of GROUP_POLICY_OBJECTs for a given dn.
 ****************************************************************/
 
-ADS_STATUS ads_get_gpo_list(ADS_STRUCT *ads,
+static ADS_STATUS ads_get_gpo_list_internal(ADS_STRUCT *ads,
 			    TALLOC_CTX *mem_ctx,
 			    const char *dn,
 			    uint32_t flags,
 			    const struct security_token *token,
-			    struct GROUP_POLICY_OBJECT **gpo_list)
+			    struct GROUP_POLICY_OBJECT **gpo_list,
+			    struct GROUP_POLICY_OBJECT **forced_gpo_list)
 {
-	/* (L)ocal (S)ite (D)omain (O)rganizational(U)nit */
+	/*
+	 * Push GPOs to gpo_list so that the traversal order of the list matches
+	 * the order of application:
+	 * (L)ocal (S)ite (D)omain (O)rganizational(U)nit
+	 * For different domains and OUs: parent-to-child.
+	 * Within same level of domains and OUs: Link order.
+	 * Since GPOs are pushed to the front of gpo_list, GPOs have to be
+	 * pushed in the opposite order of application (OUs first, local last,
+	 * child-to-parent).
+	 * Forced GPOs are appended in the end since they override all others.
+	 */
 
 	ADS_STATUS status;
 	struct GP_LINK gp_link;
@@ -719,6 +761,7 @@ ADS_STATUS ads_get_gpo_list(ADS_STRUCT *ads,
 	bool add_only_forced_gpos = false;
 
 	ZERO_STRUCTP(gpo_list);
+	ZERO_STRUCTP(forced_gpo_list);
 
 	if (!dn) {
 		return ADS_ERROR_NT(NT_STATUS_INVALID_PARAMETER);
@@ -730,11 +773,97 @@ ADS_STATUS ads_get_gpo_list(ADS_STRUCT *ads,
 
 	DEBUG(10,("ads_get_gpo_list: getting GPO list for [%s]\n", dn));
 
-	/* (L)ocal */
-	status = add_local_policy_to_gpo_list(mem_ctx, gpo_list,
-					      GP_LINK_LOCAL);
-	if (!ADS_ERR_OK(status)) {
-		return status;
+	tmp_dn = dn;
+
+	while ((parent_dn = ads_parent_dn(tmp_dn)) &&
+	       (!strequal(parent_dn, ads_parent_dn(ads->config.bind_path)))) {
+
+
+		/* (O)rganizational(U)nit */
+
+		/* An account can be a member of more OUs */
+		if (strncmp(parent_dn, "OU=", strlen("OU=")) == 0) {
+
+			DEBUG(10,("ads_get_gpo_list: query OU: [%s] for GPOs\n",
+				parent_dn));
+
+			status = ads_get_gpo_link(ads, mem_ctx, parent_dn,
+						  &gp_link);
+			if (ADS_ERR_OK(status)) {
+
+				if (DEBUGLEVEL >= 100) {
+					dump_gplink(&gp_link);
+				}
+
+				status = add_gplink_to_gpo_list(ads,
+							mem_ctx,
+							gpo_list,
+							forced_gpo_list,
+							parent_dn,
+							&gp_link,
+							GP_LINK_OU,
+							add_only_forced_gpos,
+							token);
+				if (!ADS_ERR_OK(status)) {
+					return status;
+				}
+
+				/* block inheritance from now on */
+				if (gp_link.gp_opts &
+				    GPOPTIONS_BLOCK_INHERITANCE) {
+					add_only_forced_gpos = true;
+				}
+			}
+		}
+
+		tmp_dn = parent_dn;
+
+	}
+
+	/* reset dn again */
+	tmp_dn = dn;
+
+	while ((parent_dn = ads_parent_dn(tmp_dn)) &&
+	       (!strequal(parent_dn, ads_parent_dn(ads->config.bind_path)))) {
+
+		/* (D)omain */
+
+		/* An account can just be a member of one domain */
+		if (strncmp(parent_dn, "DC=", strlen("DC=")) == 0) {
+
+			DEBUG(10,("ads_get_gpo_list: query DC: [%s] for GPOs\n",
+				parent_dn));
+
+			status = ads_get_gpo_link(ads, mem_ctx, parent_dn,
+						  &gp_link);
+			if (ADS_ERR_OK(status)) {
+
+				if (DEBUGLEVEL >= 100) {
+					dump_gplink(&gp_link);
+				}
+
+				status = add_gplink_to_gpo_list(ads,
+							mem_ctx,
+							gpo_list,
+							forced_gpo_list,
+							parent_dn,
+							&gp_link,
+							GP_LINK_DOMAIN,
+							add_only_forced_gpos,
+							token);
+				if (!ADS_ERR_OK(status)) {
+					return status;
+				}
+
+				/* block inheritance from now on */
+				if (gp_link.gp_opts &
+				    GPOPTIONS_BLOCK_INHERITANCE) {
+					add_only_forced_gpos = true;
+				}
+			}
+		}
+
+		tmp_dn = parent_dn;
 	}
 
 	/* (S)ite */
@@ -759,8 +888,12 @@ ADS_STATUS ads_get_gpo_list(ADS_STRUCT *ads,
 				dump_gplink(&gp_link);
 			}
 
-			status = add_gplink_to_gpo_list(ads, mem_ctx, gpo_list,
-							site_dn, &gp_link,
+			status = add_gplink_to_gpo_list(ads,
+							mem_ctx,
+							gpo_list,
+							forced_gpo_list,
+							site_dn,
+							&gp_link,
 							GP_LINK_SITE,
 							add_only_forced_gpos,
 							token);
@@ -776,96 +909,46 @@ ADS_STATUS ads_get_gpo_list(ADS_STRUCT *ads,
 		}
 	}
 
-	tmp_dn = dn;
-
-	while ((parent_dn = ads_parent_dn(tmp_dn)) &&
-	       (!strequal(parent_dn, ads_parent_dn(ads->config.bind_path)))) {
-
-		/* (D)omain */
-
-		/* An account can just be a member of one domain */
-		if (strncmp(parent_dn, "DC=", strlen("DC=")) == 0) {
-
-			DEBUG(10,("ads_get_gpo_list: query DC: [%s] for GPOs\n",
-				parent_dn));
-
-			status = ads_get_gpo_link(ads, mem_ctx, parent_dn,
-						  &gp_link);
-			if (ADS_ERR_OK(status)) {
-
-				if (DEBUGLEVEL >= 100) {
-					dump_gplink(&gp_link);
-				}
-
-				/* block inheritance from now on */
-				if (gp_link.gp_opts &
-				    GPOPTIONS_BLOCK_INHERITANCE) {
-					add_only_forced_gpos = true;
-				}
-
-				status = add_gplink_to_gpo_list(ads,
-							mem_ctx,
-							gpo_list,
-							parent_dn,
-							&gp_link,
-							GP_LINK_DOMAIN,
-							add_only_forced_gpos,
-							token);
-				if (!ADS_ERR_OK(status)) {
-					return status;
-				}
-			}
-		}
-
-		tmp_dn = parent_dn;
+	/* (L)ocal */
+	status = add_local_policy_to_gpo_list(mem_ctx, gpo_list,
+					      GP_LINK_LOCAL);
+	if (!ADS_ERR_OK(status)) {
+		return status;
 	}
 
-	/* reset dn again */
-	tmp_dn = dn;
+	return ADS_ERROR(LDAP_SUCCESS);
+}
 
-	while ((parent_dn = ads_parent_dn(tmp_dn)) &&
-	       (!strequal(parent_dn, ads_parent_dn(ads->config.bind_path)))) {
+/****************************************************************
+ Get the full list of GROUP_POLICY_OBJECTs for a given dn, wrapper
+ around ads_get_gpo_list_internal() that ensures correct ordering.
+****************************************************************/
 
+ADS_STATUS ads_get_gpo_list(ADS_STRUCT *ads,
+			    TALLOC_CTX *mem_ctx,
+			    const char *dn,
+			    uint32_t flags,
+			    const struct security_token *token,
+			    struct GROUP_POLICY_OBJECT **gpo_list)
+{
+	struct GROUP_POLICY_OBJECT *forced_gpo_list = NULL;
+	ADS_STATUS status;
 
-		/* (O)rganizational(U)nit */
-
-		/* An account can be a member of more OUs */
-		if (strncmp(parent_dn, "OU=", strlen("OU=")) == 0) {
-
-			DEBUG(10,("ads_get_gpo_list: query OU: [%s] for GPOs\n",
-				parent_dn));
-
-			status = ads_get_gpo_link(ads, mem_ctx, parent_dn,
-						  &gp_link);
-			if (ADS_ERR_OK(status)) {
-
-				if (DEBUGLEVEL >= 100) {
-					dump_gplink(&gp_link);
-				}
-
-				/* block inheritance from now on */
-				if (gp_link.gp_opts &
-				    GPOPTIONS_BLOCK_INHERITANCE) {
-					add_only_forced_gpos = true;
-				}
-
-				status = add_gplink_to_gpo_list(ads,
-							mem_ctx,
-							gpo_list,
-							parent_dn,
-							&gp_link,
-							GP_LINK_OU,
-							add_only_forced_gpos,
-							token);
-				if (!ADS_ERR_OK(status)) {
-					return status;
-				}
-			}
-		}
-
-		tmp_dn = parent_dn;
-
-	};
+	status = ads_get_gpo_list_internal(ads,
+					   mem_ctx,
+					   dn,
+					   flags,
+					   token,
+					   gpo_list,
+					   &forced_gpo_list);
+	if (!ADS_ERR_OK(status)) {
+		return status;
+	}
+	/*
+	 * Append |forced_gpo_list| at the end of |gpo_list|,
+	 * so that forced GPOs are applied on top of non enforced GPOs.
+	 */
+	DLIST_CONCATENATE(*gpo_list, forced_gpo_list);
 
 	return ADS_ERROR(LDAP_SUCCESS);
 }

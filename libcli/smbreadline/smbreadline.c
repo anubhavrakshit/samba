@@ -47,7 +47,7 @@
 
 static bool smb_rl_done;
 
-#if HAVE_LIBREADLINE
+#ifdef HAVE_LIBREADLINE
 /*
  * MacOS/X does not have rl_done in readline.h, but
  * readline.so has it
@@ -58,7 +58,7 @@ extern int rl_done;
 void smb_readline_done(void)
 {
 	smb_rl_done = true;
-#if HAVE_LIBREADLINE
+#ifdef HAVE_LIBREADLINE
 	rl_done = 1;
 #endif
 }
@@ -71,13 +71,13 @@ static char *smb_readline_replacement(const char *prompt, void (*callback)(void)
 				char **(completion_fn)(const char *text, int start, int end))
 {
 	char *line = NULL;
-	int fd = x_fileno(x_stdin);
+	int fd = fileno(stdin);
 	char *ret;
 
 	/* Prompt might be NULL in non-interactive mode. */
 	if (prompt) {
-		x_fprintf(x_stdout, "%s", prompt);
-		x_fflush(x_stdout);
+		printf("%s", prompt);
+		fflush(stdout);
 	}
 
 	line = (char *)malloc(BUFSIZ);
@@ -93,7 +93,7 @@ static char *smb_readline_replacement(const char *prompt, void (*callback)(void)
 		pfd.events = POLLIN|POLLHUP;
 
 		if (sys_poll_intr(&pfd, 1, 5000) == 1) {
-			ret = x_fgets(line, BUFSIZ, x_stdin);
+			ret = fgets(line, BUFSIZ, stdin);
 			if (ret == 0) {
 				SAFE_FREE(line);
 			}
@@ -117,12 +117,12 @@ char *smb_readline(const char *prompt, void (*callback)(void),
 	char *ret;
 	bool interactive;
 
-	interactive = isatty(x_fileno(x_stdin)) || getenv("CLI_FORCE_INTERACTIVE");
+	interactive = isatty(fileno(stdin)) || getenv("CLI_FORCE_INTERACTIVE");
 	if (!interactive) {
 		return smb_readline_replacement(NULL, callback, completion_fn);
 	}
 
-#if HAVE_LIBREADLINE
+#ifdef HAVE_LIBREADLINE
 
 	/* Aargh!  Readline does bizzare things with the terminal width
 	that mucks up expect(1).  Set CLI_NO_READLINE in the environment
@@ -137,9 +137,15 @@ char *smb_readline(const char *prompt, void (*callback)(void),
 		works in all of them to date, but we get compiler
 		warnings in some.  */
 		rl_attempted_completion_function = RL_COMPLETION_CAST completion_fn;
+
+		/*
+		 * We only want sensible characters as the word-break chars
+		 * for the most part. This allows us to tab through a path.
+		 */
+		rl_basic_word_break_characters = " \t\n";
 	}
 
-#if HAVE_DECL_RL_EVENT_HOOK
+#ifdef HAVE_DECL_RL_EVENT_HOOK
 	if (callback)
 		rl_event_hook = (rl_hook_func_t *)callback;
 #endif

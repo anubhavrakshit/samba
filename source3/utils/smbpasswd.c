@@ -21,7 +21,10 @@
 #include "secrets.h"
 #include "../librpc/gen_ndr/samr.h"
 #include "../lib/util/util_pw.h"
+#include "libsmb/proto.h"
 #include "passdb.h"
+#include "cmdline_contexts.h"
+#include "passwd_proto.h"
 
 /*
  * Next two lines needed for SunOS and don't
@@ -57,7 +60,7 @@ static void usage(void)
 	printf("  -c smb.conf file     Use the given path to the smb.conf file\n");
 	printf("  -D LEVEL             debug level\n");
 	printf("  -r MACHINE           remote machine\n");
-	printf("  -U USER              remote username\n");
+	printf("  -U USER              remote username (e.g. SAM/user)\n");
 
 	printf("extra options when run by root or in local mode:\n");
 	printf("  -a                   add user\n");
@@ -94,7 +97,7 @@ static int process_options(int argc, char **argv, int local_flags)
 
 	user_name[0] = '\0';
 
-	while ((ch = getopt(argc, argv, "c:axdehminjr:sw:R:D:U:LW")) != EOF) {
+	while ((ch = getopt(argc, argv, "c:axdehminjr:sw:R:D:U:LWS:")) != EOF) {
 		switch(ch) {
 		case 'L':
 			if (getuid() != 0) {
@@ -242,8 +245,9 @@ static char *prompt_for_new_password(bool stdin_get)
  Change a password either locally or remotely.
 *************************************************************/
 
-static NTSTATUS password_change(const char *remote_mach, char *username, 
-				char *old_passwd, char *new_pw,
+static NTSTATUS password_change(const char *remote_mach,
+				const char *domain, const char *username,
+				const char *old_passwd, const char *new_pw,
 				int local_flags)
 {
 	NTSTATUS ret;
@@ -258,7 +262,8 @@ static NTSTATUS password_change(const char *remote_mach, char *username,
 			fprintf(stderr, "Invalid remote operation!\n");
 			return NT_STATUS_UNSUCCESSFUL;
 		}
-		ret = remote_password_change(remote_mach, username,
+		ret = remote_password_change(remote_mach,
+					     domain, username,
 					     old_passwd, new_pw, &err_str);
 	} else {
 		ret = local_password_change(username, local_flags, new_pw,
@@ -291,7 +296,7 @@ static bool store_ldap_admin_pw (char* pw)
 	if (!secrets_init())
 		return False;
 
-	return secrets_store_ldap_pw(lp_ldap_admin_dn(talloc_tos()), pw);
+	return secrets_store_ldap_pw(lp_ldap_admin_dn(), pw);
 }
 
 
@@ -306,7 +311,7 @@ static int process_root(int local_flags)
 	char *old_passwd = NULL;
 
 	if (local_flags & LOCAL_SET_LDAP_ADMIN_PW) {
-		char *ldap_admin_dn = lp_ldap_admin_dn(talloc_tos());
+		const char *ldap_admin_dn = lp_ldap_admin_dn();
 		if ( ! *ldap_admin_dn ) {
 			DEBUG(0,("ERROR: 'ldap admin dn' not defined! Please check your smb.conf\n"));
 			goto done;
@@ -365,36 +370,44 @@ static int process_root(int local_flags)
 
 	if (local_flags & LOCAL_TRUST_ACCOUNT) {
 		/* add the $ automatically */
-		static fstring buf;
+		size_t user_name_len = strlen(user_name);
 
-		/*
-		 * Remove any trailing '$' before we
-		 * generate the initial machine password.
-		 */
-
-		if (user_name[strlen(user_name)-1] == '$') {
-			user_name[strlen(user_name)-1] = 0;
+		if (user_name[user_name_len - 1] == '$') {
+			user_name_len--;
+		} else {
+			if (user_name_len + 2 > sizeof(user_name)) {
+				fprintf(stderr, "machine name too long\n");
+				exit(1);
+			}
+			user_name[user_name_len] = '$';
+			user_name[user_name_len + 1] = '\0';
 		}
 
 		if (local_flags & LOCAL_ADD_USER) {
 		        SAFE_FREE(new_passwd);
-			new_passwd = smb_xstrdup(user_name);
+
+			/*
+			 * Remove any trailing '$' before we
+			 * generate the initial machine password.
+			 */
+			new_passwd = smb_xstrndup(user_name, user_name_len);
 			if (!strlower_m(new_passwd)) {
 				fprintf(stderr, "strlower_m %s failed\n",
 					new_passwd);
 				exit(1);
 			}
 		}
-
-		/*
-		 * Now ensure the username ends in '$' for
-		 * the machine add.
-		 */
-
-		slprintf(buf, sizeof(buf)-1, "%s$", user_name);
-		strlcpy(user_name, buf, sizeof(user_name));
 	} else if (local_flags & LOCAL_INTERDOM_ACCOUNT) {
-		static fstring buf;
+		size_t user_name_len = strlen(user_name);
+
+		if (user_name[user_name_len - 1] != '$') {
+			if (user_name_len + 2 > sizeof(user_name)) {
+				fprintf(stderr, "machine name too long\n");
+				exit(1);
+			}
+			user_name[user_name_len] = '$';
+			user_name[user_name_len + 1] = '\0';
+		}
 
 		if ((local_flags & LOCAL_ADD_USER) && (new_passwd == NULL)) {
 			/*
@@ -406,11 +419,6 @@ static int process_root(int local_flags)
 				exit(1);
 			}
 		}
-
-		/* prepare uppercased and '$' terminated username */
-		slprintf(buf, sizeof(buf) - 1, "%s$", user_name);
-		strlcpy(user_name, buf, sizeof(user_name));
-
 	} else {
 
 		if (remote_machine != NULL) {
@@ -463,7 +471,8 @@ static int process_root(int local_flags)
 		}
 	}
 
-	if (!NT_STATUS_IS_OK(password_change(remote_machine, user_name,
+	if (!NT_STATUS_IS_OK(password_change(remote_machine,
+					     NULL, user_name,
 					     old_passwd, new_passwd,
 					     local_flags))) {
 		result = 1;
@@ -515,6 +524,9 @@ static int process_nonroot(int local_flags)
 	int result = 0;
 	char *old_pw = NULL;
 	char *new_pw = NULL;
+	const char *username = user_name;
+	const char *domain = NULL;
+	char *p = NULL;
 
 	if (local_flags & ~(LOCAL_AM_ROOT | LOCAL_SET_PASSWORD)) {
 		/* Extra flags that we can't honor non-root */
@@ -532,6 +544,15 @@ static int process_nonroot(int local_flags)
 		}
 	}
 
+	/* Allow domain as part of the username */
+	if ((p = strchr_m(user_name, '\\')) ||
+	    (p = strchr_m(user_name, '/')) ||
+	    (p = strchr_m(user_name, *lp_winbind_separator()))) {
+		*p = '\0';
+		username = p + 1;
+		domain = user_name;
+	}
+
 	/*
 	 * A non-root user is always setting a password
 	 * via a remote machine (even if that machine is
@@ -540,16 +561,24 @@ static int process_nonroot(int local_flags)
 
 	load_interfaces(); /* Delayed from main() */
 
-	if (remote_machine == NULL) {
+	if (remote_machine != NULL) {
+		if (!is_ipaddress(remote_machine)) {
+			domain = remote_machine;
+		}
+	} else {
 		remote_machine = "127.0.0.1";
+
+		/*
+		 * If we deal with a local user, change the password for the
+		 * user in our SAM.
+		 */
+		domain = get_global_sam_name();
 	}
 
-	if (remote_machine != NULL) {
-		old_pw = get_pass("Old SMB password:",stdin_passwd_get);
-		if (old_pw == NULL) {
-			fprintf(stderr, "Unable to get old password.\n");
-			exit(1);
-		}
+	old_pw = get_pass("Old SMB password:",stdin_passwd_get);
+	if (old_pw == NULL) {
+		fprintf(stderr, "Unable to get old password.\n");
+		exit(1);
 	}
 
 	if (!new_passwd) {
@@ -563,13 +592,14 @@ static int process_nonroot(int local_flags)
 		exit(1);
 	}
 
-	if (!NT_STATUS_IS_OK(password_change(remote_machine, user_name, old_pw,
-					     new_pw, 0))) {
+	if (!NT_STATUS_IS_OK(password_change(remote_machine,
+					     domain, username,
+					     old_pw, new_pw, 0))) {
 		result = 1;
 		goto done;
 	}
 
-	printf("Password changed for user %s\n", user_name);
+	printf("Password changed for user %s\n", username);
 
  done:
 	SAFE_FREE(old_pw);

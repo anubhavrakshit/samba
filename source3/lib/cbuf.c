@@ -27,8 +27,12 @@
  */
 
 
-#include "includes.h"
+#include "replace.h"
+#include "system/locale.h"
 #include "cbuf.h"
+#include <talloc.h>
+#include <assert.h>
+#include "lib/util/byteorder.h"
 
 
 struct cbuf {
@@ -278,7 +282,8 @@ int cbuf_print_quoted_string(cbuf* ost, const char* s)
 		case '\\':
 			cbuf_putc(ost, '\\');
 		        n++;
-			/* no break */
+
+			FALL_THROUGH;
 		default:
 			cbuf_putc(ost, *s);
 			n++;
@@ -306,7 +311,9 @@ int cbuf_print_quoted(cbuf* ost, const char* s, size_t len)
 			if (isprint(*s) && ((*s == ' ') || !isspace(*s))) {
 				ret = cbuf_putc(ost, *s);
 			} else {
-				ret = cbuf_printf(ost, "\\%02x", (uchar)*s);
+				ret = cbuf_printf(ost,
+						  "\\%02x",
+						  (unsigned char)*s);
 			}
 		}
 		s++;

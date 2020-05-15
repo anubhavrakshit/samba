@@ -24,6 +24,7 @@
 #include "lib/netapi/netapi.h"
 #include "lib/netapi/netapi_private.h"
 #include "lib/netapi/libnetapi.h"
+#include "libsmb/dsgetdcname.h"
 
 /********************************************************************
 ********************************************************************/
@@ -69,7 +70,7 @@ WERROR NetGetDCName_r(struct libnetapi_ctx *ctx,
 	}
 
 	if (NetApiBufferAllocate(strlen_m_term(dcname), &buffer)) {
-		werr = WERR_NOMEM;
+		werr = WERR_NOT_ENOUGH_MEMORY;
 		goto done;
 	}
 	memcpy(buffer, dcname, strlen_m_term(dcname));
@@ -122,7 +123,7 @@ WERROR NetGetAnyDCName_r(struct libnetapi_ctx *ctx,
 	}
 
 	if (NetApiBufferAllocate(strlen_m_term(dcname), &buffer)) {
-		werr = WERR_NOMEM;
+		werr = WERR_NOT_ENOUGH_MEMORY;
 		goto done;
 	}
 	memcpy(buffer, dcname, strlen_m_term(dcname));
@@ -169,7 +170,7 @@ WERROR DsGetDcName_r(struct libnetapi_ctx *ctx,
 		     struct DsGetDcName *r)
 {
 	WERROR werr;
-	NTSTATUS status = NT_STATUS_DOMAIN_CONTROLLER_NOT_FOUND;
+	NTSTATUS status;
 	struct dcerpc_binding_handle *b;
 
 	werr = libnetapi_get_binding_handle(ctx, r->in.server_name,

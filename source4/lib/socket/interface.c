@@ -75,8 +75,7 @@ static struct interface *iface_list_find(struct interface *interfaces,
 /****************************************************************************
 add an interface to the linked list of interfaces
 ****************************************************************************/
-static void add_interface(TALLOC_CTX *mem_ctx, const struct iface_struct *ifs, struct interface **interfaces,
-			  bool enable_ipv6)
+static void add_interface(TALLOC_CTX *mem_ctx, const struct iface_struct *ifs, struct interface **interfaces)
 {
 	char addr[INET6_ADDRSTRLEN];
 	struct interface *iface;
@@ -91,10 +90,6 @@ static void add_interface(TALLOC_CTX *mem_ctx, const struct iface_struct *ifs, s
 		!(ifs->flags & (IFF_BROADCAST|IFF_LOOPBACK))) {
 		DEBUG(3,("not adding non-broadcast interface %s\n",
 					ifs->name ));
-		return;
-	}
-
-	if (!enable_ipv6 && ifs->ip.ss_family != AF_INET) {
 		return;
 	}
 
@@ -135,7 +130,7 @@ static void add_interface(TALLOC_CTX *mem_ctx, const struct iface_struct *ifs, s
 	   this needs to be a ADD_END, as some tests (such as the
 	   spoolss notify test) depend on the interfaces ordering
 	*/
-	DLIST_ADD_END(*interfaces, iface, NULL);
+	DLIST_ADD_END(*interfaces, iface);
 }
 
 /**
@@ -153,8 +148,7 @@ static void interpret_interface(TALLOC_CTX *mem_ctx,
 				const char *token, 
 				struct iface_struct *probed_ifaces, 
 				int total_probed,
-				struct interface **local_interfaces,
-				bool enable_ipv6)
+				struct interface **local_interfaces)
 {
 	struct sockaddr_storage ss;
 	struct sockaddr_storage ss_mask;
@@ -170,12 +164,21 @@ static void interpret_interface(TALLOC_CTX *mem_ctx,
 	for (i=0;i<total_probed;i++) {
 		if (gen_fnmatch(token, probed_ifaces[i].name) == 0) {
 			add_interface(mem_ctx, &probed_ifaces[i],
-				      local_interfaces, enable_ipv6);
+				      local_interfaces);
 			added = true;
 		}
 	}
 	if (added) {
 		return;
+	}
+
+	p = strchr_m(token, ';');
+	if (p != NULL) {
+		/*
+		 * skip smbd-specific extra data:
+		 * link speed, capabilities, and interface index
+		 */
+		*p = 0;
 	}
 
 	/* maybe it is a DNS name */
@@ -190,7 +193,7 @@ static void interpret_interface(TALLOC_CTX *mem_ctx,
 		for (i=0;i<total_probed;i++) {
 			if (sockaddr_equal((struct sockaddr *)&ss, (struct sockaddr *)&probed_ifaces[i].ip)) {
 				add_interface(mem_ctx, &probed_ifaces[i],
-					      local_interfaces, enable_ipv6);
+					      local_interfaces);
 				return;
 			}
 		}
@@ -221,9 +224,14 @@ static void interpret_interface(TALLOC_CTX *mem_ctx,
 			return;
 		}
 	} else {
-		char *endp = NULL;
-		unsigned long val = strtoul(p, &endp, 0);
-		if (p == endp || (endp && *endp != '\0')) {
+		int error = 0;
+
+		unsigned long val = smb_strtoul(p,
+						NULL,
+						0,
+						&error,
+						SMB_STR_FULL_STR_CONV);
+		if (error != 0) {
 			DEBUG(2,("interpret_interface: "
 				"can't determine netmask value from %s\n",
 				p));
@@ -260,7 +268,7 @@ static void interpret_interface(TALLOC_CTX *mem_ctx,
 					p,
 					probed_ifaces[i].name));
 				add_interface(mem_ctx, &probed_ifaces[i],
-					      local_interfaces, enable_ipv6);
+					      local_interfaces);
 				probed_ifaces[i].netmask = saved_mask;
 				return;
 			}
@@ -282,8 +290,7 @@ static void interpret_interface(TALLOC_CTX *mem_ctx,
 	ifs.ip = ss;
 	ifs.netmask = ss_mask;
 	ifs.bcast = ss_bcast;
-	add_interface(mem_ctx, &ifs,
-		      local_interfaces, enable_ipv6);
+	add_interface(mem_ctx, &ifs, local_interfaces);
 }
 
 
@@ -296,7 +303,6 @@ void load_interface_list(TALLOC_CTX *mem_ctx, struct loadparm_context *lp_ctx, s
 	int i;
 	struct iface_struct *ifaces = NULL;
 	int total_probed;
-	bool enable_ipv6 = lpcfg_parm_bool(lp_ctx, NULL, "ipv6", "enable", true);
 
 	*local_interfaces = NULL;
 
@@ -311,13 +317,13 @@ void load_interface_list(TALLOC_CTX *mem_ctx, struct loadparm_context *lp_ctx, s
 		}
 		for (i=0;i<total_probed;i++) {
 			if (!is_loopback_addr((struct sockaddr *)&ifaces[i].ip)) {
-				add_interface(mem_ctx, &ifaces[i], local_interfaces, enable_ipv6);
+				add_interface(mem_ctx, &ifaces[i], local_interfaces);
 			}
 		}
 	}
 
 	while (ptr && *ptr) {
-		interpret_interface(mem_ctx, *ptr, ifaces, total_probed, local_interfaces, enable_ipv6);
+		interpret_interface(mem_ctx, *ptr, ifaces, total_probed, local_interfaces);
 		ptr++;
 	}
 

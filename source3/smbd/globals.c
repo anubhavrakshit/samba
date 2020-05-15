@@ -24,15 +24,9 @@
 #include "messages.h"
 #include <tdb.h>
 
-int aio_pending_size = 100;	/* tevent supports 100 signals SA_SIGINFO */
-int outstanding_aio_calls = 0;
-
 #ifdef USE_DMAPI
 struct smbd_dmapi_context *dmapi_ctx = NULL;
 #endif
-
-/* how many write cache buffers have been allocated */
-unsigned int allocated_write_caches = 0;
 
 const struct mangle_fns *mangle_fns = NULL;
 
@@ -49,7 +43,6 @@ unsigned mangle_prefix = 0;
 bool logged_ioctl_message = false;
 
 time_t last_smb_conf_reload_time = 0;
-time_t last_printer_reload_time = 0;
 pid_t background_lpq_updater_pid = -1;
 
 /****************************************************************************
@@ -112,4 +105,22 @@ void smbd_init_globals(void)
 	ZERO_STRUCT(conn_ctx_stack);
 
 	ZERO_STRUCT(sec_ctx_stack);
+}
+
+struct GUID smbd_request_guid(struct smb_request *smb1req, uint16_t idx)
+{
+	struct GUID v = {
+		.time_low = (uint32_t)smb1req->mid,
+		.time_hi_and_version = idx,
+	};
+
+	if (smb1req->smb2req != NULL) {
+		v.time_mid = (uint16_t)smb1req->smb2req->current_idx;
+	} else {
+		v.time_mid = (uint16_t)(uintptr_t)smb1req->vwv;
+	}
+
+	SBVAL((uint8_t *)&v, 8, (uintptr_t)smb1req->xconn);
+
+	return v;
 }

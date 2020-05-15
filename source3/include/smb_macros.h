@@ -43,20 +43,43 @@
 /* these are useful macros for checking validity of handles */
 #define IS_IPC(conn)       ((conn) && (conn)->ipc)
 #define IS_PRINT(conn)       ((conn) && (conn)->printer)
-/* you must add the following extern declaration to files using this macro
- * (do not add it to the macro as that causes nested extern declaration warnings)
- * extern struct current_user current_user;
+
+#define CHECK_READ(fsp,req) \
+	(((fsp)->fh->fd != -1) && \
+	 (((fsp)->fsp_flags.can_read) || \
+	  ((req->flags2 & FLAGS2_READ_PERMIT_EXECUTE) && \
+	   (fsp->access_mask & FILE_EXECUTE))))
+
+/*
+ * This is not documented in revision 49 of [MS-SMB2] but should be added in a
+ * later revision (and torture test smb2.read.access as well as
+ * smb2.ioctl_copy_chunk_bad_access against Server 2012R2 confirms this)
+ *
+ * If FILE_EXECUTE is granted to a handle then the SMB2 server acts as if
+ * FILE_READ_DATA has also been granted. We must still keep the original granted
+ * mask, because with ioctl requests, access checks are made on the file handle,
+ * "below" the SMB2 server, and the object store below the SMB layer is not
+ * aware of this arrangement (see smb2.ioctl.copy_chunk_bad_access torture
+ * test).
  */
-#define FSP_BELONGS_CONN(fsp,conn) do {\
-			if (!((fsp) && (conn) && ((conn)==(fsp)->conn) && (current_user.vuid==(fsp)->vuid))) \
-				return ERROR_NT(NT_STATUS_INVALID_HANDLE); \
-			} while(0)
+#define CHECK_READ_SMB2(fsp) \
+	(((fsp)->fh->fd != -1) && \
+	 (((fsp)->fsp_flags.can_read) || \
+	  (fsp->access_mask & FILE_EXECUTE)))
 
-#define CHECK_READ(fsp,req) (((fsp)->fh->fd != -1) && ((fsp)->can_read || \
-			((req->flags2 & FLAGS2_READ_PERMIT_EXECUTE) && \
-			 (fsp->access_mask & FILE_EXECUTE))))
+/* An IOCTL readability check (validating read access
+ * when the IOCTL code requires it)
+ * http://social.technet.microsoft.com/wiki/contents/articles/24653.decoding-io-control-codes-ioctl-fsctl-and-deviceiocodes-with-table-of-known-values.aspx
+ * ). On Windows servers, this is done by the IO manager, which is unaware of
+ * the "if execute is granted then also grant read" arrangement.
+ */
+#define CHECK_READ_IOCTL(fsp) \
+	(((fsp)->fh->fd != -1) && \
+	 (((fsp)->fsp_flags.can_read)))
 
-#define CHECK_WRITE(fsp) ((fsp)->can_write && ((fsp)->fh->fd != -1))
+#define CHECK_WRITE(fsp) \
+	((fsp)->fsp_flags.can_write && \
+	 ((fsp)->fh->fd != -1))
 
 #define ERROR_WAS_LOCK_DENIED(status) (NT_STATUS_EQUAL((status), NT_STATUS_LOCK_NOT_GRANTED) || \
 				NT_STATUS_EQUAL((status), NT_STATUS_FILE_LOCK_CONFLICT) )
@@ -190,6 +213,7 @@ copy an IP address from one buffer to another
 *****************************************************************************/
 
 #define IS_DC  (lp_server_role()==ROLE_DOMAIN_PDC || lp_server_role()==ROLE_DOMAIN_BDC || lp_server_role() == ROLE_ACTIVE_DIRECTORY_DC) 
+#define IS_AD_DC  (lp_server_role() == ROLE_ACTIVE_DIRECTORY_DC)
 
 /*
  * If you add any entries to KERBEROS_VERIFY defines, please modify the below expressions
@@ -207,9 +231,7 @@ copy an IP address from one buffer to another
 #define SMB_MALLOC_ARRAY(type,count) (type *)malloc_array(sizeof(type),(count))
 #define SMB_MEMALIGN_ARRAY(type,align,count) (type *)memalign_array(sizeof(type),align,(count))
 #define SMB_REALLOC(p,s) Realloc((p),(s),True)	/* Always frees p on error or s == 0 */
-#define SMB_REALLOC_KEEP_OLD_ON_ERROR(p,s) Realloc((p),(s),False) /* Never frees p on error or s == 0 */
 #define SMB_REALLOC_ARRAY(p,type,count) (type *)realloc_array((p),sizeof(type),(count),True) /* Always frees p on error or s == 0 */
-#define SMB_REALLOC_ARRAY_KEEP_OLD_ON_ERROR(p,type,count) (type *)realloc_array((p),sizeof(type),(count),False) /* Never frees p on error or s == 0 */
 #define SMB_CALLOC_ARRAY(type,count) (type *)calloc_array(sizeof(type),(count))
 #define SMB_XMALLOC_P(type) (type *)smb_xmalloc_array(sizeof(type),1)
 #define SMB_XMALLOC_ARRAY(type,count) (type *)smb_xmalloc_array(sizeof(type),(count))

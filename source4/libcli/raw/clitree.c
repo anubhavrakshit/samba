@@ -135,7 +135,7 @@ NTSTATUS smb_raw_tcon_recv(struct smbcli_request *req, TALLOC_CTX *mem_ctx,
 
 		p += smbcli_req_pull_string(&req->in.bufinfo, mem_ctx, &parms->tconx.out.dev_type, 
 					    p, -1, STR_ASCII | STR_TERMINATE);
-		p += smbcli_req_pull_string(&req->in.bufinfo, mem_ctx, &parms->tconx.out.fs_type, 
+		smbcli_req_pull_string(&req->in.bufinfo, mem_ctx, &parms->tconx.out.fs_type,
 					 p, -1, STR_TERMINATE);
 		break;
 
@@ -207,6 +207,7 @@ NTSTATUS smbcli_tree_full_connection(TALLOC_CTX *parent_ctx,
 	io.in.called_name = strupper_talloc(tmp_ctx, dest_host);
 	io.in.service = service;
 	io.in.service_type = service_type;
+	io.in.existing_conn = NULL;
 	io.in.credentials = credentials;
 	io.in.gensec_settings = gensec_settings;
 	io.in.fallback_to_anonymous = false;

@@ -28,21 +28,6 @@
 #include "../librpc/ndr/libndr.h"
 #include "../include/client.h"
 
-/*******************************************************************
- Setup the word count and byte count for a client smb message.
-********************************************************************/
-
-int cli_set_message(char *buf,int num_words,int num_bytes,bool zero)
-{
-	if (zero && (num_words || num_bytes)) {
-		memset(buf + smb_size,'\0',num_words*2 + num_bytes);
-	}
-	SCVAL(buf,smb_wct,num_words);
-	SSVAL(buf,smb_vwv + num_words*SIZEOFWORD,num_bytes);
-	smb_setlen(buf,smb_size + num_words*2 + num_bytes - 4);
-	return (smb_size + num_words*2 + num_bytes);
-}
-
 /****************************************************************************
  Change the timeout (in milliseconds).
 ****************************************************************************/
@@ -75,7 +60,6 @@ struct GUID cli_state_client_guid;
 struct cli_state *cli_state_create(TALLOC_CTX *mem_ctx,
 				   int fd,
 				   const char *remote_name,
-				   const char *remote_realm,
 				   int signing_state, int flags)
 {
 	struct cli_state *cli = NULL;
@@ -170,6 +154,15 @@ struct cli_state *cli_state_create(TALLOC_CTX *mem_ctx,
 		use_level_II_oplocks = true;
 	}
 
+	if (signing_state == SMB_SIGNING_IPC_DEFAULT) {
+		/*
+		 * Ensure for IPC/RPC the default is to require
+		 * signing unless explicitly turned off by the
+		 * administrator.
+		 */
+		signing_state = lp_client_ipc_signing();
+	}
+
 	if (signing_state == SMB_SIGNING_DEFAULT) {
 		signing_state = lp_client_signing();
 	}
@@ -200,13 +193,6 @@ struct cli_state *cli_state_create(TALLOC_CTX *mem_ctx,
 
 	smb2_capabilities = SMB2_CAP_ALL;
 
-	if (remote_realm) {
-		cli->remote_realm = talloc_strdup(cli, remote_realm);
-		if (cli->remote_realm == NULL) {
-			goto error;
-		}
-	}
-
 	cli->conn = smbXcli_conn_create(cli, fd, remote_name,
 					signing_state,
 					smb1_capabilities,
@@ -216,13 +202,8 @@ struct cli_state *cli_state_create(TALLOC_CTX *mem_ctx,
 		goto error;
 	}
 
-	cli->smb1.pid = (uint16_t)getpid();
+	cli->smb1.pid = (uint32_t)getpid();
 	cli->smb1.vc_num = cli->smb1.pid;
-	cli->smb1.tcon = smbXcli_tcon_create(cli);
-	if (cli->smb1.tcon == NULL) {
-		goto error;
-	}
-	smb1cli_tcon_set_id(cli->smb1.tcon, UINT16_MAX);
 	cli->smb1.session = smbXcli_session_create(cli, cli->conn);
 	if (cli->smb1.session == NULL) {
 		goto error;
@@ -304,11 +285,6 @@ void cli_shutdown(struct cli_state *cli)
 	_cli_shutdown(cli);
 }
 
-const char *cli_state_remote_realm(struct cli_state *cli)
-{
-	return cli->remote_realm;
-}
-
 uint16_t cli_state_get_vc_num(struct cli_state *cli)
 {
 	return cli->smb1.vc_num;
@@ -318,39 +294,94 @@ uint16_t cli_state_get_vc_num(struct cli_state *cli)
  Set the PID to use for smb messages. Return the old pid.
 ****************************************************************************/
 
-uint16_t cli_setpid(struct cli_state *cli, uint16_t pid)
+uint32_t cli_setpid(struct cli_state *cli, uint32_t pid)
 {
-	uint16_t ret = cli->smb1.pid;
+	uint32_t ret = cli->smb1.pid;
 	cli->smb1.pid = pid;
 	return ret;
 }
 
-uint16_t cli_getpid(struct cli_state *cli)
+uint32_t cli_getpid(struct cli_state *cli)
 {
 	return cli->smb1.pid;
 }
 
-bool cli_state_has_tcon(struct cli_state *cli)
+bool cli_state_is_encryption_on(struct cli_state *cli)
 {
-	uint16_t tid = cli_state_get_tid(cli);
+	if (smbXcli_conn_protocol(cli->conn) < PROTOCOL_SMB2_02) {
+		return smb1cli_conn_encryption_on(cli->conn);
+	}
 
-	if (tid == UINT16_MAX) {
+	if (cli->smb2.tcon == NULL) {
 		return false;
 	}
 
+	return smb2cli_tcon_is_encryption_on(cli->smb2.tcon);
+}
+
+bool cli_state_has_tcon(struct cli_state *cli)
+{
+	uint32_t tid;
+	if (smbXcli_conn_protocol(cli->conn) >= PROTOCOL_SMB2_02) {
+		if (cli->smb2.tcon == NULL) {
+			return false;
+		}
+		tid = cli_state_get_tid(cli);
+		if (tid == UINT32_MAX) {
+			return false;
+		}
+	} else {
+		if (cli->smb1.tcon == NULL) {
+			return false;
+		}
+		tid = cli_state_get_tid(cli);
+		if (tid == UINT16_MAX) {
+			return false;
+		}
+	}
 	return true;
 }
 
-uint16_t cli_state_get_tid(struct cli_state *cli)
+uint32_t cli_state_get_tid(struct cli_state *cli)
 {
-	return smb1cli_tcon_current_id(cli->smb1.tcon);
+	if (smbXcli_conn_protocol(cli->conn) >= PROTOCOL_SMB2_02) {
+		return smb2cli_tcon_current_id(cli->smb2.tcon);
+	} else {
+		return (uint32_t)smb1cli_tcon_current_id(cli->smb1.tcon);
+	}
 }
 
-uint16_t cli_state_set_tid(struct cli_state *cli, uint16_t tid)
+uint32_t cli_state_set_tid(struct cli_state *cli, uint32_t tid)
 {
-	uint16_t ret = smb1cli_tcon_current_id(cli->smb1.tcon);
-	smb1cli_tcon_set_id(cli->smb1.tcon, tid);
+	uint32_t ret;
+	if (smbXcli_conn_protocol(cli->conn) >= PROTOCOL_SMB2_02) {
+		ret = smb2cli_tcon_current_id(cli->smb2.tcon);
+		smb2cli_tcon_set_id(cli->smb2.tcon, tid);
+	} else {
+		ret = smb1cli_tcon_current_id(cli->smb1.tcon);
+		smb1cli_tcon_set_id(cli->smb1.tcon, tid);
+	}
 	return ret;
+}
+
+struct smbXcli_tcon *cli_state_save_tcon(struct cli_state *cli)
+{
+	if (smbXcli_conn_protocol(cli->conn) >= PROTOCOL_SMB2_02) {
+		return smbXcli_tcon_copy(cli, cli->smb2.tcon);
+	} else {
+		return smbXcli_tcon_copy(cli, cli->smb1.tcon);
+	}
+}
+
+void cli_state_restore_tcon(struct cli_state *cli, struct smbXcli_tcon *tcon)
+{
+	if (smbXcli_conn_protocol(cli->conn) >= PROTOCOL_SMB2_02) {
+		TALLOC_FREE(cli->smb2.tcon);
+		cli->smb2.tcon = tcon;
+	} else {
+		TALLOC_FREE(cli->smb1.tcon);
+		cli->smb1.tcon = tcon;
+	}
 }
 
 uint16_t cli_state_get_uid(struct cli_state *cli)
@@ -539,31 +570,6 @@ NTSTATUS cli_echo(struct cli_state *cli, uint16_t num_echos, DATA_BLOB data)
 	return status;
 }
 
-/**
- * Is the SMB command able to hold an AND_X successor
- * @param[in] cmd	The SMB command in question
- * @retval Can we add a chained request after "cmd"?
- */
-bool is_andx_req(uint8_t cmd)
-{
-	switch (cmd) {
-	case SMBtconX:
-	case SMBlockingX:
-	case SMBopenX:
-	case SMBreadX:
-	case SMBwriteX:
-	case SMBsesssetupX:
-	case SMBulogoffX:
-	case SMBntcreateX:
-		return true;
-		break;
-	default:
-		break;
-	}
-
-	return false;
-}
-
 NTSTATUS cli_smb(TALLOC_CTX *mem_ctx, struct cli_state *cli,
 		 uint8_t smb_command, uint8_t additional_flags,
 		 uint8_t wct, uint16_t *vwv,
@@ -583,7 +589,7 @@ NTSTATUS cli_smb(TALLOC_CTX *mem_ctx, struct cli_state *cli,
         if (ev == NULL) {
                 goto fail;
         }
-        req = cli_smb_send(mem_ctx, ev, cli, smb_command, additional_flags,
+        req = cli_smb_send(mem_ctx, ev, cli, smb_command, additional_flags, 0,
 			   wct, vwv, num_bytes, bytes);
         if (req == NULL) {
                 goto fail;

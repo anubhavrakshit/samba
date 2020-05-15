@@ -1,5 +1,5 @@
 /* 
-   Unix SMB/CIFS mplementation.
+   Unix SMB/CIFS implementation.
    LDAP protocol helper functions for SAMBA
    
    Copyright (C) Andrew Tridgell  2004
@@ -223,7 +223,7 @@ static void ldap_connection_recv_next(struct ldap_connection *conn)
 	}
 
 	/*
-	 * The minimun size of a LDAP pdu is 7 bytes
+	 * The minimum size of a LDAP pdu is 7 bytes
 	 *
 	 * dumpasn1 -hh ldap-unbind-min.dat
 	 *
@@ -277,6 +277,7 @@ static void ldap_connection_recv_done(struct tevent_req *subreq)
 	struct ldap_message *msg;
 	struct asn1_data *asn1;
 	DATA_BLOB blob;
+	struct ldap_request_limits limits = {0};
 
 	msg = talloc_zero(conn, struct ldap_message);
 	if (msg == NULL) {
@@ -284,7 +285,7 @@ static void ldap_connection_recv_done(struct tevent_req *subreq)
 		return;
 	}
 
-	asn1 = asn1_init(conn);
+	asn1 = asn1_init(conn, ASN1_MAX_TREE_DEPTH);
 	if (asn1 == NULL) {
 		TALLOC_FREE(msg);
 		ldap_error_handler(conn, NT_STATUS_NO_MEMORY);
@@ -306,7 +307,7 @@ static void ldap_connection_recv_done(struct tevent_req *subreq)
 
 	asn1_load_nocopy(asn1, blob.data, blob.length);
 
-	status = ldap_decode(asn1, samba_ldap_control_handlers(), msg);
+	status = ldap_decode(asn1, &limits, samba_ldap_control_handlers(), msg);
 	asn1_free(asn1);
 	if (!NT_STATUS_IS_OK(status)) {
 		TALLOC_FREE(msg);
@@ -412,12 +413,13 @@ _PUBLIC_ struct composite_context *ldap_connect_send(struct ldap_connection *con
 	if (strequal(protocol, "ldapi")) {
 		struct socket_address *unix_addr;
 		char path[1025];
-	
-		NTSTATUS status = socket_create("unix", SOCKET_TYPE_STREAM, &state->sock, 0);
+		char *end = NULL;
+		NTSTATUS status = socket_create(state, "unix",
+						SOCKET_TYPE_STREAM,
+						&state->sock, 0);
 		if (!NT_STATUS_IS_OK(status)) {
 			return NULL;
 		}
-		talloc_steal(state, state->sock);
 		SMB_ASSERT(sizeof(protocol)>10);
 		SMB_ASSERT(sizeof(path)>1024);
 	
@@ -439,14 +441,17 @@ _PUBLIC_ struct composite_context *ldap_connect_send(struct ldap_connection *con
 			return result;
 		}
 
-		rfc1738_unescape(path);
-
+		end = rfc1738_unescape(path);
+		if (end == NULL) {
+			composite_error(state->ctx,
+					NT_STATUS_INVALID_PARAMETER);
+			return result;
+		}	
 		unix_addr = socket_address_from_strings(state, state->sock->backend_name,
 							path, 0);
 		if (composite_nomem(unix_addr, result)) {
 			return result;
 		}
-
 
 		ctx = socket_connect_send(state->sock, NULL, unix_addr,
 					  0, result->event_ctx);
@@ -465,16 +470,15 @@ _PUBLIC_ struct composite_context *ldap_connect_send(struct ldap_connection *con
 			char *ca_file = lpcfg_tls_cafile(state, conn->lp_ctx);
 			char *crl_file = lpcfg_tls_crlfile(state, conn->lp_ctx);
 			const char *tls_priority = lpcfg_tls_priority(conn->lp_ctx);
-			if (!ca_file || !*ca_file) {
-				composite_error(result,
-						NT_STATUS_INVALID_PARAMETER_MIX);
-				return result;
-			}
+			enum tls_verify_peer_state verify_peer =
+				lpcfg_tls_verify_peer(conn->lp_ctx);
 
 			status = tstream_tls_params_client(state,
 							   ca_file,
 							   crl_file,
 							   tls_priority,
+							   verify_peer,
+							   conn->host,
 							   &state->tls_params);
 			if (!NT_STATUS_IS_OK(status)) {
 				composite_error(result, status);
@@ -662,13 +666,48 @@ static void ldap_reconnect(struct ldap_connection *conn)
 	}
 }
 
+static void ldap_request_destructor_abandon(struct ldap_request *abandon)
+{
+	TALLOC_FREE(abandon);
+}
+
 /* destroy an open ldap request */
 static int ldap_request_destructor(struct ldap_request *req)
 {
 	if (req->state == LDAP_REQUEST_PENDING) {
+		struct ldap_message msg = {
+			.type = LDAP_TAG_AbandonRequest,
+			.r.AbandonRequest.messageid = req->messageid,
+		};
+		struct ldap_request *abandon = NULL;
+
+		DLIST_REMOVE(req->conn->pending, req);
+
+		abandon = ldap_request_send(req->conn, &msg);
+		if (abandon == NULL) {
+			ldap_error_handler(req->conn, NT_STATUS_NO_MEMORY);
+			return 0;
+		}
+		abandon->async.fn = ldap_request_destructor_abandon;
+		abandon->async.private_data = NULL;
+	}
+
+	return 0;
+}
+
+static void ldap_request_timeout_abandon(struct ldap_request *abandon)
+{
+	struct ldap_request *req =
+		talloc_get_type_abort(abandon->async.private_data,
+		struct ldap_request);
+
+	if (req->state == LDAP_REQUEST_PENDING) {
 		DLIST_REMOVE(req->conn->pending, req);
 	}
-	return 0;
+	req->state = LDAP_REQUEST_DONE;
+	if (req->async.fn) {
+		req->async.fn(req);
+	}
 }
 
 /*
@@ -683,7 +722,22 @@ static void ldap_request_timeout(struct tevent_context *ev, struct tevent_timer 
 
 	req->status = NT_STATUS_IO_TIMEOUT;
 	if (req->state == LDAP_REQUEST_PENDING) {
+		struct ldap_message msg = {
+			.type = LDAP_TAG_AbandonRequest,
+			.r.AbandonRequest.messageid = req->messageid,
+		};
+		struct ldap_request *abandon = NULL;
+
+		abandon = ldap_request_send(req->conn, &msg);
+		if (abandon == NULL) {
+			ldap_error_handler(req->conn, NT_STATUS_NO_MEMORY);
+			return;
+		}
+		talloc_reparent(req->conn, req, abandon);
+		abandon->async.fn = ldap_request_timeout_abandon;
+		abandon->async.private_data = req;
 		DLIST_REMOVE(req->conn->pending, req);
+		return;
 	}
 	req->state = LDAP_REQUEST_DONE;
 	if (req->async.fn) {
@@ -967,32 +1021,9 @@ _PUBLIC_ NTSTATUS ldap_result_one(struct ldap_request *req, struct ldap_message 
 	if (!NT_STATUS_IS_OK(status)) {
 		return status;
 	}
-	if ((*msg)->type != type) {
+	if ((*msg) != NULL && (*msg)->type != type) {
 		*msg = NULL;
 		return NT_STATUS_UNEXPECTED_NETWORK_ERROR;
 	}
-	return status;
-}
-
-/*
-  a simple ldap transaction, for single result requests that only need a status code
-  this relies on single valued requests having the response type == request type + 1
-*/
-_PUBLIC_ NTSTATUS ldap_transaction(struct ldap_connection *conn, struct ldap_message *msg)
-{
-	struct ldap_request *req = ldap_request_send(conn, msg);
-	struct ldap_message *res;
-	NTSTATUS status;
-	status = ldap_result_n(req, 0, &res);
-	if (!NT_STATUS_IS_OK(status)) {
-		talloc_free(req);
-		return status;
-	}
-	if (res->type != msg->type + 1) {
-		talloc_free(req);
-		return NT_STATUS_LDAP(LDAP_PROTOCOL_ERROR);
-	}
-	status = ldap_check_response(conn, &res->r.GeneralResult);
-	talloc_free(req);
 	return status;
 }

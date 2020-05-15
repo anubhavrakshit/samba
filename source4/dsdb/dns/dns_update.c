@@ -1,5 +1,5 @@
 /*
-   Unix SMB/CIFS mplementation.
+   Unix SMB/CIFS Implementation.
 
    DNS update service
 
@@ -39,8 +39,9 @@
 #include "libcli/composite/composite.h"
 #include "libcli/security/dom_sid.h"
 #include "librpc/gen_ndr/ndr_irpc.h"
+#include "libds/common/roles.h"
 
-NTSTATUS server_service_dnsupdate_init(void);
+NTSTATUS server_service_dnsupdate_init(TALLOC_CTX *);
 
 struct dnsupdate_service {
 	struct task_server *task;
@@ -66,210 +67,6 @@ struct dnsupdate_service {
 };
 
 /*
-  called when rndc reload has finished
- */
-static void dnsupdate_rndc_done(struct tevent_req *subreq)
-{
-	struct dnsupdate_service *service = tevent_req_callback_data(subreq,
-					    struct dnsupdate_service);
-	int ret;
-	int sys_errno;
-
-	service->confupdate.subreq = NULL;
-
-	ret = samba_runcmd_recv(subreq, &sys_errno);
-	TALLOC_FREE(subreq);
-	if (ret != 0) {
-		service->confupdate.status = map_nt_error_from_unix_common(sys_errno);
-	} else {
-		service->confupdate.status = NT_STATUS_OK;
-	}
-
-	if (!NT_STATUS_IS_OK(service->confupdate.status)) {
-		DEBUG(0,(__location__ ": Failed rndc update - %s\n",
-			 nt_errstr(service->confupdate.status)));
-	} else {
-		DEBUG(3,("Completed rndc reload OK\n"));
-	}
-}
-
-/*
-  called every 'dnsupdate:conf interval' seconds
- */
-static void dnsupdate_rebuild(struct dnsupdate_service *service)
-{
-	int ret;
-	size_t size;
-	struct ldb_result *res1, *res2;
-	const char *tmp_path, *path, *path_static;
-	char *static_policies;
-	int fd;
-	unsigned int i;
-	const char *attrs1[] = { "msDS-HasDomainNCs", NULL };
-	const char *attrs2[] = { "name", NULL };
-	const char *realm = lpcfg_realm(service->task->lp_ctx);
-	TALLOC_CTX *tmp_ctx = talloc_new(service);
-	const char * const *rndc_command = lpcfg_rndc_command(service->task->lp_ctx);
-	const char **dc_list;
-	int dc_count=0;
-
-	/* abort any pending script run */
-	TALLOC_FREE(service->confupdate.subreq);
-
-	/* find the DNs for all the non-RODC DCs in the forest */
-	ret = dsdb_search(service->samdb, tmp_ctx, &res1, ldb_get_config_basedn(service->samdb),
-			  LDB_SCOPE_SUBTREE,
-			  attrs1,
-			  0,
-			  "(&(objectclass=NTDSDSA)(!(msDS-isRODC=TRUE)))");
-	if (ret != LDB_SUCCESS) {
-		DEBUG(0,(__location__ ": Unable to find DCs list - %s", ldb_errstring(service->samdb)));
-		talloc_free(tmp_ctx);
-		return;
-	}
-
-	dc_list = talloc_array(tmp_ctx, const char *, 0);
-	for (i=0; i<res1->count; i++) {
-		struct ldb_dn *server_dn = res1->msgs[i]->dn;
-		struct ldb_dn *domain_dn;
-		const char *acct_name, *full_account, *dns_domain;
-
-		/* this is a nasty hack to form the account name of
-		 * this DC. We do it this way as we don't necessarily
-		 * have access to the domain NC, so all we have to go
-		 * on is what is in the configuration partition
-		 */
-
-		domain_dn = ldb_msg_find_attr_as_dn(service->samdb, tmp_ctx, res1->msgs[i], "msDS-HasDomainNCs");
-		if (domain_dn == NULL) continue;
-
-		ldb_dn_remove_child_components(server_dn, 1);
-		ret = dsdb_search_dn(service->samdb, tmp_ctx, &res2, server_dn, attrs2, 0);
-		if (ret != LDB_SUCCESS) {
-			continue;
-		}
-
-		acct_name = ldb_msg_find_attr_as_string(res2->msgs[0], "name", NULL);
-		if (acct_name == NULL) continue;
-
-		dns_domain = samdb_dn_to_dns_domain(tmp_ctx, domain_dn);
-		if (dns_domain == NULL) {
-			continue;
-		}
-
-		full_account = talloc_asprintf(tmp_ctx, "%s$@%s", acct_name, dns_domain);
-		if (full_account == NULL) continue;
-
-		dc_list = talloc_realloc(tmp_ctx, dc_list, const char *, dc_count+1);
-		if (dc_list == NULL) {
-			continue;
-		}
-		dc_list[dc_count++] = full_account;
-	}
-
-	path = lpcfg_parm_string(service->task->lp_ctx, NULL, "dnsupdate", "path");
-	if (path == NULL) {
-		path = lpcfg_private_path(tmp_ctx, service->task->lp_ctx, "named.conf.update");
-	}
-
-	path_static = lpcfg_parm_string(service->task->lp_ctx, NULL, "dnsupdate", "extra_static_grant_rules");
-	if (path_static == NULL) {
-		path_static = lpcfg_private_path(tmp_ctx, service->task->lp_ctx, "named.conf.update.static");
-	}
-
-	tmp_path = talloc_asprintf(tmp_ctx, "%s.tmp", path);
-	if (path == NULL || tmp_path == NULL || path_static == NULL ) {
-		DEBUG(0,(__location__ ": Unable to get paths\n"));
-		talloc_free(tmp_ctx);
-		return;
-	}
-
-	static_policies = file_load(path_static, &size, 0, tmp_ctx);
-
-	unlink(tmp_path);
-	fd = open(tmp_path, O_CREAT|O_TRUNC|O_WRONLY, 0444);
-	if (fd == -1) {
-		DEBUG(1,(__location__ ": Unable to open %s - %s\n", tmp_path, strerror(errno)));
-		talloc_free(tmp_ctx);
-		return;
-	}
-
-	dprintf(fd, "/* this file is auto-generated - do not edit */\n");
-	dprintf(fd, "update-policy {\n");
-	if( static_policies != NULL ) {
-		dprintf(fd, "/* Start of static entries */\n");
-		dprintf(fd, "%s\n",static_policies);
-		dprintf(fd, "/* End of static entries */\n");
-	}
-	dprintf(fd, "\tgrant %s ms-self * A AAAA;\n", realm);
-	dprintf(fd, "\tgrant Administrator@%s wildcard * A AAAA SRV CNAME;\n", realm);
-
-	for (i=0; i<dc_count; i++) {
-		dprintf(fd, "\tgrant %s wildcard * A AAAA SRV CNAME;\n", dc_list[i]);
-	}
-	dprintf(fd, "};\n");
-	close(fd);
-
-
-	if (NT_STATUS_IS_OK(service->confupdate.status) &&
-	    file_compare(tmp_path, path) == true) {
-		unlink(tmp_path);
-		talloc_free(tmp_ctx);
-		return;
-	}
-
-	if (rename(tmp_path, path) != 0) {
-		DEBUG(0,(__location__ ": Failed to rename %s to %s - %s\n",
-			 tmp_path, path, strerror(errno)));
-		talloc_free(tmp_ctx);
-		return;
-	}
-
-	DEBUG(2,("Loading new DNS update grant rules\n"));
-	service->confupdate.subreq = samba_runcmd_send(service,
-						       service->task->event_ctx,
-						       timeval_current_ofs(10, 0),
-						       2, 0,
-						       rndc_command,
-						       "reload", NULL);
-	if (service->confupdate.subreq == NULL) {
-		DEBUG(0,(__location__ ": samba_runcmd_send() failed with no memory\n"));
-		talloc_free(tmp_ctx);
-		return;
-	}
-	tevent_req_set_callback(service->confupdate.subreq,
-				dnsupdate_rndc_done,
-				service);
-
-	talloc_free(tmp_ctx);
-}
-
-static NTSTATUS dnsupdate_confupdate_schedule(struct dnsupdate_service *service);
-
-/*
-  called every 'dnsupdate:conf interval' seconds
- */
-static void dnsupdate_confupdate_handler_te(struct tevent_context *ev, struct tevent_timer *te,
-					  struct timeval t, void *ptr)
-{
-	struct dnsupdate_service *service = talloc_get_type(ptr, struct dnsupdate_service);
-
-	dnsupdate_rebuild(service);
-	dnsupdate_confupdate_schedule(service);
-}
-
-
-static NTSTATUS dnsupdate_confupdate_schedule(struct dnsupdate_service *service)
-{
-	service->confupdate.te = tevent_add_timer(service->task->event_ctx, service,
-						timeval_current_ofs(service->confupdate.interval, 0),
-						dnsupdate_confupdate_handler_te, service);
-	NT_STATUS_HAVE_NO_MEMORY(service->confupdate.te);
-	return NT_STATUS_OK;
-}
-
-
-/*
   called when dns update script has finished
  */
 static void dnsupdate_nameupdate_done(struct tevent_req *subreq)
@@ -283,15 +80,10 @@ static void dnsupdate_nameupdate_done(struct tevent_req *subreq)
 
 	ret = samba_runcmd_recv(subreq, &sys_errno);
 	TALLOC_FREE(subreq);
-	if (ret != 0) {
-		service->nameupdate.status = map_nt_error_from_unix_common(sys_errno);
-	} else {
-		service->nameupdate.status = NT_STATUS_OK;
-	}
 
-	if (!NT_STATUS_IS_OK(service->nameupdate.status)) {
-		DEBUG(0,(__location__ ": Failed DNS update - %s\n",
-			 nt_errstr(service->nameupdate.status)));
+	if (ret != 0) {
+		DBG_ERR("Failed DNS update with exit code %d\n",
+			sys_errno);
 	} else {
 		DEBUG(3,("Completed DNS update check OK\n"));
 	}
@@ -313,14 +105,8 @@ static void dnsupdate_spnupdate_done(struct tevent_req *subreq)
 	ret = samba_runcmd_recv(subreq, &sys_errno);
 	TALLOC_FREE(subreq);
 	if (ret != 0) {
-		service->nameupdate.status = map_nt_error_from_unix_common(sys_errno);
-	} else {
-		service->nameupdate.status = NT_STATUS_OK;
-	}
-
-	if (!NT_STATUS_IS_OK(service->nameupdate.status)) {
-		DEBUG(0,(__location__ ": Failed SPN update - %s\n",
-			 nt_errstr(service->nameupdate.status)));
+		DEBUG(0,(__location__ ": Failed SPN update - with error code %d\n",
+			 sys_errno));
 	} else {
 		DEBUG(3,("Completed SPN update check OK\n"));
 	}
@@ -525,7 +311,7 @@ static NTSTATUS dnsupdate_dnsupdate_RODC(struct irpc_message *msg,
 
 
 	/* find dnsdomain and dnsforest */
-	dnsdomain = lpcfg_realm(s->task->lp_ctx);
+	dnsdomain = lpcfg_dnsdomain(s->task->lp_ctx);
 	dnsforest = dnsdomain;
 
 	/* find the hostname */
@@ -541,36 +327,35 @@ static NTSTATUS dnsupdate_dnsupdate_RODC(struct irpc_message *msg,
 		return NT_STATUS_OK;
 	}
 
-
 	for (i=0; i<st->r->in.dns_names->count; i++) {
 		struct NL_DNS_NAME_INFO *n = &r->in.dns_names->names[i];
 		switch (n->type) {
 		case NlDnsLdapAtSite:
-			dprintf(st->fd, "SRV _ldap._tcp.%s._sites.%s. %s %u\n",
+			dprintf(st->fd, "SRV _ldap._tcp.%s._sites.%s %s %u\n",
 				site, dnsdomain, hostname, n->port);
 			break;
 		case NlDnsGcAtSite:
-			dprintf(st->fd, "SRV _ldap._tcp.%s._sites.gc._msdcs.%s. %s %u\n",
+			dprintf(st->fd, "SRV _ldap._tcp.%s._sites.gc._msdcs.%s %s %u\n",
 				site, dnsdomain, hostname, n->port);
 			break;
 		case NlDnsDsaCname:
-			dprintf(st->fd, "CNAME %s._msdcs.%s. %s\n",
+			dprintf(st->fd, "CNAME %s._msdcs.%s %s\n",
 				ntdsguid, dnsforest, hostname);
 			break;
 		case NlDnsKdcAtSite:
-			dprintf(st->fd, "SRV _kerberos._tcp.%s._sites.dc._msdcs.%s. %s %u\n",
+			dprintf(st->fd, "SRV _kerberos._tcp.%s._sites.dc._msdcs.%s %s %u\n",
 				site, dnsdomain, hostname, n->port);
 			break;
 		case NlDnsDcAtSite:
-			dprintf(st->fd, "SRV _ldap._tcp.%s._sites.dc._msdcs.%s. %s %u\n",
+			dprintf(st->fd, "SRV _ldap._tcp.%s._sites.dc._msdcs.%s %s %u\n",
 				site, dnsdomain, hostname, n->port);
 			break;
 		case NlDnsRfc1510KdcAtSite:
-			dprintf(st->fd, "SRV _kerberos._tcp.%s._sites.%s. %s %u\n",
+			dprintf(st->fd, "SRV _kerberos._tcp.%s._sites.%s %s %u\n",
 				site, dnsdomain, hostname, n->port);
 			break;
 		case NlDnsGenericGcAtSite:
-			dprintf(st->fd, "SRV _gc._tcp.%s._sites.%s. %s %u\n",
+			dprintf(st->fd, "SRV _gc._tcp.%s._sites.%s %s %u\n",
 				site, dnsforest, hostname, n->port);
 			break;
 		}
@@ -603,14 +388,14 @@ static NTSTATUS dnsupdate_dnsupdate_RODC(struct irpc_message *msg,
 /*
   startup the dns update task
 */
-static void dnsupdate_task_init(struct task_server *task)
+static NTSTATUS dnsupdate_task_init(struct task_server *task)
 {
 	NTSTATUS status;
 	struct dnsupdate_service *service;
 
 	if (lpcfg_server_role(task->lp_ctx) != ROLE_ACTIVE_DIRECTORY_DC) {
 		/* not useful for non-DC */
-		return;
+		return NT_STATUS_INVALID_DOMAIN_ROLE;
 	}
 
 	task_server_set_title(task, "task[dnsupdate]");
@@ -618,7 +403,7 @@ static void dnsupdate_task_init(struct task_server *task)
 	service = talloc_zero(task, struct dnsupdate_service);
 	if (!service) {
 		task_server_terminate(task, "dnsupdate_task_init: out of memory", true);
-		return;
+		return NT_STATUS_NO_MEMORY;
 	}
 	service->task		= task;
 	task->private_data	= service;
@@ -628,31 +413,23 @@ static void dnsupdate_task_init(struct task_server *task)
 		task_server_terminate(task,
 				      "dnsupdate: Failed to obtain server credentials\n",
 				      true);
-		return;
+		return NT_STATUS_UNSUCCESSFUL;
 	}
 
-	service->samdb = samdb_connect(service, service->task->event_ctx, task->lp_ctx,
-				       service->system_session_info, 0);
+	service->samdb = samdb_connect(service,
+				       service->task->event_ctx,
+				       task->lp_ctx,
+				       service->system_session_info,
+				       NULL,
+				       0);
 	if (!service->samdb) {
 		task_server_terminate(task, "dnsupdate: Failed to connect to local samdb\n",
 				      true);
-		return;
+		return NT_STATUS_UNSUCCESSFUL;
 	}
-
-	service->confupdate.interval	= lpcfg_parm_int(task->lp_ctx, NULL,
-						      "dnsupdate", "config interval", 60); /* in seconds */
 
 	service->nameupdate.interval	= lpcfg_parm_int(task->lp_ctx, NULL,
 						      "dnsupdate", "name interval", 600); /* in seconds */
-
-	dnsupdate_rebuild(service);
-	status = dnsupdate_confupdate_schedule(service);
-	if (!NT_STATUS_IS_OK(status)) {
-		task_server_terminate(task, talloc_asprintf(task,
-				      "dnsupdate: Failed to confupdate schedule: %s\n",
-							    nt_errstr(status)), true);
-		return;
-	}
 
 	dnsupdate_check_names(service);
 	status = dnsupdate_nameupdate_schedule(service);
@@ -660,7 +437,7 @@ static void dnsupdate_task_init(struct task_server *task)
 		task_server_terminate(task, talloc_asprintf(task,
 				      "dnsupdate: Failed to nameupdate schedule: %s\n",
 							    nt_errstr(status)), true);
-		return;
+		return status;
 	}
 
 	irpc_add_name(task->msg_ctx, "dnsupdate");
@@ -668,15 +445,20 @@ static void dnsupdate_task_init(struct task_server *task)
 	IRPC_REGISTER(task->msg_ctx, irpc, DNSUPDATE_RODC,
 		      dnsupdate_dnsupdate_RODC, service);
 
-	/* create the intial file */
-	dnsupdate_rebuild(service);
+	return NT_STATUS_OK;
 
 }
 
 /*
   register ourselves as a available server
 */
-NTSTATUS server_service_dnsupdate_init(void)
+NTSTATUS server_service_dnsupdate_init(TALLOC_CTX *ctx)
 {
-	return register_server_service("dnsupdate", dnsupdate_task_init);
+	static const struct service_details details = {
+		.inhibit_fork_on_accept = true,
+		.inhibit_pre_fork = true,
+		.task_init = dnsupdate_task_init,
+		.post_fork = NULL
+	};
+	return register_server_service(ctx, "dnsupdate", &details);
 }

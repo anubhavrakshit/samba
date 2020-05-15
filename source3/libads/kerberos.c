@@ -22,6 +22,7 @@
 */
 
 #include "includes.h"
+#include "libsmb/namequery.h"
 #include "system/filesys.h"
 #include "smb_krb5.h"
 #include "../librpc/gen_ndr/ndr_misc.h"
@@ -29,6 +30,7 @@
 #include "libads/cldap.h"
 #include "secrets.h"
 #include "../lib/tsocket/tsocket.h"
+#include "lib/util/asn1.h"
 
 #ifdef HAVE_KRB5
 
@@ -47,6 +49,43 @@ kerb_prompter(krb5_context ctx, void *data,
 	       krb5_prompt prompts[])
 {
 	if (num_prompts == 0) return 0;
+	if (num_prompts == 2) {
+		/*
+		 * only heimdal has a prompt type and we need to deal with it here to
+		 * avoid loops.
+		 *
+		 * removing the prompter completely is not an option as at least these
+		 * versions would crash: heimdal-1.0.2 and heimdal-1.1. Later heimdal
+		 * version have looping detection and return with a proper error code.
+		 */
+
+#if defined(HAVE_KRB5_PROMPT_TYPE) /* Heimdal */
+		 if (prompts[0].type == KRB5_PROMPT_TYPE_NEW_PASSWORD &&
+		     prompts[1].type == KRB5_PROMPT_TYPE_NEW_PASSWORD_AGAIN) {
+			/*
+			 * We don't want to change passwords here. We're
+			 * called from heimal when the KDC returns
+			 * KRB5KDC_ERR_KEY_EXPIRED, but at this point we don't
+			 * have the chance to ask the user for a new
+			 * password. If we return 0 (i.e. success), we will be
+			 * spinning in the endless for-loop in
+			 * change_password() in
+			 * source4/heimdal/lib/krb5/init_creds_pw.c:526ff
+			 */
+			return KRB5KDC_ERR_KEY_EXPIRED;
+		}
+#elif defined(HAVE_KRB5_GET_PROMPT_TYPES) /* MIT */
+		krb5_prompt_type *prompt_types = NULL;
+
+		prompt_types = krb5_get_prompt_types(ctx);
+		if (prompt_types != NULL) {
+			if (prompt_types[0] == KRB5_PROMPT_TYPE_NEW_PASSWORD &&
+			    prompt_types[1] == KRB5_PROMPT_TYPE_NEW_PASSWORD_AGAIN) {
+				return KRB5KDC_ERR_KEY_EXP;
+			}
+		}
+#endif
+	}
 
 	memset(prompts[0].reply->data, '\0', prompts[0].reply->length);
 	if (prompts[0].reply->length > 0) {
@@ -61,102 +100,12 @@ kerb_prompter(krb5_context ctx, void *data,
 	return 0;
 }
 
- static bool smb_krb5_get_ntstatus_from_krb5_error(krb5_error *error,
-						   NTSTATUS *nt_status)
-{
-	DATA_BLOB edata;
-	DATA_BLOB unwrapped_edata;
-	TALLOC_CTX *mem_ctx;
-	struct KRB5_EDATA_NTSTATUS parsed_edata;
-	enum ndr_err_code ndr_err;
-
-#ifdef HAVE_E_DATA_POINTER_IN_KRB5_ERROR
-	edata = data_blob(error->e_data->data, error->e_data->length);
-#else
-	edata = data_blob(error->e_data.data, error->e_data.length);
-#endif /* HAVE_E_DATA_POINTER_IN_KRB5_ERROR */
-
-#ifdef DEVELOPER
-	dump_data(10, edata.data, edata.length);
-#endif /* DEVELOPER */
-
-	mem_ctx = talloc_init("smb_krb5_get_ntstatus_from_krb5_error");
-	if (mem_ctx == NULL) {
-		data_blob_free(&edata);
-		return False;
-	}
-
-	if (!unwrap_edata_ntstatus(mem_ctx, &edata, &unwrapped_edata)) {
-		data_blob_free(&edata);
-		TALLOC_FREE(mem_ctx);
-		return False;
-	}
-
-	data_blob_free(&edata);
-
-	ndr_err = ndr_pull_struct_blob_all(&unwrapped_edata, mem_ctx, 
-		&parsed_edata, (ndr_pull_flags_fn_t)ndr_pull_KRB5_EDATA_NTSTATUS);
-	if (!NDR_ERR_CODE_IS_SUCCESS(ndr_err)) {
-		data_blob_free(&unwrapped_edata);
-		TALLOC_FREE(mem_ctx);
-		return False;
-	}
-
-	data_blob_free(&unwrapped_edata);
-
-	if (nt_status) {
-		*nt_status = parsed_edata.ntstatus;
-	}
-
-	TALLOC_FREE(mem_ctx);
-
-	return True;
-}
-
- static bool smb_krb5_get_ntstatus_from_krb5_error_init_creds_opt(krb5_context ctx, 
- 								  krb5_get_init_creds_opt *opt, 
-								  NTSTATUS *nt_status)
-{
-	bool ret = False;
-	krb5_error *error = NULL;
-
-#ifdef HAVE_KRB5_GET_INIT_CREDS_OPT_GET_ERROR
-	ret = krb5_get_init_creds_opt_get_error(ctx, opt, &error);
-	if (ret) {
-		DEBUG(1,("krb5_get_init_creds_opt_get_error gave: %s\n", 
-			error_message(ret)));
-		return False;
-	}
-#endif /* HAVE_KRB5_GET_INIT_CREDS_OPT_GET_ERROR */
-
-	if (!error) {
-		DEBUG(1,("no krb5_error\n"));
-		return False;
-	}
-
-#ifdef HAVE_E_DATA_POINTER_IN_KRB5_ERROR
-	if (!error->e_data) {
-#else
-	if (error->e_data.data == NULL) {
-#endif /* HAVE_E_DATA_POINTER_IN_KRB5_ERROR */
-		DEBUG(1,("no edata in krb5_error\n")); 
-		krb5_free_error(ctx, error);
-		return False;
-	}
-
-	ret = smb_krb5_get_ntstatus_from_krb5_error(error, nt_status);
-
-	krb5_free_error(ctx, error);
-
-	return ret;
-}
-
 /*
   simulate a kinit, putting the tgt in the given cache location. If cache_name == NULL
   place in default cache location.
   remus@snapserver.com
 */
-int kerberos_kinit_password_ext(const char *principal,
+int kerberos_kinit_password_ext(const char *given_principal,
 				const char *password,
 				int time_offset,
 				time_t *expire_time,
@@ -165,45 +114,64 @@ int kerberos_kinit_password_ext(const char *principal,
 				bool request_pac,
 				bool add_netbios_addr,
 				time_t renewable_time,
+				TALLOC_CTX *mem_ctx,
+				char **_canon_principal,
+				char **_canon_realm,
 				NTSTATUS *ntstatus)
 {
+	TALLOC_CTX *frame = talloc_stackframe();
 	krb5_context ctx = NULL;
 	krb5_error_code code = 0;
 	krb5_ccache cc = NULL;
 	krb5_principal me = NULL;
+	krb5_principal canon_princ = NULL;
 	krb5_creds my_creds;
 	krb5_get_init_creds_opt *opt = NULL;
 	smb_krb5_addresses *addr = NULL;
+	char *canon_principal = NULL;
+	char *canon_realm = NULL;
 
 	ZERO_STRUCT(my_creds);
 
-	initialize_krb5_error_table();
-	if ((code = krb5_init_context(&ctx)))
-		goto out;
+	code = smb_krb5_init_context_common(&ctx);
+	if (code != 0) {
+		DBG_ERR("kerberos init context failed (%s)\n",
+			error_message(code));
+		TALLOC_FREE(frame);
+		return code;
+	}
 
 	if (time_offset != 0) {
 		krb5_set_real_time(ctx, time(NULL) + time_offset, 0);
 	}
 
-	DEBUG(10,("kerberos_kinit_password: as %s using [%s] as ccache and config [%s]\n",
-			principal,
-			cache_name ? cache_name: krb5_cc_default_name(ctx),
-			getenv("KRB5_CONFIG")));
+	DBG_DEBUG("as %s using [%s] as ccache and config [%s]\n",
+		  given_principal,
+		  cache_name ? cache_name: krb5_cc_default_name(ctx),
+		  getenv("KRB5_CONFIG"));
 
 	if ((code = krb5_cc_resolve(ctx, cache_name ? cache_name : krb5_cc_default_name(ctx), &cc))) {
 		goto out;
 	}
 
-	if ((code = smb_krb5_parse_name(ctx, principal, &me))) {
+	if ((code = smb_krb5_parse_name(ctx, given_principal, &me))) {
 		goto out;
 	}
 
-	if ((code = smb_krb5_get_init_creds_opt_alloc(ctx, &opt))) {
+	if ((code = krb5_get_init_creds_opt_alloc(ctx, &opt))) {
 		goto out;
 	}
 
 	krb5_get_init_creds_opt_set_renew_life(opt, renewable_time);
 	krb5_get_init_creds_opt_set_forwardable(opt, True);
+
+	/* Turn on canonicalization for lower case realm support */
+#ifdef SAMBA4_USES_HEIMDAL
+	krb5_get_init_creds_opt_set_win2k(ctx, opt, true);
+	krb5_get_init_creds_opt_set_canonicalize(ctx, opt, true);
+#else /* MIT */
+	krb5_get_init_creds_opt_set_canonicalize(opt, true);
+#endif /* MIT */
 #if 0
 	/* insane testing */
 	krb5_get_init_creds_opt_set_tkt_life(opt, 60);
@@ -230,7 +198,25 @@ int kerberos_kinit_password_ext(const char *principal,
 		goto out;
 	}
 
-	if ((code = krb5_cc_initialize(ctx, cc, me))) {
+	canon_princ = my_creds.client;
+
+	code = smb_krb5_unparse_name(frame,
+				     ctx,
+				     canon_princ,
+				     &canon_principal);
+	if (code != 0) {
+		goto out;
+	}
+
+	DBG_DEBUG("%s mapped to %s\n", given_principal, canon_principal);
+
+	canon_realm = smb_krb5_principal_get_realm(frame, ctx, canon_princ);
+	if (canon_realm == NULL) {
+		code = ENOMEM;
+		goto out;
+	}
+
+	if ((code = krb5_cc_initialize(ctx, cc, canon_princ))) {
 		goto out;
 	}
 
@@ -245,22 +231,18 @@ int kerberos_kinit_password_ext(const char *principal,
 	if (renew_till_time) {
 		*renew_till_time = (time_t) my_creds.times.renew_till;
 	}
+
+	if (_canon_principal != NULL) {
+		*_canon_principal = talloc_move(mem_ctx, &canon_principal);
+	}
+	if (_canon_realm != NULL) {
+		*_canon_realm = talloc_move(mem_ctx, &canon_realm);
+	}
  out:
 	if (ntstatus) {
-
-		NTSTATUS status;
-
 		/* fast path */
 		if (code == 0) {
 			*ntstatus = NT_STATUS_OK;
-			goto cleanup;
-		}
-
-		/* try to get ntstatus code out of krb5_error when we have it
-		 * inside the krb5_get_init_creds_opt - gd */
-
-		if (opt && smb_krb5_get_ntstatus_from_krb5_error_init_creds_opt(ctx, opt, &status)) {
-			*ntstatus = status;
 			goto cleanup;
 		}
 
@@ -276,8 +258,8 @@ int kerberos_kinit_password_ext(const char *principal,
 	if (addr) {
 		smb_krb5_free_addresses(ctx, addr);
 	}
- 	if (opt) {
-		smb_krb5_get_init_creds_opt_free(ctx, opt);
+	if (opt) {
+		krb5_get_init_creds_opt_free(ctx, opt);
 	}
 	if (cc) {
 		krb5_cc_close(ctx, cc);
@@ -285,6 +267,7 @@ int kerberos_kinit_password_ext(const char *principal,
 	if (ctx) {
 		krb5_free_context(ctx);
 	}
+	TALLOC_FREE(frame);
 	return code;
 }
 
@@ -294,10 +277,10 @@ int ads_kdestroy(const char *cc_name)
 	krb5_context ctx = NULL;
 	krb5_ccache cc = NULL;
 
-	initialize_krb5_error_table();
-	if ((code = krb5_init_context (&ctx))) {
-		DEBUG(3, ("ads_kdestroy: kdb5_init_context failed: %s\n", 
-			error_message(code)));
+	code = smb_krb5_init_context_common(&ctx);
+	if (code != 0) {
+		DBG_ERR("kerberos init context failed (%s)\n",
+			error_message(code));
 		return code;
 	}
 
@@ -324,153 +307,14 @@ int ads_kdestroy(const char *cc_name)
 	return code;
 }
 
-/************************************************************************
- Routine to fetch the salting principal for a service.  Active
- Directory may use a non-obvious principal name to generate the salt
- when it determines the key to use for encrypting tickets for a service,
- and hopefully we detected that when we joined the domain.
- ************************************************************************/
-
-static char *kerberos_secrets_fetch_salting_principal(const char *service, int enctype)
-{
-	char *key = NULL;
-	char *ret = NULL;
-
-	if (asprintf(&key, "%s/%s/enctype=%d",
-		     SECRETS_SALTING_PRINCIPAL, service, enctype) == -1) {
-		return NULL;
-	}
-	ret = (char *)secrets_fetch(key, NULL);
-	SAFE_FREE(key);
-	return ret;
-}
-
-/************************************************************************
- Return the standard DES salt key
-************************************************************************/
-
-char* kerberos_standard_des_salt( void )
-{
-	fstring salt;
-
-	fstr_sprintf( salt, "host/%s.%s@", lp_netbios_name(), lp_realm() );
-	(void)strlower_m( salt );
-	fstrcat( salt, lp_realm() );
-
-	return SMB_STRDUP( salt );
-}
-
-/************************************************************************
-************************************************************************/
-
-static char* des_salt_key( void )
-{
-	char *key;
-
-	if (asprintf(&key, "%s/DES/%s", SECRETS_SALTING_PRINCIPAL,
-		     lp_realm()) == -1) {
-		return NULL;
-	}
-
-	return key;
-}
-
-/************************************************************************
-************************************************************************/
-
-bool kerberos_secrets_store_des_salt( const char* salt )
-{
-	char* key;
-	bool ret;
-
-	if ( (key = des_salt_key()) == NULL ) {
-		DEBUG(0,("kerberos_secrets_store_des_salt: failed to generate key!\n"));
-		return False;
-	}
-
-	if ( !salt ) {
-		DEBUG(8,("kerberos_secrets_store_des_salt: deleting salt\n"));
-		secrets_delete( key );
-		return True;
-	}
-
-	DEBUG(3,("kerberos_secrets_store_des_salt: Storing salt \"%s\"\n", salt));
-
-	ret = secrets_store( key, salt, strlen(salt)+1 );
-
-	SAFE_FREE( key );
-
-	return ret;
-}
-
-/************************************************************************
-************************************************************************/
-
-static
-char* kerberos_secrets_fetch_des_salt( void )
-{
-	char *salt, *key;
-
-	if ( (key = des_salt_key()) == NULL ) {
-		DEBUG(0,("kerberos_secrets_fetch_des_salt: failed to generate key!\n"));
-		return NULL;
-	}
-
-	salt = (char*)secrets_fetch( key, NULL );
-
-	SAFE_FREE( key );
-
-	return salt;
-}
-
-/************************************************************************
- Routine to get the salting principal for this service.  This is 
- maintained for backwards compatibilty with releases prior to 3.0.24.
- Since we store the salting principal string only at join, we may have 
- to look for the older tdb keys.  Caller must free if return is not null.
- ************************************************************************/
-
-static
-krb5_principal kerberos_fetch_salt_princ_for_host_princ(krb5_context context,
-							krb5_principal host_princ,
-							int enctype)
-{
-	char *unparsed_name = NULL, *salt_princ_s = NULL;
-	krb5_principal ret_princ = NULL;
-
-	/* lookup new key first */
-
-	if ( (salt_princ_s = kerberos_secrets_fetch_des_salt()) == NULL ) {
-
-		/* look under the old key.  If this fails, just use the standard key */
-
-		if (smb_krb5_unparse_name(talloc_tos(), context, host_princ, &unparsed_name) != 0) {
-			return (krb5_principal)NULL;
-		}
-		if ((salt_princ_s = kerberos_secrets_fetch_salting_principal(unparsed_name, enctype)) == NULL) {
-			/* fall back to host/machine.realm@REALM */
-			salt_princ_s = kerberos_standard_des_salt();
-		}
-	}
-
-	if (smb_krb5_parse_name(context, salt_princ_s, &ret_princ) != 0) {
-		ret_princ = NULL;
-	}
-
-	TALLOC_FREE(unparsed_name);
-	SAFE_FREE(salt_princ_s);
-
-	return ret_princ;
-}
-
 int create_kerberos_key_from_string(krb5_context context,
 					krb5_principal host_princ,
+					krb5_principal salt_princ,
 					krb5_data *password,
 					krb5_keyblock *key,
 					krb5_enctype enctype,
 					bool no_salt)
 {
-	krb5_principal salt_princ = NULL;
 	int ret;
 	/*
 	 * Check if we've determined that the KDC is salting keys for this
@@ -487,90 +331,14 @@ int create_kerberos_key_from_string(krb5_context context,
 		KRB5_KEY_TYPE(key) = enctype;
 		return 0;
 	}
-	salt_princ = kerberos_fetch_salt_princ_for_host_princ(context, host_princ, enctype);
 	ret = smb_krb5_create_key_from_string(context,
 					      salt_princ ? salt_princ : host_princ,
 					      NULL,
 					      password,
 					      enctype,
 					      key);
-	if (salt_princ) {
-		krb5_free_principal(context, salt_princ);
-	}
 	return ret;
 }
-
-/************************************************************************
- Routine to set the salting principal for this service.  Active
- Directory may use a non-obvious principal name to generate the salt
- when it determines the key to use for encrypting tickets for a service,
- and hopefully we detected that when we joined the domain.
- Setting principal to NULL deletes this entry.
- ************************************************************************/
-
-bool kerberos_secrets_store_salting_principal(const char *service,
-					      int enctype,
-					      const char *principal)
-{
-	char *key = NULL;
-	bool ret = False;
-	krb5_context context = NULL;
-	krb5_principal princ = NULL;
-	char *princ_s = NULL;
-	char *unparsed_name = NULL;
-	krb5_error_code code;
-
-	if (((code = krb5_init_context(&context)) != 0) || (context == NULL)) {
-		DEBUG(5, ("kerberos_secrets_store_salting_pricipal: kdb5_init_context failed: %s\n",
-			  error_message(code)));
-		return False;
-	}
-	if (strchr_m(service, '@')) {
-		if (asprintf(&princ_s, "%s", service) == -1) {
-			goto out;
-		}
-	} else {
-		if (asprintf(&princ_s, "%s@%s", service, lp_realm()) == -1) {
-			goto out;
-		}
-	}
-
-	if (smb_krb5_parse_name(context, princ_s, &princ) != 0) {
-		goto out;
-	}
-	if (smb_krb5_unparse_name(talloc_tos(), context, princ, &unparsed_name) != 0) {
-		goto out;
-	}
-
-	if (asprintf(&key, "%s/%s/enctype=%d",
-		     SECRETS_SALTING_PRINCIPAL, unparsed_name, enctype)
-	    == -1) {
-		goto out;
-	}
-
-	if ((principal != NULL) && (strlen(principal) > 0)) {
-		ret = secrets_store(key, principal, strlen(principal) + 1);
-	} else {
-		ret = secrets_delete(key);
-	}
-
- out:
-
-	SAFE_FREE(key);
-	SAFE_FREE(princ_s);
-	TALLOC_FREE(unparsed_name);
-
-	if (princ) {
-		krb5_free_principal(context, princ);
-	}
-
-	if (context) {
-		krb5_free_context(context);
-	}
-
-	return ret;
-}
-
 
 /************************************************************************
 ************************************************************************/
@@ -589,6 +357,9 @@ int kerberos_kinit_password(const char *principal,
 					   False,
 					   False,
 					   0,
+					   NULL,
+					   NULL,
+					   NULL,
 					   NULL);
 }
 
@@ -603,10 +374,10 @@ int kerberos_kinit_password(const char *principal,
 
 ************************************************************************/
 
-static void add_sockaddr_unique(struct sockaddr_storage *addrs, int *num_addrs,
+static void add_sockaddr_unique(struct sockaddr_storage *addrs, size_t *num_addrs,
 				const struct sockaddr_storage *addr)
 {
-	int i;
+	size_t i;
 
 	for (i=0; i<*num_addrs; i++) {
 		if (sockaddr_equal((const struct sockaddr *)&addrs[i],
@@ -649,12 +420,12 @@ static char *get_kdc_ip_string(char *mem_ctx,
 		const struct sockaddr_storage *pss)
 {
 	TALLOC_CTX *frame = talloc_stackframe();
-	int i;
+	size_t i;
 	struct ip_service *ip_srv_site = NULL;
 	struct ip_service *ip_srv_nonsite = NULL;
 	int count_site = 0;
 	int count_nonsite;
-	int num_dcs;
+	size_t num_dcs;
 	struct sockaddr_storage *dc_addrs;
 	struct tsocket_address **dc_addrs2 = NULL;
 	const struct tsocket_address * const *dc_addrs3 = NULL;
@@ -715,7 +486,7 @@ static char *get_kdc_ip_string(char *mem_ctx,
 				      struct tsocket_address *,
 				      num_dcs);
 
-	DEBUG(10, ("%d additional KDCs to test\n", num_dcs));
+	DBG_DEBUG("%zu additional KDCs to test\n", num_dcs);
 	if (num_dcs == 0) {
 		goto out;
 	}
@@ -791,6 +562,76 @@ out:
  run as root or will fail (which is a good thing :-).
 ************************************************************************/
 
+#if !defined(SAMBA4_USES_HEIMDAL) /* MIT version */
+static char *get_enctypes(TALLOC_CTX *mem_ctx)
+{
+	char *aes_enctypes = NULL;
+	const char *legacy_enctypes = "";
+	char *enctypes = NULL;
+
+	aes_enctypes = talloc_strdup(mem_ctx, "");
+	if (aes_enctypes == NULL) {
+		goto done;
+	}
+
+	if (lp_kerberos_encryption_types() == KERBEROS_ETYPES_ALL ||
+	    lp_kerberos_encryption_types() == KERBEROS_ETYPES_STRONG) {
+#ifdef HAVE_ENCTYPE_AES256_CTS_HMAC_SHA1_96
+		aes_enctypes = talloc_asprintf_append(
+		    aes_enctypes, "%s", "aes256-cts-hmac-sha1-96 ");
+		if (aes_enctypes == NULL) {
+			goto done;
+		}
+#endif
+#ifdef HAVE_ENCTYPE_AES128_CTS_HMAC_SHA1_96
+		aes_enctypes = talloc_asprintf_append(
+		    aes_enctypes, "%s", "aes128-cts-hmac-sha1-96");
+		if (aes_enctypes == NULL) {
+			goto done;
+		}
+#endif
+	}
+
+	if (lp_kerberos_encryption_types() == KERBEROS_ETYPES_ALL ||
+	    lp_kerberos_encryption_types() == KERBEROS_ETYPES_LEGACY) {
+		legacy_enctypes = "RC4-HMAC DES-CBC-CRC DES-CBC-MD5";
+	}
+
+	enctypes =
+	    talloc_asprintf(mem_ctx, "\tdefault_tgs_enctypes = %s %s\n"
+				     "\tdefault_tkt_enctypes = %s %s\n"
+				     "\tpreferred_enctypes = %s %s\n",
+			    aes_enctypes, legacy_enctypes, aes_enctypes,
+			    legacy_enctypes, aes_enctypes, legacy_enctypes);
+done:
+	TALLOC_FREE(aes_enctypes);
+	return enctypes;
+}
+#else /* Heimdal version */
+static char *get_enctypes(TALLOC_CTX *mem_ctx)
+{
+	const char *aes_enctypes = "";
+	const char *legacy_enctypes = "";
+	char *enctypes = NULL;
+
+	if (lp_kerberos_encryption_types() == KERBEROS_ETYPES_ALL ||
+	    lp_kerberos_encryption_types() == KERBEROS_ETYPES_STRONG) {
+		aes_enctypes =
+		    "aes256-cts-hmac-sha1-96 aes128-cts-hmac-sha1-96";
+	}
+
+	if (lp_kerberos_encryption_types() == KERBEROS_ETYPES_ALL ||
+	    lp_kerberos_encryption_types() == KERBEROS_ETYPES_LEGACY) {
+		legacy_enctypes = "arcfour-hmac-md5 des-cbc-crc des-cbc-md5";
+	}
+
+	enctypes = talloc_asprintf(mem_ctx, "\tdefault_etypes = %s %s\n",
+				   aes_enctypes, legacy_enctypes);
+
+	return enctypes;
+}
+#endif
+
 bool create_local_private_krb5_conf_for_domain(const char *realm,
 						const char *domain,
 						const char *sitename,
@@ -806,7 +647,8 @@ bool create_local_private_krb5_conf_for_domain(const char *realm,
 	int fd;
 	char *realm_upper = NULL;
 	bool result = false;
-	char *aes_enctypes = NULL;
+	char *enctypes = NULL;
+	const char *include_system_krb5 = "";
 	mode_t mask;
 
 	if (!lp_create_krb5_conf()) {
@@ -823,7 +665,7 @@ bool create_local_private_krb5_conf_for_domain(const char *realm,
 		return false;
 	}
 
-	dname = lock_path("smb_krb5");
+	dname = lock_path(talloc_tos(), "smb_krb5");
 	if (!dname) {
 		return false;
 	}
@@ -834,7 +676,7 @@ bool create_local_private_krb5_conf_for_domain(const char *realm,
 		goto done;
 	}
 
-	tmpname = lock_path("smb_tmp_krb5.XXXXXX");
+	tmpname = lock_path(talloc_tos(), "smb_tmp_krb5.XXXXXX");
 	if (!tmpname) {
 		goto done;
 	}
@@ -857,34 +699,38 @@ bool create_local_private_krb5_conf_for_domain(const char *realm,
 		goto done;
 	}
 
-	aes_enctypes = talloc_strdup(fname, "");
-	if (aes_enctypes == NULL) {
+	enctypes = get_enctypes(fname);
+	if (enctypes == NULL) {
 		goto done;
 	}
 
-#ifdef HAVE_ENCTYPE_AES256_CTS_HMAC_SHA1_96
-	aes_enctypes = talloc_asprintf_append(aes_enctypes, "%s", "aes256-cts-hmac-sha1-96 ");
-	if (aes_enctypes == NULL) {
-		goto done;
-	}
-#endif
-#ifdef HAVE_ENCTYPE_AES128_CTS_HMAC_SHA1_96
-	aes_enctypes = talloc_asprintf_append(aes_enctypes, "%s", "aes128-cts-hmac-sha1-96");
-	if (aes_enctypes == NULL) {
-		goto done;
+#if !defined(SAMBA4_USES_HEIMDAL)
+	if (lp_include_system_krb5_conf()) {
+		include_system_krb5 = "include /etc/krb5.conf";
 	}
 #endif
 
-	file_contents = talloc_asprintf(fname,
-					"[libdefaults]\n\tdefault_realm = %s\n"
-					"\tdefault_tgs_enctypes = %s RC4-HMAC DES-CBC-CRC DES-CBC-MD5\n"
-					"\tdefault_tkt_enctypes = %s RC4-HMAC DES-CBC-CRC DES-CBC-MD5\n"
-					"\tpreferred_enctypes = %s RC4-HMAC DES-CBC-CRC DES-CBC-MD5\n"
-					"\tdns_lookup_realm = false\n\n"
-					"[realms]\n\t%s = {\n"
-					"%s\t}\n",
-					realm_upper, aes_enctypes, aes_enctypes, aes_enctypes,
-					realm_upper, kdc_ip_string);
+	/*
+	 * We are setting 'dns_lookup_kdc' to true, because we want to lookup
+	 * KDCs which are not configured via DNS SRV records, eg. if we do:
+	 *
+	 *     net ads join -Uadmin@otherdomain
+	 */
+	file_contents =
+	    talloc_asprintf(fname,
+			    "[libdefaults]\n"
+			    "\tdefault_realm = %s\n"
+			    "%s"
+			    "\tdns_lookup_realm = false\n"
+			    "\tdns_lookup_kdc = true\n\n"
+			    "[realms]\n\t%s = {\n"
+			    "%s\t}\n"
+			    "%s\n",
+			    realm_upper,
+			    enctypes,
+			    realm_upper,
+			    kdc_ip_string,
+			    include_system_krb5);
 
 	if (!file_contents) {
 		goto done;

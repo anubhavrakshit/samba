@@ -28,10 +28,13 @@
 #include "../lib/tsocket/tsocket.h"
 #include "../libcli/security/security.h"
 #include "../lib/util/tevent_ntstatus.h"
-#include "lib/crypto/sha512.h"
-#include "lib/crypto/aes.h"
-#include "lib/crypto/aes_ccm_128.h"
-#include "lib/crypto/aes_gcm_128.h"
+
+#include "lib/crypto/gnutls_helpers.h"
+#include <gnutls/gnutls.h>
+#include <gnutls/crypto.h>
+
+#undef DBGC_CLASS
+#define DBGC_CLASS DBGC_SMB2
 
 static struct tevent_req *smbd_smb2_session_setup_wrap_send(TALLOC_CTX *mem_ctx,
 					struct tevent_context *ev,
@@ -104,7 +107,16 @@ NTSTATUS smbd_smb2_request_process_sesssetup(struct smbd_smb2_request *smb2req)
 	}
 	tevent_req_set_callback(subreq, smbd_smb2_request_sesssetup_done, smb2req);
 
-	return smbd_smb2_request_pending_queue(smb2req, subreq, 500);
+	/*
+	 * Avoid sending a STATUS_PENDING message, which
+	 * matches a Windows Server and avoids problems with
+	 * MacOS clients.
+	 *
+	 * Even after 90 seconds a Windows Server doesn't return
+	 * STATUS_PENDING if using NTLMSSP against a non reachable
+	 * trusted domain.
+	 */
+	return smbd_smb2_request_pending_queue(smb2req, subreq, 0);
 }
 
 static void smbd_smb2_request_sesssetup_done(struct tevent_req *subreq)
@@ -208,19 +220,32 @@ static NTSTATUS smbd_smb2_auth_generic_return(struct smbXsrv_session *session,
 		struct smbXsrv_preauth *preauth;
 		struct _derivation *d;
 		DATA_BLOB p;
-		struct hc_sha512state sctx;
+		gnutls_hash_hd_t hash_hnd;
+		int rc;
 
 		preauth = talloc_move(smb2req, &auth->preauth);
 
-		samba_SHA512_Init(&sctx);
-		samba_SHA512_Update(&sctx, preauth->sha512_value,
-				    sizeof(preauth->sha512_value));
-		for (i = 1; i < smb2req->in.vector_count; i++) {
-			samba_SHA512_Update(&sctx,
-					    smb2req->in.vector[i].iov_base,
-					    smb2req->in.vector[i].iov_len);
+		rc = gnutls_hash_init(&hash_hnd, GNUTLS_DIG_SHA512);
+		if (rc < 0) {
+			return gnutls_error_to_ntstatus(rc, NT_STATUS_HASH_NOT_SUPPORTED);
 		}
-		samba_SHA512_Final(preauth->sha512_value, &sctx);
+		rc = gnutls_hash(hash_hnd,
+				 preauth->sha512_value,
+				 sizeof(preauth->sha512_value));
+		if (rc < 0) {
+			gnutls_hash_deinit(hash_hnd, NULL);
+			return NT_STATUS_ACCESS_DENIED;
+		}
+		for (i = 1; i < smb2req->in.vector_count; i++) {
+			rc = gnutls_hash(hash_hnd,
+					 smb2req->in.vector[i].iov_base,
+					 smb2req->in.vector[i].iov_len);
+			if (rc < 0) {
+				gnutls_hash_deinit(hash_hnd, NULL);
+				return NT_STATUS_ACCESS_DENIED;
+			}
+		}
+		gnutls_hash_deinit(hash_hnd, preauth->sha512_value);
 
 		p = data_blob_const(preauth->sha512_value,
 				    sizeof(preauth->sha512_value));
@@ -262,44 +287,48 @@ static NTSTATUS smbd_smb2_auth_generic_return(struct smbXsrv_session *session,
 	}
 
 	if ((in_security_mode & SMB2_NEGOTIATE_SIGNING_REQUIRED) ||
-	    lp_server_signing() == SMB_SIGNING_REQUIRED) {
-		x->global->signing_required = true;
+	    (xconn->smb2.server.security_mode & SMB2_NEGOTIATE_SIGNING_REQUIRED))
+	{
+		x->global->signing_flags = SMBXSRV_SIGNING_REQUIRED;
 	}
 
 	if ((lp_smb_encrypt(-1) >= SMB_SIGNING_DESIRED) &&
 	    (xconn->smb2.client.capabilities & SMB2_CAP_ENCRYPTION)) {
-		x->encryption_desired = true;
+		x->global->encryption_flags = SMBXSRV_ENCRYPTION_DESIRED;
 	}
 
 	if (lp_smb_encrypt(-1) == SMB_SIGNING_REQUIRED) {
-		x->encryption_desired = true;
-		x->global->encryption_required = true;
+		x->global->encryption_flags = SMBXSRV_ENCRYPTION_REQUIRED |
+			SMBXSRV_ENCRYPTION_DESIRED;
 	}
 
 	if (security_session_user_level(session_info, NULL) < SECURITY_USER) {
-		/* we map anonymous to guest internally */
-		*out_session_flags |= SMB2_SESSION_FLAG_IS_GUEST;
-		*out_session_flags |= SMB2_SESSION_FLAG_IS_NULL;
+		if (security_session_user_level(session_info, NULL) == SECURITY_GUEST) {
+			*out_session_flags |= SMB2_SESSION_FLAG_IS_GUEST;
+		}
 		/* force no signing */
-		x->global->signing_required = false;
+		x->global->signing_flags &= ~SMBXSRV_SIGNING_REQUIRED;
+		/* we map anonymous to guest internally */
 		guest = true;
 	}
 
-	if (guest && x->global->encryption_required) {
+	if (guest && (x->global->encryption_flags & SMBXSRV_ENCRYPTION_REQUIRED)) {
 		DEBUG(1,("reject guest session as encryption is required\n"));
 		return NT_STATUS_ACCESS_DENIED;
 	}
 
 	if (xconn->smb2.server.cipher == 0) {
-		if (x->global->encryption_required) {
+		if (x->global->encryption_flags & SMBXSRV_ENCRYPTION_REQUIRED) {
 			DEBUG(1,("reject session with dialect[0x%04X] "
 				 "as encryption is required\n",
 				 xconn->smb2.server.dialect));
 			return NT_STATUS_ACCESS_DENIED;
 		}
+	} else {
+		x->global->channels[0].encryption_cipher = xconn->smb2.server.cipher;
 	}
 
-	if (x->encryption_desired) {
+	if (x->global->encryption_flags & SMBXSRV_ENCRYPTION_DESIRED) {
 		*out_session_flags |= SMB2_SESSION_FLAG_ENCRYPT_DATA;
 	}
 
@@ -307,10 +336,21 @@ static NTSTATUS smbd_smb2_auth_generic_return(struct smbXsrv_session *session,
 	memcpy(session_key, session_info->session_key.data,
 	       MIN(session_info->session_key.length, sizeof(session_key)));
 
-	x->global->signing_key = data_blob_talloc(x->global,
-						  session_key,
-						  sizeof(session_key));
-	if (x->global->signing_key.data == NULL) {
+	x->global->signing_key = talloc_zero(x->global,
+					     struct smb2_signing_key);
+	if (x->global->signing_key == NULL) {
+		ZERO_STRUCT(session_key);
+		return NT_STATUS_NO_MEMORY;
+	}
+	talloc_set_destructor(x->global->signing_key,
+			      smb2_signing_key_destructor);
+
+	x->global->signing_key->blob =
+		x->global->signing_key_blob =
+			data_blob_talloc(x->global,
+					 session_key,
+					 sizeof(session_key));
+	if (!smb2_signing_key_valid(x->global->signing_key)) {
 		ZERO_STRUCT(session_key);
 		return NT_STATUS_NO_MEMORY;
 	}
@@ -318,45 +358,74 @@ static NTSTATUS smbd_smb2_auth_generic_return(struct smbXsrv_session *session,
 	if (xconn->protocol >= PROTOCOL_SMB2_24) {
 		struct _derivation *d = &derivation.signing;
 
-		smb2_key_derivation(session_key, sizeof(session_key),
-				    d->label.data, d->label.length,
-				    d->context.data, d->context.length,
-				    x->global->signing_key.data);
+		status = smb2_key_derivation(session_key, sizeof(session_key),
+					     d->label.data, d->label.length,
+					     d->context.data, d->context.length,
+					     x->global->signing_key->blob.data);
+		if (!NT_STATUS_IS_OK(status)) {
+			return status;
+		}
 	}
 
 	if (xconn->protocol >= PROTOCOL_SMB2_24) {
 		struct _derivation *d = &derivation.decryption;
 
-		x->global->decryption_key = data_blob_talloc(x->global,
-							     session_key,
-							     sizeof(session_key));
-		if (x->global->decryption_key.data == NULL) {
+		x->global->decryption_key =
+			talloc_zero(x->global, struct smb2_signing_key);
+		if (x->global->decryption_key == NULL) {
 			ZERO_STRUCT(session_key);
 			return NT_STATUS_NO_MEMORY;
 		}
 
-		smb2_key_derivation(session_key, sizeof(session_key),
-				    d->label.data, d->label.length,
-				    d->context.data, d->context.length,
-				    x->global->decryption_key.data);
+		x->global->decryption_key->blob =
+			x->global->decryption_key_blob =
+				data_blob_talloc(x->global->decryption_key,
+						 session_key,
+						 sizeof(session_key));
+		if (!smb2_signing_key_valid(x->global->decryption_key)) {
+			ZERO_STRUCT(session_key);
+			return NT_STATUS_NO_MEMORY;
+		}
+		talloc_keep_secret(x->global->decryption_key->blob.data);
+
+		status = smb2_key_derivation(session_key, sizeof(session_key),
+					     d->label.data, d->label.length,
+					     d->context.data, d->context.length,
+					     x->global->decryption_key->blob.data);
+		if (!NT_STATUS_IS_OK(status)) {
+			return status;
+		}
 	}
 
 	if (xconn->protocol >= PROTOCOL_SMB2_24) {
 		struct _derivation *d = &derivation.encryption;
 		size_t nonce_size;
 
-		x->global->encryption_key = data_blob_talloc(x->global,
-							     session_key,
-							     sizeof(session_key));
-		if (x->global->encryption_key.data == NULL) {
+		x->global->encryption_key =
+			talloc_zero(x->global, struct smb2_signing_key);
+		if (x->global->encryption_key == NULL) {
 			ZERO_STRUCT(session_key);
 			return NT_STATUS_NO_MEMORY;
 		}
 
-		smb2_key_derivation(session_key, sizeof(session_key),
-				    d->label.data, d->label.length,
-				    d->context.data, d->context.length,
-				    x->global->encryption_key.data);
+		x->global->encryption_key->blob =
+			x->global->encryption_key_blob =
+				data_blob_talloc(x->global->encryption_key,
+						 session_key,
+						 sizeof(session_key));
+		if (!smb2_signing_key_valid(x->global->encryption_key)) {
+			ZERO_STRUCT(session_key);
+			return NT_STATUS_NO_MEMORY;
+		}
+		talloc_keep_secret(x->global->encryption_key->blob.data);
+
+		status = smb2_key_derivation(session_key, sizeof(session_key),
+					     d->label.data, d->label.length,
+					     d->context.data, d->context.length,
+					     x->global->encryption_key->blob.data);
+		if (!NT_STATUS_IS_OK(status)) {
+			return status;
+		}
 
 		/*
 		 * CCM and GCM algorithms must never have their
@@ -367,14 +436,14 @@ static NTSTATUS smbd_smb2_auth_generic_return(struct smbXsrv_session *session,
 		 *
 		 * NOTE: We assume nonces greater than 8 bytes.
 		 */
-		generate_random_buffer((uint8_t *)&x->nonce_high_random,
-				       sizeof(x->nonce_high_random));
+		generate_nonce_buffer((uint8_t *)&x->nonce_high_random,
+				      sizeof(x->nonce_high_random));
 		switch (xconn->smb2.server.cipher) {
 		case SMB2_ENCRYPTION_AES128_CCM:
-			nonce_size = AES_CCM_128_NONCE_SIZE;
+			nonce_size = SMB2_AES_128_CCM_NONCE_SIZE;
 			break;
 		case SMB2_ENCRYPTION_AES128_GCM:
-			nonce_size = AES_GCM_128_IV_SIZE;
+			nonce_size = gnutls_cipher_get_iv_size(GNUTLS_CIPHER_AES_128_GCM);
 			break;
 		default:
 			nonce_size = 0;
@@ -385,28 +454,68 @@ static NTSTATUS smbd_smb2_auth_generic_return(struct smbXsrv_session *session,
 		x->nonce_low = 0;
 	}
 
-	x->global->application_key = data_blob_dup_talloc(x->global,
-						x->global->signing_key);
+	x->global->application_key =
+		data_blob_dup_talloc(x->global, x->global->signing_key->blob);
 	if (x->global->application_key.data == NULL) {
 		ZERO_STRUCT(session_key);
 		return NT_STATUS_NO_MEMORY;
 	}
+	talloc_keep_secret(x->global->application_key.data);
 
 	if (xconn->protocol >= PROTOCOL_SMB2_24) {
 		struct _derivation *d = &derivation.application;
 
-		smb2_key_derivation(session_key, sizeof(session_key),
-				    d->label.data, d->label.length,
-				    d->context.data, d->context.length,
-				    x->global->application_key.data);
+		status = smb2_key_derivation(session_key, sizeof(session_key),
+					     d->label.data, d->label.length,
+					     d->context.data, d->context.length,
+					     x->global->application_key.data);
+		if (!NT_STATUS_IS_OK(status)) {
+			return status;
+		}
 	}
+
+	if (xconn->protocol >= PROTOCOL_SMB3_00 && lp_debug_encryption()) {
+		DEBUG(0, ("debug encryption: dumping generated session keys\n"));
+		DEBUGADD(0, ("Session Id    "));
+		dump_data(0, (uint8_t*)&session->global->session_wire_id,
+			  sizeof(session->global->session_wire_id));
+		DEBUGADD(0, ("Session Key   "));
+		dump_data(0, session_key, sizeof(session_key));
+		DEBUGADD(0, ("Signing Key   "));
+		dump_data(0, x->global->signing_key->blob.data,
+			  x->global->signing_key->blob.length);
+		DEBUGADD(0, ("App Key       "));
+		dump_data(0, x->global->application_key.data,
+			  x->global->application_key.length);
+
+		/* In server code, ServerIn is the decryption key */
+
+		DEBUGADD(0, ("ServerIn Key  "));
+		dump_data(0, x->global->decryption_key->blob.data,
+			  x->global->decryption_key->blob.length);
+		DEBUGADD(0, ("ServerOut Key "));
+		dump_data(0, x->global->encryption_key->blob.data,
+			  x->global->encryption_key->blob.length);
+	}
+
 	ZERO_STRUCT(session_key);
 
-	x->global->channels[0].signing_key = data_blob_dup_talloc(x->global->channels,
-						x->global->signing_key);
-	if (x->global->channels[0].signing_key.data == NULL) {
+	x->global->channels[0].signing_key =
+		talloc_zero(x->global->channels, struct smb2_signing_key);
+	if (x->global->channels[0].signing_key == NULL) {
 		return NT_STATUS_NO_MEMORY;
 	}
+	talloc_set_destructor(x->global->channels[0].signing_key,
+			      smb2_signing_key_destructor);
+
+	x->global->channels[0].signing_key->blob =
+		x->global->channels[0].signing_key_blob =
+			data_blob_dup_talloc(x->global->channels[0].signing_key,
+					     x->global->signing_key->blob);
+	if (!smb2_signing_key_valid(x->global->channels[0].signing_key)) {
+		return NT_STATUS_NO_MEMORY;
+	}
+	talloc_keep_secret(x->global->channels[0].signing_key->blob.data);
 
 	data_blob_clear_free(&session_info->session_key);
 	session_info->session_key = data_blob_dup_talloc(session_info,
@@ -414,21 +523,12 @@ static NTSTATUS smbd_smb2_auth_generic_return(struct smbXsrv_session *session,
 	if (session_info->session_key.data == NULL) {
 		return NT_STATUS_NO_MEMORY;
 	}
+	talloc_keep_secret(session_info->session_key.data);
 
-	session->compat = talloc_zero(session, struct user_struct);
-	if (session->compat == NULL) {
-		return NT_STATUS_NO_MEMORY;
-	}
-	session->compat->session = session;
-	session->compat->homes_snum = -1;
-	session->compat->session_info = session_info;
-	session->compat->session_keystr = NULL;
-	session->compat->vuid = session->global->session_wire_id;
-	DLIST_ADD(smb2req->sconn->users, session->compat);
 	smb2req->sconn->num_users++;
 
 	if (security_session_user_level(session_info, NULL) >= SECURITY_USER) {
-		session->compat->homes_snum =
+		session->homes_snum =
 			register_homes_share(session_info->unix_info->unix_name);
 	}
 
@@ -455,7 +555,7 @@ static NTSTATUS smbd_smb2_auth_generic_return(struct smbXsrv_session *session,
 	if (!session_claim(session)) {
 		DEBUG(1, ("smb2: Failed to claim session "
 			"for vuid=%llu\n",
-			(unsigned long long)session->compat->vuid));
+			(unsigned long long)session->global->session_wire_id));
 		return NT_STATUS_LOGON_FAILURE;
 	}
 
@@ -463,7 +563,7 @@ static NTSTATUS smbd_smb2_auth_generic_return(struct smbXsrv_session *session,
 	status = smbXsrv_session_update(session);
 	if (!NT_STATUS_IS_OK(status)) {
 		DEBUG(0, ("smb2: Failed to update session for vuid=%llu - %s\n",
-			  (unsigned long long)session->compat->vuid,
+			  (unsigned long long)session->global->session_wire_id,
 			  nt_errstr(status)));
 		return NT_STATUS_LOGON_FAILURE;
 	}
@@ -479,6 +579,7 @@ static NTSTATUS smbd_smb2_auth_generic_return(struct smbXsrv_session *session,
 	global_client_caps |= (CAP_LEVEL_II_OPLOCKS|CAP_STATUS32);
 
 	*out_session_id = session->global->session_wire_id;
+	smb2req->last_session_id = session->global->session_wire_id;
 
 	return NT_STATUS_OK;
 }
@@ -493,6 +594,7 @@ static NTSTATUS smbd_smb2_reauth_generic_return(struct smbXsrv_session *session,
 	NTSTATUS status;
 	struct smbXsrv_session *x = session;
 	struct smbXsrv_session_auth0 *auth = *_auth;
+	struct smbXsrv_connection *xconn = smb2req->xconn;
 	size_t i;
 
 	*_auth = NULL;
@@ -503,11 +605,9 @@ static NTSTATUS smbd_smb2_reauth_generic_return(struct smbXsrv_session *session,
 	if (session_info->session_key.data == NULL) {
 		return NT_STATUS_NO_MEMORY;
 	}
+	talloc_keep_secret(session_info->session_key.data);
 
-	session->compat->session_info = session_info;
-	session->compat->vuid = session->global->session_wire_id;
-
-	session->compat->homes_snum =
+	session->homes_snum =
 			register_homes_share(session_info->unix_info->unix_name);
 
 	set_current_user_info(session_info->unix_info->sanitized_username,
@@ -515,6 +615,10 @@ static NTSTATUS smbd_smb2_reauth_generic_return(struct smbXsrv_session *session,
 			      session_info->info->domain_name);
 
 	reload_services(smb2req->sconn, conn_snum_used, true);
+
+	if (security_session_user_level(session_info, NULL) >= SECURITY_USER) {
+		smb2req->do_signing = true;
+	}
 
 	session->status = NT_STATUS_OK;
 	TALLOC_FREE(session->global->auth_session_info);
@@ -535,15 +639,150 @@ static NTSTATUS smbd_smb2_reauth_generic_return(struct smbXsrv_session *session,
 	status = smbXsrv_session_update(session);
 	if (!NT_STATUS_IS_OK(status)) {
 		DEBUG(0, ("smb2: Failed to update session for vuid=%llu - %s\n",
-			  (unsigned long long)session->compat->vuid,
+			  (unsigned long long)session->global->session_wire_id,
 			  nt_errstr(status)));
 		return NT_STATUS_LOGON_FAILURE;
 	}
 
-	conn_clear_vuid_caches(smb2req->sconn, session->compat->vuid);
+	conn_clear_vuid_caches(xconn->client->sconn,
+			       session->global->session_wire_id);
 
-	if (security_session_user_level(session_info, NULL) >= SECURITY_USER) {
-		smb2req->do_signing = true;
+	*out_session_id = session->global->session_wire_id;
+
+	return NT_STATUS_OK;
+}
+
+static NTSTATUS smbd_smb2_bind_auth_return(struct smbXsrv_session *session,
+					   struct smbXsrv_session_auth0 **_auth,
+					   struct smbd_smb2_request *smb2req,
+					   struct auth_session_info *session_info,
+					   uint16_t *out_session_flags,
+					   uint64_t *out_session_id)
+{
+	NTSTATUS status;
+	struct smbXsrv_session *x = session;
+	struct smbXsrv_session_auth0 *auth = *_auth;
+	struct smbXsrv_connection *xconn = smb2req->xconn;
+	struct smbXsrv_channel_global0 *c = NULL;
+	uint8_t session_key[16];
+	size_t i;
+	struct _derivation {
+		DATA_BLOB label;
+		DATA_BLOB context;
+	};
+	struct {
+		struct _derivation signing;
+	} derivation = { };
+	bool ok;
+
+	*_auth = NULL;
+
+	if (xconn->protocol >= PROTOCOL_SMB3_10) {
+		struct smbXsrv_preauth *preauth;
+		struct _derivation *d;
+		DATA_BLOB p;
+		gnutls_hash_hd_t hash_hnd = NULL;
+		int rc;
+
+		preauth = talloc_move(smb2req, &auth->preauth);
+
+		rc = gnutls_hash_init(&hash_hnd, GNUTLS_DIG_SHA512);
+		if (rc < 0) {
+			return gnutls_error_to_ntstatus(rc, NT_STATUS_HASH_NOT_SUPPORTED);
+		}
+
+		rc = gnutls_hash(hash_hnd,
+				 preauth->sha512_value,
+				 sizeof(preauth->sha512_value));
+		if (rc < 0) {
+			gnutls_hash_deinit(hash_hnd, NULL);
+			return gnutls_error_to_ntstatus(rc, NT_STATUS_HASH_NOT_SUPPORTED);
+		}
+		for (i = 1; i < smb2req->in.vector_count; i++) {
+			rc = gnutls_hash(hash_hnd,
+					 smb2req->in.vector[i].iov_base,
+					 smb2req->in.vector[i].iov_len);
+			if (rc < 0) {
+				gnutls_hash_deinit(hash_hnd, NULL);
+				return gnutls_error_to_ntstatus(rc, NT_STATUS_HASH_NOT_SUPPORTED);
+			}
+		}
+		gnutls_hash_deinit(hash_hnd, preauth->sha512_value);
+
+		p = data_blob_const(preauth->sha512_value,
+				    sizeof(preauth->sha512_value));
+
+		d = &derivation.signing;
+		d->label = data_blob_string_const_null("SMBSigningKey");
+		d->context = p;
+
+	} else if (xconn->protocol >= PROTOCOL_SMB2_24) {
+		struct _derivation *d;
+
+		d = &derivation.signing;
+		d->label = data_blob_string_const_null("SMB2AESCMAC");
+		d->context = data_blob_string_const_null("SmbSign");
+	}
+
+	status = smbXsrv_session_find_channel(session, xconn, &c);
+	if (!NT_STATUS_IS_OK(status)) {
+		return status;
+	}
+
+	ok = security_token_is_sid(session_info->security_token,
+			&x->global->auth_session_info->security_token->sids[0]);
+	if (!ok) {
+		return NT_STATUS_NOT_SUPPORTED;
+	}
+
+	if (session_info->session_key.length == 0) {
+		/* See [MS-SMB2] 3.3.5.2.4 for the return code. */
+		return NT_STATUS_NOT_SUPPORTED;
+	}
+
+	ZERO_STRUCT(session_key);
+	memcpy(session_key, session_info->session_key.data,
+	       MIN(session_info->session_key.length, sizeof(session_key)));
+
+	c->signing_key = talloc_zero(x->global, struct smb2_signing_key);
+	if (c->signing_key == NULL) {
+		ZERO_STRUCT(session_key);
+		return NT_STATUS_NO_MEMORY;
+	}
+	talloc_set_destructor(c->signing_key,
+			      smb2_signing_key_destructor);
+
+	c->signing_key->blob =
+		c->signing_key_blob =
+			data_blob_talloc(c->signing_key,
+					 session_key,
+					 sizeof(session_key));
+	if (!smb2_signing_key_valid(c->signing_key)) {
+		ZERO_STRUCT(session_key);
+		return NT_STATUS_NO_MEMORY;
+	}
+	talloc_keep_secret(c->signing_key->blob.data);
+
+	if (xconn->protocol >= PROTOCOL_SMB2_24) {
+		struct _derivation *d = &derivation.signing;
+
+		status = smb2_key_derivation(session_key, sizeof(session_key),
+					     d->label.data, d->label.length,
+					     d->context.data, d->context.length,
+					     c->signing_key->blob.data);
+		if (!NT_STATUS_IS_OK(status)) {
+			return status;
+		}
+	}
+	ZERO_STRUCT(session_key);
+
+	TALLOC_FREE(auth);
+	status = smbXsrv_session_update(session);
+	if (!NT_STATUS_IS_OK(status)) {
+		DEBUG(0, ("smb2: Failed to update session for vuid=%llu - %s\n",
+			  (unsigned long long)session->global->session_wire_id,
+			  nt_errstr(status)));
+		return NT_STATUS_LOGON_FAILURE;
 	}
 
 	*out_session_id = session->global->session_wire_id;
@@ -586,6 +825,7 @@ static struct tevent_req *smbd_smb2_session_setup_send(TALLOC_CTX *mem_ctx,
 	NTTIME now = timeval_to_nttime(&smb2req->request_time);
 	struct tevent_req *subreq;
 	struct smbXsrv_channel_global0 *c = NULL;
+	enum security_user_level seclvl;
 
 	req = tevent_req_create(mem_ctx, &state,
 				struct smbd_smb2_session_setup_state);
@@ -606,12 +846,86 @@ static struct tevent_req *smbd_smb2_session_setup_send(TALLOC_CTX *mem_ctx,
 			return tevent_req_post(req, ev);
 		}
 
+		if (!smb2req->xconn->client->server_multi_channel_enabled) {
+			tevent_req_nterror(req, NT_STATUS_REQUEST_NOT_ACCEPTED);
+			return tevent_req_post(req, ev);
+		}
+
+		if (in_session_id == 0) {
+			tevent_req_nterror(req, NT_STATUS_INVALID_PARAMETER);
+			return tevent_req_post(req, ev);
+		}
+
+		if (smb2req->session == NULL) {
+			tevent_req_nterror(req, NT_STATUS_USER_SESSION_DELETED);
+			return tevent_req_post(req, ev);
+		}
+
+		if (!smb2req->do_signing) {
+			tevent_req_nterror(req, NT_STATUS_INVALID_PARAMETER);
+			return tevent_req_post(req, ev);
+		}
+
+		status = smbXsrv_session_find_channel(smb2req->session,
+						      smb2req->xconn,
+						      &c);
+		if (NT_STATUS_IS_OK(status)) {
+			if (!smb2_signing_key_valid(c->signing_key)) {
+				goto auth;
+			}
+			tevent_req_nterror(req, NT_STATUS_REQUEST_NOT_ACCEPTED);
+			return tevent_req_post(req, ev);
+		}
+
 		/*
-		 * We do not support multi channel.
+		 * OLD: 3.00 NEW 3.02 => INVALID_PARAMETER
+		 * OLD: 3.02 NEW 3.00 => INVALID_PARAMETER
+		 * OLD: 2.10 NEW 3.02 => ACCESS_DENIED
+		 * OLD: 3.02 NEW 2.10 => ACCESS_DENIED
 		 */
-		tevent_req_nterror(req, NT_STATUS_NOT_SUPPORTED);
-		return tevent_req_post(req, ev);
+		if (smb2req->session->global->connection_dialect
+		    < SMB2_DIALECT_REVISION_222)
+		{
+			tevent_req_nterror(req, NT_STATUS_ACCESS_DENIED);
+			return tevent_req_post(req, ev);
+		}
+		if (smb2req->xconn->smb2.server.dialect
+		    < SMB2_DIALECT_REVISION_222)
+		{
+			tevent_req_nterror(req, NT_STATUS_ACCESS_DENIED);
+			return tevent_req_post(req, ev);
+		}
+		if (smb2req->session->global->connection_dialect
+		    != smb2req->xconn->smb2.server.dialect)
+		{
+			tevent_req_nterror(req, NT_STATUS_INVALID_PARAMETER);
+			return tevent_req_post(req, ev);
+		}
+
+		seclvl = security_session_user_level(
+				smb2req->session->global->auth_session_info,
+				NULL);
+		if (seclvl < SECURITY_USER) {
+			tevent_req_nterror(req, NT_STATUS_NOT_SUPPORTED);
+			return tevent_req_post(req, ev);
+		}
+
+		status = smbXsrv_session_add_channel(smb2req->session,
+						     smb2req->xconn,
+						     &c);
+		if (!NT_STATUS_IS_OK(status)) {
+			tevent_req_nterror(req, status);
+			return tevent_req_post(req, ev);
+		}
+
+		status = smbXsrv_session_update(smb2req->session);
+		if (!NT_STATUS_IS_OK(status)) {
+			tevent_req_nterror(req, status);
+			return tevent_req_post(req, ev);
+		}
 	}
+
+auth:
 
 	if (state->in_session_id == 0) {
 		/* create a new session */
@@ -665,6 +979,8 @@ static struct tevent_req *smbd_smb2_session_setup_send(TALLOC_CTX *mem_ctx,
 	if (state->auth->gensec == NULL) {
 		status = auth_generic_prepare(state->auth,
 					      state->smb2req->xconn->remote_address,
+					      state->smb2req->xconn->local_address,
+					      "SMB2",
 					      &state->auth->gensec);
 		if (tevent_req_nterror(req, status)) {
 			return tevent_req_post(req, ev);
@@ -672,6 +988,7 @@ static struct tevent_req *smbd_smb2_session_setup_send(TALLOC_CTX *mem_ctx,
 
 		gensec_want_feature(state->auth->gensec, GENSEC_FEATURE_SESSION_KEY);
 		gensec_want_feature(state->auth->gensec, GENSEC_FEATURE_UNIX_TOKEN);
+		gensec_want_feature(state->auth->gensec, GENSEC_FEATURE_SMB_TRANSPORT);
 
 		status = gensec_start_mech_by_oid(state->auth->gensec,
 						  GENSEC_OID_SPNEGO);
@@ -776,6 +1093,20 @@ static void smbd_smb2_session_setup_auth_return(struct tevent_req *req)
 		tevent_req_data(req,
 		struct smbd_smb2_session_setup_state);
 	NTSTATUS status;
+
+	if (state->in_flags & SMB2_SESSION_FLAG_BINDING) {
+		status = smbd_smb2_bind_auth_return(state->session,
+						    &state->auth,
+						    state->smb2req,
+						    state->session_info,
+						    &state->out_session_flags,
+						    &state->out_session_id);
+		if (tevent_req_nterror(req, status)) {
+			return;
+		}
+		tevent_req_done(req);
+		return;
+	}
 
 	if (state->session->global->auth_session_info != NULL) {
 		status = smbd_smb2_reauth_generic_return(state->session,
@@ -1014,10 +1345,10 @@ NTSTATUS smbd_smb2_request_process_logoff(struct smbd_smb2_request *req)
 	tevent_req_set_callback(subreq, smbd_smb2_request_logoff_done, req);
 
 	/*
-	 * Wait a long time before going async on this to allow
-	 * requests we're waiting on to finish. Set timeout to 10 secs.
+	 * Avoid sending a STATUS_PENDING message, it's very likely
+	 * the client won't expect that.
 	 */
-	return smbd_smb2_request_pending_queue(req, subreq, 10000000);
+	return smbd_smb2_request_pending_queue(req, subreq, 0);
 }
 
 static void smbd_smb2_request_logoff_done(struct tevent_req *subreq)
@@ -1102,12 +1433,23 @@ static void smbd_smb2_logoff_shutdown_done(struct tevent_req *subreq)
 	struct smbd_smb2_logoff_state *state = tevent_req_data(
 		req, struct smbd_smb2_logoff_state);
 	NTSTATUS status;
+	bool ok;
+	const struct GUID *client_guid =
+		&state->smb2req->session->client->connections->smb2.client.guid;
 
 	status = smb2srv_session_shutdown_recv(subreq);
 	if (tevent_req_nterror(req, status)) {
 		return;
 	}
 	TALLOC_FREE(subreq);
+
+	if (!GUID_all_zero(client_guid)) {
+		ok = remote_arch_cache_delete(client_guid);
+		if (!ok) {
+			/* Most likely not an error, but not in cache */
+			DBG_DEBUG("Deletion from remote arch cache failed\n");
+		}
+	}
 
 	/*
 	 * As we've been awoken, we may have changed

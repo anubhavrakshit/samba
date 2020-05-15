@@ -35,9 +35,6 @@ static int vfs_recycle_debug_level = DBGC_VFS;
 #undef DBGC_CLASS
 #define DBGC_CLASS vfs_recycle_debug_level
  
-static int recycle_unlink(vfs_handle_struct *handle,
-			  const struct smb_filename *smb_fname);
-
 static const char *recycle_repository(vfs_handle_struct *handle)
 {
 	const char *tmp_str = NULL;
@@ -186,10 +183,12 @@ static mode_t recycle_subdir_mode(vfs_handle_struct *handle)
 
 static bool recycle_directory_exist(vfs_handle_struct *handle, const char *dname)
 {
-	SMB_STRUCT_STAT st;
+	struct smb_filename smb_fname = {
+			.base_name = discard_const_p(char, dname)
+	};
 
-	if (vfs_stat_smb_basename(handle->conn, dname, &st) == 0) {
-		if (S_ISDIR(st.st_ex_mode)) {
+	if (SMB_VFS_STAT(handle->conn, &smb_fname) == 0) {
+		if (S_ISDIR(smb_fname.st.st_ex_mode)) {
 			return True;
 		}
 	}
@@ -237,8 +236,8 @@ static off_t recycle_get_file_size(vfs_handle_struct *handle,
 	}
 
 	if (SMB_VFS_STAT(handle->conn, smb_fname_tmp) != 0) {
-		DEBUG(0,("recycle: stat for %s returned %s\n",
-			 smb_fname_str_dbg(smb_fname_tmp), strerror(errno)));
+		DBG_DEBUG("stat for %s returned %s\n",
+			 smb_fname_str_dbg(smb_fname_tmp), strerror(errno));
 		size = (off_t)0;
 		goto out;
 	}
@@ -283,7 +282,7 @@ static bool recycle_create_dir(vfs_handle_struct *handle, const char *dname)
 		}
 	}
 
-	/* Create directory tree if neccessary */
+	/* Create directory tree if necessary */
 	for(token = strtok_r(tok_str, "/", &saveptr); token;
 	    token = strtok_r(NULL, "/", &saveptr)) {
 		if (strlcat(new_dir, token, len+1) >= len+1) {
@@ -292,12 +291,35 @@ static bool recycle_create_dir(vfs_handle_struct *handle, const char *dname)
 		if (recycle_directory_exist(handle, new_dir))
 			DEBUG(10, ("recycle: dir %s already exists\n", new_dir));
 		else {
+			struct smb_filename *smb_fname = NULL;
+			int retval;
+
 			DEBUG(5, ("recycle: creating new dir %s\n", new_dir));
-			if (SMB_VFS_NEXT_MKDIR(handle, new_dir, mode) != 0) {
-				DEBUG(1,("recycle: mkdir failed for %s with error: %s\n", new_dir, strerror(errno)));
+
+			smb_fname = synthetic_smb_fname(talloc_tos(),
+						new_dir,
+						NULL,
+						NULL,
+						0,
+						0);
+			if (smb_fname == NULL) {
+				goto done;
+			}
+
+			retval = SMB_VFS_NEXT_MKDIRAT(handle,
+					handle->conn->cwd_fsp,
+					smb_fname,
+					mode);
+			if (retval != 0) {
+				DBG_WARNING("recycle: mkdirat failed "
+					"for %s with error: %s\n",
+					new_dir,
+					strerror(errno));
+				TALLOC_FREE(smb_fname);
 				ret = False;
 				goto done;
 			}
+			TALLOC_FREE(smb_fname);
 		}
 		if (strlcat(new_dir, "/", len+1) >= len+1) {
 			goto done;
@@ -396,7 +418,7 @@ static void recycle_do_touch(vfs_handle_struct *handle,
 	struct smb_file_time ft;
 	int ret, err;
 
-	ZERO_STRUCT(ft);
+	init_smb_file_time(&ft);
 
 	smb_fname_tmp = cp_smb_filename(talloc_tos(), smb_fname);
 	if (smb_fname_tmp == NULL) {
@@ -428,9 +450,13 @@ static void recycle_do_touch(vfs_handle_struct *handle,
 /**
  * Check if file should be recycled
  **/
-static int recycle_unlink(vfs_handle_struct *handle,
-    const struct smb_filename *smb_fname)
+static int recycle_unlink_internal(vfs_handle_struct *handle,
+				struct files_struct *dirfsp,
+				const struct smb_filename *smb_fname,
+				int flags)
 {
+	const struct loadparm_substitution *lp_sub =
+		loadparm_s3_global_substitution();
 	connection_struct *conn = handle->conn;
 	char *path_name = NULL;
        	char *temp_name = NULL;
@@ -444,7 +470,7 @@ static int recycle_unlink(vfs_handle_struct *handle,
 	bool exist;
 	int rc = -1;
 
-	repository = talloc_sub_advanced(NULL, lp_servicename(talloc_tos(), SNUM(conn)),
+	repository = talloc_sub_full(NULL, lp_servicename(talloc_tos(), lp_sub, SNUM(conn)),
 					conn->session_info->unix_info->unix_name,
 					conn->connectpath,
 					conn->session_info->unix_token->gid,
@@ -459,7 +485,10 @@ static int recycle_unlink(vfs_handle_struct *handle,
 	if(!repository || *(repository) == '\0') {
 		DEBUG(3, ("recycle: repository path not set, purging %s...\n",
 			  smb_fname_str_dbg(smb_fname)));
-		rc = SMB_VFS_NEXT_UNLINK(handle, smb_fname);
+		rc = SMB_VFS_NEXT_UNLINKAT(handle,
+					dirfsp,
+					smb_fname,
+					flags);
 		goto done;
 	}
 
@@ -467,7 +496,10 @@ static int recycle_unlink(vfs_handle_struct *handle,
 	if (strncmp(smb_fname->base_name, repository,
 		    strlen(repository)) == 0) {
 		DEBUG(3, ("recycle: File is within recycling bin, unlinking ...\n"));
-		rc = SMB_VFS_NEXT_UNLINK(handle, smb_fname);
+		rc = SMB_VFS_NEXT_UNLINKAT(handle,
+					dirfsp,
+					smb_fname,
+					flags);
 		goto done;
 	}
 
@@ -477,7 +509,10 @@ static int recycle_unlink(vfs_handle_struct *handle,
 	 *
 	if(fsize == 0) {
 		DEBUG(3, ("recycle: File %s is empty, purging...\n", file_name));
-		rc = SMB_VFS_NEXT_UNLINK(handle,file_name);
+		rc = SMB_VFS_NEXT_UNLINKAT(handle,
+					dirfsp,
+					file_name,
+					flags);
 		goto done;
 	}
 	 */
@@ -490,14 +525,20 @@ static int recycle_unlink(vfs_handle_struct *handle,
 	if(maxsize > 0 && file_size > maxsize) {
 		DEBUG(3, ("recycle: File %s exceeds maximum recycle size, "
 			  "purging... \n", smb_fname_str_dbg(smb_fname)));
-		rc = SMB_VFS_NEXT_UNLINK(handle, smb_fname);
+		rc = SMB_VFS_NEXT_UNLINKAT(handle,
+					dirfsp,
+					smb_fname,
+					flags);
 		goto done;
 	}
 	minsize = recycle_minsize(handle);
 	if(minsize > 0 && file_size < minsize) {
 		DEBUG(3, ("recycle: File %s lowers minimum recycle size, "
 			  "purging... \n", smb_fname_str_dbg(smb_fname)));
-		rc = SMB_VFS_NEXT_UNLINK(handle, smb_fname);
+		rc = SMB_VFS_NEXT_UNLINKAT(handle,
+					dirfsp,
+					smb_fname,
+					flags);
 		goto done;
 	}
 
@@ -508,7 +549,10 @@ static int recycle_unlink(vfs_handle_struct *handle,
 	DEBUG(5, ("space_avail = %Lu, file_size = %Lu\n", space_avail, file_size));
 	if(space_avail < file_size) {
 		DEBUG(3, ("recycle: Not enough diskspace, purging file %s\n", file_name));
-		rc = SMB_VFS_NEXT_UNLINK(handle, file_name);
+		rc = SMB_VFS_NEXT_UNLINKAT(handle,
+					dirfsp,
+					file_name,
+					flags);
 		goto done;
 	}
 	 */
@@ -536,13 +580,19 @@ static int recycle_unlink(vfs_handle_struct *handle,
 
 	if (matchparam(recycle_exclude(handle), base)) {
 		DEBUG(3, ("recycle: file %s is excluded \n", base));
-		rc = SMB_VFS_NEXT_UNLINK(handle, smb_fname);
+		rc = SMB_VFS_NEXT_UNLINKAT(handle,
+					dirfsp,
+					smb_fname,
+					flags);
 		goto done;
 	}
 
 	if (matchdirparam(recycle_exclude_dir(handle), path_name)) {
 		DEBUG(3, ("recycle: directory %s is excluded \n", path_name));
-		rc = SMB_VFS_NEXT_UNLINK(handle, smb_fname);
+		rc = SMB_VFS_NEXT_UNLINKAT(handle,
+					dirfsp,
+					smb_fname,
+					flags);
 		goto done;
 	}
 
@@ -564,7 +614,10 @@ static int recycle_unlink(vfs_handle_struct *handle,
 			DEBUG(3, ("recycle: Could not create directory, "
 				  "purging %s...\n",
 				  smb_fname_str_dbg(smb_fname)));
-			rc = SMB_VFS_NEXT_UNLINK(handle, smb_fname);
+			rc = SMB_VFS_NEXT_UNLINKAT(handle,
+					dirfsp,
+					smb_fname,
+					flags);
 			goto done;
 		}
 	}
@@ -574,10 +627,17 @@ static int recycle_unlink(vfs_handle_struct *handle,
 	}
 
 	/* Create smb_fname with final base name and orig stream name. */
-	smb_fname_final = synthetic_smb_fname(talloc_tos(), final_name,
-					      smb_fname->stream_name, NULL);
+	smb_fname_final = synthetic_smb_fname(talloc_tos(),
+					final_name,
+					smb_fname->stream_name,
+					NULL,
+					smb_fname->twrp,
+					smb_fname->flags);
 	if (smb_fname_final == NULL) {
-		rc = SMB_VFS_NEXT_UNLINK(handle, smb_fname);
+		rc = SMB_VFS_NEXT_UNLINKAT(handle,
+					dirfsp,
+					smb_fname,
+					flags);
 		goto done;
 	}
 
@@ -590,8 +650,10 @@ static int recycle_unlink(vfs_handle_struct *handle,
 		if (recycle_versions(handle) == False || matchparam(recycle_noversions(handle), base) == True) {
 			DEBUG(3, ("recycle: Removing old file %s from recycle "
 				  "bin\n", smb_fname_str_dbg(smb_fname_final)));
-			if (SMB_VFS_NEXT_UNLINK(handle,
-						smb_fname_final) != 0) {
+			if (SMB_VFS_NEXT_UNLINKAT(handle,
+						dirfsp,
+						smb_fname_final,
+						flags) != 0) {
 				DEBUG(1, ("recycle: Error deleting old file: %s\n", strerror(errno)));
 			}
 		}
@@ -608,20 +670,30 @@ static int recycle_unlink(vfs_handle_struct *handle,
 		smb_fname_final->base_name = talloc_strdup(smb_fname_final,
 							   final_name);
 		if (smb_fname_final->base_name == NULL) {
-			rc = SMB_VFS_NEXT_UNLINK(handle, smb_fname);
+			rc = SMB_VFS_NEXT_UNLINKAT(handle,
+						dirfsp,
+						smb_fname,
+						flags);
 			goto done;
 		}
 	}
 
 	DEBUG(10, ("recycle: Moving %s to %s\n", smb_fname_str_dbg(smb_fname),
 		smb_fname_str_dbg(smb_fname_final)));
-	rc = SMB_VFS_NEXT_RENAME(handle, smb_fname, smb_fname_final);
+	rc = SMB_VFS_NEXT_RENAMEAT(handle,
+			handle->conn->cwd_fsp,
+			smb_fname,
+			handle->conn->cwd_fsp,
+			smb_fname_final);
 	if (rc != 0) {
 		DEBUG(3, ("recycle: Move error %d (%s), purging file %s "
 			  "(%s)\n", errno, strerror(errno),
 			  smb_fname_str_dbg(smb_fname),
 			  smb_fname_str_dbg(smb_fname_final)));
-		rc = SMB_VFS_NEXT_UNLINK(handle, smb_fname);
+		rc = SMB_VFS_NEXT_UNLINKAT(handle,
+				dirfsp,
+				smb_fname,
+				flags);
 		goto done;
 	}
 
@@ -639,12 +711,34 @@ done:
 	return rc;
 }
 
+static int recycle_unlinkat(vfs_handle_struct *handle,
+		struct files_struct *dirfsp,
+		const struct smb_filename *smb_fname,
+		int flags)
+{
+	int ret;
+
+	if (flags & AT_REMOVEDIR) {
+		ret = SMB_VFS_NEXT_UNLINKAT(handle,
+					dirfsp,
+					smb_fname,
+					flags);
+	} else {
+		SMB_ASSERT(dirfsp == dirfsp->conn->cwd_fsp);
+		ret = recycle_unlink_internal(handle,
+					dirfsp,
+					smb_fname,
+					flags);
+	}
+	return ret;
+}
+
 static struct vfs_fn_pointers vfs_recycle_fns = {
-	.unlink_fn = recycle_unlink
+	.unlinkat_fn = recycle_unlinkat
 };
 
-NTSTATUS vfs_recycle_init(void);
-NTSTATUS vfs_recycle_init(void)
+static_decl_vfs;
+NTSTATUS vfs_recycle_init(TALLOC_CTX *ctx)
 {
 	NTSTATUS ret = smb_register_vfs(SMB_VFS_INTERFACE_VERSION, "recycle",
 					&vfs_recycle_fns);

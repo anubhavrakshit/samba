@@ -587,7 +587,8 @@ static bool test_lock(struct torture_context *torture,
 {
 	NTSTATUS status;
 	bool ret = true;
-	struct smb2_handle h, h2;
+	struct smb2_handle h = {{0}};
+	struct smb2_handle h2 = {{0}};
 	uint8_t buf[200];
 	struct smb2_lock lck;
 	struct smb2_lock_element el[2];
@@ -799,7 +800,8 @@ static bool test_async(struct torture_context *torture,
 {
 	NTSTATUS status;
 	bool ret = true;
-	struct smb2_handle h, h2;
+	struct smb2_handle h = {{0}};
+	struct smb2_handle h2 = {{0}};
 	uint8_t buf[200];
 	struct smb2_lock lck;
 	struct smb2_lock_element el[2];
@@ -867,7 +869,8 @@ static bool test_cancel(struct torture_context *torture,
 {
 	NTSTATUS status;
 	bool ret = true;
-	struct smb2_handle h, h2;
+	struct smb2_handle h = {{0}};
+	struct smb2_handle h2 = {{0}};
 	uint8_t buf[200];
 	struct smb2_lock lck;
 	struct smb2_lock_element el[2];
@@ -995,7 +998,8 @@ static bool test_cancel_tdis(struct torture_context *torture,
 {
 	NTSTATUS status;
 	bool ret = true;
-	struct smb2_handle h, h2;
+	struct smb2_handle h = {{0}};
+	struct smb2_handle h2 = {{0}};
 	uint8_t buf[200];
 	struct smb2_lock lck;
 	struct smb2_lock_element el[2];
@@ -1089,7 +1093,8 @@ static bool test_cancel_logoff(struct torture_context *torture,
 {
 	NTSTATUS status;
 	bool ret = true;
-	struct smb2_handle h, h2;
+	struct smb2_handle h = {{0}};
+	struct smb2_handle h2 = {{0}};
 	uint8_t buf[200];
 	struct smb2_lock lck;
 	struct smb2_lock_element el[2];
@@ -1185,7 +1190,8 @@ static bool test_errorcode(struct torture_context *torture,
 {
 	NTSTATUS status;
 	bool ret = true;
-	struct smb2_handle h, h2;
+	struct smb2_handle h = {{0}};
+	struct smb2_handle h2 = {{0}};
 	uint8_t buf[200];
 	struct smb2_lock lck;
 	struct smb2_lock_element el[2];
@@ -1348,7 +1354,8 @@ static bool test_zerobytelength(struct torture_context *torture,
 {
 	NTSTATUS status;
 	bool ret = true;
-	struct smb2_handle h, h2;
+	struct smb2_handle h = {{0}};
+	struct smb2_handle h2 = {{0}};
 	uint8_t buf[200];
 	struct smb2_lock lck;
 	int i;
@@ -1467,7 +1474,8 @@ static bool test_zerobyteread(struct torture_context *torture,
 {
 	NTSTATUS status;
 	bool ret = true;
-	struct smb2_handle h, h2;
+	struct smb2_handle h = {{0}};
+	struct smb2_handle h2 = {{0}};
 	uint8_t buf[200];
 	struct smb2_lock lck;
 	struct smb2_lock_element el[1];
@@ -1585,7 +1593,8 @@ static bool test_unlock(struct torture_context *torture,
 {
 	NTSTATUS status;
 	bool ret = true;
-	struct smb2_handle h, h2;
+	struct smb2_handle h = {{0}};
+	struct smb2_handle h2 = {{0}};
 	uint8_t buf[200];
 	struct smb2_lock lck;
 	struct smb2_lock_element el1[1];
@@ -2136,7 +2145,8 @@ static bool test_stacking(struct torture_context *torture,
 {
 	NTSTATUS status;
 	bool ret = true;
-	struct smb2_handle h, h2;
+	struct smb2_handle h = {{0}};
+	struct smb2_handle h2 = {{0}};
 	uint8_t buf[200];
 	struct smb2_lock lck;
 	struct smb2_lock_element el[1];
@@ -2339,7 +2349,8 @@ static bool test_contend(struct torture_context *torture,
 {
 	NTSTATUS status;
 	bool ret = true;
-	struct smb2_handle h, h2;
+	struct smb2_handle h = {{0}};
+	struct smb2_handle h2 = {{0}};
 	uint8_t buf[200];
 	struct smb2_lock lck;
 	struct smb2_lock_element el[1];
@@ -2408,7 +2419,8 @@ static bool test_context(struct torture_context *torture,
 {
 	NTSTATUS status;
 	bool ret = true;
-	struct smb2_handle h, h2;
+	struct smb2_handle h = {{0}};
+	struct smb2_handle h2 = {{0}};
 	uint8_t buf[200];
 	struct smb2_lock lck;
 	struct smb2_lock_element el[1];
@@ -2474,7 +2486,8 @@ static bool test_range(struct torture_context *torture,
 {
 	NTSTATUS status;
 	bool ret = true;
-	struct smb2_handle h, h2;
+	struct smb2_handle h = {{0}};
+	struct smb2_handle h2 = {{0}};
 	uint8_t buf[200];
 	struct smb2_lock lck;
 	struct smb2_lock_element el[1];
@@ -2675,7 +2688,9 @@ static bool test_overlap(struct torture_context *torture,
 {
 	NTSTATUS status;
 	bool ret = true;
-	struct smb2_handle h, h2, h3;
+	struct smb2_handle h = {{0}};
+	struct smb2_handle h2 = {{0}};
+	struct smb2_handle h3 = {{0}};
 	uint8_t buf[200];
 	bool correct = true;
 
@@ -2775,7 +2790,8 @@ static bool test_truncate(struct torture_context *torture,
 {
 	NTSTATUS status;
 	bool ret = true;
-	struct smb2_handle h, h2;
+	struct smb2_handle h = {{0}};
+	struct smb2_handle h2 = {{0}};
 	uint8_t buf[200];
 	struct smb2_lock lck;
 	struct smb2_lock_element el[1];
@@ -2918,7 +2934,7 @@ static bool test_replay(struct torture_context *torture,
 		.level = RAW_IOCTL_SMB2,
 		.in.file.handle = h,
 		.in.function = FSCTL_LMR_REQ_RESILIENCY,
-		.in.max_response_size = 0,
+		.in.max_output_response = 0,
 		.in.flags = SMB2_IOCTL_FLAG_IS_FSCTL,
 		.in.out.data = res_req,
 		.in.out.length = sizeof(res_req)
@@ -3033,12 +3049,75 @@ done:
 	return ret;
 }
 
+/**
+ * Test lock interaction between smbd and ctdb with tombstone records.
+ *
+ * Re-locking an unlocked record could lead to a deadlock between
+ * smbd and ctdb. Make sure we don't regress.
+ *
+ * https://bugzilla.samba.org/show_bug.cgi?id=12005
+ * https://bugzilla.samba.org/show_bug.cgi?id=10008
+ */
+static bool test_deadlock(struct torture_context *torture,
+			  struct smb2_tree *tree)
+{
+	NTSTATUS status;
+	bool ret = true;
+	struct smb2_handle _h;
+	struct smb2_handle *h = NULL;
+	uint8_t buf[200];
+	const char *fname = BASEDIR "\\deadlock.txt";
+
+	if (!lpcfg_clustering(torture->lp_ctx)) {
+		torture_skip(torture, "Test must be run on a ctdb cluster\n");
+		return true;
+	}
+
+	status = torture_smb2_testdir(tree, BASEDIR, &_h);
+	torture_assert_ntstatus_ok(torture, status,
+				   "torture_smb2_testdir failed");
+	smb2_util_close(tree, _h);
+
+	status = torture_smb2_testfile(tree, fname, &_h);
+	torture_assert_ntstatus_ok_goto(torture, status, ret, done,
+					"torture_smb2_testfile failed");
+	h = &_h;
+
+	ZERO_STRUCT(buf);
+	status = smb2_util_write(tree, *h, buf, 0, ARRAY_SIZE(buf));
+	torture_assert_ntstatus_ok_goto(torture, status, ret, done,
+					"smb2_util_write failed");
+
+	status = test_smb2_lock(tree, *h, 0, 1, true);
+	torture_assert_ntstatus_ok_goto(torture, status, ret, done,
+					"test_smb2_lock failed");
+
+	status = test_smb2_unlock(tree, *h, 0, 1);
+	torture_assert_ntstatus_ok_goto(torture, status, ret, done,
+					"test_smb2_unlock failed");
+
+	status = test_smb2_lock(tree, *h, 0, 1, true);
+	torture_assert_ntstatus_ok_goto(torture, status, ret, done,
+					"test_smb2_lock failed");
+
+	status = test_smb2_unlock(tree, *h, 0, 1);
+	torture_assert_ntstatus_ok_goto(torture, status, ret, done,
+					"test_smb2_unlock failed");
+
+done:
+	if (h != NULL) {
+		smb2_util_close(tree, *h);
+	}
+	smb2_deltree(tree, BASEDIR);
+	return ret;
+}
+
 /* basic testing of SMB2 locking
 */
-struct torture_suite *torture_smb2_lock_init(void)
+struct torture_suite *torture_smb2_lock_init(TALLOC_CTX *ctx)
 {
 	struct torture_suite *suite =
-	    torture_suite_create(talloc_autofree_context(), "lock");
+	    torture_suite_create(ctx, "lock");
 	torture_suite_add_1smb2_test(suite, "valid-request",
 	    test_valid_request);
 	torture_suite_add_1smb2_test(suite, "rw-none", test_lock_rw_none);
@@ -3068,6 +3147,7 @@ struct torture_suite *torture_smb2_lock_init(void)
 	torture_suite_add_2smb2_test(suite, "overlap", test_overlap);
 	torture_suite_add_1smb2_test(suite, "truncate", test_truncate);
 	torture_suite_add_1smb2_test(suite, "replay", test_replay);
+	torture_suite_add_1smb2_test(suite, "ctdb-delrec-deadlock", test_deadlock);
 
 	suite->description = talloc_strdup(suite, "SMB2-LOCK tests");
 

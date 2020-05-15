@@ -16,11 +16,13 @@
 
 package Subunit;
 use POSIX;
+use Time::HiRes;
 
 require Exporter;
 @ISA = qw(Exporter);
 
 use strict;
+use warnings;
 
 sub start_test($)
 {
@@ -43,10 +45,11 @@ sub end_test($$;$)
 	}
 }
 
-sub report_time($)
+sub report_time()
 {
 	my ($time) = @_;
-	my ($sec, $min, $hour, $mday, $mon, $year, $wday, $yday, $isdst) = localtime($time);
+	$time = Time::HiRes::time() unless (defined($time));
+	my ($sec, $min, $hour, $mday, $mon, $year, $wday, $yday, $isdst) = gmtime($time);
 	$sec = ($time - int($time) + $sec);
 	my $msg = sprintf("%f", $sec);
 	if (substr($msg, 1, 1) eq ".") {

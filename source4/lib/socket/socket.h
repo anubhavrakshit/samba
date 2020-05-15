@@ -98,7 +98,6 @@ enum socket_state {
 	SOCKET_STATE_SERVER_ERROR
 };
 
-#define SOCKET_FLAG_BLOCK        0x00000001
 #define SOCKET_FLAG_PEEK         0x00000002
 #define SOCKET_FLAG_TESTNONBLOCK 0x00000004
 #define SOCKET_FLAG_ENCRYPT      0x00000008 /* This socket
@@ -133,7 +132,8 @@ struct tsocket_address;
 NTSTATUS socket_create_with_ops(TALLOC_CTX *mem_ctx, const struct socket_ops *ops,
 				struct socket_context **new_sock, 
 				enum socket_type type, uint32_t flags);
-NTSTATUS socket_create(const char *name, enum socket_type type, 
+NTSTATUS socket_create(TALLOC_CTX *mem_ctx,
+		       const char *name, enum socket_type type,
 		       struct socket_context **new_sock, uint32_t flags);
 NTSTATUS socket_connect(struct socket_context *sock,
 			const struct socket_address *my_address, 
@@ -183,9 +183,6 @@ _PUBLIC_ void socket_address_set_port(struct socket_address *a,
 struct socket_address *socket_address_copy(TALLOC_CTX *mem_ctx,
 					   const struct socket_address *oaddr);
 const struct socket_ops *socket_getops_byname(const char *name, enum socket_type type);
-bool socket_allow_access(TALLOC_CTX *mem_ctx,
-			 const char **deny_list, const char **allow_list,
-			 const char *cname, const char *caddr);
 bool socket_check_access(struct socket_context *sock, 
 			 const char *service_name,
 			 const char **allow_list, const char **deny_list);

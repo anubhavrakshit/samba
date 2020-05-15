@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 #
 # script to verify cached prefixMap on remote
@@ -20,6 +20,7 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #
 
+from __future__ import print_function
 import os
 import sys
 from optparse import OptionParser
@@ -34,7 +35,7 @@ from samba.drs_utils import drs_DsBind
 from samba.samdb import SamDB
 from samba.auth import system_session
 from samba.ndr import ndr_pack, ndr_unpack
-
+from samba.compat import text_type
 
 def _samdb_fetch_pfm(samdb):
     """Fetch prefixMap stored in SamDB using LDB connection"""
@@ -47,6 +48,7 @@ def _samdb_fetch_pfm(samdb):
 
     return (pfm.ctr, pfm_schi)
 
+
 def _samdb_fetch_schi(samdb):
     """Fetch schemaInfo stored in SamDB using LDB connection"""
     res = samdb.search(base=samdb.get_schema_basedn(), expression="", scope=SCOPE_BASE, attrs=["*"])
@@ -56,8 +58,9 @@ def _samdb_fetch_schi(samdb):
                               str(res[0]['schemaInfo']))
     else:
         pfm_schi = drsblobs.schemaInfoBlob()
-        pfm_schi.marker = 0xFF;
+        pfm_schi.marker = 0xFF
     return pfm_schi
+
 
 def _drs_fetch_pfm(server, samdb, creds, lp):
     """Fetch prefixMap using DRS interface"""
@@ -65,7 +68,7 @@ def _drs_fetch_pfm(server, samdb, creds, lp):
 
     drs = drsuapi.drsuapi(binding_str, lp, creds)
     (drs_handle, supported_extensions) = drs_DsBind(drs)
-    print "DRS Handle: %s" % drs_handle
+    print("DRS Handle: %s" % drs_handle)
 
     req8 = drsuapi.DsGetNCChangesRequest8()
 
@@ -75,7 +78,7 @@ def _drs_fetch_pfm(server, samdb, creds, lp):
     req8.destination_dsa_guid = dest_dsa
     req8.source_dsa_invocation_id = misc.GUID(samdb.get_invocation_id())
     req8.naming_context = drsuapi.DsReplicaObjectIdentifier()
-    req8.naming_context.dn = unicode(samdb.get_schema_basedn())
+    req8.naming_context.dn = text_type(samdb.get_schema_basedn())
     req8.highwatermark = drsuapi.DsReplicaHighWaterMark()
     req8.highwatermark.tmp_highest_usn = 0
     req8.highwatermark.reserved_usn = 0
@@ -97,14 +100,13 @@ def _drs_fetch_pfm(server, samdb, creds, lp):
     pfm_it = pfm.mappings[-1]
     assert pfm_it.id_prefix == 0
     assert pfm_it.oid.length == 21
-    s = ''
-    for x in pfm_it.oid.binary_oid:
-        s += chr(x)
+    s = "".join(chr(x) for x in pfm_it.oid.binary_oid)
     pfm_schi = ndr_unpack(drsblobs.schemaInfoBlob, s)
     assert pfm_schi.marker == 0xFF
     # remove schemaInfo element
     pfm.num_mappings -= 1
     return (pfm, pfm_schi)
+
 
 def _pfm_verify(drs_pfm, ldb_pfm):
     errors = []
@@ -126,10 +128,11 @@ def _pfm_verify(drs_pfm, ldb_pfm):
             errors.append("[%2d] differences in (%s)" % (i, it_err))
     return errors
 
+
 def _pfm_schi_verify(drs_schi, ldb_schi):
     errors = []
-    print drs_schi.revision
-    print drs_schi.invocation_id
+    print(drs_schi.revision)
+    print(drs_schi.invocation_id)
     if drs_schi.marker != ldb_schi.marker:
         errors.append("Different marker in schemaInfo: drs = %d, ldb = %d"
                       % (drs_schi.marker, ldb_schi.marker))
@@ -140,6 +143,7 @@ def _pfm_schi_verify(drs_schi, ldb_schi):
         errors.append("Different invocation_id in schemaInfo: drs = %s, ldb = %s"
                       % (drs_schi.invocation_id, ldb_schi.invocation_id))
     return errors
+
 
 ########### main code ###########
 if __name__ == "__main__":
@@ -156,9 +160,8 @@ if __name__ == "__main__":
     creds = credopts.get_credentials(lp)
 
     if len(args) != 1:
-        import os
-        if not "DC_SERVER" in os.environ.keys():
-             parser.error("You must supply a server")
+        if "DC_SERVER" not in os.environ.keys():
+            parser.error("You must supply a server")
         args.append(os.environ["DC_SERVER"])
 
     if creds.is_anonymous():
@@ -177,14 +180,14 @@ if __name__ == "__main__":
     # verify prefixMaps
     errors = _pfm_verify(drs_pfm, ldb_pfm)
     if len(errors):
-        print "prefixMap verification errors:"
-        print "%s" % errors
+        print("prefixMap verification errors:")
+        print("%s" % errors)
         exit_code = 1
     # verify schemaInfos
     errors = _pfm_schi_verify(drs_schi, ldb_schi)
     if len(errors):
-        print "schemaInfo verification errors:"
-        print "%s" % errors
+        print("schemaInfo verification errors:")
+        print("%s" % errors)
         exit_code = 2
 
     if exit_code != 0:

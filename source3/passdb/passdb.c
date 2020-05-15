@@ -36,24 +36,6 @@
 #undef DBGC_CLASS
 #define DBGC_CLASS DBGC_PASSDB
 
-/******************************************************************
- Get the default domain/netbios name to be used when
- testing authentication.
-
- LEGACY: this function provides the legacy domain mapping used with
-	 the lp_map_untrusted_to_domain() parameter
-******************************************************************/
-
-const char *my_sam_name(void)
-{
-       /* Standalone servers can only use the local netbios name */
-       if ( lp_server_role() == ROLE_STANDALONE )
-               return lp_netbios_name();
-
-       /* Default to the DOMAIN name when not specified */
-       return lp_workgroup();
-}
-
 /**********************************************************************
 ***********************************************************************/
 
@@ -626,8 +608,11 @@ bool lookup_global_sam_name(const char *name, int flags, uint32_t *rid,
 
 		if (ret) {
 			if (!sid_check_is_in_our_sam(&user_sid)) {
-				DEBUG(0, ("User %s with invalid SID %s in passdb\n",
-					  name, sid_string_dbg(&user_sid)));
+				struct dom_sid_buf buf;
+				DBG_ERR("User %s with invalid SID %s"
+					" in passdb\n",
+					name,
+					dom_sid_str_buf(&user_sid, &buf));
 				return False;
 			}
 
@@ -657,8 +642,11 @@ bool lookup_global_sam_name(const char *name, int flags, uint32_t *rid,
 
 	/* BUILTIN groups are looked up elsewhere */
 	if (!sid_check_is_in_our_sam(&map->sid)) {
+		struct dom_sid_buf buf;
 		DEBUG(10, ("Found group %s (%s) not in our domain -- "
-			   "ignoring.", name, sid_string_dbg(&map->sid)));
+			   "ignoring.\n",
+			   name,
+			   dom_sid_str_buf(&map->sid, &buf)));
 		TALLOC_FREE(map);
 		return False;
 	}
@@ -2037,7 +2025,7 @@ static uint32_t init_buffer_from_samu_v3 (uint8_t **buf, struct samu *sampass, b
 
 	/* check to make sure we got it correct */
 	if (buflen != len) {
-		DEBUG(0, ("init_buffer_from_samu_v3: somthing odd is going on here: bufflen (%lu) != len (%lu) in tdb_pack operations!\n", 
+		DEBUG(0, ("init_buffer_from_samu_v3: something odd is going on here: bufflen (%lu) != len (%lu) in tdb_pack operations!\n", 
 			  (unsigned long)buflen, (unsigned long)len));  
 		/* error */
 		SAFE_FREE (*buf);
@@ -2511,7 +2499,7 @@ NTSTATUS pdb_get_trust_credentials(const char *netbios_domain,
 				   struct cli_credentials **_creds)
 {
 	TALLOC_CTX *frame = talloc_stackframe();
-	NTSTATUS status = NT_STATUS_INTERNAL_ERROR;
+	NTSTATUS status;
 	struct loadparm_context *lp_ctx;
 	enum netr_SchannelType channel;
 	time_t last_set_time;
@@ -2638,6 +2626,19 @@ NTSTATUS pdb_get_trust_credentials(const char *netbios_domain,
 			status = NT_STATUS_NO_MEMORY;
 			goto fail;
 		}
+
+		/*
+		 * It's not possible to use NTLMSSP with a domain trust account.
+		 */
+		cli_credentials_set_kerberos_state(creds, CRED_MUST_USE_KERBEROS);
+	} else {
+		/*
+		 * We can't use kerberos against an NT4 domain.
+		 *
+		 * We should have a mode that also disallows NTLMSSP here,
+		 * as only NETLOGON SCHANNEL is possible.
+		 */
+		cli_credentials_set_kerberos_state(creds, CRED_DONT_USE_KERBEROS);
 	}
 
 	ok = cli_credentials_set_username(creds, account_name, CRED_SPECIFIED);
@@ -2652,6 +2653,10 @@ NTSTATUS pdb_get_trust_credentials(const char *netbios_domain,
 			status = NT_STATUS_NO_MEMORY;
 			goto fail;
 		}
+		/*
+		 * We currently can't do kerberos just with an NTHASH.
+		 */
+		cli_credentials_set_kerberos_state(creds, CRED_DONT_USE_KERBEROS);
 		goto done;
 	}
 

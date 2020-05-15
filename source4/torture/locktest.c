@@ -578,11 +578,19 @@ int main(int argc, const char *argv[])
 		POPT_COMMON_CONNECTION
 		POPT_COMMON_CREDENTIALS
 		POPT_COMMON_VERSION
-		{ NULL }
+		{0}
 	};
+	TALLOC_CTX *mem_ctx = NULL;
+	int ret = -1;
 
 	setlinebuf(stdout);
 	seed = time(NULL);
+
+	mem_ctx = talloc_named_const(NULL, 0, "locktest_ctx");
+	if (mem_ctx == NULL) {
+		printf("Unable to allocate locktest_ctx\n");
+		exit(1);
+	}
 
 	pc = poptGetContext("locktest", argc, argv, long_options,
 			    POPT_CONTEXT_KEEP_FIRST);
@@ -590,8 +598,8 @@ int main(int argc, const char *argv[])
 	poptSetOtherOptionHelp(pc, "<unc1> <unc2>");
 
 	lp_ctx = cmdline_lp_ctx;
-	servers[0] = cli_credentials_init(talloc_autofree_context());
-	servers[1] = cli_credentials_init(talloc_autofree_context());
+	servers[0] = cli_credentials_init(mem_ctx);
+	servers[1] = cli_credentials_init(mem_ctx);
 	cli_credentials_guess(servers[0], lp_ctx);
 	cli_credentials_guess(servers[1], lp_ctx);
 
@@ -603,6 +611,7 @@ int main(int argc, const char *argv[])
 		case 'U':
 			if (username_count == 2) {
 				usage(pc);
+				talloc_free(mem_ctx);
 				exit(1);
 			}
 			cli_credentials_parse_string(servers[username_count], poptGetOptArg(pc), CRED_SPECIFIED);
@@ -636,13 +645,14 @@ int main(int argc, const char *argv[])
 
 	if (username_count == 0) {
 		usage(pc);
+		poptFreeContext(pc);
 		return -1;
 	}
 	if (username_count == 1) {
 		servers[1] = servers[0];
 	}
 
-	ev = s4_event_context_init(talloc_autofree_context());
+	ev = s4_event_context_init(mem_ctx);
 
 	gensec_init();
 
@@ -650,6 +660,9 @@ int main(int argc, const char *argv[])
 		 seed, lock_base, lock_range, min_length));
 	srandom(seed);
 
-	return test_locks(ev, lp_ctx, NULL, share);
+	ret = test_locks(ev, lp_ctx, NULL, share);
+	poptFreeContext(pc);
+	talloc_free(mem_ctx);
+	return ret;
 }
 

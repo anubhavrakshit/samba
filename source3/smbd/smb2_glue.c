@@ -23,6 +23,9 @@
 #include "smbd/globals.h"
 #include "../libcli/smb/smb_common.h"
 
+#undef DBGC_CLASS
+#define DBGC_CLASS DBGC_SMB2
+
 struct smb_request *smbd_smb2_fake_smb_request(struct smbd_smb2_request *req)
 {
 	struct smb_request *smbreq;
@@ -38,16 +41,18 @@ struct smb_request *smbd_smb2_fake_smb_request(struct smbd_smb2_request *req)
 	}
 
 	smbreq->request_time = req->request_time;
-	smbreq->vuid = req->session->compat->vuid;
+	smbreq->vuid = req->session->global->session_wire_id;
 	smbreq->tid = req->tcon->compat->cnum;
 	smbreq->conn = req->tcon->compat;
 	smbreq->sconn = req->sconn;
 	smbreq->xconn = req->xconn;
+	smbreq->session = req->session;
 	smbreq->smbpid = (uint16_t)IVAL(inhdr, SMB2_HDR_PID);
 	smbreq->flags2 = FLAGS2_UNICODE_STRINGS |
 			 FLAGS2_32_BIT_ERROR_CODES |
 			 FLAGS2_LONG_PATH_COMPONENTS |
 			 FLAGS2_IS_LONG_NAME;
+
 	if (IVAL(inhdr, SMB2_HDR_FLAGS) & SMB2_HDR_FLAG_DFS) {
 		smbreq->flags2 |= FLAGS2_DFS_PATHNAMES;
 	}

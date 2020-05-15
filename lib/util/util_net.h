@@ -23,6 +23,19 @@
 
 #include "system/network.h"
 
+struct samba_sockaddr {
+	socklen_t sa_socklen;
+	union {
+		struct sockaddr sa;
+		struct sockaddr_in in;
+#ifdef HAVE_IPV6
+		struct sockaddr_in6 in6;
+#endif
+		struct sockaddr_un un;
+		struct sockaddr_storage ss;
+	} u;
+};
+
 /* The following definitions come from lib/util/util_net.c  */
 
 void zero_sockaddr(struct sockaddr_storage *pss);
@@ -86,6 +99,7 @@ _PUBLIC_ uint32_t interpret_addr(const char *str);
 _PUBLIC_ struct in_addr interpret_addr2(const char *str);
 
 _PUBLIC_ bool is_ipaddress_v4(const char *str);
+_PUBLIC_ bool is_ipv6_literal(const char *str);
 _PUBLIC_ bool is_ipaddress_v6(const char *str);
 
 bool is_address_any(const struct sockaddr *psa);

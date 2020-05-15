@@ -38,18 +38,17 @@
 #include "includes.h"
 #include "smbd/smbd.h"
 #include <stdio.h>
-#include "api/glfs.h"
+#include <glusterfs/api/glfs.h>
 #include "lib/util/dlinklist.h"
 #include "lib/util/tevent_unix.h"
-#include "lib/tevent/tevent_internal.h"
 #include "smbd/globals.h"
-#include "lib/sys_rw.h"
+#include "lib/util/sys_rw.h"
+#include "smbprofile.h"
+#include "modules/posixacl_xattr.h"
+#include "lib/pthreadpool/pthreadpool_tevent.h"
 
 #define DEFAULT_VOLFILE_SERVER "localhost"
-
-static int read_fd = -1;
-static int write_fd = -1;
-static struct tevent_fd *aio_read_event = NULL;
+#define GLUSTER_NAME_MAX 255
 
 /**
  * Helper to convert struct stat to struct stat_ex.
@@ -72,12 +71,16 @@ static void smb_stat_ex_from_stat(struct stat_ex *dst, const struct stat *src)
 	dst->st_ex_btime.tv_sec = src->st_mtime;
 	dst->st_ex_blksize = src->st_blksize;
 	dst->st_ex_blocks = src->st_blocks;
+	dst->st_ex_file_id = dst->st_ex_ino;
+	dst->st_ex_iflags |= ST_EX_IFLAG_CALCULATED_FILE_ID;
 #ifdef STAT_HAVE_NSEC
 	dst->st_ex_atime.tv_nsec = src->st_atime_nsec;
 	dst->st_ex_mtime.tv_nsec = src->st_mtime_nsec;
 	dst->st_ex_ctime.tv_nsec = src->st_ctime_nsec;
 	dst->st_ex_btime.tv_nsec = src->st_mtime_nsec;
 #endif
+	dst->st_ex_itime = dst->st_ex_btime;
+	dst->st_ex_iflags |= ST_EX_IFLAG_CALCULATED_ITIME;
 }
 
 /* pre-opened glfs_t */
@@ -156,13 +159,118 @@ static void glfs_clear_preopened(glfs_t *fs)
 	}
 }
 
+static int vfs_gluster_set_volfile_servers(glfs_t *fs,
+					   const char *volfile_servers)
+{
+	char *server = NULL;
+	size_t server_count = 0;
+	size_t server_success = 0;
+	int   ret = -1;
+	TALLOC_CTX *frame = talloc_stackframe();
+
+	DBG_INFO("servers list %s\n", volfile_servers);
+
+	while (next_token_talloc(frame, &volfile_servers, &server, " \t")) {
+		char *transport = NULL;
+		char *host = NULL;
+		int   port = 0;
+
+		server_count++;
+		DBG_INFO("server %zu %s\n", server_count, server);
+
+		/* Determine the transport type */
+		if (strncmp(server, "unix+", 5) == 0) {
+			port = 0;
+			transport = talloc_strdup(frame, "unix");
+			if (!transport) {
+				errno = ENOMEM;
+				goto out;
+			}
+			host = talloc_strdup(frame, server + 5);
+			if (!host) {
+				errno = ENOMEM;
+				goto out;
+			}
+		} else {
+			char *p = NULL;
+			char *port_index = NULL;
+
+			if (strncmp(server, "tcp+", 4) == 0) {
+				server += 4;
+			}
+
+			/* IPv6 is enclosed in []
+			 * ':' before ']' is part of IPv6
+			 * ':' after  ']' indicates port
+			 */
+			p = server;
+			if (server[0] == '[') {
+				server++;
+				p = index(server, ']');
+				if (p == NULL) {
+					/* Malformed IPv6 */
+					continue;
+				}
+				p[0] = '\0';
+				p++;
+			}
+
+			port_index = index(p, ':');
+
+			if (port_index == NULL) {
+				port = 0;
+			} else {
+				port = atoi(port_index + 1);
+				port_index[0] = '\0';
+			}
+			transport = talloc_strdup(frame, "tcp");
+			if (!transport) {
+				errno = ENOMEM;
+				goto out;
+			}
+			host = talloc_strdup(frame, server);
+			if (!host) {
+				errno = ENOMEM;
+				goto out;
+			}
+		}
+
+		DBG_INFO("Calling set volfile server with params "
+			 "transport=%s, host=%s, port=%d\n", transport,
+			  host, port);
+
+		ret = glfs_set_volfile_server(fs, transport, host, port);
+		if (ret < 0) {
+			DBG_WARNING("Failed to set volfile_server "
+				    "transport=%s, host=%s, port=%d (%s)\n",
+				    transport, host, port, strerror(errno));
+		} else {
+			server_success++;
+		}
+	}
+
+out:
+	if (server_count == 0) {
+		ret = -1;
+	} else if (server_success < server_count) {
+		DBG_WARNING("Failed to set %zu out of %zu servers parsed\n",
+			    server_count - server_success, server_count);
+		ret = 0;
+	}
+
+	TALLOC_FREE(frame);
+	return ret;
+}
+
 /* Disk Operations */
 
 static int vfs_gluster_connect(struct vfs_handle_struct *handle,
 			       const char *service,
 			       const char *user)
 {
-	const char *volfile_server;
+	const struct loadparm_substitution *lp_sub =
+		loadparm_s3_global_substitution();
+	const char *volfile_servers;
 	const char *volume;
 	char *logfile;
 	int loglevel;
@@ -175,15 +283,23 @@ static int vfs_gluster_connect(struct vfs_handle_struct *handle,
 		ret = -1;
 		goto done;
 	}
-	logfile = lp_parm_talloc_string(tmp_ctx, SNUM(handle->conn), "glusterfs",
-				       "logfile", NULL);
+	logfile = lp_parm_substituted_string(tmp_ctx,
+					     lp_sub,
+					     SNUM(handle->conn),
+					     "glusterfs",
+					     "logfile",
+					     NULL);
 
 	loglevel = lp_parm_int(SNUM(handle->conn), "glusterfs", "loglevel", -1);
 
-	volfile_server = lp_parm_const_string(SNUM(handle->conn), "glusterfs",
-					       "volfile_server", NULL);
-	if (volfile_server == NULL) {
-		volfile_server = DEFAULT_VOLFILE_SERVER;
+	volfile_servers = lp_parm_substituted_string(tmp_ctx,
+						     lp_sub,
+						     SNUM(handle->conn),
+						     "glusterfs",
+						     "volfile_server",
+						     NULL);
+	if (volfile_servers == NULL) {
+		volfile_servers = DEFAULT_VOLFILE_SERVER;
 	}
 
 	volume = lp_parm_const_string(SNUM(handle->conn), "glusterfs", "volume",
@@ -203,9 +319,10 @@ static int vfs_gluster_connect(struct vfs_handle_struct *handle,
 		goto done;
 	}
 
-	ret = glfs_set_volfile_server(fs, "tcp", volfile_server, 0);
+	ret = vfs_gluster_set_volfile_servers(fs, volfile_servers);
 	if (ret < 0) {
-		DEBUG(0, ("Failed to set volfile_server %s\n", volfile_server));
+		DBG_ERR("Failed to set volfile_servers from list %s\n",
+			volfile_servers);
 		goto done;
 	}
 
@@ -223,8 +340,7 @@ static int vfs_gluster_connect(struct vfs_handle_struct *handle,
 	if (ret < 0) {
 		DEBUG(0, ("%s: Failed to set xlator option:"
 			  " snapdir-entry-path\n", volume));
-		glfs_fini(fs);
-		return -1;
+		goto done;
 	}
 
 	ret = glfs_set_logging(fs, logfile, loglevel);
@@ -247,18 +363,32 @@ static int vfs_gluster_connect(struct vfs_handle_struct *handle,
 			  volume, strerror(errno)));
 		goto done;
 	}
+
+	/*
+	 * The shadow_copy2 module will fail to export subdirectories
+	 * of a gluster volume unless we specify the mount point,
+	 * because the detection fails if the file system is not
+	 * locally mounted:
+	 * https://bugzilla.samba.org/show_bug.cgi?id=13091
+	 */
+	lp_do_parameter(SNUM(handle->conn), "shadow:mountpoint", "/");
+
+	/*
+	 * Unless we have an async implementation of getxattrat turn this off.
+	 */
+	lp_do_parameter(SNUM(handle->conn), "smbd async dosmode", "false");
+
 done:
-	talloc_free(tmp_ctx);
 	if (ret < 0) {
 		if (fs)
 			glfs_fini(fs);
-		return -1;
 	} else {
-		DEBUG(0, ("%s: Initialized volume from server %s\n",
-                         volume, volfile_server));
+		DBG_ERR("%s: Initialized volume from servers %s\n",
+			volume, volfile_servers);
 		handle->data = fs;
-		return 0;
 	}
+	talloc_free(tmp_ctx);
+	return ret;
 }
 
 static void vfs_gluster_disconnect(struct vfs_handle_struct *handle)
@@ -271,13 +401,15 @@ static void vfs_gluster_disconnect(struct vfs_handle_struct *handle)
 }
 
 static uint64_t vfs_gluster_disk_free(struct vfs_handle_struct *handle,
-				      const char *path, uint64_t *bsize_p,
-				      uint64_t *dfree_p, uint64_t *dsize_p)
+				const struct smb_filename *smb_fname,
+				uint64_t *bsize_p,
+				uint64_t *dfree_p,
+				uint64_t *dsize_p)
 {
 	struct statvfs statvfs = { 0, };
 	int ret;
 
-	ret = glfs_statvfs(handle->data, path, &statvfs);
+	ret = glfs_statvfs(handle->data, smb_fname->base_name, &statvfs);
 	if (ret < 0) {
 		return -1;
 	}
@@ -296,8 +428,10 @@ static uint64_t vfs_gluster_disk_free(struct vfs_handle_struct *handle,
 }
 
 static int vfs_gluster_get_quota(struct vfs_handle_struct *handle,
-				 enum SMB_QUOTA_TYPE qtype, unid_t id,
-				 SMB_DISK_QUOTA *qt)
+				const struct smb_filename *smb_fname,
+				enum SMB_QUOTA_TYPE qtype,
+				unid_t id,
+				SMB_DISK_QUOTA *qt)
 {
 	errno = ENOSYS;
 	return -1;
@@ -312,16 +446,16 @@ vfs_gluster_set_quota(struct vfs_handle_struct *handle,
 }
 
 static int vfs_gluster_statvfs(struct vfs_handle_struct *handle,
-			       const char *path,
-			       struct vfs_statvfs_struct *vfs_statvfs)
+				const struct smb_filename *smb_fname,
+				struct vfs_statvfs_struct *vfs_statvfs)
 {
 	struct statvfs statvfs = { 0, };
 	int ret;
 
-	ret = glfs_statvfs(handle->data, path, &statvfs);
+	ret = glfs_statvfs(handle->data, smb_fname->base_name, &statvfs);
 	if (ret < 0) {
 		DEBUG(0, ("glfs_statvfs(%s) failed: %s\n",
-			  path, strerror(errno)));
+			  smb_fname->base_name, strerror(errno)));
 		return -1;
 	}
 
@@ -346,6 +480,10 @@ static uint32_t vfs_gluster_fs_capabilities(struct vfs_handle_struct *handle,
 {
 	uint32_t caps = FILE_CASE_SENSITIVE_SEARCH | FILE_CASE_PRESERVED_NAMES;
 
+#ifdef HAVE_GFAPI_VER_6
+	caps |= FILE_SUPPORTS_SPARSE_FILES;
+#endif
+
 #ifdef STAT_HAVE_NSEC
 	*p_ts_res = TIMESTAMP_SET_NT_OR_BETTER;
 #endif
@@ -353,31 +491,44 @@ static uint32_t vfs_gluster_fs_capabilities(struct vfs_handle_struct *handle,
 	return caps;
 }
 
-static DIR *vfs_gluster_opendir(struct vfs_handle_struct *handle,
-				const char *path, const char *mask,
-				uint32_t attributes)
+static glfs_fd_t *vfs_gluster_fetch_glfd(struct vfs_handle_struct *handle,
+					 files_struct *fsp)
 {
-	glfs_fd_t *fd;
-
-	fd = glfs_opendir(handle->data, path);
-	if (fd == NULL) {
-		DEBUG(0, ("glfs_opendir(%s) failed: %s\n",
-			  path, strerror(errno)));
+	glfs_fd_t **glfd = (glfs_fd_t **)VFS_FETCH_FSP_EXTENSION(handle, fsp);
+	if (glfd == NULL) {
+		DBG_INFO("Failed to fetch fsp extension\n");
+		return NULL;
+	}
+	if (*glfd == NULL) {
+		DBG_INFO("Empty glfs_fd_t pointer\n");
+		return NULL;
 	}
 
-	return (DIR *) fd;
+	return *glfd;
 }
 
 static DIR *vfs_gluster_fdopendir(struct vfs_handle_struct *handle,
 				  files_struct *fsp, const char *mask,
 				  uint32_t attributes)
 {
-	return (DIR *) *(glfs_fd_t **)VFS_FETCH_FSP_EXTENSION(handle, fsp);
+	glfs_fd_t *glfd = vfs_gluster_fetch_glfd(handle, fsp);
+	if (glfd == NULL) {
+		DBG_ERR("Failed to fetch gluster fd\n");
+		return NULL;
+	}
+
+	return (DIR *)glfd;
 }
 
 static int vfs_gluster_closedir(struct vfs_handle_struct *handle, DIR *dirp)
 {
-	return glfs_closedir((void *)dirp);
+	int ret;
+
+	START_PROFILE(syscall_closedir);
+	ret = glfs_closedir((void *)dirp);
+	END_PROFILE(syscall_closedir);
+
+	return ret;
 }
 
 static struct dirent *vfs_gluster_readdir(struct vfs_handle_struct *handle,
@@ -388,6 +539,7 @@ static struct dirent *vfs_gluster_readdir(struct vfs_handle_struct *handle,
 	struct stat stat;
 	struct dirent *dirent = 0;
 
+	START_PROFILE(syscall_readdir);
 	if (sbuf != NULL) {
 		ret = glfs_readdirplus_r((void *)dirp, &stat, (void *)direntbuf,
 					 &dirent);
@@ -396,47 +548,60 @@ static struct dirent *vfs_gluster_readdir(struct vfs_handle_struct *handle,
 	}
 
 	if ((ret < 0) || (dirent == NULL)) {
+		END_PROFILE(syscall_readdir);
 		return NULL;
 	}
 
 	if (sbuf != NULL) {
-		smb_stat_ex_from_stat(sbuf, &stat);
+		SET_STAT_INVALID(*sbuf);
+		if (!S_ISLNK(stat.st_mode)) {
+			smb_stat_ex_from_stat(sbuf, &stat);
+		}
 	}
 
+	END_PROFILE(syscall_readdir);
 	return dirent;
 }
 
 static long vfs_gluster_telldir(struct vfs_handle_struct *handle, DIR *dirp)
 {
-	return glfs_telldir((void *)dirp);
+	long ret;
+
+	START_PROFILE(syscall_telldir);
+	ret = glfs_telldir((void *)dirp);
+	END_PROFILE(syscall_telldir);
+
+	return ret;
 }
 
 static void vfs_gluster_seekdir(struct vfs_handle_struct *handle, DIR *dirp,
 				long offset)
 {
+	START_PROFILE(syscall_seekdir);
 	glfs_seekdir((void *)dirp, offset);
+	END_PROFILE(syscall_seekdir);
 }
 
 static void vfs_gluster_rewinddir(struct vfs_handle_struct *handle, DIR *dirp)
 {
+	START_PROFILE(syscall_rewinddir);
 	glfs_seekdir((void *)dirp, 0);
+	END_PROFILE(syscall_rewinddir);
 }
 
-static void vfs_gluster_init_search_op(struct vfs_handle_struct *handle,
-				       DIR *dirp)
+static int vfs_gluster_mkdirat(struct vfs_handle_struct *handle,
+			struct files_struct *dirfsp,
+			const struct smb_filename *smb_fname,
+			mode_t mode)
 {
-	return;
-}
+	int ret;
 
-static int vfs_gluster_mkdir(struct vfs_handle_struct *handle, const char *path,
-			     mode_t mode)
-{
-	return glfs_mkdir(handle->data, path, mode);
-}
+	START_PROFILE(syscall_mkdirat);
+	SMB_ASSERT(dirfsp == dirfsp->conn->cwd_fsp);
+	ret = glfs_mkdir(handle->data, smb_fname->base_name, mode);
+	END_PROFILE(syscall_mkdirat);
 
-static int vfs_gluster_rmdir(struct vfs_handle_struct *handle, const char *path)
-{
-	return glfs_rmdir(handle->data, path);
+	return ret;
 }
 
 static int vfs_gluster_open(struct vfs_handle_struct *handle,
@@ -445,6 +610,15 @@ static int vfs_gluster_open(struct vfs_handle_struct *handle,
 {
 	glfs_fd_t *glfd;
 	glfs_fd_t **p_tmp;
+
+	START_PROFILE(syscall_open);
+
+	p_tmp = VFS_ADD_FSP_EXTENSION(handle, fsp, glfs_fd_t *, NULL);
+	if (p_tmp == NULL) {
+		END_PROFILE(syscall_open);
+		errno = ENOMEM;
+		return -1;
+	}
 
 	if (flags & O_DIRECTORY) {
 		glfd = glfs_opendir(handle->data, smb_fname->base_name);
@@ -456,11 +630,15 @@ static int vfs_gluster_open(struct vfs_handle_struct *handle,
 	}
 
 	if (glfd == NULL) {
+		END_PROFILE(syscall_open);
+		/* no extension destroy_fn, so no need to save errno */
+		VFS_REMOVE_FSP_EXTENSION(handle, fsp);
 		return -1;
 	}
-	p_tmp = (glfs_fd_t **)VFS_ADD_FSP_EXTENSION(handle, fsp,
-							  glfs_fd_t *, NULL);
+
 	*p_tmp = glfd;
+
+	END_PROFILE(syscall_open);
 	/* An arbitrary value for error reporting, so you know its us. */
 	return 13371337;
 }
@@ -468,190 +646,205 @@ static int vfs_gluster_open(struct vfs_handle_struct *handle,
 static int vfs_gluster_close(struct vfs_handle_struct *handle,
 			     files_struct *fsp)
 {
-	glfs_fd_t *glfd;
-	glfd = *(glfs_fd_t **)VFS_FETCH_FSP_EXTENSION(handle, fsp);
-	VFS_REMOVE_FSP_EXTENSION(handle, fsp);
-	return glfs_close(glfd);
-}
+	int ret;
+	glfs_fd_t *glfd = NULL;
 
-static ssize_t vfs_gluster_read(struct vfs_handle_struct *handle,
-				files_struct *fsp, void *data, size_t n)
-{
-	return glfs_read(*(glfs_fd_t **)VFS_FETCH_FSP_EXTENSION(handle, fsp), data, n, 0);
+	START_PROFILE(syscall_close);
+
+	glfd = vfs_gluster_fetch_glfd(handle, fsp);
+	if (glfd == NULL) {
+		END_PROFILE(syscall_close);
+		DBG_ERR("Failed to fetch gluster fd\n");
+		return -1;
+	}
+
+	VFS_REMOVE_FSP_EXTENSION(handle, fsp);
+
+	ret = glfs_close(glfd);
+	END_PROFILE(syscall_close);
+
+	return ret;
 }
 
 static ssize_t vfs_gluster_pread(struct vfs_handle_struct *handle,
 				 files_struct *fsp, void *data, size_t n,
 				 off_t offset)
 {
-	return glfs_pread(*(glfs_fd_t **)VFS_FETCH_FSP_EXTENSION(handle, fsp), data, n, offset, 0);
+	ssize_t ret;
+	glfs_fd_t *glfd = NULL;
+
+	START_PROFILE_BYTES(syscall_pread, n);
+
+	glfd = vfs_gluster_fetch_glfd(handle, fsp);
+	if (glfd == NULL) {
+		END_PROFILE_BYTES(syscall_pread);
+		DBG_ERR("Failed to fetch gluster fd\n");
+		return -1;
+	}
+
+#ifdef HAVE_GFAPI_VER_7_6
+	ret = glfs_pread(glfd, data, n, offset, 0, NULL);
+#else
+	ret = glfs_pread(glfd, data, n, offset, 0);
+#endif
+	END_PROFILE_BYTES(syscall_pread);
+
+	return ret;
 }
 
-struct glusterfs_aio_state {
+struct vfs_gluster_pread_state {
 	ssize_t ret;
-	int err;
+	glfs_fd_t *fd;
+	void *buf;
+	size_t count;
+	off_t offset;
+
+	struct vfs_aio_state vfs_aio_state;
+	SMBPROFILE_BYTES_ASYNC_STATE(profile_bytes);
 };
 
-/*
- * This function is the callback that will be called on glusterfs
- * threads once the async IO submitted is complete. To notify
- * Samba of the completion we use a pipe based queue.
- */
-static void aio_glusterfs_done(glfs_fd_t *fd, ssize_t ret, void *data)
-{
-	struct tevent_req *req = NULL;
-	struct glusterfs_aio_state *state = NULL;
-	int sts = 0;
-
-	req = talloc_get_type_abort(data, struct tevent_req);
-	state = tevent_req_data(req, struct glusterfs_aio_state);
-
-	if (ret < 0) {
-		state->ret = -1;
-		state->err = errno;
-	} else {
-		state->ret = ret;
-		state->err = 0;
-	}
-
-	/*
-	 * Write the pointer to each req that needs to be completed
-	 * by calling tevent_req_done(). tevent_req_done() cannot
-	 * be called here, as it is not designed to be executed
-	 * in the multithread environment, tevent_req_done() must be
-	 * executed from the smbd main thread.
-	 *
-	 * write(2) on pipes with sizes under _POSIX_PIPE_BUF
-	 * in size is atomic, without this, the use op pipes in this
-	 * code would not work.
-	 *
-	 * sys_write is a thin enough wrapper around write(2)
-	 * that we can trust it here.
-	 */
-
-	sts = sys_write(write_fd, &req, sizeof(struct tevent_req *));
-	if (sts < 0) {
-		DEBUG(0,("\nWrite to pipe failed (%s)", strerror(errno)));
-	}
-
-	return;
-}
-
-/*
- * Read each req off the pipe and process it.
- */
-static void aio_tevent_fd_done(struct tevent_context *event_ctx,
-				struct tevent_fd *fde,
-				uint16_t flags, void *data)
-{
-	struct tevent_req *req = NULL;
-	int sts = 0;
-
-	/*
-	 * read(2) on pipes is atomic if the needed data is available
-	 * in the pipe, per SUS and POSIX.  Because we always write
-	 * to the pipe in sizeof(struct tevent_req *) chunks, we can
-	 * always read in those chunks, atomically.
-	 *
-	 * sys_read is a thin enough wrapper around read(2) that we
-	 * can trust it here.
-	 */
-
-	sts = sys_read(read_fd, &req, sizeof(struct tevent_req *));
-	if (sts < 0) {
-		DEBUG(0,("\nRead from pipe failed (%s)", strerror(errno)));
-	}
-
-	if (req) {
-		tevent_req_done(req);
-	}
-	return;
-}
-
-static bool init_gluster_aio(struct vfs_handle_struct *handle)
-{
-	int fds[2];
-	int ret = -1;
-
-	if (read_fd != -1) {
-		/*
-		 * Already initialized.
-		 */
-		return true;
-	}
-
-	ret = pipe(fds);
-	if (ret == -1) {
-		goto fail;
-	}
-
-	read_fd = fds[0];
-	write_fd = fds[1];
-
-	aio_read_event = tevent_add_fd(handle->conn->sconn->ev_ctx,
-					NULL,
-					read_fd,
-					TEVENT_FD_READ,
-					aio_tevent_fd_done,
-					NULL);
-	if (aio_read_event == NULL) {
-		goto fail;
-	}
-
-	return true;
-fail:
-	TALLOC_FREE(aio_read_event);
-	if (read_fd != -1) {
-		close(read_fd);
-		close(write_fd);
-		read_fd = -1;
-		write_fd = -1;
-	}
-	return false;
-}
+static void vfs_gluster_pread_do(void *private_data);
+static void vfs_gluster_pread_done(struct tevent_req *subreq);
+static int vfs_gluster_pread_state_destructor(struct vfs_gluster_pread_state *state);
 
 static struct tevent_req *vfs_gluster_pread_send(struct vfs_handle_struct
-						 *handle, TALLOC_CTX *mem_ctx,
-						 struct tevent_context *ev,
-						 files_struct *fsp, void *data,
-						 size_t n, off_t offset)
+						  *handle, TALLOC_CTX *mem_ctx,
+						  struct tevent_context *ev,
+						  files_struct *fsp,
+						  void *data, size_t n,
+						  off_t offset)
 {
-	struct tevent_req *req = NULL;
-	struct glusterfs_aio_state *state = NULL;
-	int ret = 0;
+	struct vfs_gluster_pread_state *state;
+	struct tevent_req *req, *subreq;
 
-	req = tevent_req_create(mem_ctx, &state, struct glusterfs_aio_state);
+	glfs_fd_t *glfd = vfs_gluster_fetch_glfd(handle, fsp);
+	if (glfd == NULL) {
+		DBG_ERR("Failed to fetch gluster fd\n");
+		return NULL;
+	}
+
+	req = tevent_req_create(mem_ctx, &state, struct vfs_gluster_pread_state);
 	if (req == NULL) {
 		return NULL;
 	}
 
-	if (!init_gluster_aio(handle)) {
-		tevent_req_error(req, EIO);
+	state->ret = -1;
+	state->fd = glfd;
+	state->buf = data;
+	state->count = n;
+	state->offset = offset;
+
+	SMBPROFILE_BYTES_ASYNC_START(syscall_asys_pread, profile_p,
+				     state->profile_bytes, n);
+	SMBPROFILE_BYTES_ASYNC_SET_IDLE(state->profile_bytes);
+
+	subreq = pthreadpool_tevent_job_send(
+		state, ev, handle->conn->sconn->pool,
+		vfs_gluster_pread_do, state);
+	if (tevent_req_nomem(subreq, req)) {
 		return tevent_req_post(req, ev);
 	}
-	ret = glfs_pread_async(*(glfs_fd_t **)VFS_FETCH_FSP_EXTENSION(handle,
-				fsp), data, n, offset, 0, aio_glusterfs_done,
-				req);
-	if (ret < 0) {
-		tevent_req_error(req, -ret);
-		return tevent_req_post(req, ev);
-	}
+	tevent_req_set_callback(subreq, vfs_gluster_pread_done, req);
+
+	talloc_set_destructor(state, vfs_gluster_pread_state_destructor);
 
 	return req;
 }
 
-static ssize_t vfs_gluster_write(struct vfs_handle_struct *handle,
-				 files_struct *fsp, const void *data, size_t n)
+static void vfs_gluster_pread_do(void *private_data)
 {
-	return glfs_write(*(glfs_fd_t **)VFS_FETCH_FSP_EXTENSION(handle, fsp), data, n, 0);
+	struct vfs_gluster_pread_state *state = talloc_get_type_abort(
+		private_data, struct vfs_gluster_pread_state);
+	struct timespec start_time;
+	struct timespec end_time;
+
+	SMBPROFILE_BYTES_ASYNC_SET_BUSY(state->profile_bytes);
+
+	PROFILE_TIMESTAMP(&start_time);
+
+	do {
+#ifdef HAVE_GFAPI_VER_7_6
+		state->ret = glfs_pread(state->fd, state->buf, state->count,
+					state->offset, 0, NULL);
+#else
+		state->ret = glfs_pread(state->fd, state->buf, state->count,
+					state->offset, 0);
+#endif
+	} while ((state->ret == -1) && (errno == EINTR));
+
+	if (state->ret == -1) {
+		state->vfs_aio_state.error = errno;
+	}
+
+	PROFILE_TIMESTAMP(&end_time);
+
+	state->vfs_aio_state.duration = nsec_time_diff(&end_time, &start_time);
+
+	SMBPROFILE_BYTES_ASYNC_SET_IDLE(state->profile_bytes);
 }
 
-static ssize_t vfs_gluster_pwrite(struct vfs_handle_struct *handle,
-				  files_struct *fsp, const void *data,
-				  size_t n, off_t offset)
+static int vfs_gluster_pread_state_destructor(struct vfs_gluster_pread_state *state)
 {
-	return glfs_pwrite(*(glfs_fd_t **)VFS_FETCH_FSP_EXTENSION(handle, fsp), data, n, offset, 0);
+	return -1;
 }
+
+static void vfs_gluster_pread_done(struct tevent_req *subreq)
+{
+	struct tevent_req *req = tevent_req_callback_data(
+		subreq, struct tevent_req);
+	struct vfs_gluster_pread_state *state = tevent_req_data(
+		req, struct vfs_gluster_pread_state);
+	int ret;
+
+	ret = pthreadpool_tevent_job_recv(subreq);
+	TALLOC_FREE(subreq);
+	SMBPROFILE_BYTES_ASYNC_END(state->profile_bytes);
+	talloc_set_destructor(state, NULL);
+	if (ret != 0) {
+		if (ret != EAGAIN) {
+			tevent_req_error(req, ret);
+			return;
+		}
+		/*
+		 * If we get EAGAIN from pthreadpool_tevent_job_recv() this
+		 * means the lower level pthreadpool failed to create a new
+		 * thread. Fallback to sync processing in that case to allow
+		 * some progress for the client.
+		 */
+		vfs_gluster_pread_do(state);
+	}
+
+	tevent_req_done(req);
+}
+
+static ssize_t vfs_gluster_pread_recv(struct tevent_req *req,
+				      struct vfs_aio_state *vfs_aio_state)
+{
+	struct vfs_gluster_pread_state *state = tevent_req_data(
+		req, struct vfs_gluster_pread_state);
+
+	if (tevent_req_is_unix_error(req, &vfs_aio_state->error)) {
+		return -1;
+	}
+
+	*vfs_aio_state = state->vfs_aio_state;
+	return state->ret;
+}
+
+struct vfs_gluster_pwrite_state {
+	ssize_t ret;
+	glfs_fd_t *fd;
+	const void *buf;
+	size_t count;
+	off_t offset;
+
+	struct vfs_aio_state vfs_aio_state;
+	SMBPROFILE_BYTES_ASYNC_STATE(profile_bytes);
+};
+
+static void vfs_gluster_pwrite_do(void *private_data);
+static void vfs_gluster_pwrite_done(struct tevent_req *subreq);
+static int vfs_gluster_pwrite_state_destructor(struct vfs_gluster_pwrite_state *state);
 
 static struct tevent_req *vfs_gluster_pwrite_send(struct vfs_handle_struct
 						  *handle, TALLOC_CTX *mem_ctx,
@@ -660,50 +853,169 @@ static struct tevent_req *vfs_gluster_pwrite_send(struct vfs_handle_struct
 						  const void *data, size_t n,
 						  off_t offset)
 {
-	struct tevent_req *req = NULL;
-	struct glusterfs_aio_state *state = NULL;
-	int ret = 0;
+	struct tevent_req *req, *subreq;
+	struct vfs_gluster_pwrite_state *state;
 
-	req = tevent_req_create(mem_ctx, &state, struct glusterfs_aio_state);
+	glfs_fd_t *glfd = vfs_gluster_fetch_glfd(handle, fsp);
+	if (glfd == NULL) {
+		DBG_ERR("Failed to fetch gluster fd\n");
+		return NULL;
+	}
+
+	req = tevent_req_create(mem_ctx, &state, struct vfs_gluster_pwrite_state);
 	if (req == NULL) {
 		return NULL;
 	}
-	if (!init_gluster_aio(handle)) {
-		tevent_req_error(req, EIO);
+
+	state->ret = -1;
+	state->fd = glfd;
+	state->buf = data;
+	state->count = n;
+	state->offset = offset;
+
+	SMBPROFILE_BYTES_ASYNC_START(syscall_asys_pwrite, profile_p,
+				     state->profile_bytes, n);
+	SMBPROFILE_BYTES_ASYNC_SET_IDLE(state->profile_bytes);
+
+	subreq = pthreadpool_tevent_job_send(
+		state, ev, handle->conn->sconn->pool,
+		vfs_gluster_pwrite_do, state);
+	if (tevent_req_nomem(subreq, req)) {
 		return tevent_req_post(req, ev);
 	}
-	ret = glfs_pwrite_async(*(glfs_fd_t **)VFS_FETCH_FSP_EXTENSION(handle,
-				fsp), data, n, offset, 0, aio_glusterfs_done,
-				req);
-	if (ret < 0) {
-		tevent_req_error(req, -ret);
-		return tevent_req_post(req, ev);
-	}
+	tevent_req_set_callback(subreq, vfs_gluster_pwrite_done, req);
+
+	talloc_set_destructor(state, vfs_gluster_pwrite_state_destructor);
+
 	return req;
 }
 
-static ssize_t vfs_gluster_recv(struct tevent_req *req, int *err)
+static void vfs_gluster_pwrite_do(void *private_data)
 {
-	struct glusterfs_aio_state *state = NULL;
+	struct vfs_gluster_pwrite_state *state = talloc_get_type_abort(
+		private_data, struct vfs_gluster_pwrite_state);
+	struct timespec start_time;
+	struct timespec end_time;
 
-	state = tevent_req_data(req, struct glusterfs_aio_state);
-	if (state == NULL) {
-		return -1;
-	}
+	SMBPROFILE_BYTES_ASYNC_SET_BUSY(state->profile_bytes);
 
-	if (tevent_req_is_unix_error(req, err)) {
-		return -1;
-	}
+	PROFILE_TIMESTAMP(&start_time);
+
+	do {
+#ifdef HAVE_GFAPI_VER_7_6
+		state->ret = glfs_pwrite(state->fd, state->buf, state->count,
+					 state->offset, 0, NULL, NULL);
+#else
+		state->ret = glfs_pwrite(state->fd, state->buf, state->count,
+					 state->offset, 0);
+#endif
+	} while ((state->ret == -1) && (errno == EINTR));
+
 	if (state->ret == -1) {
-		*err = state->err;
+		state->vfs_aio_state.error = errno;
 	}
+
+	PROFILE_TIMESTAMP(&end_time);
+
+	state->vfs_aio_state.duration = nsec_time_diff(&end_time, &start_time);
+
+	SMBPROFILE_BYTES_ASYNC_SET_IDLE(state->profile_bytes);
+}
+
+static int vfs_gluster_pwrite_state_destructor(struct vfs_gluster_pwrite_state *state)
+{
+	return -1;
+}
+
+static void vfs_gluster_pwrite_done(struct tevent_req *subreq)
+{
+	struct tevent_req *req = tevent_req_callback_data(
+		subreq, struct tevent_req);
+	struct vfs_gluster_pwrite_state *state = tevent_req_data(
+		req, struct vfs_gluster_pwrite_state);
+	int ret;
+
+	ret = pthreadpool_tevent_job_recv(subreq);
+	TALLOC_FREE(subreq);
+	SMBPROFILE_BYTES_ASYNC_END(state->profile_bytes);
+	talloc_set_destructor(state, NULL);
+	if (ret != 0) {
+		if (ret != EAGAIN) {
+			tevent_req_error(req, ret);
+			return;
+		}
+		/*
+		 * If we get EAGAIN from pthreadpool_tevent_job_recv() this
+		 * means the lower level pthreadpool failed to create a new
+		 * thread. Fallback to sync processing in that case to allow
+		 * some progress for the client.
+		 */
+		vfs_gluster_pwrite_do(state);
+	}
+
+	tevent_req_done(req);
+}
+
+static ssize_t vfs_gluster_pwrite_recv(struct tevent_req *req,
+				       struct vfs_aio_state *vfs_aio_state)
+{
+	struct vfs_gluster_pwrite_state *state = tevent_req_data(
+		req, struct vfs_gluster_pwrite_state);
+
+	if (tevent_req_is_unix_error(req, &vfs_aio_state->error)) {
+		return -1;
+	}
+
+	*vfs_aio_state = state->vfs_aio_state;
+
 	return state->ret;
+}
+
+static ssize_t vfs_gluster_pwrite(struct vfs_handle_struct *handle,
+				  files_struct *fsp, const void *data,
+				  size_t n, off_t offset)
+{
+	ssize_t ret;
+	glfs_fd_t *glfd = NULL;
+
+	START_PROFILE_BYTES(syscall_pwrite, n);
+
+	glfd = vfs_gluster_fetch_glfd(handle, fsp);
+	if (glfd == NULL) {
+		END_PROFILE_BYTES(syscall_pwrite);
+		DBG_ERR("Failed to fetch gluster fd\n");
+		return -1;
+	}
+
+#ifdef HAVE_GFAPI_VER_7_6
+	ret = glfs_pwrite(glfd, data, n, offset, 0, NULL, NULL);
+#else
+	ret = glfs_pwrite(glfd, data, n, offset, 0);
+#endif
+	END_PROFILE_BYTES(syscall_pwrite);
+
+	return ret;
 }
 
 static off_t vfs_gluster_lseek(struct vfs_handle_struct *handle,
 			       files_struct *fsp, off_t offset, int whence)
 {
-	return glfs_lseek(*(glfs_fd_t **)VFS_FETCH_FSP_EXTENSION(handle, fsp), offset, whence);
+	off_t ret = 0;
+	glfs_fd_t *glfd = NULL;
+
+	START_PROFILE(syscall_lseek);
+
+	glfd = vfs_gluster_fetch_glfd(handle, fsp);
+	if (glfd == NULL) {
+		END_PROFILE(syscall_lseek);
+		DBG_ERR("Failed to fetch gluster fd\n");
+		return -1;
+	}
+
+	ret = glfs_lseek(glfd, offset, whence);
+	END_PROFILE(syscall_lseek);
+
+	return ret;
 }
 
 static ssize_t vfs_gluster_sendfile(struct vfs_handle_struct *handle, int tofd,
@@ -723,52 +1035,148 @@ static ssize_t vfs_gluster_recvfile(struct vfs_handle_struct *handle,
 	return -1;
 }
 
-static int vfs_gluster_rename(struct vfs_handle_struct *handle,
-			      const struct smb_filename *smb_fname_src,
-			      const struct smb_filename *smb_fname_dst)
+static int vfs_gluster_renameat(struct vfs_handle_struct *handle,
+			files_struct *srcfsp,
+			const struct smb_filename *smb_fname_src,
+			files_struct *dstfsp,
+			const struct smb_filename *smb_fname_dst)
 {
-	return glfs_rename(handle->data, smb_fname_src->base_name,
-			   smb_fname_dst->base_name);
+	int ret;
+
+	START_PROFILE(syscall_renameat);
+	ret = glfs_rename(handle->data, smb_fname_src->base_name,
+			  smb_fname_dst->base_name);
+	END_PROFILE(syscall_renameat);
+
+	return ret;
 }
 
-static int vfs_gluster_fsync(struct vfs_handle_struct *handle,
-			     files_struct *fsp)
-{
-	return glfs_fsync(*(glfs_fd_t **)VFS_FETCH_FSP_EXTENSION(handle, fsp));
-}
+struct vfs_gluster_fsync_state {
+	ssize_t ret;
+	glfs_fd_t *fd;
+
+	struct vfs_aio_state vfs_aio_state;
+	SMBPROFILE_BYTES_ASYNC_STATE(profile_bytes);
+};
+
+static void vfs_gluster_fsync_do(void *private_data);
+static void vfs_gluster_fsync_done(struct tevent_req *subreq);
+static int vfs_gluster_fsync_state_destructor(struct vfs_gluster_fsync_state *state);
 
 static struct tevent_req *vfs_gluster_fsync_send(struct vfs_handle_struct
 						 *handle, TALLOC_CTX *mem_ctx,
 						 struct tevent_context *ev,
 						 files_struct *fsp)
 {
-	struct tevent_req *req = NULL;
-	struct glusterfs_aio_state *state = NULL;
-	int ret = 0;
+	struct tevent_req *req, *subreq;
+	struct vfs_gluster_fsync_state *state;
 
-	req = tevent_req_create(mem_ctx, &state, struct glusterfs_aio_state);
+	glfs_fd_t *glfd = vfs_gluster_fetch_glfd(handle, fsp);
+	if (glfd == NULL) {
+		DBG_ERR("Failed to fetch gluster fd\n");
+		return NULL;
+	}
+
+	req = tevent_req_create(mem_ctx, &state, struct vfs_gluster_fsync_state);
 	if (req == NULL) {
 		return NULL;
 	}
-	if (!init_gluster_aio(handle)) {
-		tevent_req_error(req, EIO);
+
+	state->ret = -1;
+	state->fd = glfd;
+
+	SMBPROFILE_BYTES_ASYNC_START(syscall_asys_fsync, profile_p,
+                                     state->profile_bytes, 0);
+	SMBPROFILE_BYTES_ASYNC_SET_IDLE(state->profile_bytes);
+
+	subreq = pthreadpool_tevent_job_send(
+		state, ev, handle->conn->sconn->pool, vfs_gluster_fsync_do, state);
+	if (tevent_req_nomem(subreq, req)) {
 		return tevent_req_post(req, ev);
 	}
-	ret = glfs_fsync_async(*(glfs_fd_t **)VFS_FETCH_FSP_EXTENSION(handle,
-				fsp), aio_glusterfs_done, req);
-	if (ret < 0) {
-		tevent_req_error(req, -ret);
-		return tevent_req_post(req, ev);
-	}
+	tevent_req_set_callback(subreq, vfs_gluster_fsync_done, req);
+
+	talloc_set_destructor(state, vfs_gluster_fsync_state_destructor);
+
 	return req;
 }
 
-static int vfs_gluster_fsync_recv(struct tevent_req *req, int *err)
+static void vfs_gluster_fsync_do(void *private_data)
 {
-	/*
-	 * Use implicit conversion ssize_t->int
-	 */
-	return vfs_gluster_recv(req, err);
+	struct vfs_gluster_fsync_state *state = talloc_get_type_abort(
+		private_data, struct vfs_gluster_fsync_state);
+	struct timespec start_time;
+	struct timespec end_time;
+
+	SMBPROFILE_BYTES_ASYNC_SET_BUSY(state->profile_bytes);
+
+	PROFILE_TIMESTAMP(&start_time);
+
+	do {
+#ifdef HAVE_GFAPI_VER_7_6
+		state->ret = glfs_fsync(state->fd, NULL, NULL);
+#else
+		state->ret = glfs_fsync(state->fd);
+#endif
+	} while ((state->ret == -1) && (errno == EINTR));
+
+	if (state->ret == -1) {
+		state->vfs_aio_state.error = errno;
+	}
+
+	PROFILE_TIMESTAMP(&end_time);
+
+	state->vfs_aio_state.duration = nsec_time_diff(&end_time, &start_time);
+
+	SMBPROFILE_BYTES_ASYNC_SET_IDLE(state->profile_bytes);
+}
+
+static int vfs_gluster_fsync_state_destructor(struct vfs_gluster_fsync_state *state)
+{
+	return -1;
+}
+
+static void vfs_gluster_fsync_done(struct tevent_req *subreq)
+{
+	struct tevent_req *req = tevent_req_callback_data(
+		subreq, struct tevent_req);
+	struct vfs_gluster_fsync_state *state = tevent_req_data(
+		req, struct vfs_gluster_fsync_state);
+	int ret;
+
+	ret = pthreadpool_tevent_job_recv(subreq);
+	TALLOC_FREE(subreq);
+	SMBPROFILE_BYTES_ASYNC_END(state->profile_bytes);
+	talloc_set_destructor(state, NULL);
+	if (ret != 0) {
+		if (ret != EAGAIN) {
+			tevent_req_error(req, ret);
+			return;
+		}
+		/*
+		 * If we get EAGAIN from pthreadpool_tevent_job_recv() this
+		 * means the lower level pthreadpool failed to create a new
+		 * thread. Fallback to sync processing in that case to allow
+		 * some progress for the client.
+		 */
+		vfs_gluster_fsync_do(state);
+	}
+
+	tevent_req_done(req);
+}
+
+static int vfs_gluster_fsync_recv(struct tevent_req *req,
+				  struct vfs_aio_state *vfs_aio_state)
+{
+	struct vfs_gluster_fsync_state *state = tevent_req_data(
+		req, struct vfs_gluster_fsync_state);
+
+	if (tevent_req_is_unix_error(req, &vfs_aio_state->error)) {
+		return -1;
+	}
+
+	*vfs_aio_state = state->vfs_aio_state;
+	return state->ret;
 }
 
 static int vfs_gluster_stat(struct vfs_handle_struct *handle,
@@ -777,6 +1185,7 @@ static int vfs_gluster_stat(struct vfs_handle_struct *handle,
 	struct stat st;
 	int ret;
 
+	START_PROFILE(syscall_stat);
 	ret = glfs_stat(handle->data, smb_fname->base_name, &st);
 	if (ret == 0) {
 		smb_stat_ex_from_stat(&smb_fname->st, &st);
@@ -785,6 +1194,8 @@ static int vfs_gluster_stat(struct vfs_handle_struct *handle,
 		DEBUG(0, ("glfs_stat(%s) failed: %s\n",
 			  smb_fname->base_name, strerror(errno)));
 	}
+	END_PROFILE(syscall_stat);
+
 	return ret;
 }
 
@@ -793,8 +1204,18 @@ static int vfs_gluster_fstat(struct vfs_handle_struct *handle,
 {
 	struct stat st;
 	int ret;
+	glfs_fd_t *glfd = NULL;
 
-	ret = glfs_fstat(*(glfs_fd_t **)VFS_FETCH_FSP_EXTENSION(handle, fsp), &st);
+	START_PROFILE(syscall_fstat);
+
+	glfd = vfs_gluster_fetch_glfd(handle, fsp);
+	if (glfd == NULL) {
+		END_PROFILE(syscall_fstat);
+		DBG_ERR("Failed to fetch gluster fd\n");
+		return -1;
+	}
+
+	ret = glfs_fstat(glfd, &st);
 	if (ret == 0) {
 		smb_stat_ex_from_stat(sbuf, &st);
 	}
@@ -802,6 +1223,8 @@ static int vfs_gluster_fstat(struct vfs_handle_struct *handle,
 		DEBUG(0, ("glfs_fstat(%d) failed: %s\n",
 			  fsp->fh->fd, strerror(errno)));
 	}
+	END_PROFILE(syscall_fstat);
+
 	return ret;
 }
 
@@ -811,6 +1234,7 @@ static int vfs_gluster_lstat(struct vfs_handle_struct *handle,
 	struct stat st;
 	int ret;
 
+	START_PROFILE(syscall_lstat);
 	ret = glfs_lstat(handle->data, smb_fname->base_name, &st);
 	if (ret == 0) {
 		smb_stat_ex_from_stat(&smb_fname->st, &st);
@@ -819,6 +1243,8 @@ static int vfs_gluster_lstat(struct vfs_handle_struct *handle,
 		DEBUG(0, ("glfs_lstat(%s) failed: %s\n",
 			  smb_fname->base_name, strerror(errno)));
 	}
+	END_PROFILE(syscall_lstat);
+
 	return ret;
 }
 
@@ -826,74 +1252,157 @@ static uint64_t vfs_gluster_get_alloc_size(struct vfs_handle_struct *handle,
 					   files_struct *fsp,
 					   const SMB_STRUCT_STAT *sbuf)
 {
-	return sbuf->st_ex_blocks * 512;
+	uint64_t ret;
+
+	START_PROFILE(syscall_get_alloc_size);
+	ret = sbuf->st_ex_blocks * 512;
+	END_PROFILE(syscall_get_alloc_size);
+
+	return ret;
 }
 
-static int vfs_gluster_unlink(struct vfs_handle_struct *handle,
-			      const struct smb_filename *smb_fname)
+static int vfs_gluster_unlinkat(struct vfs_handle_struct *handle,
+			struct files_struct *dirfsp,
+			const struct smb_filename *smb_fname,
+			int flags)
 {
-	return glfs_unlink(handle->data, smb_fname->base_name);
+	int ret;
+
+	START_PROFILE(syscall_unlinkat);
+	SMB_ASSERT(dirfsp == dirfsp->conn->cwd_fsp);
+	if (flags & AT_REMOVEDIR) {
+		ret = glfs_rmdir(handle->data, smb_fname->base_name);
+	} else {
+		ret = glfs_unlink(handle->data, smb_fname->base_name);
+	}
+	END_PROFILE(syscall_unlinkat);
+
+	return ret;
 }
 
 static int vfs_gluster_chmod(struct vfs_handle_struct *handle,
-			     const char *path, mode_t mode)
+				const struct smb_filename *smb_fname,
+				mode_t mode)
 {
-	return glfs_chmod(handle->data, path, mode);
+	int ret;
+
+	START_PROFILE(syscall_chmod);
+	ret = glfs_chmod(handle->data, smb_fname->base_name, mode);
+	END_PROFILE(syscall_chmod);
+
+	return ret;
 }
 
 static int vfs_gluster_fchmod(struct vfs_handle_struct *handle,
 			      files_struct *fsp, mode_t mode)
 {
-	return glfs_fchmod(*(glfs_fd_t **)VFS_FETCH_FSP_EXTENSION(handle, fsp), mode);
-}
+	int ret;
+	glfs_fd_t *glfd = NULL;
 
-static int vfs_gluster_chown(struct vfs_handle_struct *handle,
-			     const char *path, uid_t uid, gid_t gid)
-{
-	return glfs_chown(handle->data, path, uid, gid);
+	START_PROFILE(syscall_fchmod);
+
+	glfd = vfs_gluster_fetch_glfd(handle, fsp);
+	if (glfd == NULL) {
+		END_PROFILE(syscall_fchmod);
+		DBG_ERR("Failed to fetch gluster fd\n");
+		return -1;
+	}
+
+	ret = glfs_fchmod(glfd, mode);
+	END_PROFILE(syscall_fchmod);
+
+	return ret;
 }
 
 static int vfs_gluster_fchown(struct vfs_handle_struct *handle,
 			      files_struct *fsp, uid_t uid, gid_t gid)
 {
-	return glfs_fchown(*(glfs_fd_t **)VFS_FETCH_FSP_EXTENSION(handle, fsp), uid, gid);
+	int ret;
+	glfs_fd_t *glfd = NULL;
+
+	START_PROFILE(syscall_fchown);
+
+	glfd = vfs_gluster_fetch_glfd(handle, fsp);
+	if (glfd == NULL) {
+		END_PROFILE(syscall_fchown);
+		DBG_ERR("Failed to fetch gluster fd\n");
+		return -1;
+	}
+
+	ret = glfs_fchown(glfd, uid, gid);
+	END_PROFILE(syscall_fchown);
+
+	return ret;
 }
 
 static int vfs_gluster_lchown(struct vfs_handle_struct *handle,
-			      const char *path, uid_t uid, gid_t gid)
+			const struct smb_filename *smb_fname,
+			uid_t uid,
+			gid_t gid)
 {
-	return glfs_lchown(handle->data, path, uid, gid);
+	int ret;
+
+	START_PROFILE(syscall_lchown);
+	ret = glfs_lchown(handle->data, smb_fname->base_name, uid, gid);
+	END_PROFILE(syscall_lchown);
+
+	return ret;
 }
 
-static int vfs_gluster_chdir(struct vfs_handle_struct *handle, const char *path)
+static int vfs_gluster_chdir(struct vfs_handle_struct *handle,
+			const struct smb_filename *smb_fname)
 {
-	return glfs_chdir(handle->data, path);
+	int ret;
+
+	START_PROFILE(syscall_chdir);
+	ret = glfs_chdir(handle->data, smb_fname->base_name);
+	END_PROFILE(syscall_chdir);
+
+	return ret;
 }
 
-static char *vfs_gluster_getwd(struct vfs_handle_struct *handle)
+static struct smb_filename *vfs_gluster_getwd(struct vfs_handle_struct *handle,
+				TALLOC_CTX *ctx)
 {
 	char *cwd;
 	char *ret;
+	struct smb_filename *smb_fname = NULL;
+
+	START_PROFILE(syscall_getwd);
 
 	cwd = SMB_CALLOC_ARRAY(char, PATH_MAX);
 	if (cwd == NULL) {
+		END_PROFILE(syscall_getwd);
 		return NULL;
 	}
 
 	ret = glfs_getcwd(handle->data, cwd, PATH_MAX - 1);
-	if (ret == 0) {
-		free(cwd);
+	END_PROFILE(syscall_getwd);
+
+	if (ret == NULL) {
+		SAFE_FREE(cwd);
+		return NULL;
 	}
-	return ret;
+	smb_fname = synthetic_smb_fname(ctx,
+					ret,
+					NULL,
+					NULL,
+					0,
+					0);
+	SAFE_FREE(cwd);
+	return smb_fname;
 }
 
 static int vfs_gluster_ntimes(struct vfs_handle_struct *handle,
 			      const struct smb_filename *smb_fname,
 			      struct smb_file_time *ft)
 {
+	int ret = -1;
 	struct timespec times[2];
 
-	if (null_timespec(ft->atime)) {
+	START_PROFILE(syscall_ntimes);
+
+	if (is_omit_timespec(&ft->atime)) {
 		times[0].tv_sec = smb_fname->st.st_ex_atime.tv_sec;
 		times[0].tv_nsec = smb_fname->st.st_ex_atime.tv_nsec;
 	} else {
@@ -901,7 +1410,7 @@ static int vfs_gluster_ntimes(struct vfs_handle_struct *handle,
 		times[0].tv_nsec = ft->atime.tv_nsec;
 	}
 
-	if (null_timespec(ft->mtime)) {
+	if (is_omit_timespec(&ft->mtime)) {
 		times[1].tv_sec = smb_fname->st.st_ex_mtime.tv_sec;
 		times[1].tv_nsec = smb_fname->st.st_ex_mtime.tv_nsec;
 	} else {
@@ -913,16 +1422,39 @@ static int vfs_gluster_ntimes(struct vfs_handle_struct *handle,
 			      &smb_fname->st.st_ex_atime) == 0) &&
 	    (timespec_compare(&times[1],
 			      &smb_fname->st.st_ex_mtime) == 0)) {
+		END_PROFILE(syscall_ntimes);
 		return 0;
 	}
 
-	return glfs_utimens(handle->data, smb_fname->base_name, times);
+	ret = glfs_utimens(handle->data, smb_fname->base_name, times);
+	END_PROFILE(syscall_ntimes);
+
+	return ret;
 }
 
 static int vfs_gluster_ftruncate(struct vfs_handle_struct *handle,
 				 files_struct *fsp, off_t offset)
 {
-	return glfs_ftruncate(*(glfs_fd_t **)VFS_FETCH_FSP_EXTENSION(handle, fsp), offset);
+	int ret;
+	glfs_fd_t *glfd = NULL;
+
+	START_PROFILE(syscall_ftruncate);
+
+	glfd = vfs_gluster_fetch_glfd(handle, fsp);
+	if (glfd == NULL) {
+		END_PROFILE(syscall_ftruncate);
+		DBG_ERR("Failed to fetch gluster fd\n");
+		return -1;
+	}
+
+#ifdef HAVE_GFAPI_VER_7_6
+	ret = glfs_ftruncate(glfd, offset, NULL, NULL);
+#else
+	ret = glfs_ftruncate(glfd, offset);
+#endif
+	END_PROFILE(syscall_ftruncate);
+
+	return ret;
 }
 
 static int vfs_gluster_fallocate(struct vfs_handle_struct *handle,
@@ -930,15 +1462,80 @@ static int vfs_gluster_fallocate(struct vfs_handle_struct *handle,
 				 uint32_t mode,
 				 off_t offset, off_t len)
 {
-	/* TODO: add support using glfs_fallocate() and glfs_zerofill() */
+	int ret;
+#ifdef HAVE_GFAPI_VER_6
+	glfs_fd_t *glfd = NULL;
+	int keep_size, punch_hole;
+
+	START_PROFILE(syscall_fallocate);
+
+	glfd = vfs_gluster_fetch_glfd(handle, fsp);
+	if (glfd == NULL) {
+		END_PROFILE(syscall_fallocate);
+		DBG_ERR("Failed to fetch gluster fd\n");
+		return -1;
+	}
+
+	keep_size = mode & VFS_FALLOCATE_FL_KEEP_SIZE;
+	punch_hole = mode & VFS_FALLOCATE_FL_PUNCH_HOLE;
+
+	mode &= ~(VFS_FALLOCATE_FL_KEEP_SIZE|VFS_FALLOCATE_FL_PUNCH_HOLE);
+	if (mode != 0) {
+		END_PROFILE(syscall_fallocate);
+		errno = ENOTSUP;
+		return -1;
+	}
+
+	if (punch_hole) {
+		ret = glfs_discard(glfd, offset, len);
+		if (ret != 0) {
+			DBG_DEBUG("glfs_discard failed: %s\n",
+				  strerror(errno));
+		}
+	}
+
+	ret = glfs_fallocate(glfd, keep_size, offset, len);
+	END_PROFILE(syscall_fallocate);
+#else
 	errno = ENOTSUP;
-	return -1;
+	ret = -1;
+#endif
+	return ret;
 }
 
-static char *vfs_gluster_realpath(struct vfs_handle_struct *handle,
-				  const char *path)
+static struct smb_filename *vfs_gluster_realpath(struct vfs_handle_struct *handle,
+				TALLOC_CTX *ctx,
+				const struct smb_filename *smb_fname)
 {
-	return glfs_realpath(handle->data, path, 0);
+	char *result = NULL;
+	struct smb_filename *result_fname = NULL;
+	char *resolved_path = NULL;
+
+	START_PROFILE(syscall_realpath);
+
+	resolved_path = SMB_MALLOC_ARRAY(char, PATH_MAX+1);
+	if (resolved_path == NULL) {
+		END_PROFILE(syscall_realpath);
+		errno = ENOMEM;
+		return NULL;
+	}
+
+	result = glfs_realpath(handle->data,
+			smb_fname->base_name,
+			resolved_path);
+	if (result != NULL) {
+		result_fname = synthetic_smb_fname(ctx,
+						   result,
+						   NULL,
+						   NULL,
+						   0,
+						   0);
+	}
+
+	SAFE_FREE(resolved_path);
+	END_PROFILE(syscall_realpath);
+
+	return result_fname;
 }
 
 static bool vfs_gluster_lock(struct vfs_handle_struct *handle,
@@ -947,6 +1544,17 @@ static bool vfs_gluster_lock(struct vfs_handle_struct *handle,
 {
 	struct flock flock = { 0, };
 	int ret;
+	glfs_fd_t *glfd = NULL;
+	bool ok = false;
+
+	START_PROFILE(syscall_fcntl_lock);
+
+	glfd = vfs_gluster_fetch_glfd(handle, fsp);
+	if (glfd == NULL) {
+		DBG_ERR("Failed to fetch gluster fd\n");
+		ok = false;
+		goto out;
+	}
 
 	flock.l_type = type;
 	flock.l_whence = SEEK_SET;
@@ -954,30 +1562,66 @@ static bool vfs_gluster_lock(struct vfs_handle_struct *handle,
 	flock.l_len = count;
 	flock.l_pid = 0;
 
-	ret = glfs_posix_lock(*(glfs_fd_t **)VFS_FETCH_FSP_EXTENSION(handle, fsp), op, &flock);
+	ret = glfs_posix_lock(glfd, op, &flock);
 
 	if (op == F_GETLK) {
 		/* lock query, true if someone else has locked */
 		if ((ret != -1) &&
 		    (flock.l_type != F_UNLCK) &&
-		    (flock.l_pid != 0) && (flock.l_pid != getpid()))
-			return true;
+		    (flock.l_pid != 0) && (flock.l_pid != getpid())) {
+			ok = true;
+			goto out;
+		}
 		/* not me */
-		return false;
+		ok = false;
+		goto out;
 	}
 
 	if (ret == -1) {
-		return false;
+		ok = false;
+		goto out;
 	}
 
-	return true;
+	ok = true;
+out:
+	END_PROFILE(syscall_fcntl_lock);
+
+	return ok;
 }
 
 static int vfs_gluster_kernel_flock(struct vfs_handle_struct *handle,
-				    files_struct *fsp, uint32_t share_mode,
+				    files_struct *fsp, uint32_t share_access,
 				    uint32_t access_mask)
 {
 	errno = ENOSYS;
+	return -1;
+}
+
+static int vfs_gluster_fcntl(vfs_handle_struct *handle,
+			     files_struct *fsp, int cmd, va_list cmd_arg)
+{
+	/*
+	 * SMB_VFS_FCNTL() is currently only called by vfs_set_blocking() to
+	 * clear O_NONBLOCK, etc for LOCK_MAND and FIFOs. Ignore it.
+	 */
+	if (cmd == F_GETFL) {
+		return 0;
+	} else if (cmd == F_SETFL) {
+		va_list dup_cmd_arg;
+		int opt;
+
+		va_copy(dup_cmd_arg, cmd_arg);
+		opt = va_arg(dup_cmd_arg, int);
+		va_end(dup_cmd_arg);
+		if (opt == 0) {
+			return 0;
+		}
+		DBG_ERR("unexpected fcntl SETFL(%d)\n", opt);
+		goto err_out;
+	}
+	DBG_ERR("unexpected fcntl: %d\n", cmd);
+err_out:
+	errno = EINVAL;
 	return -1;
 }
 
@@ -994,6 +1638,16 @@ static bool vfs_gluster_getlock(struct vfs_handle_struct *handle,
 {
 	struct flock flock = { 0, };
 	int ret;
+	glfs_fd_t *glfd = NULL;
+
+	START_PROFILE(syscall_fcntl_getlock);
+
+	glfd = vfs_gluster_fetch_glfd(handle, fsp);
+	if (glfd == NULL) {
+		END_PROFILE(syscall_fcntl_getlock);
+		DBG_ERR("Failed to fetch gluster fd\n");
+		return false;
+	}
 
 	flock.l_type = *ptype;
 	flock.l_whence = SEEK_SET;
@@ -1001,9 +1655,10 @@ static bool vfs_gluster_getlock(struct vfs_handle_struct *handle,
 	flock.l_len = *pcount;
 	flock.l_pid = 0;
 
-	ret = glfs_posix_lock(*(glfs_fd_t **)VFS_FETCH_FSP_EXTENSION(handle, fsp), F_GETLK, &flock);
+	ret = glfs_posix_lock(glfd, F_GETLK, &flock);
 
 	if (ret == -1) {
+		END_PROFILE(syscall_fcntl_getlock);
 		return false;
 	}
 
@@ -1011,61 +1666,113 @@ static bool vfs_gluster_getlock(struct vfs_handle_struct *handle,
 	*poffset = flock.l_start;
 	*pcount = flock.l_len;
 	*ppid = flock.l_pid;
+	END_PROFILE(syscall_fcntl_getlock);
 
 	return true;
 }
 
-static int vfs_gluster_symlink(struct vfs_handle_struct *handle,
-			       const char *oldpath, const char *newpath)
+static int vfs_gluster_symlinkat(struct vfs_handle_struct *handle,
+				const struct smb_filename *link_target,
+				struct files_struct *dirfsp,
+				const struct smb_filename *new_smb_fname)
 {
-	return glfs_symlink(handle->data, oldpath, newpath);
+	int ret;
+
+	START_PROFILE(syscall_symlinkat);
+	SMB_ASSERT(dirfsp == dirfsp->conn->cwd_fsp);
+	ret = glfs_symlink(handle->data,
+			link_target->base_name,
+			new_smb_fname->base_name);
+	END_PROFILE(syscall_symlinkat);
+
+	return ret;
 }
 
-static int vfs_gluster_readlink(struct vfs_handle_struct *handle,
-				const char *path, char *buf, size_t bufsiz)
+static int vfs_gluster_readlinkat(struct vfs_handle_struct *handle,
+				files_struct *dirfsp,
+				const struct smb_filename *smb_fname,
+				char *buf,
+				size_t bufsiz)
 {
-	return glfs_readlink(handle->data, path, buf, bufsiz);
+	int ret;
+
+	START_PROFILE(syscall_readlinkat);
+	SMB_ASSERT(dirfsp == dirfsp->conn->cwd_fsp);
+	ret = glfs_readlink(handle->data, smb_fname->base_name, buf, bufsiz);
+	END_PROFILE(syscall_readlinkat);
+
+	return ret;
 }
 
-static int vfs_gluster_link(struct vfs_handle_struct *handle,
-			    const char *oldpath, const char *newpath)
+static int vfs_gluster_linkat(struct vfs_handle_struct *handle,
+				files_struct *srcfsp,
+				const struct smb_filename *old_smb_fname,
+				files_struct *dstfsp,
+				const struct smb_filename *new_smb_fname,
+				int flags)
 {
-	return glfs_link(handle->data, oldpath, newpath);
+	int ret;
+
+	START_PROFILE(syscall_linkat);
+
+	SMB_ASSERT(srcfsp == srcfsp->conn->cwd_fsp);
+	SMB_ASSERT(dstfsp == dstfsp->conn->cwd_fsp);
+
+	ret = glfs_link(handle->data,
+			old_smb_fname->base_name,
+			new_smb_fname->base_name);
+	END_PROFILE(syscall_linkat);
+
+	return ret;
 }
 
-static int vfs_gluster_mknod(struct vfs_handle_struct *handle, const char *path,
-			     mode_t mode, SMB_DEV_T dev)
+static int vfs_gluster_mknodat(struct vfs_handle_struct *handle,
+				files_struct *dirfsp,
+				const struct smb_filename *smb_fname,
+				mode_t mode,
+				SMB_DEV_T dev)
 {
-	return glfs_mknod(handle->data, path, mode, dev);
+	int ret;
+
+	START_PROFILE(syscall_mknodat);
+	SMB_ASSERT(dirfsp == dirfsp->conn->cwd_fsp);
+	ret = glfs_mknod(handle->data, smb_fname->base_name, mode, dev);
+	END_PROFILE(syscall_mknodat);
+
+	return ret;
 }
 
 static int vfs_gluster_chflags(struct vfs_handle_struct *handle,
-			       const char *path, unsigned int flags)
+				const struct smb_filename *smb_fname,
+				unsigned int flags)
 {
 	errno = ENOSYS;
 	return -1;
 }
 
 static int vfs_gluster_get_real_filename(struct vfs_handle_struct *handle,
-					 const char *path, const char *name,
-					 TALLOC_CTX *mem_ctx, char **found_name)
+					 const struct smb_filename *path,
+					 const char *name,
+					 TALLOC_CTX *mem_ctx,
+					 char **found_name)
 {
 	int ret;
-	char key_buf[NAME_MAX + 64];
-	char val_buf[NAME_MAX + 1];
+	char key_buf[GLUSTER_NAME_MAX + 64];
+	char val_buf[GLUSTER_NAME_MAX + 1];
 
-	if (strlen(name) >= NAME_MAX) {
+	if (strlen(name) >= GLUSTER_NAME_MAX) {
 		errno = ENAMETOOLONG;
 		return -1;
 	}
 
-	snprintf(key_buf, NAME_MAX + 64,
+	snprintf(key_buf, GLUSTER_NAME_MAX + 64,
 		 "glusterfs.get_real_filename:%s", name);
 
-	ret = glfs_getxattr(handle->data, path, key_buf, val_buf, NAME_MAX + 1);
+	ret = glfs_getxattr(handle->data, path->base_name, key_buf, val_buf,
+			    GLUSTER_NAME_MAX + 1);
 	if (ret == -1) {
-		if (errno == ENODATA) {
-			errno = EOPNOTSUPP;
+		if (errno == ENOATTR) {
+			errno = ENOENT;
 		}
 		return -1;
 	}
@@ -1079,7 +1786,7 @@ static int vfs_gluster_get_real_filename(struct vfs_handle_struct *handle,
 }
 
 static const char *vfs_gluster_connectpath(struct vfs_handle_struct *handle,
-					   const char *filename)
+				const struct smb_filename *smb_fname)
 {
 	return handle->conn->connectpath;
 }
@@ -1087,57 +1794,87 @@ static const char *vfs_gluster_connectpath(struct vfs_handle_struct *handle,
 /* EA Operations */
 
 static ssize_t vfs_gluster_getxattr(struct vfs_handle_struct *handle,
-				    const char *path, const char *name,
-				    void *value, size_t size)
+				const struct smb_filename *smb_fname,
+				const char *name,
+				void *value,
+				size_t size)
 {
-	return glfs_getxattr(handle->data, path, name, value, size);
+	return glfs_getxattr(handle->data, smb_fname->base_name,
+			     name, value, size);
 }
 
 static ssize_t vfs_gluster_fgetxattr(struct vfs_handle_struct *handle,
 				     files_struct *fsp, const char *name,
 				     void *value, size_t size)
 {
-	return glfs_fgetxattr(*(glfs_fd_t **)VFS_FETCH_FSP_EXTENSION(handle, fsp), name, value, size);
+	glfs_fd_t *glfd = vfs_gluster_fetch_glfd(handle, fsp);
+	if (glfd == NULL) {
+		DBG_ERR("Failed to fetch gluster fd\n");
+		return -1;
+	}
+
+	return glfs_fgetxattr(glfd, name, value, size);
 }
 
 static ssize_t vfs_gluster_listxattr(struct vfs_handle_struct *handle,
-				     const char *path, char *list, size_t size)
+				const struct smb_filename *smb_fname,
+				char *list,
+				size_t size)
 {
-	return glfs_listxattr(handle->data, path, list, size);
+	return glfs_listxattr(handle->data, smb_fname->base_name, list, size);
 }
 
 static ssize_t vfs_gluster_flistxattr(struct vfs_handle_struct *handle,
 				      files_struct *fsp, char *list,
 				      size_t size)
 {
-	return glfs_flistxattr(*(glfs_fd_t **)VFS_FETCH_FSP_EXTENSION(handle, fsp), list, size);
+	glfs_fd_t *glfd = vfs_gluster_fetch_glfd(handle, fsp);
+	if (glfd == NULL) {
+		DBG_ERR("Failed to fetch gluster fd\n");
+		return -1;
+	}
+
+	return glfs_flistxattr(glfd, list, size);
 }
 
 static int vfs_gluster_removexattr(struct vfs_handle_struct *handle,
-				   const char *path, const char *name)
+				const struct smb_filename *smb_fname,
+				const char *name)
 {
-	return glfs_removexattr(handle->data, path, name);
+	return glfs_removexattr(handle->data, smb_fname->base_name, name);
 }
 
 static int vfs_gluster_fremovexattr(struct vfs_handle_struct *handle,
 				    files_struct *fsp, const char *name)
 {
-	return glfs_fremovexattr(*(glfs_fd_t **)VFS_FETCH_FSP_EXTENSION(handle, fsp), name);
+	glfs_fd_t *glfd = vfs_gluster_fetch_glfd(handle, fsp);
+	if (glfd == NULL) {
+		DBG_ERR("Failed to fetch gluster fd\n");
+		return -1;
+	}
+
+	return glfs_fremovexattr(glfd, name);
 }
 
 static int vfs_gluster_setxattr(struct vfs_handle_struct *handle,
-				const char *path, const char *name,
+				const struct smb_filename *smb_fname,
+				const char *name,
 				const void *value, size_t size, int flags)
 {
-	return glfs_setxattr(handle->data, path, name, value, size, flags);
+	return glfs_setxattr(handle->data, smb_fname->base_name, name, value, size, flags);
 }
 
 static int vfs_gluster_fsetxattr(struct vfs_handle_struct *handle,
 				 files_struct *fsp, const char *name,
 				 const void *value, size_t size, int flags)
 {
-	return glfs_fsetxattr(*(glfs_fd_t **)VFS_FETCH_FSP_EXTENSION(handle, fsp), name, value, size,
-			      flags);
+	glfs_fd_t *glfd = vfs_gluster_fetch_glfd(handle, fsp);
+	if (glfd == NULL) {
+		DBG_ERR("Failed to fetch gluster fd\n");
+		return -1;
+	}
+
+	return glfs_fsetxattr(glfd, name, value, size, flags);
 }
 
 /* AIO Operations */
@@ -1148,531 +1885,137 @@ static bool vfs_gluster_aio_force(struct vfs_handle_struct *handle,
 	return false;
 }
 
-/* Offline Operations */
-
-static bool vfs_gluster_is_offline(struct vfs_handle_struct *handle,
-				   const struct smb_filename *fname,
-				   SMB_STRUCT_STAT *sbuf)
+static NTSTATUS vfs_gluster_create_dfs_pathat(struct vfs_handle_struct *handle,
+				struct files_struct *dirfsp,
+				const struct smb_filename *smb_fname,
+				const struct referral *reflist,
+				size_t referral_count)
 {
-	return false;
-}
+	TALLOC_CTX *frame = talloc_stackframe();
+	NTSTATUS status = NT_STATUS_NO_MEMORY;
+	int ret;
+	char *msdfs_link = NULL;
 
-static int vfs_gluster_set_offline(struct vfs_handle_struct *handle,
-				   const struct smb_filename *fname)
-{
-	errno = ENOTSUP;
-	return -1;
+	SMB_ASSERT(dirfsp == dirfsp->conn->cwd_fsp);
+
+	/* Form the msdfs_link contents */
+	msdfs_link = msdfs_link_string(frame,
+					reflist,
+					referral_count);
+	if (msdfs_link == NULL) {
+		goto out;
+	}
+
+	ret = glfs_symlink(handle->data,
+			msdfs_link,
+			smb_fname->base_name);
+	if (ret == 0) {
+		status = NT_STATUS_OK;
+	} else {
+		status = map_nt_error_from_unix(errno);
+	}
+
+  out:
+
+	TALLOC_FREE(frame);
+	return status;
 }
 
 /*
-  Gluster ACL Format:
-
-  Size = 4 (header) + N * 8 (entry)
-
-  Offset  Size    Field (Little Endian)
-  -------------------------------------
-  0-3     4-byte  Version
-
-  4-5     2-byte  Entry-1 tag
-  6-7     2-byte  Entry-1 perm
-  8-11    4-byte  Entry-1 id
-
-  12-13   2-byte  Entry-2 tag
-  14-15   2-byte  Entry-2 perm
-  16-19   4-byte  Entry-2 id
-
-  ...
-
+ * Read and return the contents of a DFS redirect given a
+ * pathname. A caller can pass in NULL for ppreflist and
+ * preferral_count but still determine if this was a
+ * DFS redirect point by getting NT_STATUS_OK back
+ * without incurring the overhead of reading and parsing
+ * the referral contents.
  */
 
-/* header version */
-#define GLUSTER_ACL_VERSION 2
-
-/* perm bits */
-#define GLUSTER_ACL_READ    0x04
-#define GLUSTER_ACL_WRITE   0x02
-#define GLUSTER_ACL_EXECUTE 0x01
-
-/* tag values */
-#define GLUSTER_ACL_UNDEFINED_TAG  0x00
-#define GLUSTER_ACL_USER_OBJ       0x01
-#define GLUSTER_ACL_USER           0x02
-#define GLUSTER_ACL_GROUP_OBJ      0x04
-#define GLUSTER_ACL_GROUP          0x08
-#define GLUSTER_ACL_MASK           0x10
-#define GLUSTER_ACL_OTHER          0x20
-
-#define GLUSTER_ACL_UNDEFINED_ID  (-1)
-
-#define GLUSTER_ACL_HEADER_SIZE    4
-#define GLUSTER_ACL_ENTRY_SIZE     8
-
-#define GLUSTER_ACL_SIZE(n)       (GLUSTER_ACL_HEADER_SIZE + (n * GLUSTER_ACL_ENTRY_SIZE))
-
-static SMB_ACL_T mode_to_smb_acls(const struct stat *mode, TALLOC_CTX *mem_ctx)
+static NTSTATUS vfs_gluster_read_dfs_pathat(struct vfs_handle_struct *handle,
+				TALLOC_CTX *mem_ctx,
+				struct files_struct *dirfsp,
+				const struct smb_filename *smb_fname,
+				struct referral **ppreflist,
+				size_t *preferral_count)
 {
-	struct smb_acl_t *result;
-	int count;
+	NTSTATUS status = NT_STATUS_NO_MEMORY;
+	size_t bufsize;
+	char *link_target = NULL;
+	int referral_len;
+	bool ok;
+#if defined(HAVE_BROKEN_READLINK)
+	char link_target_buf[PATH_MAX];
+#else
+	char link_target_buf[7];
+#endif
 
-	count = 3;
-	result = sys_acl_init(mem_ctx);
-	if (!result) {
-		errno = ENOMEM;
-		return NULL;
-	}
+	SMB_ASSERT(dirfsp == dirfsp->conn->cwd_fsp);
 
-	result->acl = talloc_array(result, struct smb_acl_entry, count);
-	if (!result->acl) {
-		errno = ENOMEM;
-		talloc_free(result);
-		return NULL;
-	}
-
-	result->count = count;
-
-	result->acl[0].a_type = SMB_ACL_USER_OBJ;
-	result->acl[0].a_perm = (mode->st_mode & S_IRWXU) >> 6;;
-
-	result->acl[1].a_type = SMB_ACL_GROUP_OBJ;
-	result->acl[1].a_perm = (mode->st_mode & S_IRWXG) >> 3;;
-
-	result->acl[2].a_type = SMB_ACL_OTHER;
-	result->acl[2].a_perm = mode->st_mode & S_IRWXO;;
-
-	return result;
-}
-
-static SMB_ACL_T gluster_to_smb_acl(const char *buf, size_t xattr_size,
-				    TALLOC_CTX *mem_ctx)
-{
-	int count;
-	size_t size;
-	struct smb_acl_entry *smb_ace;
-	struct smb_acl_t *result;
-	int i;
-	int offset;
-	uint16_t tag;
-	uint16_t perm;
-	uint32_t id;
-
-	size = xattr_size;
-
-	if (size < GLUSTER_ACL_HEADER_SIZE) {
-		/* ACL should be at least as big as the header (4 bytes) */
-		errno = EINVAL;
-		return NULL;
-	}
-
-	size -= GLUSTER_ACL_HEADER_SIZE; /* size of header = 4 bytes */
-
-	if (size % GLUSTER_ACL_ENTRY_SIZE) {
-		/* Size of entries must strictly be a multiple of
-		   size of an ACE (8 bytes)
-		*/
-		errno = EINVAL;
-		return NULL;
-	}
-
-	count = size / GLUSTER_ACL_ENTRY_SIZE;
-
-	/* Version is the first 4 bytes of the ACL */
-	if (IVAL(buf, 0) != GLUSTER_ACL_VERSION) {
-		DEBUG(0, ("Unknown gluster ACL version: %d\n",
-			  IVAL(buf, 0)));
-		return NULL;
-	}
-	offset = GLUSTER_ACL_HEADER_SIZE;
-
-	result = sys_acl_init(mem_ctx);
-	if (!result) {
-		errno = ENOMEM;
-		return NULL;
-	}
-
-	result->acl = talloc_array(result, struct smb_acl_entry, count);
-	if (!result->acl) {
-		errno = ENOMEM;
-		talloc_free(result);
-		return NULL;
-	}
-
-	result->count = count;
-
-	smb_ace = result->acl;
-
-	for (i = 0; i < count; i++) {
-		/* TAG is the first 2 bytes of an entry */
-		tag = SVAL(buf, offset);
-		offset += 2;
-
-		/* PERM is the next 2 bytes of an entry */
-		perm = SVAL(buf, offset);
-		offset += 2;
-
-		/* ID is the last 4 bytes of an entry */
-		id = IVAL(buf, offset);
-		offset += 4;
-
-		switch(tag) {
-		case GLUSTER_ACL_USER:
-			smb_ace->a_type = SMB_ACL_USER;
-			break;
-		case GLUSTER_ACL_USER_OBJ:
-			smb_ace->a_type = SMB_ACL_USER_OBJ;
-			break;
-		case GLUSTER_ACL_GROUP:
-			smb_ace->a_type = SMB_ACL_GROUP;
-			break;
-		case GLUSTER_ACL_GROUP_OBJ:
-			smb_ace->a_type = SMB_ACL_GROUP_OBJ;
-			break;
-		case GLUSTER_ACL_OTHER:
-			smb_ace->a_type = SMB_ACL_OTHER;
-			break;
-		case GLUSTER_ACL_MASK:
-			smb_ace->a_type = SMB_ACL_MASK;
-			break;
-		default:
-			DEBUG(0, ("unknown tag type %d\n", (unsigned int) tag));
-			return NULL;
-		}
-
-
-		switch(smb_ace->a_type) {
-		case SMB_ACL_USER:
-			smb_ace->info.user.uid = id;
-			break;
-		case SMB_ACL_GROUP:
-			smb_ace->info.group.gid = id;
-			break;
-		default:
-			break;
-		}
-
-		smb_ace->a_perm = 0;
-		smb_ace->a_perm |=
-			((perm & GLUSTER_ACL_READ) ? SMB_ACL_READ : 0);
-		smb_ace->a_perm |=
-			((perm & GLUSTER_ACL_WRITE) ? SMB_ACL_WRITE : 0);
-		smb_ace->a_perm |=
-			((perm & GLUSTER_ACL_EXECUTE) ? SMB_ACL_EXECUTE : 0);
-
-		smb_ace++;
-	}
-
-	return result;
-}
-
-
-static int gluster_ace_cmp(const void *left, const void *right)
-{
-	int ret = 0;
-	uint16_t tag_left, tag_right;
-	uint32_t id_left, id_right;
-
-	/*
-	  Sorting precedence:
-
-	   - Smaller TAG values must be earlier.
-
-	   - Within same TAG, smaller identifiers must be earlier, E.g:
-	     UID 0 entry must be earlier than UID 200
-	     GID 17 entry must be earlier than GID 19
-	*/
-
-	/* TAG is the first element in the entry */
-	tag_left = SVAL(left, 0);
-	tag_right = SVAL(right, 0);
-
-	ret = (tag_left - tag_right);
-	if (!ret) {
-		/* ID is the third element in the entry, after two short
-		   integers (tag and perm), i.e at offset 4.
-		*/
-		id_left = IVAL(left, 4);
-		id_right = IVAL(right, 4);
-		ret = id_left - id_right;
-	}
-
-	return ret;
-}
-
-
-static ssize_t smb_to_gluster_acl(SMB_ACL_T theacl, char *buf, size_t len)
-{
-	ssize_t size;
-	struct smb_acl_entry *smb_ace;
-	int i;
-	int count;
-	uint16_t tag;
-	uint16_t perm;
-	uint32_t id;
-	int offset;
-
-	count = theacl->count;
-
-	size = GLUSTER_ACL_HEADER_SIZE + (count * GLUSTER_ACL_ENTRY_SIZE);
-	if (!buf) {
-		return size;
-	}
-
-	if (len < size) {
-		errno = ERANGE;
-		return -1;
-	}
-
-	smb_ace = theacl->acl;
-
-	/* Version is the first 4 bytes of the ACL */
-	SIVAL(buf, 0, GLUSTER_ACL_VERSION);
-	offset = GLUSTER_ACL_HEADER_SIZE;
-
-	for (i = 0; i < count; i++) {
-		/* Calculate tag */
-		switch(smb_ace->a_type) {
-		case SMB_ACL_USER:
-			tag = GLUSTER_ACL_USER;
-			break;
-		case SMB_ACL_USER_OBJ:
-			tag = GLUSTER_ACL_USER_OBJ;
-			break;
-		case SMB_ACL_GROUP:
-			tag = GLUSTER_ACL_GROUP;
-			break;
-		case SMB_ACL_GROUP_OBJ:
-			tag = GLUSTER_ACL_GROUP_OBJ;
-			break;
-		case SMB_ACL_OTHER:
-			tag = GLUSTER_ACL_OTHER;
-			break;
-		case SMB_ACL_MASK:
-			tag = GLUSTER_ACL_MASK;
-			break;
-		default:
-			DEBUG(0, ("Unknown tag value %d\n",
-				  smb_ace->a_type));
-			errno = EINVAL;
-			return -1;
-		}
-
-
-		/* Calculate id */
-		switch(smb_ace->a_type) {
-		case SMB_ACL_USER:
-			id = smb_ace->info.user.uid;
-			break;
-		case SMB_ACL_GROUP:
-			id = smb_ace->info.group.gid;
-			break;
-		default:
-			id = GLUSTER_ACL_UNDEFINED_ID;
-			break;
-		}
-
-		/* Calculate perm */
-		perm = 0;
-
-		perm |=
-			((smb_ace->a_perm & SMB_ACL_READ) ? GLUSTER_ACL_READ : 0);
-		perm |=
-			((smb_ace->a_perm & SMB_ACL_WRITE) ? GLUSTER_ACL_WRITE : 0);
-		perm |=
-			((smb_ace->a_perm & SMB_ACL_EXECUTE) ? GLUSTER_ACL_EXECUTE : 0);
-
-
-		/* TAG is the first 2 bytes of an entry */
-		SSVAL(buf, offset, tag);
-		offset += 2;
-
-		/* PERM is the next 2 bytes of an entry */
-		SSVAL(buf, offset, perm);
-		offset += 2;
-
-		/* ID is the last 4 bytes of an entry */
-		SIVAL(buf, offset, id);
-		offset += 4;
-
-		smb_ace++;
-	}
-
-	/* Skip the header, sort @count number of 8-byte entries */
-	qsort(buf+GLUSTER_ACL_HEADER_SIZE, count, GLUSTER_ACL_ENTRY_SIZE,
-	      gluster_ace_cmp);
-
-	return size;
-}
-
-
-static SMB_ACL_T vfs_gluster_sys_acl_get_file(struct vfs_handle_struct *handle,
-					      const char *path_p,
-					      SMB_ACL_TYPE_T type,
-					      TALLOC_CTX *mem_ctx)
-{
-	struct smb_acl_t *result;
-	struct stat st;
-	char *buf;
-	const char *key;
-	ssize_t ret, size = GLUSTER_ACL_SIZE(20);
-
-	switch (type) {
-	case SMB_ACL_TYPE_ACCESS:
-		key = "system.posix_acl_access";
-		break;
-	case SMB_ACL_TYPE_DEFAULT:
-		key = "system.posix_acl_default";
-		break;
-	default:
-		errno = EINVAL;
-		return NULL;
-	}
-
-	buf = alloca(size);
-	if (!buf) {
-		return NULL;
-	}
-
-	ret = glfs_getxattr(handle->data, path_p, key, buf, size);
-	if (ret == -1 && errno == ERANGE) {
-		ret = glfs_getxattr(handle->data, path_p, key, 0, 0);
-		if (ret > 0) {
-			buf = alloca(ret);
-			if (!buf) {
-				return NULL;
-			}
-			ret = glfs_getxattr(handle->data, path_p, key, buf, ret);
+	if (ppreflist == NULL && preferral_count == NULL) {
+		/*
+		 * We're only checking if this is a DFS
+		 * redirect. We don't need to return data.
+		 */
+		bufsize = sizeof(link_target_buf);
+		link_target = link_target_buf;
+	} else {
+		bufsize = PATH_MAX;
+		link_target = talloc_array(mem_ctx, char, bufsize);
+		if (!link_target) {
+			goto err;
 		}
 	}
 
-	/* retrieving the ACL from the xattr has finally failed, do a
-	 * mode-to-acl mapping */
-
-	if (ret == -1 && errno == ENODATA) {
-		ret = glfs_stat(handle->data, path_p, &st);
-		if (ret == 0) {
-			result = mode_to_smb_acls(&st, mem_ctx);
-			return result;
+	referral_len = glfs_readlink(handle->data,
+				smb_fname->base_name,
+				link_target,
+				bufsize - 1);
+	if (referral_len < 0) {
+		if (errno == EINVAL) {
+			DBG_INFO("%s is not a link.\n", smb_fname->base_name);
+			status = NT_STATUS_OBJECT_TYPE_MISMATCH;
+		} else {
+			status = map_nt_error_from_unix(errno);
+			DBG_ERR("Error reading "
+				"msdfs link %s: %s\n",
+				smb_fname->base_name,
+				strerror(errno));
 		}
+		goto err;
+	}
+	link_target[referral_len] = '\0';
+
+	DBG_INFO("%s -> %s\n",
+			smb_fname->base_name,
+			link_target);
+
+	if (!strnequal(link_target, "msdfs:", 6)) {
+		status = NT_STATUS_OBJECT_TYPE_MISMATCH;
+		goto err;
 	}
 
-	if (ret <= 0) {
-		return NULL;
+	if (ppreflist == NULL && preferral_count == NULL) {
+		/* Early return for checking if this is a DFS link. */
+		return NT_STATUS_OK;
 	}
 
-	result = gluster_to_smb_acl(buf, ret, mem_ctx);
+	ok = parse_msdfs_symlink(mem_ctx,
+			lp_msdfs_shuffle_referrals(SNUM(handle->conn)),
+			link_target,
+			ppreflist,
+			preferral_count);
 
-	return result;
-}
-
-static SMB_ACL_T vfs_gluster_sys_acl_get_fd(struct vfs_handle_struct *handle,
-					    struct files_struct *fsp,
-					    TALLOC_CTX *mem_ctx)
-{
-	struct smb_acl_t *result;
-	struct stat st;
-	ssize_t ret, size = GLUSTER_ACL_SIZE(20);
-	char *buf;
-	glfs_fd_t *glfd;
-
-	glfd = *(glfs_fd_t **)VFS_FETCH_FSP_EXTENSION(handle, fsp);
-
-	buf = alloca(size);
-	if (!buf) {
-		return NULL;
+	if (ok) {
+		status = NT_STATUS_OK;
+	} else {
+		status = NT_STATUS_NO_MEMORY;
 	}
 
-	ret = glfs_fgetxattr(glfd, "system.posix_acl_access", buf, size);
-	if (ret == -1 && errno == ERANGE) {
-		ret = glfs_fgetxattr(glfd, "system.posix_acl_access", 0, 0);
-		if (ret > 0) {
-			buf = alloca(ret);
-			if (!buf) {
-				return NULL;
-			}
-			ret = glfs_fgetxattr(glfd, "system.posix_acl_access",
-					     buf, ret);
-		}
+  err:
+
+	if (link_target != link_target_buf) {
+		TALLOC_FREE(link_target);
 	}
-
-	/* retrieving the ACL from the xattr has finally failed, do a
-	 * mode-to-acl mapping */
-
-	if (ret == -1 && errno == ENODATA) {
-		ret = glfs_fstat(glfd, &st);
-		if (ret == 0) {
-			result = mode_to_smb_acls(&st, mem_ctx);
-			return result;
-		}
-	}
-
-	if (ret <= 0) {
-		return NULL;
-	}
-
-	result = gluster_to_smb_acl(buf, ret, mem_ctx);
-
-	return result;
-}
-
-static int vfs_gluster_sys_acl_set_file(struct vfs_handle_struct *handle,
-					const char *name,
-					SMB_ACL_TYPE_T acltype,
-					SMB_ACL_T theacl)
-{
-	int ret;
-	const char *key;
-	char *buf;
-	ssize_t size;
-
-	switch (acltype) {
-	case SMB_ACL_TYPE_ACCESS:
-		key = "system.posix_acl_access";
-		break;
-	case SMB_ACL_TYPE_DEFAULT:
-		key = "system.posix_acl_default";
-		break;
-	default:
-		errno = EINVAL;
-		return -1;
-	}
-
-	size = smb_to_gluster_acl(theacl, 0, 0);
-	buf = alloca(size);
-
-	size = smb_to_gluster_acl(theacl, buf, size);
-	if (size == -1) {
-		return -1;
-	}
-
-	ret = glfs_setxattr(handle->data, name, key, buf, size, 0);
-
-	return ret;
-}
-
-static int vfs_gluster_sys_acl_set_fd(struct vfs_handle_struct *handle,
-				      struct files_struct *fsp,
-				      SMB_ACL_T theacl)
-{
-	int ret;
-	char *buf;
-	ssize_t size;
-
-	size = smb_to_gluster_acl(theacl, 0, 0);
-	buf = alloca(size);
-
-	size = smb_to_gluster_acl(theacl, buf, size);
-	if (size == -1) {
-		return -1;
-	}
-
-	ret = glfs_fsetxattr(*(glfs_fd_t **)VFS_FETCH_FSP_EXTENSION(handle, fsp),
-			     "system.posix_acl_access", buf, size, 0);
-	return ret;
-}
-
-static int vfs_gluster_sys_acl_delete_def_file(struct vfs_handle_struct *handle,
-					       const char *path)
-{
-	return glfs_removexattr(handle->data, path, "system.posix_acl_default");
+	return status;
 }
 
 static struct vfs_fn_pointers glusterfs_fns = {
@@ -1691,35 +2034,29 @@ static struct vfs_fn_pointers glusterfs_fns = {
 
 	/* Directory Operations */
 
-	.opendir_fn = vfs_gluster_opendir,
 	.fdopendir_fn = vfs_gluster_fdopendir,
 	.readdir_fn = vfs_gluster_readdir,
 	.seekdir_fn = vfs_gluster_seekdir,
 	.telldir_fn = vfs_gluster_telldir,
 	.rewind_dir_fn = vfs_gluster_rewinddir,
-	.mkdir_fn = vfs_gluster_mkdir,
-	.rmdir_fn = vfs_gluster_rmdir,
+	.mkdirat_fn = vfs_gluster_mkdirat,
 	.closedir_fn = vfs_gluster_closedir,
-	.init_search_op_fn = vfs_gluster_init_search_op,
 
 	/* File Operations */
 
 	.open_fn = vfs_gluster_open,
 	.create_file_fn = NULL,
 	.close_fn = vfs_gluster_close,
-	.read_fn = vfs_gluster_read,
 	.pread_fn = vfs_gluster_pread,
 	.pread_send_fn = vfs_gluster_pread_send,
-	.pread_recv_fn = vfs_gluster_recv,
-	.write_fn = vfs_gluster_write,
+	.pread_recv_fn = vfs_gluster_pread_recv,
 	.pwrite_fn = vfs_gluster_pwrite,
 	.pwrite_send_fn = vfs_gluster_pwrite_send,
-	.pwrite_recv_fn = vfs_gluster_recv,
+	.pwrite_recv_fn = vfs_gluster_pwrite_recv,
 	.lseek_fn = vfs_gluster_lseek,
 	.sendfile_fn = vfs_gluster_sendfile,
 	.recvfile_fn = vfs_gluster_recvfile,
-	.rename_fn = vfs_gluster_rename,
-	.fsync_fn = vfs_gluster_fsync,
+	.renameat_fn = vfs_gluster_renameat,
 	.fsync_send_fn = vfs_gluster_fsync_send,
 	.fsync_recv_fn = vfs_gluster_fsync_recv,
 
@@ -1727,11 +2064,10 @@ static struct vfs_fn_pointers glusterfs_fns = {
 	.fstat_fn = vfs_gluster_fstat,
 	.lstat_fn = vfs_gluster_lstat,
 	.get_alloc_size_fn = vfs_gluster_get_alloc_size,
-	.unlink_fn = vfs_gluster_unlink,
+	.unlinkat_fn = vfs_gluster_unlinkat,
 
 	.chmod_fn = vfs_gluster_chmod,
 	.fchmod_fn = vfs_gluster_fchmod,
-	.chown_fn = vfs_gluster_chown,
 	.fchown_fn = vfs_gluster_fchown,
 	.lchown_fn = vfs_gluster_lchown,
 	.chdir_fn = vfs_gluster_chdir,
@@ -1741,48 +2077,47 @@ static struct vfs_fn_pointers glusterfs_fns = {
 	.fallocate_fn = vfs_gluster_fallocate,
 	.lock_fn = vfs_gluster_lock,
 	.kernel_flock_fn = vfs_gluster_kernel_flock,
+	.fcntl_fn = vfs_gluster_fcntl,
 	.linux_setlease_fn = vfs_gluster_linux_setlease,
 	.getlock_fn = vfs_gluster_getlock,
-	.symlink_fn = vfs_gluster_symlink,
-	.readlink_fn = vfs_gluster_readlink,
-	.link_fn = vfs_gluster_link,
-	.mknod_fn = vfs_gluster_mknod,
+	.symlinkat_fn = vfs_gluster_symlinkat,
+	.readlinkat_fn = vfs_gluster_readlinkat,
+	.linkat_fn = vfs_gluster_linkat,
+	.mknodat_fn = vfs_gluster_mknodat,
 	.realpath_fn = vfs_gluster_realpath,
 	.chflags_fn = vfs_gluster_chflags,
 	.file_id_create_fn = NULL,
-	.copy_chunk_send_fn = NULL,
-	.copy_chunk_recv_fn = NULL,
 	.streaminfo_fn = NULL,
 	.get_real_filename_fn = vfs_gluster_get_real_filename,
 	.connectpath_fn = vfs_gluster_connectpath,
+	.create_dfs_pathat_fn = vfs_gluster_create_dfs_pathat,
+	.read_dfs_pathat_fn = vfs_gluster_read_dfs_pathat,
 
 	.brl_lock_windows_fn = NULL,
 	.brl_unlock_windows_fn = NULL,
-	.brl_cancel_windows_fn = NULL,
-	.strict_lock_fn = NULL,
-	.strict_unlock_fn = NULL,
+	.strict_lock_check_fn = NULL,
 	.translate_name_fn = NULL,
 	.fsctl_fn = NULL,
 
 	/* NT ACL Operations */
 	.fget_nt_acl_fn = NULL,
-	.get_nt_acl_fn = NULL,
+	.get_nt_acl_at_fn = NULL,
 	.fset_nt_acl_fn = NULL,
 	.audit_file_fn = NULL,
 
 	/* Posix ACL Operations */
-	.chmod_acl_fn = NULL,	/* passthrough to default */
-	.fchmod_acl_fn = NULL,	/* passthrough to default */
-	.sys_acl_get_file_fn = vfs_gluster_sys_acl_get_file,
-	.sys_acl_get_fd_fn = vfs_gluster_sys_acl_get_fd,
+	.sys_acl_get_file_fn = posixacl_xattr_acl_get_file,
+	.sys_acl_get_fd_fn = posixacl_xattr_acl_get_fd,
 	.sys_acl_blob_get_file_fn = posix_sys_acl_blob_get_file,
 	.sys_acl_blob_get_fd_fn = posix_sys_acl_blob_get_fd,
-	.sys_acl_set_file_fn = vfs_gluster_sys_acl_set_file,
-	.sys_acl_set_fd_fn = vfs_gluster_sys_acl_set_fd,
-	.sys_acl_delete_def_file_fn = vfs_gluster_sys_acl_delete_def_file,
+	.sys_acl_set_file_fn = posixacl_xattr_acl_set_file,
+	.sys_acl_set_fd_fn = posixacl_xattr_acl_set_fd,
+	.sys_acl_delete_def_file_fn = posixacl_xattr_acl_delete_def_file,
 
 	/* EA Operations */
 	.getxattr_fn = vfs_gluster_getxattr,
+	.getxattrat_send_fn = vfs_not_implemented_getxattrat_send,
+	.getxattrat_recv_fn = vfs_not_implemented_getxattrat_recv,
 	.fgetxattr_fn = vfs_gluster_fgetxattr,
 	.listxattr_fn = vfs_gluster_listxattr,
 	.flistxattr_fn = vfs_gluster_flistxattr,
@@ -1794,18 +2129,14 @@ static struct vfs_fn_pointers glusterfs_fns = {
 	/* AIO Operations */
 	.aio_force_fn = vfs_gluster_aio_force,
 
-	/* Offline Operations */
-	.is_offline_fn = vfs_gluster_is_offline,
-	.set_offline_fn = vfs_gluster_set_offline,
-
 	/* Durable handle Operations */
 	.durable_cookie_fn = NULL,
 	.durable_disconnect_fn = NULL,
 	.durable_reconnect_fn = NULL,
 };
 
-NTSTATUS vfs_glusterfs_init(void);
-NTSTATUS vfs_glusterfs_init(void)
+static_decl_vfs;
+NTSTATUS vfs_glusterfs_init(TALLOC_CTX *ctx)
 {
 	return smb_register_vfs(SMB_VFS_INTERFACE_VERSION,
 				"glusterfs", &glusterfs_fns);

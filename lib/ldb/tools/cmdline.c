@@ -59,7 +59,7 @@ static struct poptOption builtin_popt_options[] = {
 	{ "relax", 0, POPT_ARG_NONE, NULL, CMDLINE_RELAX, "pass relax control", NULL },
 	{ "cross-ncs", 0, POPT_ARG_NONE, NULL, 'N', "search across NC boundaries", NULL },
 	{ "extended-dn", 0, POPT_ARG_NONE, NULL, 'E', "show extended DNs", NULL },
-	{ NULL }
+	{0}
 };
 
 void ldb_cmdline_help(struct ldb_context *ldb, const char *cmdname, FILE *f)
@@ -93,9 +93,11 @@ static bool add_control(TALLOC_CTX *mem_ctx, const char *control)
 /**
   process command line options
 */
-struct ldb_cmdline *ldb_cmdline_process(struct ldb_context *ldb, 
+static struct ldb_cmdline *ldb_cmdline_process_internal(struct ldb_context *ldb,
 					int argc, const char **argv,
-					void (*usage)(struct ldb_context *))
+					void (*usage)(struct ldb_context *),
+					bool dont_create,
+					bool search)
 {
 	struct ldb_cmdline *ret=NULL;
 	poptContext pc;
@@ -278,8 +280,12 @@ struct ldb_cmdline *ldb_cmdline_process(struct ldb_context *ldb,
 		flags |= LDB_FLG_NOSYNC;
 	}
 
-	if (options.show_binary) {
-		flags |= LDB_FLG_SHOW_BINARY;
+	if (search) {
+		flags |= LDB_FLG_DONT_CREATE_DB;
+
+		if (options.show_binary) {
+			flags |= LDB_FLG_SHOW_BINARY;
+		}
 	}
 
 	if (options.tracing) {
@@ -315,6 +321,27 @@ failed:
 	talloc_free(ret);
 	exit(LDB_ERR_OPERATIONS_ERROR);
 	return NULL;
+}
+
+struct ldb_cmdline *ldb_cmdline_process_search(struct ldb_context *ldb,
+					       int argc, const char **argv,
+					       void (*usage)(struct ldb_context *))
+{
+	return ldb_cmdline_process_internal(ldb, argc, argv, usage, true, true);
+}
+
+struct ldb_cmdline *ldb_cmdline_process_edit(struct ldb_context *ldb,
+					     int argc, const char **argv,
+					     void (*usage)(struct ldb_context *))
+{
+	return ldb_cmdline_process_internal(ldb, argc, argv, usage, false, true);
+}
+
+struct ldb_cmdline *ldb_cmdline_process(struct ldb_context *ldb,
+					int argc, const char **argv,
+					void (*usage)(struct ldb_context *))
+{
+	return ldb_cmdline_process_internal(ldb, argc, argv, usage, false, false);
 }
 
 /* this function check controls reply and determines if more
@@ -456,6 +483,39 @@ int handle_controls_reply(struct ldb_control **reply, struct ldb_control **reque
 
 			cookie = ldb_base64_encode(req_control, rep_control->cookie, rep_control->cookie_len);
 			printf("# DIRSYNC cookie returned was:\n# %s\n", cookie);
+
+			continue;
+		}
+		if (strcmp(LDB_CONTROL_DIRSYNC_EX_OID, reply[i]->oid) == 0) {
+			struct ldb_dirsync_control *rep_control, *req_control;
+			char *cookie;
+
+			rep_control = talloc_get_type(reply[i]->data, struct ldb_dirsync_control);
+			if (rep_control->cookie_len == 0) /* we are done */
+				break;
+
+			/* more processing required */
+			/* let's fill in the request control with the new cookie */
+
+			for (j = 0; request[j]; j++) {
+				if (strcmp(LDB_CONTROL_DIRSYNC_EX_OID, request[j]->oid) == 0)
+					break;
+			}
+			/* if there's a reply control we must find a request
+			 * control matching it */
+			if (! request[j]) return -1;
+
+			req_control = talloc_get_type(request[j]->data, struct ldb_dirsync_control);
+
+			if (req_control->cookie)
+				talloc_free(req_control->cookie);
+			req_control->cookie = (char *)talloc_memdup(
+				req_control, rep_control->cookie,
+				rep_control->cookie_len);
+			req_control->cookie_len = rep_control->cookie_len;
+
+			cookie = ldb_base64_encode(req_control, rep_control->cookie, rep_control->cookie_len);
+			printf("# DIRSYNC_EX cookie returned was:\n# %s\n", cookie);
 
 			continue;
 		}

@@ -34,7 +34,13 @@ typedef struct {
 	struct ldb_context *ldb_ctx;
 } PyLdbObject;
 
-#define pyldb_Ldb_AsLdbContext(pyobj) ((PyLdbObject *)pyobj)->ldb_ctx
+/* pyldb_Ldb_AS_LDBCONTEXT() does not check argument validity,
+   pyldb_Ldb_AsLdbContext() does */
+#define pyldb_Ldb_AS_LDBCONTEXT(pyobj) ((PyLdbObject *)pyobj)->ldb_ctx
+
+#define pyldb_Ldb_AsLdbContext(pyobj)		\
+	(pyldb_check_type(pyobj, "Ldb") ?	\
+	 pyldb_Ldb_AS_LDBCONTEXT(pyobj) : NULL)
 
 typedef struct {
 	PyObject_HEAD
@@ -44,7 +50,9 @@ typedef struct {
 
 PyObject *pyldb_Dn_FromDn(struct ldb_dn *);
 bool pyldb_Object_AsDn(TALLOC_CTX *mem_ctx, PyObject *object, struct ldb_context *ldb_ctx, struct ldb_dn **dn);
-#define pyldb_Dn_AsDn(pyobj) ((PyLdbDnObject *)pyobj)->dn
+#define pyldb_Dn_AS_DN(pyobj) ((PyLdbDnObject *)pyobj)->dn
+
+bool pyldb_check_type(PyObject *obj, const char *type_name);
 
 typedef struct {
 	PyObject_HEAD
@@ -60,11 +68,18 @@ typedef struct {
 } PyLdbModuleObject;
 #define pyldb_Module_AsModule(pyobj) ((PyLdbModuleObject *)pyobj)->mod
 
+/*
+ * NOTE: el (and so the return value of
+ * pyldb_MessageElement_AsMessageElement()) may not be a valid talloc
+ * context, it could be part of an array
+ */
+
 typedef struct {
 	PyObject_HEAD
 	TALLOC_CTX *mem_ctx;
 	struct ldb_message_element *el;
 } PyLdbMessageElementObject;
+
 #define pyldb_MessageElement_AsMessageElement(pyobj) ((PyLdbMessageElementObject *)pyobj)->el
 
 typedef struct {
@@ -88,11 +103,12 @@ typedef struct {
 	struct ldb_control *data;
 } PyLdbControlObject;
 
-#define PyErr_LDB_ERROR_IS_ERR_RAISE(err,ret,ldb) \
+#define PyErr_LDB_ERROR_IS_ERR_RAISE(err,ret,ldb) do { \
 	if (ret != LDB_SUCCESS) { \
 		PyErr_SetLdbError(err, ret, ldb); \
 		return NULL; \
-	}
+	} \
+} while(0)
 
 /* Picked out of thin air. To do this properly, we should probably have some part of the 
  * errors in LDB be allocated to bindings ? */

@@ -31,7 +31,10 @@
 #include "lib/param/param.h"
 #include "lib/param/loadparm.h"
 #include "lib/param/param_global.h"
+#include "libcli/auth/ntlm_check.h"
 #include "libcli/smb/smb_constants.h"
+#include "libds/common/roles.h"
+#include "source4/lib/tls/tls.h"
 
 #ifndef N_
 #define N_(x) x
@@ -57,6 +60,17 @@ static const struct enum_list enum_protocol[] = {
 	{PROTOCOL_COREPLUS, "CORE+"},
 	{-1, NULL}
 };
+
+const char* lpcfg_get_smb_protocol(int type)
+{
+	int i;
+	for (i = 1; enum_protocol[i].value != -1; i++) {
+		if (enum_protocol[i].value == type) {
+			return enum_protocol[i].name;
+		}
+	}
+	return NULL;
+}
 
 static const struct enum_list enum_security[] = {
 	{SEC_AUTO, "AUTO"},
@@ -124,6 +138,26 @@ static const struct enum_list enum_smb_signing_vals[] = {
 	{-1, NULL}
 };
 
+static const struct enum_list enum_mdns_name_values[] = {
+	{MDNS_NAME_NETBIOS, "netbios"},
+	{MDNS_NAME_MDNS, "mdns"},
+	{-1, NULL}
+};
+
+static const struct enum_list enum_tls_verify_peer_vals[] = {
+	{TLS_VERIFY_PEER_NO_CHECK,
+	 TLS_VERIFY_PEER_NO_CHECK_STRING},
+	{TLS_VERIFY_PEER_CA_ONLY,
+	 TLS_VERIFY_PEER_CA_ONLY_STRING},
+	{TLS_VERIFY_PEER_CA_AND_NAME_IF_AVAILABLE,
+	 TLS_VERIFY_PEER_CA_AND_NAME_IF_AVAILABLE_STRING},
+	{TLS_VERIFY_PEER_CA_AND_NAME,
+	 TLS_VERIFY_PEER_CA_AND_NAME_STRING},
+	{TLS_VERIFY_PEER_AS_STRICT_AS_POSSIBLE,
+	 TLS_VERIFY_PEER_AS_STRICT_AS_POSSIBLE_STRING},
+	{-1, NULL}
+};
+
 /* DNS update options. */
 static const struct enum_list enum_dns_update_settings[] = {
 	{DNS_UPDATE_OFF, "disabled"},
@@ -186,9 +220,22 @@ static const struct enum_list enum_smbd_profiling_level[] = {
 static const struct enum_list enum_kerberos_method[] = {
 	{KERBEROS_VERIFY_SECRETS, "default"},
 	{KERBEROS_VERIFY_SECRETS, "secrets only"},
+	{KERBEROS_VERIFY_SECRETS, "secretsonly"},
 	{KERBEROS_VERIFY_SYSTEM_KEYTAB, "system keytab"},
+	{KERBEROS_VERIFY_SYSTEM_KEYTAB, "systemkeytab"},
 	{KERBEROS_VERIFY_DEDICATED_KEYTAB, "dedicated keytab"},
+	{KERBEROS_VERIFY_DEDICATED_KEYTAB, "dedicatedkeytab"},
 	{KERBEROS_VERIFY_SECRETS_AND_KEYTAB, "secrets and keytab"},
+	{KERBEROS_VERIFY_SECRETS_AND_KEYTAB, "secretsandkeytab"},
+	{-1, NULL}
+};
+
+/* Kerberos encryption types selection options */
+
+static const struct enum_list enum_kerberos_encryption_types_vals[] = {
+	{KERBEROS_ETYPES_ALL, "all"},
+	{KERBEROS_ETYPES_STRONG, "strong"},
+	{KERBEROS_ETYPES_LEGACY, "legacy"},
 	{-1, NULL}
 };
 
@@ -219,6 +266,18 @@ static const struct enum_list enum_ldap_sasl_wrapping[] = {
 	{0, "plain"},
 	{ADS_AUTH_SASL_SIGN, "sign"},
 	{ADS_AUTH_SASL_SEAL, "seal"},
+	{-1, NULL}
+};
+
+static const struct enum_list enum_ldap_server_require_strong_auth_vals[] = {
+	{ LDAP_SERVER_REQUIRE_STRONG_AUTH_NO, "No" },
+	{ LDAP_SERVER_REQUIRE_STRONG_AUTH_NO, "False" },
+	{ LDAP_SERVER_REQUIRE_STRONG_AUTH_NO, "0" },
+	{ LDAP_SERVER_REQUIRE_STRONG_AUTH_ALLOW_SASL_OVER_TLS,
+	  "allow_sasl_over_tls" },
+	{ LDAP_SERVER_REQUIRE_STRONG_AUTH_YES, "Yes" },
+	{ LDAP_SERVER_REQUIRE_STRONG_AUTH_YES, "True" },
+	{ LDAP_SERVER_REQUIRE_STRONG_AUTH_YES, "1" },
 	{-1, NULL}
 };
 
@@ -271,6 +330,44 @@ static const struct enum_list enum_case[] = {
 	{-1, NULL}
 };
 
+static const struct enum_list enum_inherit_owner_vals[] = {
+    {INHERIT_OWNER_NO, "no"},
+    {INHERIT_OWNER_WINDOWS_AND_UNIX, "windows and unix"},
+    {INHERIT_OWNER_WINDOWS_AND_UNIX, "yes"},
+    {INHERIT_OWNER_UNIX_ONLY, "unix only"},
+    {-1, NULL}};
+
+static const struct enum_list enum_mangled_names[] = {
+	{MANGLED_NAMES_NO, "no"},
+	{MANGLED_NAMES_NO, "false"},
+	{MANGLED_NAMES_NO, "0"},
+	{MANGLED_NAMES_ILLEGAL, "illegal"},
+	{MANGLED_NAMES_YES, "yes"},
+	{MANGLED_NAMES_YES, "true"},
+	{MANGLED_NAMES_YES, "1"},
+	{-1, NULL}
+};
+
+static const struct enum_list enum_ntlm_auth[] = {
+	{NTLM_AUTH_DISABLED, "disabled"},
+	{NTLM_AUTH_NTLMV2_ONLY, "ntlmv2-only"},
+	{NTLM_AUTH_NTLMV2_ONLY, "no"},
+	{NTLM_AUTH_NTLMV2_ONLY, "false"},
+	{NTLM_AUTH_NTLMV2_ONLY, "0"},
+	{NTLM_AUTH_ON, "ntlmv1-permitted"},
+	{NTLM_AUTH_ON, "yes"},
+	{NTLM_AUTH_ON, "true"},
+	{NTLM_AUTH_ON, "1"},
+	{NTLM_AUTH_MSCHAPv2_NTLMV2_ONLY, "mschapv2-and-ntlmv2-only"},
+	{-1, NULL}
+};
+
+static const struct enum_list enum_spotlight_backend[] = {
+	{SPOTLIGHT_BACKEND_NOINDEX, "noindex"},
+	{SPOTLIGHT_BACKEND_TRACKER, "tracker"},
+	{SPOTLIGHT_BACKEND_ES, "elasticsearch"},
+	{-1, NULL}
+};
 
 /* Note: We do not initialise the defaults union - it is not allowed in ANSI C
  *

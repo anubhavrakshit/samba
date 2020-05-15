@@ -28,7 +28,10 @@
 #include "../libcli/auth/pam_errors.h"
 #include "param/param.h"
 
-_PUBLIC_ NTSTATUS auth4_unix_init(void);
+#undef DBGC_CLASS
+#define DBGC_CLASS DBGC_AUTH
+
+_PUBLIC_ NTSTATUS auth4_unix_init(TALLOC_CTX *);
 
 /* TODO: look at how to best fill in parms retrieveing a struct passwd info
  * except in case USER_INFO_DONT_CHECK_UNIX_ACCOUNT is set
@@ -263,7 +266,7 @@ static NTSTATUS smb_pam_start(pam_handle_t **pamh, const char *account_name, con
 
 		pam_error = pam_end(*pamh, 0);
 		if (pam_error != PAM_SUCCESS) {
-			/* no vaild pamh here, can we reliably call pam_strerror ? */
+			/* no valid pamh here, can we reliably call pam_strerror ? */
 			DEBUG(4,("smb_pam_start: clean up failed, pam_end gave error %d.\n",
 				 pam_error));
 			return pam_to_nt_status(pam_error);
@@ -283,7 +286,7 @@ static NTSTATUS smb_pam_start(pam_handle_t **pamh, const char *account_name, con
 
 		pam_error = pam_end(*pamh, 0);
 		if (pam_error != PAM_SUCCESS) {
-			/* no vaild pamh here, can we reliably call pam_strerror ? */
+			/* no valid pamh here, can we reliably call pam_strerror ? */
 			DEBUG(4,("smb_pam_start: clean up failed, pam_end gave error %d.\n",
 				 pam_error));
 			return pam_to_nt_status(pam_error);
@@ -303,7 +306,7 @@ static NTSTATUS smb_pam_end(pam_handle_t *pamh)
 	if (pamh != NULL) {
 		pam_error = pam_end(pamh, 0);
 		if (pam_error != PAM_SUCCESS) {
-			/* no vaild pamh here, can we reliably call pam_strerror ? */
+			/* no valid pamh here, can we reliably call pam_strerror ? */
 			DEBUG(4,("smb_pam_end: clean up failed, pam_end gave error %d.\n",
 				 pam_error));
 			return pam_to_nt_status(pam_error);
@@ -329,7 +332,7 @@ static NTSTATUS smb_pam_auth(pam_handle_t *pamh, bool allow_null_passwords, cons
 	
 	DEBUG(4,("smb_pam_auth: PAM: Authenticate User: %s\n", user));
 
-	pam_error = pam_authenticate(pamh, PAM_SILENT | allow_null_passwords ? 0 : PAM_DISALLOW_NULL_AUTHTOK);
+	pam_error = pam_authenticate(pamh, PAM_SILENT | (allow_null_passwords ? 0 : PAM_DISALLOW_NULL_AUTHTOK));
 	switch( pam_error ){
 		case PAM_AUTH_ERR:
 			DEBUG(2, ("smb_pam_auth: PAM: Authentication Error for user %s\n", user));
@@ -713,7 +716,8 @@ static NTSTATUS authunix_want_check(struct auth_method_context *ctx,
 static NTSTATUS authunix_check_password(struct auth_method_context *ctx,
 					TALLOC_CTX *mem_ctx,
 					const struct auth_usersupplied_info *user_info,
-					struct auth_user_info_dc **user_info_dc)
+					struct auth_user_info_dc **user_info_dc,
+					bool *authoritative)
 {
 	TALLOC_CTX *check_ctx;
 	NTSTATUS nt_status;
@@ -751,11 +755,11 @@ static const struct auth_operations unix_ops = {
 	.check_password	= authunix_check_password
 };
 
-_PUBLIC_ NTSTATUS auth4_unix_init(void)
+_PUBLIC_ NTSTATUS auth4_unix_init(TALLOC_CTX *ctx)
 {
 	NTSTATUS ret;
 
-	ret = auth_register(&unix_ops);
+	ret = auth_register(ctx, &unix_ops);
 	if (!NT_STATUS_IS_OK(ret)) {
 		DEBUG(0,("Failed to register unix auth backend!\n"));
 		return ret;

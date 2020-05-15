@@ -107,7 +107,8 @@ static bool test_LogonUasLogon(struct torture_context *tctx,
 	struct dcerpc_binding_handle *b = p->binding_handle;
 
 	r.in.server_name = NULL;
-	r.in.account_name = cli_credentials_get_username(cmdline_credentials);
+	r.in.account_name = cli_credentials_get_username(
+				popt_get_cmdline_credentials());
 	r.in.workstation = TEST_MACHINE_NAME;
 	r.out.info = &info;
 
@@ -126,7 +127,8 @@ static bool test_LogonUasLogoff(struct torture_context *tctx,
 	struct dcerpc_binding_handle *b = p->binding_handle;
 
 	r.in.server_name = NULL;
-	r.in.account_name = cli_credentials_get_username(cmdline_credentials);
+	r.in.account_name = cli_credentials_get_username(
+				popt_get_cmdline_credentials());
 	r.in.workstation = TEST_MACHINE_NAME;
 	r.out.info = &info;
 
@@ -302,10 +304,18 @@ bool test_SetupCredentials3(struct dcerpc_pipe *p, struct torture_context *tctx,
 	uint32_t rid;
 	const char *machine_name;
 	const char *plain_pass;
-	struct dcerpc_binding_handle *b = p->binding_handle;
+	struct dcerpc_binding_handle *b = NULL;
+
+	if (p == NULL) {
+		return false;
+	}
+
+	b = p->binding_handle;
 
 	machine_name = cli_credentials_get_workstation(machine_credentials);
+	torture_assert(tctx, machine_name != NULL, "machine_name");
 	plain_pass = cli_credentials_get_password(machine_credentials);
+	torture_assert(tctx, plain_pass != NULL, "plain_pass");
 
 	torture_comment(tctx, "Testing ServerReqChallenge\n");
 
@@ -356,6 +366,123 @@ bool test_SetupCredentials3(struct dcerpc_pipe *p, struct torture_context *tctx,
 	torture_assert_ntstatus_ok(tctx, r.out.result, "ServerReqChallenge failed");
 
 	*creds_out = creds;
+	return true;
+}
+
+bool test_SetupCredentialsDowngrade(struct torture_context *tctx,
+					struct dcerpc_pipe *p,
+					struct cli_credentials *machine_credentials)
+{
+	struct netr_ServerReqChallenge r;
+	struct netr_ServerAuthenticate3 a;
+	struct netr_Credential credentials1, credentials2, credentials3;
+	struct netlogon_creds_CredentialState *creds;
+	struct samr_Password mach_password;
+	uint32_t rid;
+	const char *machine_name;
+	const char *plain_pass;
+	struct dcerpc_binding_handle *b = p->binding_handle;
+	uint32_t negotiate_flags = 0;
+
+	machine_name = cli_credentials_get_workstation(machine_credentials);
+	torture_assert(tctx, machine_name != NULL, "machine_name");
+	plain_pass = cli_credentials_get_password(machine_credentials);
+	torture_assert(tctx, plain_pass != NULL, "plain_pass");
+
+	torture_comment(tctx, "Testing ServerReqChallenge\n");
+
+	r.in.server_name = NULL;
+	r.in.computer_name = machine_name;
+	r.in.credentials = &credentials1;
+	r.out.return_credentials = &credentials2;
+
+	generate_random_buffer(credentials1.data, sizeof(credentials1.data));
+
+	torture_assert_ntstatus_ok(tctx, dcerpc_netr_ServerReqChallenge_r(b, tctx, &r),
+		"ServerReqChallenge failed");
+	torture_assert_ntstatus_ok(tctx, r.out.result, "ServerReqChallenge failed");
+
+	E_md4hash(plain_pass, mach_password.hash);
+
+	a.in.server_name = NULL;
+	a.in.account_name = talloc_asprintf(tctx, "%s$", machine_name);
+	a.in.secure_channel_type = cli_credentials_get_secure_channel_type(machine_credentials);
+	a.in.computer_name = machine_name;
+	a.in.negotiate_flags = &negotiate_flags;
+	a.in.credentials = &credentials3;
+	a.out.return_credentials = &credentials3;
+	a.out.negotiate_flags = &negotiate_flags;
+	a.out.rid = &rid;
+
+	creds = netlogon_creds_client_init(tctx, a.in.account_name,
+					   a.in.computer_name,
+					   a.in.secure_channel_type,
+					   &credentials1, &credentials2,
+					   &mach_password, &credentials3,
+					   negotiate_flags);
+
+	torture_assert(tctx, creds != NULL, "memory allocation");
+
+	torture_comment(tctx, "Testing ServerAuthenticate3\n");
+
+	torture_assert_ntstatus_ok(tctx, dcerpc_netr_ServerAuthenticate3_r(b, tctx, &a),
+		"ServerAuthenticate3 failed");
+	torture_assert_ntstatus_equal(tctx, a.out.result, NT_STATUS_DOWNGRADE_DETECTED, "ServerAuthenticate3 should have failed");
+
+	negotiate_flags = NETLOGON_NEG_AUTH2_ADS_FLAGS;
+	creds = netlogon_creds_client_init(tctx, a.in.account_name,
+					   a.in.computer_name,
+					   a.in.secure_channel_type,
+					   &credentials1, &credentials2,
+					   &mach_password, &credentials3,
+					   negotiate_flags);
+
+	torture_assert(tctx, creds != NULL, "memory allocation");
+
+	torture_comment(tctx, "Testing ServerAuthenticate3\n");
+
+	torture_assert_ntstatus_ok(tctx, dcerpc_netr_ServerAuthenticate3_r(b, tctx, &a),
+		"ServerAuthenticate3 failed");
+	torture_assert_ntstatus_ok(tctx, a.out.result, "ServerAuthenticate3 should succeed");
+
+	torture_assert(tctx, netlogon_creds_client_check(creds, &credentials3), "Credential chaining failed");
+
+	torture_comment(tctx, "negotiate_flags=0x%08x\n", negotiate_flags);
+
+	/* Prove that requesting a challenge again won't break it */
+	torture_assert_ntstatus_ok(tctx, dcerpc_netr_ServerReqChallenge_r(b, tctx, &r),
+		"ServerReqChallenge failed");
+	torture_assert_ntstatus_ok(tctx, r.out.result, "ServerReqChallenge failed");
+
+	return true;
+}
+
+bool test_SetupCredentialsPipe(const struct dcerpc_pipe *p1,
+			       struct torture_context *tctx,
+			       struct cli_credentials *machine_credentials,
+			       struct netlogon_creds_CredentialState *creds,
+			       uint32_t additional_flags,
+			       struct dcerpc_pipe **_p2)
+{
+	NTSTATUS status;
+	struct dcerpc_binding *b2 = NULL;
+	struct dcerpc_pipe *p2 = NULL;
+
+	b2 = dcerpc_binding_dup(tctx, p1->binding);
+	torture_assert(tctx, b2 != NULL, "dcerpc_binding_dup");
+	dcerpc_binding_set_flags(b2,
+				 DCERPC_SCHANNEL | additional_flags,
+				 DCERPC_AUTH_OPTIONS);
+
+	cli_credentials_set_netlogon_creds(machine_credentials, creds);
+	status = dcerpc_pipe_connect_b(tctx, &p2, b2,
+				       &ndr_table_netlogon,
+				       machine_credentials,
+				       tctx->ev, tctx->lp_ctx);
+	cli_credentials_set_netlogon_creds(machine_credentials, NULL);
+	torture_assert_ntstatus_ok(tctx, status, "dcerpc_pipe_connect_b schannel");
+
+	*_p2 = p2;
 	return true;
 }
 
@@ -436,7 +563,7 @@ static bool test_SetPassword(struct torture_context *tctx,
   try a change password for our machine account
 */
 static bool test_SetPassword_flags(struct torture_context *tctx,
-				   struct dcerpc_pipe *p,
+				   struct dcerpc_pipe *p1,
 				   struct cli_credentials *machine_credentials,
 				   uint32_t negotiate_flags)
 {
@@ -445,14 +572,20 @@ static bool test_SetPassword_flags(struct torture_context *tctx,
 	struct netlogon_creds_CredentialState *creds;
 	struct netr_Authenticator credential, return_authenticator;
 	struct samr_Password new_password;
-	struct dcerpc_binding_handle *b = p->binding_handle;
+	struct dcerpc_pipe *p = NULL;
+	struct dcerpc_binding_handle *b = NULL;
 
-	if (!test_SetupCredentials2(p, tctx, negotiate_flags,
+	if (!test_SetupCredentials2(p1, tctx, negotiate_flags,
 				    machine_credentials,
 				    cli_credentials_get_secure_channel_type(machine_credentials),
 				    &creds)) {
 		return false;
 	}
+	if (!test_SetupCredentialsPipe(p1, tctx, machine_credentials, creds,
+				       DCERPC_SIGN | DCERPC_SEAL, &p)) {
+		return false;
+	}
+	b = p->binding_handle;
 
 	r.in.server_name = talloc_asprintf(tctx, "\\\\%s", dcerpc_server_name(p));
 	r.in.account_name = talloc_asprintf(tctx, "%s$", TEST_MACHINE_NAME);
@@ -532,7 +665,7 @@ static DATA_BLOB netlogon_very_rand_pass(TALLOC_CTX *mem_ctx, int len)
   try a change password for our machine account
 */
 static bool test_SetPassword2_with_flags(struct torture_context *tctx,
-					 struct dcerpc_pipe *p,
+					 struct dcerpc_pipe *p1,
 					 struct cli_credentials *machine_credentials,
 					 uint32_t flags)
 {
@@ -544,11 +677,19 @@ static bool test_SetPassword2_with_flags(struct torture_context *tctx,
 	struct samr_Password nt_hash;
 	struct netr_Authenticator credential, return_authenticator;
 	struct netr_CryptPassword new_password;
-	struct dcerpc_binding_handle *b = p->binding_handle;
+	struct dcerpc_pipe *p = NULL;
+	struct dcerpc_binding_handle *b = NULL;
 
-	if (!test_SetupCredentials2(p, tctx, flags, machine_credentials, cli_credentials_get_secure_channel_type(machine_credentials), &creds)) {
+	if (!test_SetupCredentials2(p1, tctx, flags, machine_credentials,
+				    cli_credentials_get_secure_channel_type(machine_credentials),
+				    &creds)) {
 		return false;
 	}
+	if (!test_SetupCredentialsPipe(p1, tctx, machine_credentials, creds,
+				       DCERPC_SIGN | DCERPC_SEAL, &p)) {
+		return false;
+	}
+	b = p->binding_handle;
 
 	r.in.server_name = talloc_asprintf(tctx, "\\\\%s", dcerpc_server_name(p));
 	r.in.account_name = talloc_asprintf(tctx, "%s$", TEST_MACHINE_NAME);
@@ -803,7 +944,6 @@ static bool test_netlogon_ops_args(struct dcerpc_pipe *p, struct torture_context
 	NTSTATUS status;
 	struct netr_LogonSamLogon r;
 	struct netr_Authenticator auth, auth2;
-	static const struct netr_Authenticator auth_zero;
 	union netr_LogonLevel logon;
 	union netr_Validation validation;
 	uint8_t authoritative;
@@ -820,7 +960,8 @@ static bool test_netlogon_ops_args(struct dcerpc_pipe *p, struct torture_context
 		flags |= CLI_CRED_NTLMv2_AUTH;
 	}
 
-	cli_credentials_get_ntlm_username_domain(cmdline_credentials, tctx,
+	cli_credentials_get_ntlm_username_domain(popt_get_cmdline_credentials(),
+						 tctx,
 						 &ninfo.identity_info.account_name.string,
 						 &ninfo.identity_info.domain_name.string);
 
@@ -836,12 +977,14 @@ static bool test_netlogon_ops_args(struct dcerpc_pipe *p, struct torture_context
 	names_blob = NTLMv2_generate_names_blob(tctx, cli_credentials_get_workstation(credentials),
 						cli_credentials_get_domain(credentials));
 
-	status = cli_credentials_get_ntlm_response(cmdline_credentials, tctx,
-						   &flags,
-						   chal,
-						   names_blob,
-						   &lm_resp, &nt_resp,
-						   NULL, NULL);
+	status = cli_credentials_get_ntlm_response(
+				popt_get_cmdline_credentials(), tctx,
+				&flags,
+				chal,
+				NULL, /* server_timestamp */
+				names_blob,
+				&lm_resp, &nt_resp,
+				NULL, NULL);
 	torture_assert_ntstatus_ok(tctx, status, "cli_credentials_get_ntlm_response failed");
 
 	ninfo.lm.data = lm_resp.data;
@@ -851,8 +994,7 @@ static bool test_netlogon_ops_args(struct dcerpc_pipe *p, struct torture_context
 	ninfo.nt.length = nt_resp.length;
 
 	ninfo.identity_info.parameter_control = 0;
-	ninfo.identity_info.logon_id_low = 0;
-	ninfo.identity_info.logon_id_high = 0;
+	ninfo.identity_info.logon_id = 0;
 	ninfo.identity_info.workstation.string = cli_credentials_get_workstation(credentials);
 
 	logon.network = &ninfo;
@@ -902,7 +1044,7 @@ static bool test_netlogon_ops_args(struct dcerpc_pipe *p, struct torture_context
 		torture_assert_int_equal(tctx, *r.out.authoritative, 1,
 					 "LogonSamLogon invalid  *r.out.authoritative");
 		torture_assert(tctx,
-			       memcmp(&auth2, &auth_zero, sizeof(auth2)) == 0,
+			       all_zero((uint8_t *)&auth2, sizeof(auth2)),
 			       "Return authenticator non zero");
 	}
 
@@ -940,7 +1082,7 @@ static bool test_netlogon_ops_args(struct dcerpc_pipe *p, struct torture_context
 			"LogonSamLogon expected INVALID_PARAMETER");
 
 		torture_assert(tctx,
-			       memcmp(&auth2, &auth_zero, sizeof(auth2)) == 0,
+			       all_zero((uint8_t *)&auth2, sizeof(auth2)),
 			       "Return authenticator non zero");
 		torture_assert_int_equal(tctx, *r.out.authoritative, 1,
 					 "LogonSamLogon invalid  *r.out.authoritative");
@@ -961,7 +1103,7 @@ static bool test_netlogon_ops_args(struct dcerpc_pipe *p, struct torture_context
 			"LogonSamLogon expected INVALID_PARAMETER");
 
 		torture_assert(tctx,
-			       memcmp(&auth2, &auth_zero, sizeof(auth2)) == 0,
+			       all_zero((uint8_t *)&auth2, sizeof(auth2)),
 			       "Return authenticator non zero");
 		torture_assert_int_equal(tctx, *r.out.authoritative, 1,
 					 "LogonSamLogon invalid  *r.out.authoritative");
@@ -1122,7 +1264,9 @@ static bool test_ServerReqChallengeGlobal(struct torture_context *tctx,
 	struct dcerpc_binding_handle *b2 = NULL;
 
 	machine_name = cli_credentials_get_workstation(machine_credentials);
+	torture_assert(tctx, machine_name != NULL, "machine_name");
 	plain_pass = cli_credentials_get_password(machine_credentials);
+	torture_assert(tctx, plain_pass != NULL, "plain_pass");
 
 	torture_comment(tctx, "Testing ServerReqChallenge on b1\n");
 
@@ -1173,6 +1317,505 @@ static bool test_ServerReqChallengeGlobal(struct torture_context *tctx,
 	torture_assert_ntstatus_ok(tctx, a.out.result, "ServerAuthenticate3 failed on b2");
 	torture_assert(tctx, netlogon_creds_client_check(creds, &credentials3), "Credential chaining failed");
 
+	return true;
+}
+
+/*
+ * Test the re-use of the challenge is not possible on a third
+ * connection, after first useing it second one.
+ */
+
+static bool test_ServerReqChallengeReuseGlobal(struct torture_context *tctx,
+					  struct dcerpc_pipe *p1,
+					  struct cli_credentials *machine_credentials)
+{
+	uint32_t flags = NETLOGON_NEG_AUTH2_FLAGS | NETLOGON_NEG_SUPPORTS_AES;
+	struct netr_ServerReqChallenge r;
+	struct netr_ServerAuthenticate3 a;
+	struct netr_Credential credentials1, credentials2, credentials3;
+	struct netlogon_creds_CredentialState *creds;
+	struct samr_Password mach_password;
+	uint32_t rid;
+	const char *machine_name;
+	const char *plain_pass;
+	struct dcerpc_binding_handle *b1 = p1->binding_handle;
+	struct dcerpc_pipe *p2 = NULL;
+	struct dcerpc_binding_handle *b2 = NULL;
+	struct dcerpc_pipe *p3 = NULL;
+	struct dcerpc_binding_handle *b3 = NULL;
+
+	machine_name = cli_credentials_get_workstation(machine_credentials);
+	torture_assert(tctx, machine_name != NULL, "machine_name");
+	plain_pass = cli_credentials_get_password(machine_credentials);
+	torture_assert(tctx, plain_pass != NULL, "plain_pass");
+
+	torture_comment(tctx, "Testing ServerReqChallenge on b1\n");
+
+	torture_assert_ntstatus_ok(tctx,
+		dcerpc_pipe_connect_b(tctx, &p2, p1->binding,
+				      &ndr_table_netlogon,
+				      machine_credentials,
+				      tctx->ev, tctx->lp_ctx),
+		"dcerpc_pipe_connect_b failed");
+	b2 = p2->binding_handle;
+
+	torture_assert_ntstatus_ok(tctx,
+		dcerpc_pipe_connect_b(tctx, &p3, p1->binding,
+				      &ndr_table_netlogon,
+				      machine_credentials,
+				      tctx->ev, tctx->lp_ctx),
+		"dcerpc_pipe_connect_b failed");
+	b3 = p3->binding_handle;
+
+	r.in.server_name = NULL;
+	r.in.computer_name = machine_name;
+	r.in.credentials = &credentials1;
+	r.out.return_credentials = &credentials2;
+
+	generate_random_buffer(credentials1.data, sizeof(credentials1.data));
+
+	torture_assert_ntstatus_ok(tctx, dcerpc_netr_ServerReqChallenge_r(b1, tctx, &r),
+		"ServerReqChallenge failed on b1");
+	torture_assert_ntstatus_ok(tctx, r.out.result, "ServerReqChallenge failed on b1");
+
+	E_md4hash(plain_pass, mach_password.hash);
+
+	a.in.server_name = NULL;
+	a.in.account_name = talloc_asprintf(tctx, "%s$", machine_name);
+	a.in.secure_channel_type = cli_credentials_get_secure_channel_type(machine_credentials);
+	a.in.computer_name = machine_name;
+	a.in.negotiate_flags = &flags;
+	a.in.credentials = &credentials3;
+	a.out.return_credentials = &credentials3;
+	a.out.negotiate_flags = &flags;
+	a.out.rid = &rid;
+
+	creds = netlogon_creds_client_init(tctx, a.in.account_name,
+					   a.in.computer_name,
+					   a.in.secure_channel_type,
+					   &credentials1, &credentials2,
+					   &mach_password, &credentials3,
+					   flags);
+
+	torture_assert(tctx, creds != NULL, "memory allocation");
+
+	torture_comment(tctx, "Testing ServerAuthenticate3 on b2\n");
+
+	torture_assert_ntstatus_ok(tctx, dcerpc_netr_ServerAuthenticate3_r(b2, tctx, &a),
+		"ServerAuthenticate3 failed on b2");
+	torture_assert_ntstatus_ok(tctx, a.out.result, "ServerAuthenticate3 failed on b2");
+	torture_assert(tctx, netlogon_creds_client_check(creds, &credentials3), "Credential chaining failed");
+
+	/* We have to re-run this part */
+	creds = netlogon_creds_client_init(tctx, a.in.account_name,
+					   a.in.computer_name,
+					   a.in.secure_channel_type,
+					   &credentials1, &credentials2,
+					   &mach_password, &credentials3,
+					   flags);
+
+	torture_assert_ntstatus_ok(tctx, dcerpc_netr_ServerAuthenticate3_r(b3, tctx, &a),
+		"ServerAuthenticate3 failed on b3");
+	torture_assert_ntstatus_equal(tctx, a.out.result, NT_STATUS_ACCESS_DENIED,
+				      "ServerAuthenticate3 should have failed on b3, due to credential reuse");
+	return true;
+}
+
+/*
+ * Test if use of the per-pipe challenge will wipe out the globally cached challenge
+ */
+static bool test_ServerReqChallengeReuseGlobal2(struct torture_context *tctx,
+						struct dcerpc_pipe *p1,
+						struct cli_credentials *machine_credentials)
+{
+	uint32_t flags = NETLOGON_NEG_AUTH2_FLAGS | NETLOGON_NEG_SUPPORTS_AES;
+	struct netr_ServerReqChallenge r;
+	struct netr_ServerAuthenticate3 a;
+	struct netr_Credential credentials1, credentials2, credentials3;
+	struct netlogon_creds_CredentialState *creds;
+	struct samr_Password mach_password;
+	uint32_t rid;
+	const char *machine_name;
+	const char *plain_pass;
+	struct dcerpc_binding_handle *b1 = p1->binding_handle;
+	struct dcerpc_pipe *p2 = NULL;
+	struct dcerpc_binding_handle *b2 = NULL;
+
+	machine_name = cli_credentials_get_workstation(machine_credentials);
+	torture_assert(tctx, machine_name != NULL, "machine_name");
+	plain_pass = cli_credentials_get_password(machine_credentials);
+	torture_assert(tctx, plain_pass != NULL, "plain_pass");
+
+	torture_comment(tctx, "Testing ServerReqChallenge on b1\n");
+
+	torture_assert_ntstatus_ok(tctx,
+		dcerpc_pipe_connect_b(tctx, &p2, p1->binding,
+				      &ndr_table_netlogon,
+				      machine_credentials,
+				      tctx->ev, tctx->lp_ctx),
+		"dcerpc_pipe_connect_b failed");
+	b2 = p2->binding_handle;
+
+	r.in.server_name = NULL;
+	r.in.computer_name = machine_name;
+	r.in.credentials = &credentials1;
+	r.out.return_credentials = &credentials2;
+
+	generate_random_buffer(credentials1.data, sizeof(credentials1.data));
+
+	torture_assert_ntstatus_ok(tctx, dcerpc_netr_ServerReqChallenge_r(b1, tctx, &r),
+		"ServerReqChallenge failed on b1");
+	torture_assert_ntstatus_ok(tctx, r.out.result, "ServerReqChallenge failed on b1");
+
+	E_md4hash(plain_pass, mach_password.hash);
+
+	a.in.server_name = NULL;
+	a.in.account_name = talloc_asprintf(tctx, "%s$", machine_name);
+	a.in.secure_channel_type = cli_credentials_get_secure_channel_type(machine_credentials);
+	a.in.computer_name = machine_name;
+	a.in.negotiate_flags = &flags;
+	a.in.credentials = &credentials3;
+	a.out.return_credentials = &credentials3;
+	a.out.negotiate_flags = &flags;
+	a.out.rid = &rid;
+
+	creds = netlogon_creds_client_init(tctx, a.in.account_name,
+					   a.in.computer_name,
+					   a.in.secure_channel_type,
+					   &credentials1, &credentials2,
+					   &mach_password, &credentials3,
+					   flags);
+
+	torture_assert(tctx, creds != NULL, "memory allocation");
+
+	torture_comment(tctx, "Testing ServerAuthenticate3 on b2\n");
+
+	torture_assert_ntstatus_ok(tctx, dcerpc_netr_ServerAuthenticate3_r(b1, tctx, &a),
+		"ServerAuthenticate3 failed on b");
+	torture_assert_ntstatus_ok(tctx, a.out.result, "ServerAuthenticate3 failed on b");
+	torture_assert(tctx, netlogon_creds_client_check(creds, &credentials3), "Credential chaining failed");
+
+	/* We have to re-run this part */
+	creds = netlogon_creds_client_init(tctx, a.in.account_name,
+					   a.in.computer_name,
+					   a.in.secure_channel_type,
+					   &credentials1, &credentials2,
+					   &mach_password, &credentials3,
+					   flags);
+
+	torture_assert_ntstatus_ok(tctx, dcerpc_netr_ServerAuthenticate3_r(b2, tctx, &a),
+		"ServerAuthenticate3 failed on b2");
+	torture_assert_ntstatus_equal(tctx, a.out.result, NT_STATUS_ACCESS_DENIED,
+				      "ServerAuthenticate3 should have failed on b2, due to credential reuse");
+	return true;
+}
+
+/*
+ * Test if use of the globally cached challenge will wipe out the
+ * per-pipe challenge
+ */
+static bool test_ServerReqChallengeReuseGlobal3(struct torture_context *tctx,
+						struct dcerpc_pipe *p1,
+						struct cli_credentials *machine_credentials)
+{
+	uint32_t flags = NETLOGON_NEG_AUTH2_FLAGS | NETLOGON_NEG_SUPPORTS_AES;
+	struct netr_ServerReqChallenge r;
+	struct netr_ServerAuthenticate3 a;
+	struct netr_Credential credentials1, credentials2, credentials3;
+	struct netlogon_creds_CredentialState *creds;
+	struct samr_Password mach_password;
+	uint32_t rid;
+	const char *machine_name;
+	const char *plain_pass;
+	struct dcerpc_binding_handle *b1 = p1->binding_handle;
+	struct dcerpc_pipe *p2 = NULL;
+	struct dcerpc_binding_handle *b2 = NULL;
+
+	machine_name = cli_credentials_get_workstation(machine_credentials);
+	torture_assert(tctx, machine_name != NULL, "machine_name");
+	plain_pass = cli_credentials_get_password(machine_credentials);
+	torture_assert(tctx, plain_pass != NULL, "plain_pass");
+
+	torture_comment(tctx, "Testing ServerReqChallenge on b1\n");
+
+	torture_assert_ntstatus_ok(tctx,
+		dcerpc_pipe_connect_b(tctx, &p2, p1->binding,
+				      &ndr_table_netlogon,
+				      machine_credentials,
+				      tctx->ev, tctx->lp_ctx),
+		"dcerpc_pipe_connect_b failed");
+	b2 = p2->binding_handle;
+
+	r.in.server_name = NULL;
+	r.in.computer_name = machine_name;
+	r.in.credentials = &credentials1;
+	r.out.return_credentials = &credentials2;
+
+	generate_random_buffer(credentials1.data, sizeof(credentials1.data));
+
+	torture_assert_ntstatus_ok(tctx, dcerpc_netr_ServerReqChallenge_r(b1, tctx, &r),
+		"ServerReqChallenge failed on b1");
+	torture_assert_ntstatus_ok(tctx, r.out.result, "ServerReqChallenge failed on b1");
+
+	E_md4hash(plain_pass, mach_password.hash);
+
+	a.in.server_name = NULL;
+	a.in.account_name = talloc_asprintf(tctx, "%s$", machine_name);
+	a.in.secure_channel_type = cli_credentials_get_secure_channel_type(machine_credentials);
+	a.in.computer_name = machine_name;
+	a.in.negotiate_flags = &flags;
+	a.in.credentials = &credentials3;
+	a.out.return_credentials = &credentials3;
+	a.out.negotiate_flags = &flags;
+	a.out.rid = &rid;
+
+	creds = netlogon_creds_client_init(tctx, a.in.account_name,
+					   a.in.computer_name,
+					   a.in.secure_channel_type,
+					   &credentials1, &credentials2,
+					   &mach_password, &credentials3,
+					   flags);
+
+	torture_assert(tctx, creds != NULL, "memory allocation");
+
+	torture_comment(tctx, "Testing ServerAuthenticate3 on b2\n");
+
+	torture_assert_ntstatus_ok(tctx, dcerpc_netr_ServerAuthenticate3_r(b2, tctx, &a),
+		"ServerAuthenticate3 failed on b2");
+	torture_assert_ntstatus_ok(tctx, a.out.result, "ServerAuthenticate3 failed on b");
+	torture_assert(tctx, netlogon_creds_client_check(creds, &credentials3), "Credential chaining failed");
+
+	/* We have to re-run this part */
+	creds = netlogon_creds_client_init(tctx, a.in.account_name,
+					   a.in.computer_name,
+					   a.in.secure_channel_type,
+					   &credentials1, &credentials2,
+					   &mach_password, &credentials3,
+					   flags);
+
+	torture_assert(tctx, creds != NULL, "memory allocation");
+
+	torture_assert_ntstatus_ok(tctx, dcerpc_netr_ServerAuthenticate3_r(b1, tctx, &a),
+		"ServerAuthenticate3 failed on b1");
+	torture_assert_ntstatus_equal(tctx, a.out.result, NT_STATUS_ACCESS_DENIED,
+				      "ServerAuthenticate3 should have failed on b1, due to credential reuse");
+	return true;
+}
+
+/*
+ * Test if more than one globally cached challenge works
+ */
+static bool test_ServerReqChallengeReuseGlobal4(struct torture_context *tctx,
+						struct dcerpc_pipe *p1,
+						struct cli_credentials *machine_credentials)
+{
+	uint32_t flags = NETLOGON_NEG_AUTH2_FLAGS | NETLOGON_NEG_SUPPORTS_AES;
+	struct netr_ServerReqChallenge r;
+	struct netr_ServerAuthenticate3 a;
+	struct netr_Credential credentials1, credentials1_random,
+		credentials2, credentials3, credentials_discard;
+	struct netlogon_creds_CredentialState *creds;
+	struct samr_Password mach_password;
+	uint32_t rid;
+	const char *machine_name;
+	const char *plain_pass;
+	struct dcerpc_binding_handle *b1 = p1->binding_handle;
+	struct dcerpc_pipe *p2 = NULL;
+	struct dcerpc_binding_handle *b2 = NULL;
+
+	machine_name = cli_credentials_get_workstation(machine_credentials);
+	torture_assert(tctx, machine_name != NULL, "machine_name");
+	plain_pass = cli_credentials_get_password(machine_credentials);
+	torture_assert(tctx, plain_pass != NULL, "plain_pass");
+
+	torture_comment(tctx, "Testing ServerReqChallenge on b1\n");
+
+	torture_assert_ntstatus_ok(tctx,
+		dcerpc_pipe_connect_b(tctx, &p2, p1->binding,
+				      &ndr_table_netlogon,
+				      machine_credentials,
+				      tctx->ev, tctx->lp_ctx),
+		"dcerpc_pipe_connect_b failed");
+	b2 = p2->binding_handle;
+
+	r.in.server_name = NULL;
+	r.in.computer_name = "CHALTEST1";
+	r.in.credentials = &credentials1_random;
+	r.out.return_credentials = &credentials_discard;
+
+	generate_random_buffer(credentials1_random.data,
+			       sizeof(credentials1_random.data));
+
+	torture_assert_ntstatus_ok(tctx, dcerpc_netr_ServerReqChallenge_r(b1, tctx, &r),
+		"ServerReqChallenge failed on b1");
+	torture_assert_ntstatus_ok(tctx, r.out.result, "ServerReqChallenge failed on b1");
+
+	/* Now ask for the actual client name */
+	r.in.server_name = NULL;
+	r.in.computer_name = machine_name;
+	r.in.credentials = &credentials1;
+	r.out.return_credentials = &credentials2;
+
+	generate_random_buffer(credentials1.data, sizeof(credentials1.data));
+
+	torture_assert_ntstatus_ok(tctx, dcerpc_netr_ServerReqChallenge_r(b1, tctx, &r),
+		"ServerReqChallenge failed on b1");
+	torture_assert_ntstatus_ok(tctx, r.out.result, "ServerReqChallenge failed on b1");
+
+	r.in.server_name = NULL;
+	r.in.computer_name = "CHALTEST2";
+	r.in.credentials = &credentials1_random;
+	r.out.return_credentials = &credentials_discard;
+
+	generate_random_buffer(credentials1_random.data,
+			       sizeof(credentials1_random.data));
+
+	r.in.server_name = NULL;
+	r.in.computer_name = "CHALTEST3";
+	r.in.credentials = &credentials1_random;
+	r.out.return_credentials = &credentials_discard;
+
+	generate_random_buffer(credentials1_random.data,
+			       sizeof(credentials1_random.data));
+
+	torture_assert_ntstatus_ok(tctx, dcerpc_netr_ServerReqChallenge_r(b1, tctx, &r),
+		"ServerReqChallenge failed on b1");
+	torture_assert_ntstatus_ok(tctx, r.out.result, "ServerReqChallenge failed on b1");
+
+	E_md4hash(plain_pass, mach_password.hash);
+
+	a.in.server_name = NULL;
+	a.in.account_name = talloc_asprintf(tctx, "%s$", machine_name);
+	a.in.secure_channel_type = cli_credentials_get_secure_channel_type(machine_credentials);
+	a.in.computer_name = machine_name;
+	a.in.negotiate_flags = &flags;
+	a.in.credentials = &credentials3;
+	a.out.return_credentials = &credentials3;
+	a.out.negotiate_flags = &flags;
+	a.out.rid = &rid;
+
+	creds = netlogon_creds_client_init(tctx, a.in.account_name,
+					   a.in.computer_name,
+					   a.in.secure_channel_type,
+					   &credentials1, &credentials2,
+					   &mach_password, &credentials3,
+					   flags);
+
+	torture_assert(tctx, creds != NULL, "memory allocation");
+
+	torture_comment(tctx, "Testing ServerAuthenticate3 on b2 (must use global credentials)\n");
+
+	torture_assert_ntstatus_ok(tctx, dcerpc_netr_ServerAuthenticate3_r(b2, tctx, &a),
+		"ServerAuthenticate3 failed on b2");
+	torture_assert_ntstatus_ok(tctx, a.out.result, "ServerAuthenticate3 failed on b2");
+	torture_assert(tctx, netlogon_creds_client_check(creds, &credentials3), "Credential chaining failed");
+
+	/* We have to re-run this part */
+	creds = netlogon_creds_client_init(tctx, a.in.account_name,
+					   a.in.computer_name,
+					   a.in.secure_channel_type,
+					   &credentials1, &credentials2,
+					   &mach_password, &credentials3,
+					   flags);
+
+	torture_assert_ntstatus_ok(tctx, dcerpc_netr_ServerAuthenticate3_r(b1, tctx, &a),
+		"ServerAuthenticate3 failed on b1");
+	torture_assert_ntstatus_equal(tctx, a.out.result, NT_STATUS_ACCESS_DENIED,
+				      "ServerAuthenticate3 should have failed on b1, due to credential reuse");
+	return true;
+}
+
+static bool test_ServerReqChallengeReuse(struct torture_context *tctx,
+					 struct dcerpc_pipe *p,
+					 struct cli_credentials *machine_credentials)
+{
+	uint32_t flags = NETLOGON_NEG_AUTH2_FLAGS | NETLOGON_NEG_SUPPORTS_AES;
+	struct netr_ServerReqChallenge r;
+	struct netr_ServerAuthenticate3 a;
+	struct netr_Credential credentials1, credentials2, credentials3;
+	struct netlogon_creds_CredentialState *creds;
+	struct samr_Password mach_password;
+	uint32_t rid;
+	const char *machine_name;
+	const char *plain_pass;
+	struct dcerpc_binding_handle *b = p->binding_handle;
+
+	machine_name = cli_credentials_get_workstation(machine_credentials);
+	torture_assert(tctx, machine_name != NULL, "machine_name");
+	plain_pass = cli_credentials_get_password(machine_credentials);
+	torture_assert(tctx, plain_pass != NULL, "plain_pass");
+
+	torture_comment(tctx, "Testing ServerReqChallenge on b1\n");
+
+	r.in.server_name = NULL;
+	r.in.computer_name = machine_name;
+	r.in.credentials = &credentials1;
+	r.out.return_credentials = &credentials2;
+
+	generate_random_buffer(credentials1.data, sizeof(credentials1.data));
+
+	torture_assert_ntstatus_ok(tctx, dcerpc_netr_ServerReqChallenge_r(b, tctx, &r),
+		"ServerReqChallenge");
+	torture_assert_ntstatus_ok(tctx, r.out.result, "ServerReqChallenge failed on b1");
+
+	E_md4hash(plain_pass, mach_password.hash);
+
+	a.in.server_name = NULL;
+	a.in.account_name = talloc_asprintf(tctx, "%s$", machine_name);
+	a.in.secure_channel_type = cli_credentials_get_secure_channel_type(machine_credentials);
+	a.in.computer_name = machine_name;
+	a.in.negotiate_flags = &flags;
+	a.in.credentials = &credentials3;
+	a.out.return_credentials = &credentials3;
+	a.out.negotiate_flags = &flags;
+	a.out.rid = &rid;
+
+	creds = netlogon_creds_client_init(tctx, a.in.account_name,
+					   a.in.computer_name,
+					   a.in.secure_channel_type,
+					   &credentials1, &credentials2,
+					   &mach_password, &credentials3,
+					   flags);
+
+	torture_assert(tctx, creds != NULL, "memory allocation");
+
+	torture_comment(tctx, "Testing ServerAuthenticate3\n");
+
+	torture_assert_ntstatus_ok(tctx, dcerpc_netr_ServerAuthenticate3_r(b, tctx, &a),
+		"ServerAuthenticate3 failed");
+	torture_assert_ntstatus_ok(tctx, a.out.result, "ServerAuthenticate3 failed");
+	torture_assert(tctx, netlogon_creds_client_check(creds, &credentials3), "Credential chaining failed");
+
+	/* We have to re-run this part */
+	creds = netlogon_creds_client_init(tctx, a.in.account_name,
+					   a.in.computer_name,
+					   a.in.secure_channel_type,
+					   &credentials1, &credentials2,
+					   &mach_password, &credentials3,
+					   flags);
+
+	torture_assert_ntstatus_ok(tctx, dcerpc_netr_ServerAuthenticate3_r(b, tctx, &a),
+		"ServerAuthenticate3 failed");
+	torture_assert_ntstatus_equal(tctx, a.out.result, NT_STATUS_ACCESS_DENIED,
+				      "ServerAuthenticate3 should have failed on b3, due to credential reuse");
+
+	ZERO_STRUCT(credentials1.data);
+	ZERO_STRUCT(credentials2.data);
+	creds = netlogon_creds_client_init(tctx, a.in.account_name,
+					   a.in.computer_name,
+					   a.in.secure_channel_type,
+					   &credentials1, &credentials2,
+					   &mach_password, &credentials3,
+					   flags);
+
+	torture_assert(tctx, creds != NULL, "memory allocation");
+
+	torture_comment(tctx, "Testing ServerAuthenticate3 with zero'ed challenge\n");
+
+	torture_assert_ntstatus_ok(tctx, dcerpc_netr_ServerAuthenticate3_r(b, tctx, &a),
+		"ServerAuthenticate3 failed");
+	torture_assert_ntstatus_equal(tctx, a.out.result, NT_STATUS_ACCESS_DENIED,
+				      "ServerAuthenticate3 should have failed on b3, due to credential reuse");
 	return true;
 }
 
@@ -2131,7 +2774,7 @@ static bool test_LogonControl(struct torture_context *tctx,
 				"LogonControl returned unexpected error code");
 			break;
 		default:
-			torture_assert_werr_equal(tctx, r.out.result, WERR_UNKNOWN_LEVEL,
+			torture_assert_werr_equal(tctx, r.out.result, WERR_INVALID_LEVEL,
 				"LogonControl returned unexpected error code");
 			break;
 		}
@@ -2311,7 +2954,7 @@ static bool test_LogonControl2(struct torture_context *tctx,
 
 	status = dcerpc_netr_LogonControl2_r(b, tctx, &r);
 	torture_assert_ntstatus_ok(tctx, status, "LogonControl2");
-	torture_assert_werr_equal(tctx, r.out.result, WERR_UNKNOWN_LEVEL, "LogonControl2");
+	torture_assert_werr_equal(tctx, r.out.result, WERR_INVALID_LEVEL, "LogonControl2");
 
 	return true;
 }
@@ -2501,13 +3144,13 @@ static bool test_LogonControl2Ex(struct torture_context *tctx,
 
 	status = dcerpc_netr_LogonControl2Ex_r(b, tctx, &r);
 	torture_assert_ntstatus_ok(tctx, status, "LogonControl2Ex");
-	torture_assert_werr_equal(tctx, r.out.result, WERR_UNKNOWN_LEVEL, "LogonControl2Ex");
+	torture_assert_werr_equal(tctx, r.out.result, WERR_INVALID_LEVEL, "LogonControl2Ex");
 
 	return true;
 }
 
 static bool test_netr_GetForestTrustInformation(struct torture_context *tctx,
-						struct dcerpc_pipe *p,
+						struct dcerpc_pipe *p1,
 						struct cli_credentials *machine_credentials)
 {
 	struct netr_GetForestTrustInformation r;
@@ -2515,12 +3158,18 @@ static bool test_netr_GetForestTrustInformation(struct torture_context *tctx,
 	struct netr_Authenticator a;
 	struct netr_Authenticator return_authenticator;
 	struct lsa_ForestTrustInformation *forest_trust_info;
-	struct dcerpc_binding_handle *b = p->binding_handle;
+	struct dcerpc_pipe *p = NULL;
+	struct dcerpc_binding_handle *b = NULL;
 
-	if (!test_SetupCredentials3(p, tctx, NETLOGON_NEG_AUTH2_ADS_FLAGS,
+	if (!test_SetupCredentials3(p1, tctx, NETLOGON_NEG_AUTH2_ADS_FLAGS,
 				    machine_credentials, &creds)) {
 		return false;
 	}
+	if (!test_SetupCredentialsPipe(p1, tctx, machine_credentials, creds,
+				       DCERPC_SIGN | DCERPC_SEAL, &p)) {
+		return false;
+	}
+	b = p->binding_handle;
 
 	netlogon_creds_client_authenticator(creds, &a);
 
@@ -2958,7 +3607,7 @@ static bool test_netr_DsrGetDcSiteCoverageW(struct torture_context *tctx,
 		url = talloc_asprintf(tctx, "ldap://%s", dcerpc_server_name(p));
 		sam_ctx = ldb_wrap_connect(tctx, tctx->ev, tctx->lp_ctx, url,
 					   NULL,
-					   cmdline_credentials,
+					   popt_get_cmdline_credentials(),
 					   0);
 
 		torture_assert(tctx, sam_ctx, "Connection to the SAMDB on DC failed!");
@@ -3007,7 +3656,7 @@ static bool test_netr_DsRAddressToSitenamesW(struct torture_context *tctx,
 		url = talloc_asprintf(tctx, "ldap://%s", dcerpc_server_name(p));
 		sam_ctx = ldb_wrap_connect(tctx, tctx->ev, tctx->lp_ctx, url,
 					   NULL,
-					   cmdline_credentials,
+					   popt_get_cmdline_credentials(),
 					   0);
 
 		torture_assert(tctx, sam_ctx, "Connection to the SAMDB on DC failed!");
@@ -3184,7 +3833,7 @@ static bool test_netr_DsRAddressToSitenamesExW(struct torture_context *tctx,
 		url = talloc_asprintf(tctx, "ldap://%s", dcerpc_server_name(p));
 		sam_ctx = ldb_wrap_connect(tctx, tctx->ev, tctx->lp_ctx, url,
 					   NULL,
-					   cmdline_credentials,
+					   popt_get_cmdline_credentials(),
 					   0);
 
 		torture_assert(tctx, sam_ctx, "Connection to the SAMDB on DC failed!");
@@ -3343,7 +3992,7 @@ static bool test_netr_DsRAddressToSitenamesExW(struct torture_context *tctx,
 }
 
 static bool test_netr_ServerGetTrustInfo_flags(struct torture_context *tctx,
-					       struct dcerpc_pipe *p,
+					       struct dcerpc_pipe *p1,
 					       struct cli_credentials *machine_credentials,
 					       uint32_t negotiate_flags)
 {
@@ -3356,14 +4005,20 @@ static bool test_netr_ServerGetTrustInfo_flags(struct torture_context *tctx,
 	struct netr_TrustInfo *trust_info;
 
 	struct netlogon_creds_CredentialState *creds;
-	struct dcerpc_binding_handle *b = p->binding_handle;
+	struct dcerpc_pipe *p = NULL;
+	struct dcerpc_binding_handle *b = NULL;
 
 	struct samr_Password nt_hash;
 
-	if (!test_SetupCredentials3(p, tctx, negotiate_flags,
+	if (!test_SetupCredentials3(p1, tctx, negotiate_flags,
 				    machine_credentials, &creds)) {
 		return false;
 	}
+	if (!test_SetupCredentialsPipe(p1, tctx, machine_credentials, creds,
+				       DCERPC_SIGN | DCERPC_SEAL, &p)) {
+		return false;
+	}
+	b = p->binding_handle;
 
 	netlogon_creds_client_authenticator(creds, &a);
 
@@ -3413,7 +4068,7 @@ static bool test_netr_ServerGetTrustInfo_AES(struct torture_context *tctx,
 }
 
 static bool test_GetDomainInfo(struct torture_context *tctx,
-			       struct dcerpc_pipe *p,
+			       struct dcerpc_pipe *p1,
 			       struct cli_credentials *machine_credentials)
 {
 	struct netr_LogonGetDomainInfo r;
@@ -3435,15 +4090,25 @@ static bool test_GetDomainInfo(struct torture_context *tctx,
 	const char *old_dnsname = NULL;
 	char **spns = NULL;
 	int num_spns = 0;
-	char *temp_str;
-	struct dcerpc_binding_handle *b = p->binding_handle;
+	char *temp_str = NULL;
+	char *temp_str2 = NULL;
+	struct dcerpc_pipe *p = NULL;
+	struct dcerpc_binding_handle *b = NULL;
+	struct netr_OneDomainInfo *odi1 = NULL;
+	struct netr_OneDomainInfo *odi2 = NULL;
+	struct netr_trust_extension_info *tex2 = NULL;
 
 	torture_comment(tctx, "Testing netr_LogonGetDomainInfo\n");
 
-	if (!test_SetupCredentials3(p, tctx, NETLOGON_NEG_AUTH2_ADS_FLAGS,
+	if (!test_SetupCredentials3(p1, tctx, NETLOGON_NEG_AUTH2_ADS_FLAGS,
 				    machine_credentials, &creds)) {
 		return false;
 	}
+	if (!test_SetupCredentialsPipe(p1, tctx, machine_credentials, creds,
+				       DCERPC_SIGN | DCERPC_SEAL, &p)) {
+		return false;
+	}
+	b = p->binding_handle;
 
 	/* We won't double-check this when we are over 'local' transports */
 	if (dcerpc_server_name(p)) {
@@ -3451,7 +4116,7 @@ static bool test_GetDomainInfo(struct torture_context *tctx,
 		url = talloc_asprintf(tctx, "ldap://%s", dcerpc_server_name(p));
 		sam_ctx = ldb_wrap_connect(tctx, tctx->ev, tctx->lp_ctx, url,
 					   NULL,
-					   cmdline_credentials,
+					   popt_get_cmdline_credentials(),
 					   0);
 
 		torture_assert(tctx, sam_ctx, "Connection to the SAMDB on DC failed!");
@@ -3808,6 +4473,130 @@ static bool test_GetDomainInfo(struct torture_context *tctx,
 		&& (info.domain_info->trusted_domains != NULL),
 		"Trusted domains have been requested!");
 
+	odi1 = &info.domain_info->primary_domain;
+
+	torture_assert(tctx, !GUID_all_zero(&odi1->domain_guid),
+		       "primary domain_guid needs to be valid");
+
+	for (i=0; i < info.domain_info->trusted_domain_count; i++) {
+		struct netr_OneDomainInfo *odiT =
+			&info.domain_info->trusted_domains[i];
+		struct netr_trust_extension_info *texT = NULL;
+
+		torture_assert_int_equal(tctx, odiT->trust_extension.length, 16,
+					 "trust_list should have extension");
+		torture_assert(tctx, odiT->trust_extension.info != NULL,
+			       "trust_list should have extension");
+		texT = &odiT->trust_extension.info->info;
+
+		if (GUID_equal(&odiT->domain_guid, &odi1->domain_guid)) {
+			odi2 = odiT;
+			tex2 = texT;
+			continue;
+		}
+
+		torture_assert_int_equal(tctx,
+				 texT->flags & NETR_TRUST_FLAG_PRIMARY,
+				 0,
+				 "trust_list flags should not have PRIMARY");
+
+		torture_assert(tctx, odiT->domainname.string != NULL,
+			       "trust_list domainname should be valid");
+		if (texT->trust_type == LSA_TRUST_TYPE_DOWNLEVEL) {
+			torture_assert(tctx, odiT->dns_domainname.string == NULL,
+			       "trust_list dns_domainname should be NULL for downlevel");
+		} else {
+			torture_assert(tctx, odiT->dns_domainname.string != NULL,
+			       "trust_list dns_domainname should be valid for uplevel");
+		}
+		torture_assert(tctx, odiT->dns_forestname.string == NULL,
+			       "trust_list dns_forestname needs to be NULL");
+
+		torture_assert(tctx, odiT->domain_sid != NULL,
+			       "trust_list domain_sid needs to be valid");
+	}
+
+	torture_assert(tctx, odi2 != NULL,
+		       "trust_list primary domain not found.");
+
+	torture_assert_str_equal(tctx,
+				 odi1->domainname.string,
+				 odi2->domainname.string,
+				 "netbios name should match");
+
+	temp_str = talloc_strdup(tctx, odi1->dns_domainname.string);
+	torture_assert(tctx, temp_str != NULL,
+		       "primary_domain dns_domainname copy");
+	temp_str2 = strrchr(temp_str, '.');
+	torture_assert(tctx, temp_str2 != NULL && temp_str2[1] == '\0',
+		       "primary_domain dns_domainname needs trailing '.'");
+	temp_str2[0] = '\0';
+	torture_assert_str_equal(tctx,
+				 temp_str,
+				 odi2->dns_domainname.string,
+				 "dns domainname should match "
+				 "(without trailing '.')");
+
+	temp_str = talloc_strdup(tctx, odi1->dns_forestname.string);
+	torture_assert(tctx, temp_str != NULL,
+		       "primary_domain dns_forestname copy");
+	temp_str2 = strrchr(temp_str, '.');
+	torture_assert(tctx, temp_str2 != NULL && temp_str2[1] == '\0',
+		       "primary_domain dns_forestname needs trailing '.'");
+	temp_str2[0] = '\0';
+	torture_assert(tctx, odi2->dns_forestname.string == NULL,
+		       "trust_list dns_forestname needs to be NULL");
+
+	torture_assert_guid_equal(tctx, odi1->domain_guid, odi2->domain_guid,
+				  "domain_guid should match");
+	torture_assert(tctx, odi1->domain_sid != NULL,
+		       "primary domain_sid needs to be valid");
+	torture_assert(tctx, odi2->domain_sid != NULL,
+		       "trust_list domain_sid needs to be valid");
+	torture_assert_sid_equal(tctx, odi1->domain_sid, odi2->domain_sid,
+				 "domain_sid should match");
+
+	torture_assert_int_equal(tctx, odi1->trust_extension.length, 0,
+				 "primary_domain should not have extension");
+	torture_assert_int_equal(tctx, odi2->trust_extension.length, 16,
+				 "trust_list should have extension");
+	torture_assert(tctx, odi2->trust_extension.info != NULL,
+		       "trust_list should have extension");
+	tex2 = &odi2->trust_extension.info->info;
+	torture_assert_int_equal(tctx,
+				 tex2->flags & NETR_TRUST_FLAG_PRIMARY,
+				 NETR_TRUST_FLAG_PRIMARY,
+				 "trust_list flags should have PRIMARY");
+	torture_assert_int_equal(tctx,
+				 tex2->flags & NETR_TRUST_FLAG_IN_FOREST,
+				 NETR_TRUST_FLAG_IN_FOREST,
+				 "trust_list flags should have IN_FOREST");
+	torture_assert_int_equal(tctx,
+				 tex2->flags & NETR_TRUST_FLAG_NATIVE,
+				 NETR_TRUST_FLAG_NATIVE,
+				 "trust_list flags should have NATIVE");
+	torture_assert_int_equal(tctx,
+				 tex2->flags & ~NETR_TRUST_FLAG_TREEROOT,
+				 NETR_TRUST_FLAG_IN_FOREST |
+				 NETR_TRUST_FLAG_PRIMARY |
+				 NETR_TRUST_FLAG_NATIVE,
+				 "trust_list flags IN_FOREST, PRIMARY, NATIVE "
+				 "(TREEROOT optional)");
+	if (strcmp(odi1->dns_domainname.string, odi1->dns_forestname.string) == 0) {
+		torture_assert_int_equal(tctx,
+					 tex2->flags & NETR_TRUST_FLAG_TREEROOT,
+					 NETR_TRUST_FLAG_TREEROOT,
+					 "trust_list flags TREEROOT on forest root");
+		torture_assert_int_equal(tctx,
+					 tex2->parent_index, 0,
+					 "trust_list no parent on foreset root");
+	}
+	torture_assert_int_equal(tctx,
+				 tex2->trust_type, LSA_TRUST_TYPE_UPLEVEL,
+				 "trust_list uplevel");
+	torture_assert_int_equal(tctx,
+				 tex2->trust_attributes, 0,
+				 "trust_list no attributes");
 
 	torture_comment(tctx, "Testing netr_LogonGetDomainInfo 6th call (no DNS hostname)\n");
 	netlogon_creds_client_authenticator(creds, &a);
@@ -3868,7 +4657,7 @@ static bool test_GetDomainInfo(struct torture_context *tctx,
 }
 
 static bool test_GetDomainInfo_async(struct torture_context *tctx,
-				     struct dcerpc_pipe *p,
+				     struct dcerpc_pipe *p1,
 				     struct cli_credentials *machine_credentials)
 {
 	NTSTATUS status;
@@ -3882,11 +4671,16 @@ static bool test_GetDomainInfo_async(struct torture_context *tctx,
 	int i;
 	union netr_WorkstationInfo query;
 	union netr_DomainInfo info;
+	struct dcerpc_pipe *p = NULL;
 
 	torture_comment(tctx, "Testing netr_LogonGetDomainInfo - async count %d\n", ASYNC_COUNT);
 
 	if (!test_SetupCredentials3(p, tctx, NETLOGON_NEG_AUTH2_ADS_FLAGS,
 				    machine_credentials, &creds)) {
+		return false;
+	}
+	if (!test_SetupCredentialsPipe(p1, tctx, machine_credentials, creds,
+				       DCERPC_SIGN | DCERPC_SEAL, &p)) {
 		return false;
 	}
 
@@ -3944,7 +4738,7 @@ static bool test_ManyGetDCName(struct torture_context *tctx,
 {
 	NTSTATUS status;
 	struct cli_credentials *anon_creds;
-	const struct dcerpc_binding *binding2;
+	struct dcerpc_binding *binding2;
 	struct dcerpc_pipe *p2;
 	struct lsa_ObjectAttribute attr;
 	struct lsa_QosInfo qos;
@@ -3962,7 +4756,7 @@ static bool test_ManyGetDCName(struct torture_context *tctx,
 	int i;
 
 	if (p->conn->transport.transport != NCACN_NP) {
-		return true;
+		torture_skip(tctx, "test_ManyGetDCName works only with NCACN_NP");
 	}
 
 	torture_comment(tctx, "Torturing GetDCName\n");
@@ -3970,7 +4764,12 @@ static bool test_ManyGetDCName(struct torture_context *tctx,
 	anon_creds = cli_credentials_init_anon(tctx);
 	torture_assert(tctx, anon_creds != NULL, "cli_credentials_init_anon failed");
 
-	binding2 = p->binding;
+	binding2 = dcerpc_binding_dup(tctx, p->binding);
+	/* Swap the binding details from NETLOGON to LSA */
+	status = dcerpc_epm_map_binding(tctx, binding2, &ndr_table_lsarpc, tctx->ev, tctx->lp_ctx);
+	dcerpc_binding_set_assoc_group_id(binding2, 0);
+	torture_assert_ntstatus_ok(tctx, status, "epm map");
+
 	status = dcerpc_secondary_auth_connection(p, binding2, &ndr_table_lsarpc,
 						  anon_creds, tctx->lp_ctx,
 						  tctx, &p2);
@@ -4033,6 +4832,65 @@ static bool test_ManyGetDCName(struct torture_context *tctx,
 	return true;
 }
 
+static bool test_lsa_over_netlogon(struct torture_context *tctx,
+				   struct dcerpc_pipe *p)
+{
+	NTSTATUS status;
+	struct cli_credentials *anon_creds;
+	const struct dcerpc_binding *binding2;
+	struct dcerpc_pipe *p2;
+	struct lsa_ObjectAttribute attr;
+	struct lsa_QosInfo qos;
+	struct lsa_OpenPolicy2 o;
+	struct policy_handle lsa_handle;
+
+	struct dcerpc_binding_handle *b2;
+
+
+	if (p->conn->transport.transport != NCACN_NP) {
+		torture_skip(tctx, "test_lsa_over_netlogon works only with NCACN_NP");
+	}
+
+	torture_comment(tctx, "Testing if we can access the LSA server over\n"
+			" \\\\pipe\\netlogon rather than \\\\pipe\\lsarpc\n");
+
+	anon_creds = cli_credentials_init_anon(tctx);
+	torture_assert(tctx, anon_creds != NULL, "cli_credentials_init_anon failed");
+
+	binding2 = p->binding;
+
+	status = dcerpc_secondary_auth_connection(p, binding2, &ndr_table_lsarpc,
+						  anon_creds, tctx->lp_ctx,
+						  tctx, &p2);
+	torture_assert_ntstatus_ok(tctx, status, "Failed to create secondary connection");
+	b2 = p2->binding_handle;
+
+	qos.len = 0;
+	qos.impersonation_level = 2;
+	qos.context_mode = 1;
+	qos.effective_only = 0;
+
+	attr.len = 0;
+	attr.root_dir = NULL;
+	attr.object_name = NULL;
+	attr.attributes = 0;
+	attr.sec_desc = NULL;
+	attr.sec_qos = &qos;
+
+	o.in.system_name = "\\";
+	o.in.attr = &attr;
+	o.in.access_mask = SEC_FLAG_MAXIMUM_ALLOWED;
+	o.out.handle = &lsa_handle;
+
+	torture_assert_ntstatus_ok(tctx, dcerpc_lsa_OpenPolicy2_r(b2, tctx, &o),
+		"OpenPolicy2 failed");
+	torture_assert_ntstatus_ok(tctx, o.out.result, "OpenPolicy2 failed");
+
+	talloc_free(p2);
+
+	return true;
+}
+
 static bool test_SetPassword_with_flags(struct torture_context *tctx,
 					struct dcerpc_pipe *p,
 					struct cli_credentials *machine_credentials)
@@ -4074,6 +4932,11 @@ struct torture_suite *torture_rpc_netlogon(TALLOC_CTX *mem_ctx)
 	torture_rpc_tcase_add_test_creds(tcase, "SamLogon", test_SamLogon);
 	torture_rpc_tcase_add_test_creds(tcase, "invalidAuthenticate2", test_invalidAuthenticate2);
 	torture_rpc_tcase_add_test_creds(tcase, "ServerReqChallengeGlobal", test_ServerReqChallengeGlobal);
+	torture_rpc_tcase_add_test_creds(tcase, "ServerReqChallengeReuseGlobal", test_ServerReqChallengeReuseGlobal);
+	torture_rpc_tcase_add_test_creds(tcase, "ServerReqChallengeReuseGlobal2", test_ServerReqChallengeReuseGlobal2);
+	torture_rpc_tcase_add_test_creds(tcase, "ServerReqChallengeReuseGlobal3", test_ServerReqChallengeReuseGlobal3);
+	torture_rpc_tcase_add_test_creds(tcase, "ServerReqChallengeReuseGlobal4", test_ServerReqChallengeReuseGlobal4);
+	torture_rpc_tcase_add_test_creds(tcase, "ServerReqChallengeReuse", test_ServerReqChallengeReuse);
 	torture_rpc_tcase_add_test_creds(tcase, "SetPassword", test_SetPassword);
 	torture_rpc_tcase_add_test_creds(tcase, "SetPassword2", test_SetPassword2);
 	torture_rpc_tcase_add_test_creds(tcase, "SetPassword2_AES", test_SetPassword2_AES);
@@ -4103,6 +4966,9 @@ struct torture_suite *torture_rpc_netlogon(TALLOC_CTX *mem_ctx)
 	torture_rpc_tcase_add_test_creds(tcase, "ServerGetTrustInfo", test_netr_ServerGetTrustInfo);
 	torture_rpc_tcase_add_test_creds(tcase, "ServerGetTrustInfo_AES", test_netr_ServerGetTrustInfo_AES);
 	torture_rpc_tcase_add_test_creds(tcase, "GetForestTrustInformation", test_netr_GetForestTrustInformation);
+
+	torture_rpc_tcase_add_test(tcase, "lsa_over_netlogon", test_lsa_over_netlogon);
+	torture_rpc_tcase_add_test_creds(tcase, "SetupCredentialsDowngrade", test_SetupCredentialsDowngrade);
 
 	return suite;
 }

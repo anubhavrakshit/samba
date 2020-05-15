@@ -307,9 +307,6 @@ static bool test_getsysvolreferral(struct torture_context *tctx,
 	const char* str;
 	struct dfs_GetDFSReferral r, r2, r3;
 	struct dfs_referral_resp resp, resp2, resp3;
-	uint8_t zeros[16];
-
-	memset(zeros, 0, sizeof(zeros));
 
 	r.in.req.max_referral_level = 3;
 	r.in.req.servername = "";
@@ -394,8 +391,8 @@ static bool test_getsysvolreferral(struct torture_context *tctx,
 				 talloc_asprintf(tctx,
 					"Not expected version for referral entry 0 got %d expected 4",
 					resp3.referral_entries[0].version));
-	torture_assert_int_equal(tctx, memcmp(resp3.referral_entries[0].referral.v3.service_site_guid.value, zeros, 16), 0,
-				 talloc_asprintf(tctx,
+	torture_assert(tctx, all_zero(resp3.referral_entries[0].referral.v3.service_site_guid.value, 16),
+		       talloc_asprintf(tctx,
 					"Service_site_guid is not NULL as expected"));
 #if 0
 	/* Shouldn't be needed anymore*/
@@ -504,9 +501,9 @@ static bool test_low_referral_level(struct torture_context *tctx,
 	return true;
 }
 
-NTSTATUS torture_dfs_init(void)
+NTSTATUS torture_dfs_init(TALLOC_CTX *ctx)
 {
-	struct torture_suite *suite = torture_suite_create(talloc_autofree_context(), "dfs");
+	struct torture_suite *suite = torture_suite_create(ctx, "dfs");
 	struct torture_suite *suite_basic = torture_suite_create(suite, "domain");
 
 	torture_suite_add_suite(suite, suite_basic);
@@ -537,7 +534,7 @@ NTSTATUS torture_dfs_init(void)
 
 	suite->description = talloc_strdup(suite, "DFS referrals calls");
 
-	torture_register_suite(suite);
+	torture_register_suite(ctx, suite);
 
 	return NT_STATUS_OK;
 }

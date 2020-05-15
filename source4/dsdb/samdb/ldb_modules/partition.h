@@ -43,6 +43,7 @@ struct partition_module {
 struct partition_metadata {
 	struct tdb_wrap *db;
 	int in_transaction;
+	int read_lock_count;
 };
 
 struct partition_private_data {
@@ -51,12 +52,13 @@ struct partition_private_data {
 	struct partition_metadata *metadata;
 	
 	struct partition_module **modules;
-	const char *ldapBackend;
 
 	uint64_t metadata_seq;
 	uint32_t in_transaction;
 
 	struct ldb_message *forced_module_msg;
+
+	const char *backend_db_store;
 };
 
 #include "dsdb/samdb/ldb_modules/partition_proto.h"

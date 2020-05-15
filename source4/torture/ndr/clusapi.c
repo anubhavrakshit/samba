@@ -141,6 +141,9 @@ static bool clusapi_PROPERTY_LIST_check(struct torture_context *tctx,
 	torture_assert_int_equal(tctx, r->propertyValues[5].PropertyValues.Padding.length, 0, "PropertyValues.Padding.length");
 	torture_assert_int_equal(tctx, r->propertyValues[5].end_mark, CLUSPROP_SYNTAX_ENDMARK, "end_mark");
 
+	data_blob_free(&blob_dword_null);
+	data_blob_free(&blob_dword_one);
+
 	return true;
 }
 
@@ -362,6 +365,10 @@ static bool clusapi_PROPERTY_LIST_check2(struct torture_context *tctx,
 	torture_assert_int_equal(tctx, r->propertyValues[11].PropertyValues.Padding.length, 0, "PropertyValues.Padding.length");
 	torture_assert_int_equal(tctx, r->propertyValues[11].end_mark, CLUSPROP_SYNTAX_ENDMARK, "end_mark");
 
+	data_blob_free(&blob_dword_null);
+	data_blob_free(&blob_dword_one);
+	data_blob_free(&blob_dword);
+
 	return true;
 }
 
@@ -369,14 +376,14 @@ struct torture_suite *ndr_clusapi_suite(TALLOC_CTX *ctx)
 {
 	struct torture_suite *suite = torture_suite_create(ctx, "clusapi");
 
-	torture_suite_add_ndr_pullpush_test(suite,
+	torture_suite_add_ndr_pull_validate_test(suite,
 					    clusapi_PROPERTY_LIST,
-					    data_blob_const(clusapi_PROPERTY_LIST_data,sizeof(clusapi_PROPERTY_LIST_data)),
+					    clusapi_PROPERTY_LIST_data,
 					    clusapi_PROPERTY_LIST_check);
 
-	torture_suite_add_ndr_pullpush_test(suite,
+	torture_suite_add_ndr_pull_validate_test(suite,
 					    clusapi_PROPERTY_LIST,
-					    data_blob_const(clusapi_PROPERTY_LIST_data2,sizeof(clusapi_PROPERTY_LIST_data2)),
+					    clusapi_PROPERTY_LIST_data2,
 					    clusapi_PROPERTY_LIST_check2);
 
 	return suite;

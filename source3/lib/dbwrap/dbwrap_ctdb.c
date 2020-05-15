@@ -27,14 +27,16 @@
 #include "dbwrap/dbwrap_rbt.h"
 #include "lib/param/param.h"
 
-#include "ctdb.h"
-#include "ctdb_private.h"
+#include "ctdb/include/ctdb_protocol.h"
 #include "ctdbd_conn.h"
 #include "dbwrap/dbwrap.h"
 #include "dbwrap/dbwrap_private.h"
 #include "dbwrap/dbwrap_ctdb.h"
 #include "g_lock.h"
 #include "messages.h"
+#include "messages_ctdb.h"
+#include "lib/cluster_support.h"
+#include "lib/util/tevent_ntstatus.h"
 
 struct db_ctdb_transaction_handle {
 	struct db_ctdb_ctx *ctx;
@@ -66,6 +68,55 @@ struct db_ctdb_rec {
 	struct ctdb_ltdb_header header;
 	struct timeval lock_time;
 };
+
+struct ctdb_async_ctx {
+	bool initialized;
+	struct ctdbd_connection *async_conn;
+};
+
+static struct ctdb_async_ctx ctdb_async_ctx;
+
+static int ctdb_async_ctx_init_internal(TALLOC_CTX *mem_ctx,
+					struct tevent_context *ev,
+					bool reinit)
+{
+	int ret;
+
+	if (reinit) {
+		TALLOC_FREE(ctdb_async_ctx.async_conn);
+		ctdb_async_ctx.initialized = false;
+	}
+
+	if (ctdb_async_ctx.initialized) {
+		return 0;
+	}
+
+	become_root();
+	ret = ctdbd_init_async_connection(
+		mem_ctx,
+		lp_ctdbd_socket(),
+		lp_ctdb_timeout(),
+		&ctdb_async_ctx.async_conn);
+	unbecome_root();
+
+	if (ret != 0 || ctdb_async_ctx.async_conn == NULL) {
+		DBG_ERR("ctdbd_init_connection failed\n");
+		return EIO;
+	}
+
+	ctdb_async_ctx.initialized = true;
+	return 0;
+}
+
+static int ctdb_async_ctx_init(TALLOC_CTX *mem_ctx, struct tevent_context *ev)
+{
+	return ctdb_async_ctx_init_internal(mem_ctx, ev, false);
+}
+
+int ctdb_async_ctx_reinit(TALLOC_CTX *mem_ctx, struct tevent_context *ev)
+{
+	return ctdb_async_ctx_init_internal(mem_ctx, ev, true);
+}
 
 static NTSTATUS tdb_error_to_ntstatus(struct tdb_context *tdb)
 {
@@ -125,24 +176,16 @@ static NTSTATUS db_ctdb_ltdb_parse(
 static NTSTATUS db_ctdb_ltdb_store(struct db_ctdb_ctx *db,
 				   TDB_DATA key,
 				   struct ctdb_ltdb_header *header,
-				   TDB_DATA data)
+				   const TDB_DATA *dbufs, int num_dbufs)
 {
-	TDB_DATA rec;
+	TDB_DATA recs[num_dbufs+1];
 	int ret;
 
-	rec.dsize = data.dsize + sizeof(struct ctdb_ltdb_header);
-	rec.dptr = (uint8_t *)talloc_size(talloc_tos(), rec.dsize);
+	recs[0] = (TDB_DATA) { .dptr = (uint8_t *)header,
+			       .dsize = sizeof(struct ctdb_ltdb_header) };
+	memcpy(&recs[1], dbufs, sizeof(TDB_DATA) * num_dbufs);
 
-	if (rec.dptr == NULL) {
-		return NT_STATUS_NO_MEMORY;
-	}
-
-	memcpy(rec.dptr, header, sizeof(struct ctdb_ltdb_header));
-	memcpy(sizeof(struct ctdb_ltdb_header) + (uint8_t *)rec.dptr, data.dptr, data.dsize);
-
-	ret = tdb_store(db->wtdb->tdb, key, rec, TDB_REPLACE);
-
-	talloc_free(rec.dptr);
+	ret = tdb_storev(db->wtdb->tdb, key, recs, num_dbufs + 1, TDB_REPLACE);
 
 	return (ret == 0) ? NT_STATUS_OK
 			  : tdb_error_to_ntstatus(db->wtdb->tdb);
@@ -152,17 +195,17 @@ static NTSTATUS db_ctdb_ltdb_store(struct db_ctdb_ctx *db,
 /*
   form a ctdb_rec_data record from a key/data pair
  */
-static struct ctdb_rec_data *db_ctdb_marshall_record(TALLOC_CTX *mem_ctx, uint32_t reqid,
+static struct ctdb_rec_data_old *db_ctdb_marshall_record(TALLOC_CTX *mem_ctx, uint32_t reqid,
 						  TDB_DATA key,
 						  struct ctdb_ltdb_header *header,
 						  TDB_DATA data)
 {
 	size_t length;
-	struct ctdb_rec_data *d;
+	struct ctdb_rec_data_old *d;
 
-	length = offsetof(struct ctdb_rec_data, data) + key.dsize +
+	length = offsetof(struct ctdb_rec_data_old, data) + key.dsize +
 		data.dsize + sizeof(*header);
-	d = (struct ctdb_rec_data *)talloc_size(mem_ctx, length);
+	d = (struct ctdb_rec_data_old *)talloc_size(mem_ctx, length);
 	if (d == NULL) {
 		return NULL;
 	}
@@ -181,13 +224,13 @@ static struct ctdb_rec_data *db_ctdb_marshall_record(TALLOC_CTX *mem_ctx, uint32
 /* helper function for marshalling multiple records */
 static struct ctdb_marshall_buffer *db_ctdb_marshall_add(TALLOC_CTX *mem_ctx,
 					       struct ctdb_marshall_buffer *m,
-					       uint64_t db_id,
+					       uint32_t db_id,
 					       uint32_t reqid,
 					       TDB_DATA key,
 					       struct ctdb_ltdb_header *header,
 					       TDB_DATA data)
 {
-	struct ctdb_rec_data *r;
+	struct ctdb_rec_data_old *r;
 	size_t m_size, r_size;
 	struct ctdb_marshall_buffer *m2 = NULL;
 
@@ -240,13 +283,13 @@ static TDB_DATA db_ctdb_marshall_finish(struct ctdb_marshall_buffer *m)
      - pass r==NULL to start
      - loop the number of times indicated by m->count
 */
-static struct ctdb_rec_data *db_ctdb_marshall_loop_next_key(
-	struct ctdb_marshall_buffer *m, struct ctdb_rec_data *r, TDB_DATA *key)
+static struct ctdb_rec_data_old *db_ctdb_marshall_loop_next_key(
+	struct ctdb_marshall_buffer *m, struct ctdb_rec_data_old *r, TDB_DATA *key)
 {
 	if (r == NULL) {
-		r = (struct ctdb_rec_data *)&m->data[0];
+		r = (struct ctdb_rec_data_old *)&m->data[0];
 	} else {
-		r = (struct ctdb_rec_data *)(r->length + (uint8_t *)r);
+		r = (struct ctdb_rec_data_old *)(r->length + (uint8_t *)r);
 	}
 
 	key->dptr   = &r->data[0];
@@ -255,7 +298,7 @@ static struct ctdb_rec_data *db_ctdb_marshall_loop_next_key(
 }
 
 static bool db_ctdb_marshall_buf_parse(
-	struct ctdb_rec_data *r, uint32_t *reqid,
+	struct ctdb_rec_data_old *r, uint32_t *reqid,
 	struct ctdb_ltdb_header **header, TDB_DATA *data)
 {
 	if (r->datalen < sizeof(struct ctdb_ltdb_header)) {
@@ -279,7 +322,8 @@ static int db_ctdb_transaction_destructor(struct db_ctdb_transaction_handle *h)
 {
 	NTSTATUS status;
 
-	status = g_lock_unlock(h->ctx->lock_ctx, h->lock_name);
+	status = g_lock_unlock(h->ctx->lock_ctx,
+			       string_term_tdb_data(h->lock_name));
 	if (!NT_STATUS_IS_OK(status)) {
 		DEBUG(0, ("g_lock_unlock failed for %s: %s\n", h->lock_name,
 			  nt_errstr(status)));
@@ -331,8 +375,8 @@ static int db_ctdb_transaction_start(struct db_context *db)
 	/*
 	 * Wait a day, i.e. forever...
 	 */
-	status = g_lock_lock(ctx->lock_ctx, h->lock_name, G_LOCK_WRITE,
-			     timeval_set(86400, 0));
+	status = g_lock_lock(ctx->lock_ctx, string_term_tdb_data(h->lock_name),
+			     G_LOCK_WRITE, timeval_set(86400, 0));
 	if (!NT_STATUS_IS_OK(status)) {
 		DEBUG(0, ("g_lock_lock failed: %s\n", nt_errstr(status)));
 		TALLOC_FREE(h);
@@ -354,10 +398,10 @@ static bool parse_newest_in_marshall_buffer(
 		       TDB_DATA data, void *private_data),
 	void *private_data)
 {
-	struct ctdb_rec_data *rec = NULL;
+	struct ctdb_rec_data_old *rec = NULL;
 	struct ctdb_ltdb_header *h = NULL;
 	TDB_DATA data;
-	int i;
+	uint32_t i;
 
 	if (buf == NULL) {
 		return false;
@@ -445,7 +489,9 @@ static bool pull_newest_from_marshall_buffer(struct ctdb_marshall_buffer *buf,
 	return true;
 }
 
-static NTSTATUS db_ctdb_store_transaction(struct db_record *rec, TDB_DATA data, int flag);
+static NTSTATUS db_ctdb_storev_transaction(struct db_record *rec,
+					   const TDB_DATA *dbufs, int num_dbufs,
+					   int flag);
 static NTSTATUS db_ctdb_delete_transaction(struct db_record *rec);
 
 static struct db_record *db_ctdb_fetch_locked_transaction(struct db_ctdb_ctx *ctx,
@@ -472,11 +518,17 @@ static struct db_record *db_ctdb_fetch_locked_transaction(struct db_ctdb_ctx *ct
 		return NULL;
 	}
 
-	result->store = db_ctdb_store_transaction;
+	result->storev = db_ctdb_storev_transaction;
 	result->delete_rec = db_ctdb_delete_transaction;
 
+	if (ctx->transaction == NULL) {
+		DEBUG(0, ("no transaction available\n"));
+		TALLOC_FREE(result);
+		return NULL;
+	}
 	if (pull_newest_from_marshall_buffer(ctx->transaction->m_write, key,
 					     NULL, result, &result->value)) {
+		result->value_valid = true;
 		return result;
 	}
 
@@ -484,6 +536,7 @@ static struct db_record *db_ctdb_fetch_locked_transaction(struct db_ctdb_ctx *ct
 	if (ctdb_data.dptr == NULL) {
 		/* create the record */
 		result->value = tdb_null;
+		result->value_valid = true;
 		return result;
 	}
 
@@ -496,7 +549,9 @@ static struct db_record *db_ctdb_fetch_locked_transaction(struct db_ctdb_ctx *ct
 			 result->value.dsize))) {
 		DEBUG(0, ("talloc failed\n"));
 		TALLOC_FREE(result);
+		return NULL;
 	}
+	result->value_valid = true;
 
 	SAFE_FREE(ctdb_data.dptr);
 
@@ -607,13 +662,23 @@ static NTSTATUS db_ctdb_transaction_store(struct db_ctdb_transaction_handle *h,
 /* 
    a record store inside a transaction
  */
-static NTSTATUS db_ctdb_store_transaction(struct db_record *rec, TDB_DATA data, int flag)
+static NTSTATUS db_ctdb_storev_transaction(
+	struct db_record *rec, const TDB_DATA *dbufs, int num_dbufs, int flag)
 {
 	struct db_ctdb_transaction_handle *h = talloc_get_type_abort(
 		rec->private_data, struct db_ctdb_transaction_handle);
 	NTSTATUS status;
+	TDB_DATA data;
+
+	data = dbwrap_merge_dbufs(rec, dbufs, num_dbufs);
+	if (data.dptr == NULL) {
+		return NT_STATUS_NO_MEMORY;
+	}
 
 	status = db_ctdb_transaction_store(h, rec->key, data);
+
+	TALLOC_FREE(data.dptr);
+
 	return status;
 }
 
@@ -678,14 +743,8 @@ static NTSTATUS db_ctdb_store_db_seqnum(struct db_ctdb_transaction_handle *h,
 					uint64_t seqnum)
 {
 	NTSTATUS status;
-	const char *keyname = CTDB_DB_SEQNUM_KEY;
-	TDB_DATA key;
-	TDB_DATA data;
-
-	key = string_term_tdb_data(keyname);
-
-	data.dptr = (uint8_t *)&seqnum;
-	data.dsize = sizeof(uint64_t);
+	TDB_DATA key = string_term_tdb_data(CTDB_DB_SEQNUM_KEY);
+	TDB_DATA data = { .dptr=(uint8_t *)&seqnum, .dsize=sizeof(seqnum) };
 
 	status = db_ctdb_transaction_store(h, key, data);
 
@@ -700,7 +759,7 @@ static int db_ctdb_transaction_commit(struct db_context *db)
 	struct db_ctdb_ctx *ctx = talloc_get_type_abort(db->private_data,
 							struct db_ctdb_ctx);
 	NTSTATUS rets;
-	int status;
+	int32_t status;
 	struct db_ctdb_transaction_handle *h = ctx->transaction;
 	uint64_t old_seqnum, new_seqnum;
 	int ret;
@@ -760,12 +819,12 @@ static int db_ctdb_transaction_commit(struct db_context *db)
 
 again:
 	/* tell ctdbd to commit to the other nodes */
-	rets = ctdbd_control_local(messaging_ctdbd_connection(),
-				   CTDB_CONTROL_TRANS3_COMMIT,
-				   h->ctx->db_id, 0,
-				   db_ctdb_marshall_finish(h->m_write),
-				   NULL, NULL, &status);
-	if (!NT_STATUS_IS_OK(rets) || status != 0) {
+	ret = ctdbd_control_local(messaging_ctdb_connection(),
+				  CTDB_CONTROL_TRANS3_COMMIT,
+				  h->ctx->db_id, 0,
+				  db_ctdb_marshall_finish(h->m_write),
+				  NULL, NULL, &status);
+	if ((ret != 0) || status != 0) {
 		/*
 		 * The TRANS3_COMMIT control should only possibly fail when a
 		 * recovery has been running concurrently. In any case, the db
@@ -839,24 +898,30 @@ static int db_ctdb_transaction_cancel(struct db_context *db)
 }
 
 
-static NTSTATUS db_ctdb_store(struct db_record *rec, TDB_DATA data, int flag)
+static NTSTATUS db_ctdb_storev(struct db_record *rec,
+			       const TDB_DATA *dbufs, int num_dbufs, int flag)
 {
 	struct db_ctdb_rec *crec = talloc_get_type_abort(
 		rec->private_data, struct db_ctdb_rec);
+	NTSTATUS status;
 
-	return db_ctdb_ltdb_store(crec->ctdb_ctx, rec->key, &(crec->header), data);
+	status = db_ctdb_ltdb_store(crec->ctdb_ctx, rec->key, &(crec->header),
+				    dbufs, num_dbufs);
+	return status;
 }
 
 
 
 static NTSTATUS db_ctdb_send_schedule_for_deletion(struct db_record *rec)
 {
-	NTSTATUS status;
+	NTSTATUS status = NT_STATUS_OK;
+	int ret;
 	struct ctdb_control_schedule_for_deletion *dd;
 	TDB_DATA indata;
-	int cstatus;
+	int32_t cstatus;
 	struct db_ctdb_rec *crec = talloc_get_type_abort(
 		rec->private_data, struct db_ctdb_rec);
+	struct db_ctdb_ctx *ctx = crec->ctdb_ctx;
 
 	indata.dsize = offsetof(struct ctdb_control_schedule_for_deletion, key) + rec->key.dsize;
 	indata.dptr = talloc_zero_array(crec, uint8_t, indata.dsize);
@@ -866,26 +931,28 @@ static NTSTATUS db_ctdb_send_schedule_for_deletion(struct db_record *rec)
 	}
 
 	dd = (struct ctdb_control_schedule_for_deletion *)(void *)indata.dptr;
-	dd->db_id = crec->ctdb_ctx->db_id;
+	dd->db_id = ctx->db_id;
 	dd->hdr = crec->header;
 	dd->keylen = rec->key.dsize;
 	memcpy(dd->key, rec->key.dptr, rec->key.dsize);
 
-	status = ctdbd_control_local(messaging_ctdbd_connection(),
-				     CTDB_CONTROL_SCHEDULE_FOR_DELETION,
-				     crec->ctdb_ctx->db_id,
-				     CTDB_CTRL_FLAG_NOREPLY, /* flags */
-				     indata,
-				     NULL, /* outdata */
-				     NULL, /* errmsg */
-				     &cstatus);
+	ret = ctdbd_control_local(messaging_ctdb_connection(),
+				  CTDB_CONTROL_SCHEDULE_FOR_DELETION,
+				  crec->ctdb_ctx->db_id,
+				  CTDB_CTRL_FLAG_NOREPLY, /* flags */
+				  indata,
+				  NULL, /* mem_ctx */
+				  NULL, /* outdata */
+				  &cstatus);
 	talloc_free(indata.dptr);
 
-	if (!NT_STATUS_IS_OK(status) || cstatus != 0) {
+	if ((ret != 0) || cstatus != 0) {
 		DEBUG(1, (__location__ " Error sending local control "
-			  "SCHEDULE_FOR_DELETION: %s, cstatus = %d\n",
-			  nt_errstr(status), cstatus));
-		if (NT_STATUS_IS_OK(status)) {
+			  "SCHEDULE_FOR_DELETION: %s, cstatus = %"PRIi32"\n",
+			  strerror(ret), cstatus));
+		if (ret != 0) {
+			status = map_nt_error_from_unix(ret);
+		} else {
 			status = NT_STATUS_UNSUCCESSFUL;
 		}
 	}
@@ -902,7 +969,7 @@ static NTSTATUS db_ctdb_delete(struct db_record *rec)
 	 * tdb-level cleanup
 	 */
 
-	status = db_ctdb_store(rec, tdb_null, 0);
+	status = db_ctdb_storev(rec, &tdb_null, 1, 0);
 	if (!NT_STATUS_IS_OK(status)) {
 		return status;
 	}
@@ -974,9 +1041,9 @@ static int db_ctdb_record_destr(struct db_record* data)
  * either for reading or for writing.
  */
 static bool db_ctdb_can_use_local_hdr(const struct ctdb_ltdb_header *hdr,
-				      bool read_only)
+				      uint32_t my_vnn, bool read_only)
 {
-	if (hdr->dmaster != get_my_vnn()) {
+	if (hdr->dmaster != my_vnn) {
 		/* If we're not dmaster, it must be r/o copy. */
 		return read_only && (hdr->flags & CTDB_REC_RO_HAVE_READONLY);
 	}
@@ -987,7 +1054,8 @@ static bool db_ctdb_can_use_local_hdr(const struct ctdb_ltdb_header *hdr,
 	return read_only || !(hdr->flags & CTDB_REC_RO_HAVE_DELEGATIONS);
 }
 
-static bool db_ctdb_can_use_local_copy(TDB_DATA ctdb_data, bool read_only)
+static bool db_ctdb_can_use_local_copy(TDB_DATA ctdb_data, uint32_t my_vnn,
+				       bool read_only)
 {
 	if (ctdb_data.dptr == NULL) {
 		return false;
@@ -998,7 +1066,7 @@ static bool db_ctdb_can_use_local_copy(TDB_DATA ctdb_data, bool read_only)
 	}
 
 	return db_ctdb_can_use_local_hdr(
-		(struct ctdb_ltdb_header *)ctdb_data.dptr, read_only);
+		(struct ctdb_ltdb_header *)ctdb_data.dptr, my_vnn, read_only);
 }
 
 static struct db_record *fetch_locked_internal(struct db_ctdb_ctx *ctx,
@@ -1008,7 +1076,6 @@ static struct db_record *fetch_locked_internal(struct db_ctdb_ctx *ctx,
 {
 	struct db_record *result;
 	struct db_ctdb_rec *crec;
-	NTSTATUS status;
 	TDB_DATA ctdb_data;
 	int migrate_attempts;
 	struct timeval migrate_start;
@@ -1018,6 +1085,7 @@ static struct db_record *fetch_locked_internal(struct db_ctdb_ctx *ctx,
 	double ctdb_time = 0;
 	int duration_msecs;
 	int lockret;
+	int ret;
 
 	if (!(result = talloc(mem_ctx, struct db_record))) {
 		DEBUG(0, ("talloc failed\n"));
@@ -1072,7 +1140,7 @@ again:
 		return NULL;
 	}
 
-	result->store = db_ctdb_store;
+	result->storev = db_ctdb_storev;
 	result->delete_rec = db_ctdb_delete;
 	talloc_set_destructor(result, db_ctdb_record_destr);
 
@@ -1083,7 +1151,7 @@ again:
 	 * take the shortcut and just return it.
 	 */
 
-	if (!db_ctdb_can_use_local_copy(ctdb_data, false)) {
+	if (!db_ctdb_can_use_local_copy(ctdb_data, get_my_vnn(), false)) {
 		SAFE_FREE(ctdb_data.dptr);
 		tdb_chainunlock(ctx->wtdb->tdb, key);
 		talloc_set_destructor(result, NULL);
@@ -1096,21 +1164,23 @@ again:
 
 		migrate_attempts += 1;
 
-		DEBUG(10, ("ctdb_data.dptr = %p, dmaster = %u (%u) %u\n",
+		DEBUG(10, ("ctdb_data.dptr = %p, dmaster = %"PRIu32" "
+			   "(%"PRIu32") %"PRIu32"\n",
 			   ctdb_data.dptr, ctdb_data.dptr ?
-			   ((struct ctdb_ltdb_header *)ctdb_data.dptr)->dmaster : -1,
+			   ((struct ctdb_ltdb_header *)ctdb_data.dptr)->dmaster :
+			   UINT32_MAX,
 			   get_my_vnn(),
 			   ctdb_data.dptr ?
 			   ((struct ctdb_ltdb_header *)ctdb_data.dptr)->flags : 0));
 
 		GetTimeOfDay(&ctdb_start_time);
-		status = ctdbd_migrate(messaging_ctdbd_connection(), ctx->db_id,
-				       key);
+		ret = ctdbd_migrate(messaging_ctdb_connection(), ctx->db_id,
+				    key);
 		ctdb_time += timeval_elapsed(&ctdb_start_time);
 
-		if (!NT_STATUS_IS_OK(status)) {
-			DEBUG(5, ("ctdb_migrate failed: %s\n",
-				  nt_errstr(status)));
+		if (ret != 0) {
+			DEBUG(5, ("ctdbd_migrate failed: %s\n",
+				  strerror(ret)));
 			TALLOC_FREE(result);
 			return NULL;
 		}
@@ -1159,13 +1229,17 @@ again:
 	result->value.dsize = ctdb_data.dsize - sizeof(crec->header);
 	result->value.dptr = NULL;
 
-	if ((result->value.dsize != 0)
-	    && !(result->value.dptr = (uint8_t *)talloc_memdup(
-			 result, ctdb_data.dptr + sizeof(crec->header),
-			 result->value.dsize))) {
-		DEBUG(0, ("talloc failed\n"));
-		TALLOC_FREE(result);
+	if (result->value.dsize != 0) {
+		result->value.dptr = talloc_memdup(
+			result, ctdb_data.dptr + sizeof(crec->header),
+			result->value.dsize);
+		if (result->value.dptr == NULL) {
+			DBG_ERR("talloc failed\n");
+			TALLOC_FREE(result);
+			return NULL;
+		}
 	}
+	result->value_valid = true;
 
 	SAFE_FREE(ctdb_data.dptr);
 
@@ -1211,8 +1285,10 @@ static struct db_record *db_ctdb_try_fetch_locked(struct db_context *db,
 struct db_ctdb_parse_record_state {
 	void (*parser)(TDB_DATA key, TDB_DATA data, void *private_data);
 	void *private_data;
+	uint32_t my_vnn;
 	bool ask_for_readonly_copy;
 	bool done;
+	bool empty_record;
 };
 
 static void db_ctdb_parse_record_parser(
@@ -1231,8 +1307,17 @@ static void db_ctdb_parse_record_parser_nonpersistent(
 	struct db_ctdb_parse_record_state *state =
 		(struct db_ctdb_parse_record_state *)private_data;
 
-	if (db_ctdb_can_use_local_hdr(header, true)) {
-		state->parser(key, data, state->private_data);
+	if (db_ctdb_can_use_local_hdr(header, state->my_vnn, true)) {
+		/*
+		 * A record consisting only of the ctdb header can be
+		 * a validly created empty record or a tombstone
+		 * record of a deleted record (not vacuumed yet). Mark
+		 * it accordingly.
+		 */
+		state->empty_record = (data.dsize == 0);
+		if (!state->empty_record) {
+			state->parser(key, data, state->private_data);
+		}
 		state->done = true;
 	} else {
 		/*
@@ -1242,6 +1327,62 @@ static void db_ctdb_parse_record_parser_nonpersistent(
 		 */
 		state->ask_for_readonly_copy = true;
 	}
+}
+
+static NTSTATUS db_ctdb_try_parse_local_record(struct db_ctdb_ctx *ctx,
+					       TDB_DATA key,
+					       struct db_ctdb_parse_record_state *state)
+{
+	NTSTATUS status;
+
+	if (ctx->transaction != NULL) {
+		struct db_ctdb_transaction_handle *h = ctx->transaction;
+		bool found;
+
+		/*
+		 * Transactions only happen for persistent db's.
+		 */
+
+		found = parse_newest_in_marshall_buffer(
+			h->m_write, key, db_ctdb_parse_record_parser, state);
+
+		if (found) {
+			return NT_STATUS_OK;
+		}
+	}
+
+	if (ctx->db->persistent) {
+		/*
+		 * Persistent db, but not found in the transaction buffer
+		 */
+		return db_ctdb_ltdb_parse(
+			ctx, key, db_ctdb_parse_record_parser, state);
+	}
+
+	state->done = false;
+	state->ask_for_readonly_copy = false;
+
+	status = db_ctdb_ltdb_parse(
+		ctx, key, db_ctdb_parse_record_parser_nonpersistent, state);
+	if (NT_STATUS_IS_OK(status) && state->done) {
+		if (state->empty_record) {
+			/*
+			 * We know authoritatively, that this is an empty
+			 * record. Since ctdb does not distinguish between empty
+			 * and deleted records, this can be a record stored as
+			 * empty or a not-yet-vacuumed tombstone record of a
+			 * deleted record. Now Samba right now can live without
+			 * empty records, so we can safely report this record
+			 * as non-existing.
+			 *
+			 * See bugs 10008 and 12005.
+			 */
+			return NT_STATUS_NOT_FOUND;
+		}
+		return NT_STATUS_OK;
+	}
+
+	return NT_STATUS_MORE_PROCESSING_REQUIRED;
 }
 
 static NTSTATUS db_ctdb_parse_record(struct db_context *db, TDB_DATA key,
@@ -1254,45 +1395,130 @@ static NTSTATUS db_ctdb_parse_record(struct db_context *db, TDB_DATA key,
 		db->private_data, struct db_ctdb_ctx);
 	struct db_ctdb_parse_record_state state;
 	NTSTATUS status;
+	int ret;
 
 	state.parser = parser;
 	state.private_data = private_data;
+	state.my_vnn = get_my_vnn();
+	state.empty_record = false;
 
-	if (ctx->transaction != NULL) {
-		struct db_ctdb_transaction_handle *h = ctx->transaction;
-		bool found;
+	status = db_ctdb_try_parse_local_record(ctx, key, &state);
+	if (!NT_STATUS_EQUAL(status, NT_STATUS_MORE_PROCESSING_REQUIRED)) {
+		return status;
+	}
 
-		/*
-		 * Transactions only happen for persistent db's.
-		 */
-
-		found = parse_newest_in_marshall_buffer(
-			h->m_write, key, db_ctdb_parse_record_parser, &state);
-
-		if (found) {
-			return NT_STATUS_OK;
+	ret = ctdbd_parse(messaging_ctdb_connection(), ctx->db_id, key,
+			  state.ask_for_readonly_copy, parser, private_data);
+	if (ret != 0) {
+		if (ret == ENOENT) {
+			/*
+			 * This maps to
+			 * NT_STATUS_OBJECT_NAME_NOT_FOUND. Our upper
+			 * layers expect NT_STATUS_NOT_FOUND for "no
+			 * record around". We need to convert dbwrap
+			 * to 0/errno away from NTSTATUS ... :-)
+			 */
+			return NT_STATUS_NOT_FOUND;
 		}
+		return map_nt_error_from_unix(ret);
+	}
+	return NT_STATUS_OK;
+}
+
+static void db_ctdb_parse_record_done(struct tevent_req *subreq);
+
+static struct tevent_req *db_ctdb_parse_record_send(
+	TALLOC_CTX *mem_ctx,
+	struct tevent_context *ev,
+	struct db_context *db,
+	TDB_DATA key,
+	void (*parser)(TDB_DATA key,
+		       TDB_DATA data,
+		       void *private_data),
+	void *private_data,
+	enum dbwrap_req_state *req_state)
+{
+	struct db_ctdb_ctx *ctx = talloc_get_type_abort(
+		db->private_data, struct db_ctdb_ctx);
+	struct tevent_req *req = NULL;
+	struct tevent_req *subreq = NULL;
+	struct db_ctdb_parse_record_state *state = NULL;
+	NTSTATUS status;
+
+	req = tevent_req_create(mem_ctx, &state,
+				struct db_ctdb_parse_record_state);
+	if (req == NULL) {
+		*req_state = DBWRAP_REQ_ERROR;
+		return NULL;
+
 	}
 
-	if (db->persistent) {
-		/*
-		 * Persistent db, but not found in the transaction buffer
-		 */
-		return db_ctdb_ltdb_parse(
-			ctx, key, db_ctdb_parse_record_parser, &state);
+	*state = (struct db_ctdb_parse_record_state) {
+		.parser = parser,
+		.private_data = private_data,
+		.my_vnn = get_my_vnn(),
+		.empty_record = false,
+	};
+
+	status = db_ctdb_try_parse_local_record(ctx, key, state);
+	if (!NT_STATUS_EQUAL(status, NT_STATUS_MORE_PROCESSING_REQUIRED)) {
+		if (tevent_req_nterror(req, status)) {
+			*req_state = DBWRAP_REQ_ERROR;
+			return tevent_req_post(req, ev);
+		}
+		*req_state = DBWRAP_REQ_DONE;
+		tevent_req_done(req);
+		return tevent_req_post(req, ev);
 	}
 
-	state.done = false;
-	state.ask_for_readonly_copy = false;
+	subreq = ctdbd_parse_send(state,
+				  ev,
+				  ctdb_async_ctx.async_conn,
+				  ctx->db_id,
+				  key,
+				  state->ask_for_readonly_copy,
+				  parser,
+				  private_data,
+				  req_state);
+	if (tevent_req_nomem(subreq, req)) {
+		*req_state = DBWRAP_REQ_ERROR;
+		return tevent_req_post(req, ev);
+	}
+	tevent_req_set_callback(subreq, db_ctdb_parse_record_done, req);
 
-	status = db_ctdb_ltdb_parse(
-		ctx, key, db_ctdb_parse_record_parser_nonpersistent, &state);
-	if (NT_STATUS_IS_OK(status) && state.done) {
-		return NT_STATUS_OK;
+	return req;
+}
+
+static void db_ctdb_parse_record_done(struct tevent_req *subreq)
+{
+	struct tevent_req *req = tevent_req_callback_data(
+		subreq, struct tevent_req);
+	int ret;
+
+	ret = ctdbd_parse_recv(subreq);
+	TALLOC_FREE(subreq);
+	if (ret != 0) {
+		if (ret == ENOENT) {
+			/*
+			 * This maps to NT_STATUS_OBJECT_NAME_NOT_FOUND. Our
+			 * upper layers expect NT_STATUS_NOT_FOUND for "no
+			 * record around". We need to convert dbwrap to 0/errno
+			 * away from NTSTATUS ... :-)
+			 */
+			tevent_req_nterror(req, NT_STATUS_NOT_FOUND);
+			return;
+		}
+		tevent_req_nterror(req, map_nt_error_from_unix(ret));
+		return;
 	}
 
-	return ctdbd_parse(messaging_ctdbd_connection(), ctx->db_id, key,
-			   state.ask_for_readonly_copy, parser, private_data);
+	tevent_req_done(req);
+	return;
+}
+
+static NTSTATUS db_ctdb_parse_record_recv(struct tevent_req *req)
+{
+	return tevent_req_simple_recv_ntstatus(req);
 }
 
 struct traverse_state {
@@ -1305,12 +1531,20 @@ struct traverse_state {
 static void traverse_callback(TDB_DATA key, TDB_DATA data, void *private_data)
 {
 	struct traverse_state *state = (struct traverse_state *)private_data;
-	struct db_record *rec;
-	TALLOC_CTX *tmp_ctx = talloc_new(state->db);
+	struct db_record *rec = NULL;
+	TALLOC_CTX *tmp_ctx = NULL;
+
+	tmp_ctx = talloc_new(state->db);
+	if (tmp_ctx == NULL) {
+		DBG_ERR("talloc_new failed\n");
+		return;
+	}
+
 	/* we have to give them a locked record to prevent races */
 	rec = db_ctdb_fetch_locked(state->db, tmp_ctx, key);
-	if (rec && rec->value.dsize > 0) {
+	if (rec != NULL && rec->value.dsize > 0) {
 		state->fn(rec, state->private_data);
+		state->count++;
 	}
 	talloc_free(tmp_ctx);
 }
@@ -1350,25 +1584,55 @@ static int traverse_persistent_callback_dbwrap(struct db_record *rec, void* data
 	return traverse_persistent_callback(NULL, rec->key, rec->value, data);
 }
 
+static int db_ctdbd_traverse(uint32_t db_id,
+			     void (*fn)(TDB_DATA key, TDB_DATA data,
+					void *private_data),
+			     void *private_data)
+{
+	struct ctdbd_connection *conn;
+	int ret;
+
+	become_root();
+	ret = ctdbd_init_connection(talloc_tos(), lp_ctdbd_socket(),
+				    lp_ctdb_timeout(), &conn);
+	unbecome_root();
+	if (ret != 0) {
+		DBG_WARNING("ctdbd_init_connection failed: %s\n",
+			    strerror(ret));
+		return ret;
+	}
+
+	ret = ctdbd_traverse(conn, db_id, fn, private_data);
+	TALLOC_FREE(conn);
+
+	if (ret != 0) {
+		DBG_WARNING("ctdbd_traverse failed: %s\n",
+			    strerror(ret));
+		return ret;
+	}
+
+	return 0;
+}
+
 
 static int db_ctdb_traverse(struct db_context *db,
 			    int (*fn)(struct db_record *rec,
 				      void *private_data),
 			    void *private_data)
 {
-	NTSTATUS status;
+	int ret;
         struct db_ctdb_ctx *ctx = talloc_get_type_abort(db->private_data,
                                                         struct db_ctdb_ctx);
 	struct traverse_state state;
 
-	state.db = db;
-	state.fn = fn;
-	state.private_data = private_data;
-	state.count = 0;
+	state = (struct traverse_state) {
+		.db = db,
+		.fn = fn,
+		.private_data = private_data,
+	};
 
 	if (db->persistent) {
 		struct tdb_context *ltdb = ctx->wtdb->tdb;
-		int ret;
 
 		/* for persistent databases we don't need to do a ctdb traverse,
 		   we can do a faster local traverse */
@@ -1383,9 +1647,10 @@ static int db_ctdb_traverse(struct db_context *db,
 			 */
 			struct db_context *newkeys = db_open_rbt(talloc_tos());
 			struct ctdb_marshall_buffer *mbuf = ctx->transaction->m_write;
-			struct ctdb_rec_data *rec=NULL;
-			int i;
+			struct ctdb_rec_data_old *rec=NULL;
+			uint32_t i;
 			int count = 0;
+			NTSTATUS status;
 
 			if (newkeys == NULL) {
 				return -1;
@@ -1414,14 +1679,15 @@ static int db_ctdb_traverse(struct db_context *db,
 		return ret;
 	}
 
-	status = ctdbd_traverse(ctx->db_id, traverse_callback, &state);
-	if (!NT_STATUS_IS_OK(status)) {
+	ret = db_ctdbd_traverse(ctx->db_id, traverse_callback, &state);
+	if (ret != 0) {
 		return -1;
 	}
 	return state.count;
 }
 
-static NTSTATUS db_ctdb_store_deny(struct db_record *rec, TDB_DATA data, int flag)
+static NTSTATUS db_ctdb_storev_deny(struct db_record *rec,
+				    const TDB_DATA *dbufs, int num_dbufs, int flag)
 {
 	return NT_STATUS_MEDIA_WRITE_PROTECTED;
 }
@@ -1440,9 +1706,10 @@ static void traverse_read_callback(TDB_DATA key, TDB_DATA data, void *private_da
 	rec.db = state->db;
 	rec.key = key;
 	rec.value = data;
-	rec.store = db_ctdb_store_deny;
+	rec.storev = db_ctdb_storev_deny;
 	rec.delete_rec = db_ctdb_delete_deny;
 	rec.private_data = NULL;
+	rec.value_valid = true;
 	state->fn(&rec, state->private_data);
 	state->count++;
 }
@@ -1467,7 +1734,8 @@ static int traverse_persistent_callback_read(TDB_CONTEXT *tdb, TDB_DATA kbuf, TD
 	rec.db = state->db;
 	rec.key = kbuf;
 	rec.value = dbuf;
-	rec.store = db_ctdb_store_deny;
+	rec.value_valid = true;
+	rec.storev = db_ctdb_storev_deny;
 	rec.delete_rec = db_ctdb_delete_deny;
 	rec.private_data = NULL;
 
@@ -1487,24 +1755,33 @@ static int db_ctdb_traverse_read(struct db_context *db,
 					   void *private_data),
 				 void *private_data)
 {
-	NTSTATUS status;
+	int ret;
         struct db_ctdb_ctx *ctx = talloc_get_type_abort(db->private_data,
                                                         struct db_ctdb_ctx);
 	struct traverse_state state;
 
-	state.db = db;
-	state.fn = fn;
-	state.private_data = private_data;
-	state.count = 0;
+	state = (struct traverse_state) {
+		.db = db,
+		.fn = fn,
+		.private_data = private_data,
+	};
 
 	if (db->persistent) {
 		/* for persistent databases we don't need to do a ctdb traverse,
 		   we can do a faster local traverse */
-		return tdb_traverse_read(ctx->wtdb->tdb, traverse_persistent_callback_read, &state);
+		int nrecs;
+
+		nrecs = tdb_traverse_read(ctx->wtdb->tdb,
+					  traverse_persistent_callback_read,
+					  &state);
+		if (nrecs == -1) {
+			return -1;
+		}
+		return state.count;
 	}
 
-	status = ctdbd_traverse(ctx->db_id, traverse_read_callback, &state);
-	if (!NT_STATUS_IS_OK(status)) {
+	ret = db_ctdbd_traverse(ctx->db_id, traverse_read_callback, &state);
+	if (ret != 0) {
 		return -1;
 	}
 	return state.count;
@@ -1517,17 +1794,20 @@ static int db_ctdb_get_seqnum(struct db_context *db)
 	return tdb_get_seqnum(ctx->wtdb->tdb);
 }
 
-static void db_ctdb_id(struct db_context *db, const uint8_t **id,
-		       size_t *idlen)
+static size_t db_ctdb_id(struct db_context *db, uint8_t *id, size_t idlen)
 {
 	struct db_ctdb_ctx *ctx = talloc_get_type_abort(
 		db->private_data, struct db_ctdb_ctx);
 
-	*id = (uint8_t *)&ctx->db_id;
-	*idlen = sizeof(ctx->db_id);
+	if (idlen >= sizeof(ctx->db_id)) {
+		memcpy(id, &ctx->db_id, sizeof(ctx->db_id));
+	}
+
+	return sizeof(ctx->db_id);
 }
 
 struct db_context *db_open_ctdb(TALLOC_CTX *mem_ctx,
+				struct messaging_context *msg_ctx,
 				const char *name,
 				int hash_size, int tdb_flags,
 				int open_flags, mode_t mode,
@@ -1537,11 +1817,12 @@ struct db_context *db_open_ctdb(TALLOC_CTX *mem_ctx,
 	struct db_context *result;
 	struct db_ctdb_ctx *db_ctdb;
 	char *db_path;
-	struct ctdbd_connection *conn;
 	struct loadparm_context *lp_ctx;
-	struct ctdb_db_priority prio;
-	NTSTATUS status;
-	int cstatus;
+	TDB_DATA data;
+	TDB_DATA outdata = {0};
+	bool persistent = (tdb_flags & TDB_CLEAR_IF_FIRST) == 0;
+	int32_t cstatus;
+	int ret;
 
 	if (!lp_clustering()) {
 		DEBUG(10, ("Clustering disabled -- no ctdb\n"));
@@ -1570,46 +1851,72 @@ struct db_context *db_open_ctdb(TALLOC_CTX *mem_ctx,
 	db_ctdb->transaction = NULL;
 	db_ctdb->db = result;
 
-	conn = messaging_ctdbd_connection();
-	if (conn == NULL) {
-		DEBUG(1, ("Could not connect to ctdb\n"));
+	ret = ctdbd_db_attach(messaging_ctdb_connection(), name,
+			      &db_ctdb->db_id, persistent);
+	if (ret != 0) {
+		DEBUG(0, ("ctdbd_db_attach failed for %s: %s\n", name,
+			  strerror(ret)));
 		TALLOC_FREE(result);
 		return NULL;
 	}
 
-	if (!NT_STATUS_IS_OK(ctdbd_db_attach(conn, name, &db_ctdb->db_id, tdb_flags))) {
-		DEBUG(0, ("ctdbd_db_attach failed for %s\n", name));
+	if (tdb_flags & TDB_SEQNUM) {
+		data.dptr = (uint8_t *)&db_ctdb->db_id;
+		data.dsize = sizeof(db_ctdb->db_id);
+
+		ret = ctdbd_control_local(messaging_ctdb_connection(),
+					  CTDB_CONTROL_ENABLE_SEQNUM,
+					  0, 0, data,
+					  NULL, NULL, &cstatus);
+		if ((ret != 0) || cstatus != 0) {
+			DBG_ERR("ctdb_control for enable seqnum "
+				"failed: %s\n", strerror(ret));
+			TALLOC_FREE(result);
+			return NULL;
+		}
+	}
+
+	db_path = ctdbd_dbpath(messaging_ctdb_connection(), db_ctdb,
+			       db_ctdb->db_id);
+	if (db_path == NULL) {
+		DBG_ERR("ctdbd_dbpath failed\n");
 		TALLOC_FREE(result);
 		return NULL;
 	}
 
-	db_path = ctdbd_dbpath(conn, db_ctdb, db_ctdb->db_id);
-
-	result->persistent = ((tdb_flags & TDB_CLEAR_IF_FIRST) == 0);
+	result->persistent = persistent;
 	result->lock_order = lock_order;
 
-	/* only pass through specific flags */
-	tdb_flags &= TDB_SEQNUM|TDB_VOLATILE|
-		TDB_MUTEX_LOCKING|TDB_CLEAR_IF_FIRST;
+	data.dptr = (uint8_t *)&db_ctdb->db_id;
+	data.dsize = sizeof(db_ctdb->db_id);
 
-	/* honor permissions if user has specified O_CREAT */
-	if (open_flags & O_CREAT) {
-		chmod(db_path, mode);
-	}
-
-	prio.db_id = db_ctdb->db_id;
-	prio.priority = lock_order;
-
-	status = ctdbd_control_local(
-		conn, CTDB_CONTROL_SET_DB_PRIORITY, 0, 0,
-		make_tdb_data((uint8_t *)&prio, sizeof(prio)),
-		NULL, NULL, &cstatus);
-
-	if (!NT_STATUS_IS_OK(status) || (cstatus != 0)) {
-		DEBUG(1, ("CTDB_CONTROL_SET_DB_PRIORITY failed: %s, %d\n",
-			  nt_errstr(status), cstatus));
+	ret = ctdbd_control_local(messaging_ctdb_connection(),
+				  CTDB_CONTROL_DB_OPEN_FLAGS,
+				  0, 0, data, NULL, &outdata, &cstatus);
+	if (ret != 0) {
+		DBG_ERR(" ctdb control for db_open_flags "
+			 "failed: %s\n", strerror(ret));
 		TALLOC_FREE(result);
 		return NULL;
+	}
+
+	if (cstatus != 0 || outdata.dsize != sizeof(int)) {
+		DBG_ERR("ctdb_control for db_open_flags failed\n");
+		TALLOC_FREE(outdata.dptr);
+		TALLOC_FREE(result);
+		return NULL;
+	}
+
+	tdb_flags = *(int *)outdata.dptr;
+	TALLOC_FREE(outdata.dptr);
+
+	if (!result->persistent) {
+		ret = ctdb_async_ctx_init(NULL, messaging_tevent_context(msg_ctx));
+		if (ret != 0) {
+			DBG_ERR("ctdb_async_ctx_init failed: %s\n", strerror(ret));
+			TALLOC_FREE(result);
+			return NULL;
+		}
 	}
 
 	if (!result->persistent &&
@@ -1620,12 +1927,13 @@ struct db_context *db_open_ctdb(TALLOC_CTX *mem_ctx,
 		indata = make_tdb_data((uint8_t *)&db_ctdb->db_id,
 				       sizeof(db_ctdb->db_id));
 
-		status = ctdbd_control_local(
-			conn, CTDB_CONTROL_SET_DB_READONLY, 0, 0, indata,
-			NULL, NULL, &cstatus);
-		if (!NT_STATUS_IS_OK(status) || (cstatus != 0)) {
+		ret = ctdbd_control_local(
+			messaging_ctdb_connection(),
+			CTDB_CONTROL_SET_DB_READONLY, 0, 0,
+			indata, NULL, NULL, &cstatus);
+		if ((ret != 0) || (cstatus != 0)) {
 			DEBUG(1, ("CTDB_CONTROL_SET_DB_READONLY failed: "
-				  "%s, %d\n", nt_errstr(status), cstatus));
+				  "%s, %"PRIi32"\n", strerror(ret), cstatus));
 			TALLOC_FREE(result);
 			return NULL;
 		}
@@ -1648,9 +1956,21 @@ struct db_context *db_open_ctdb(TALLOC_CTX *mem_ctx,
 	}
 	talloc_free(db_path);
 
+	/* honor permissions if user has specified O_CREAT */
+	if (open_flags & O_CREAT) {
+		int fd;
+		fd = tdb_fd(db_ctdb->wtdb->tdb);
+		ret = fchmod(fd, mode);
+		if (ret == -1) {
+			DBG_WARNING("fchmod failed: %s\n",
+				    strerror(errno));
+			TALLOC_FREE(result);
+			return NULL;
+		}
+	}
+
 	if (result->persistent) {
-		db_ctdb->lock_ctx = g_lock_ctx_init(db_ctdb,
-						    ctdb_conn_msg_ctx(conn));
+		db_ctdb->lock_ctx = g_lock_ctx_init(db_ctdb, msg_ctx);
 		if (db_ctdb->lock_ctx == NULL) {
 			DEBUG(0, ("g_lock_ctx_init failed\n"));
 			TALLOC_FREE(result);
@@ -1670,6 +1990,8 @@ struct db_context *db_open_ctdb(TALLOC_CTX *mem_ctx,
 	result->fetch_locked = db_ctdb_fetch_locked;
 	result->try_fetch_locked = db_ctdb_try_fetch_locked;
 	result->parse_record = db_ctdb_parse_record;
+	result->parse_record_send = db_ctdb_parse_record_send;
+	result->parse_record_recv = db_ctdb_parse_record_recv;
 	result->traverse = db_ctdb_traverse;
 	result->traverse_read = db_ctdb_traverse_read;
 	result->get_seqnum = db_ctdb_get_seqnum;
@@ -1677,7 +1999,6 @@ struct db_context *db_open_ctdb(TALLOC_CTX *mem_ctx,
 	result->transaction_commit = db_ctdb_transaction_commit;
 	result->transaction_cancel = db_ctdb_transaction_cancel;
 	result->id = db_ctdb_id;
-	result->stored_callback = NULL;
 
 	DEBUG(3,("db_open_ctdb: opened database '%s' with dbid 0x%x\n",
 		 name, db_ctdb->db_id));

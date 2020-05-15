@@ -20,25 +20,30 @@
 */
 
 /**
- Copy any user given reseed data.
-**/
-
-void set_rand_reseed_callback(void (*fn)(void *, int *), void *userdata);
-
-/**
- * Tell the random number generator it needs to reseed.
+ * @brief Generate random values for session and temporary keys.
+ *
+ * @param[in]  out  A pointer to the buffer to fill with random data.
+ *
+ * @param[in]  len  The size of the buffer to fill.
  */
-void set_need_random_reseed(void);
-
-/**
- Interface to the (hopefully) good crypto random number generator.
- Will use our internal PRNG if more than 40 bytes of random generation
- has been requested, otherwise tries to read from /dev/random
-**/
 void generate_random_buffer(uint8_t *out, int len);
 
 /**
- Interface to the (hopefully) good crypto random number generator.
- Will always use /dev/urandom if available.
-**/
+ * @brief Generate random values for long term keys and passwords.
+ *
+ * @param[in]  out  A pointer to the buffer to fill with random data.
+ *
+ * @param[in]  len  The size of the buffer to fill.
+ */
 void generate_secret_buffer(uint8_t *out, int len);
+
+/**
+ * @brief Generate random values for a nonce buffer.
+ *
+ * This is also known as initialization vector.
+ *
+ * @param[in]  out  A pointer to the buffer to fill with random data.
+ *
+ * @param[in]  len  The size of the buffer to fill.
+ */
+void generate_nonce_buffer(uint8_t *out, int len);

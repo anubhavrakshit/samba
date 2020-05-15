@@ -123,10 +123,10 @@
     <title>OPTIONS</title>
 
     <variablelist>
-      <varlistentry><term>-n <parameter>PNN-LIST</parameter></term>
+      <varlistentry><term>-n <parameter>PNN</parameter></term>
       <listitem>
 	<para>
-	  The nodes specified by PNN-LIST should be queried for the
+	  The node specified by PNN should be queried for the
 	  requested information.  Default is to query the daemon
 	  running on the local host.
 	</para>
@@ -198,7 +198,7 @@
       <varlistentry><term>--usage</term>
       <listitem>
 	<para>
-	  Print useage information to the screen.
+	  Print usage information to the screen.
 	</para>
       </listitem>
       </varlistentry>
@@ -206,18 +206,7 @@
       <varlistentry><term>-d --debug=<parameter>DEBUGLEVEL</parameter></term>
       <listitem>
 	<para>
-	  Change the debug level for the command. Default is NOTICE (2).
-	</para>
-      </listitem>
-      </varlistentry>
-
-      <varlistentry><term>--socket=<parameter>FILENAME</parameter></term>
-      <listitem>
-	<para>
-	  Specify that FILENAME is the name of the Unix domain
-	  socket to use when connecting to the local CTDB
-	  daemon. The default is
-	  <filename>/tmp/ctdb.socket</filename>.
+	  Change the debug level for the command. Default is NOTICE.
 	</para>
       </listitem>
       </varlistentry>
@@ -239,16 +228,6 @@
     </refsect2>
 
     <refsect2>
-      <title>xpnn</title>
-      <para>
-	This command displays the PNN of the current node without
-	contacting the CTDB daemon.  It parses the nodes file
-	directly, so can produce unexpected output if the nodes file
-	has been edited but has not been reloaded.
-      </para>
-    </refsect2>
-
-    <refsect2>
       <title>status</title>
       <para>
 	This command shows the current status of all CTDB nodes based
@@ -256,7 +235,7 @@
       </para>
 
       <para>
-	Note: If the the queried node is INACTIVE then the status
+	Note: If the queried node is INACTIVE then the status
 	might not be current.
       </para>
 
@@ -302,10 +281,9 @@
 	<title>Virtual Node Number (VNN) map</title>
 	<para>
 	  Consists of the number of virtual nodes and mapping from
-	  virtual node numbers to physical node numbers.  Virtual
-	  nodes host CTDB databases.  Only nodes that are
-	  participating in the VNN map can become lmaster or dmaster
-	  for database records.
+	  virtual node numbers to physical node numbers.  Only nodes
+	  that are participating in the VNN map can become lmaster for
+	  database records.
 	</para>
       </refsect3>
 
@@ -395,17 +373,6 @@ Recovery master:0
 	    If PNN-LIST is provided then status is given for
 	    the indicated node(s).
 	  </para>
-
-	  <para>
-	    By default, <command>ctdb nodestatus</command> gathers
-	    status from the local node.  However, if invoked with "-n
-	    all" (or similar) then status is gathered from the given
-	    node(s).  In particular <command>ctdb nodestatus
-	    all</command> and <command>ctdb nodestatus -n
-	    all</command> will produce different output.  It is
-	    possible to provide 2 different nodespecs (with and
-	    without "-n") but the output is usually confusing!
-	  </para>
 	</listitem>
       </itemizedlist>
 
@@ -436,7 +403,7 @@ pnn:1 10.0.0.31        OK
       </para>
 
       <para>
-	Note: If the the queried node is INACTIVE then the status
+	Note: If the queried node is INACTIVE then the status
 	might not be current.
       </para>
     </refsect2>
@@ -478,27 +445,68 @@ Duration of last recovery/failover: 2.248552 seconds
     </refsect2>
 
     <refsect2>
-      <title>natgwlist</title>
+      <title>natgw {master|list|status}</title>
       <para>
-	Show the current NAT gateway master and the status of all
-	nodes in the current NAT gateway group.  See the
-	<citetitle>NAT GATEWAY</citetitle> section in
+	This command shows different aspects of NAT gateway status.
+	For an overview of CTDB's NAT gateway functionality please see
+	the <citetitle>NAT GATEWAY</citetitle> section in
 	<citerefentry><refentrytitle>ctdb</refentrytitle>
-	<manvolnum>7</manvolnum></citerefentry> for more details.
+	<manvolnum>7</manvolnum></citerefentry>.
       </para>
 
-      <refsect3>
-	<title>Example</title>
-	<screen>
-# ctdb natgwlist
-0 192.168.2.200
-Number of nodes:4
-pnn:0 192.168.2.200       OK (THIS NODE)
+      <variablelist>
+	<varlistentry>
+	  <term>master</term>
+	  <listitem>
+	    <para>
+	      Show the PNN and private IP address of the current NAT
+	      gateway master node.
+	    </para>
+	    <para>
+	      Example output:
+	    </para>
+	    <screen>
+1 192.168.2.201
+	    </screen>
+	  </listitem>
+	</varlistentry>
+	<varlistentry>
+	  <term>list</term>
+	  <listitem>
+	    <para>
+	      List the private IP addresses of nodes in the current
+	      NAT gateway group, annotating the master node.
+	    </para>
+	    <para>
+	      Example output:
+	    </para>
+	    <screen>
+192.168.2.200
+192.168.2.201	MASTER
+192.168.2.202
+192.168.2.203
+	    </screen>
+	  </listitem>
+	</varlistentry>
+	<varlistentry>
+	  <term>status</term>
+	  <listitem>
+	    <para>
+	      List the nodes in the current NAT gateway group and
+	      their status.
+	    </para>
+	    <para>
+	      Example output:
+	    </para>
+	    <screen>
+pnn:0 192.168.2.200       UNHEALTHY (THIS NODE)
 pnn:1 192.168.2.201       OK
 pnn:2 192.168.2.202       OK
 pnn:3 192.168.2.203       OK
-	</screen>
-      </refsect3>
+	    </screen>
+	  </listitem>
+	</varlistentry>
+      </variablelist>
     </refsect2>
 
     <refsect2>
@@ -510,11 +518,8 @@ pnn:3 192.168.2.203       OK
       <refsect3>
 	<title>Example</title>
 	<screen>
-# ctdb ping -n all
+# ctdb ping
 response from 0 time=0.000054 sec  (3 clients)
-response from 1 time=0.000144 sec  (2 clients)
-response from 2 time=0.000105 sec  (2 clients)
-response from 3 time=0.000114 sec  (2 clients)
 	</screen>
       </refsect3>
     </refsect2>
@@ -548,7 +553,7 @@ name:eth2 link:up references:1
     <refsect2>
       <title>ip</title>
       <para>
-	This command will display the list of public addresses that are provided by the cluster and which physical node is currently serving this ip. By default this command will ONLY show those public addresses that are known to the node itself. To see the full list of all public ips across the cluster you must use "ctdb ip -n all".
+	This command will display the list of public addresses that are provided by the cluster and which physical node is currently serving this ip. By default this command will ONLY show those public addresses that are known to the node itself. To see the full list of all public ips across the cluster you must use "ctdb ip all".
       </para>
       <refsect3>
 	<title>Example</title>
@@ -598,46 +603,172 @@ Interface[2]: Name:eth5 Link:up References:2 (active)
     </refsect2>
 
     <refsect2>
+      <title>event run|status|script list|script enable|script disable</title>
+      <para>
+	This command is used to control event daemon and to inspect
+	status of various events.
+      </para>
+
+      <para>
+	The commands below require a component to be specified.  In
+	the current version the only valid component is
+	<literal>legacy</literal>.
+      </para>
+
+      <variablelist>
+	<varlistentry>
+	  <term>run <parameter>TIMEOUT</parameter> <parameter>COMPONENT</parameter> <parameter>EVENT</parameter> <optional><parameter>ARGUMENTS</parameter></optional> </term>
+	  <listitem>
+	    <para>
+	     This command can be used to manually run specified EVENT
+	     in COMPONENT with optional ARGUMENTS.  The event will be
+	     allowed to run a maximum of TIMEOUT seconds.  If TIMEOUT
+	     is 0, then there is no time limit for running the event.
+	    </para>
+	  </listitem>
+	</varlistentry>
+
+	<varlistentry>
+	  <term>status <parameter>COMPONENT</parameter> <parameter>EVENT</parameter></term>
+	  <listitem>
+	    <para>
+	      This command displays the last execution status of the
+	      specified EVENT in COMPONENT.
+	    </para>
+	    <para>
+	      The command will terminate with the exit status
+	      corresponding to the overall status of event that is
+	      displayed.
+	    </para>
+	    <para>
+	      The output is the list of event scripts executed.
+	      Each line shows the name, status, duration and start time
+	      for each script.
+	    </para>
+	    <para>
+	      Example
+	    </para>
+	    <screen>
+# ctdb event status legacy monitor
+00.ctdb              OK         0.014 Sat Dec 17 19:39:11 2016
+01.reclock           OK         0.013 Sat Dec 17 19:39:11 2016
+05.system            OK         0.029 Sat Dec 17 19:39:11 2016
+06.nfs               OK         0.014 Sat Dec 17 19:39:11 2016
+10.interface         OK         0.037 Sat Dec 17 19:39:11 2016
+11.natgw             OK         0.011 Sat Dec 17 19:39:11 2016
+11.routing           OK         0.007 Sat Dec 17 19:39:11 2016
+13.per_ip_routing    OK         0.007 Sat Dec 17 19:39:11 2016
+20.multipathd        OK         0.007 Sat Dec 17 19:39:11 2016
+31.clamd             OK         0.007 Sat Dec 17 19:39:11 2016
+40.vsftpd            OK         0.013 Sat Dec 17 19:39:11 2016
+41.httpd             OK         0.018 Sat Dec 17 19:39:11 2016
+49.winbind           OK         0.023 Sat Dec 17 19:39:11 2016
+50.samba             OK         0.100 Sat Dec 17 19:39:12 2016
+60.nfs               OK         0.376 Sat Dec 17 19:39:12 2016
+70.iscsi             OK         0.009 Sat Dec 17 19:39:12 2016
+91.lvs               OK         0.007 Sat Dec 17 19:39:12 2016
+	    </screen>
+	  </listitem>
+	</varlistentry>
+
+	<varlistentry>
+	  <term>script list <parameter>COMPONENT</parameter></term>
+	  <listitem>
+	    <para>
+	      List the available event scripts in COMPONENT.  Enabled
+	      scripts are flagged with a '*'.
+	    </para>
+	    <para>
+	      Generally, event scripts are provided by CTDB.  However,
+	      local or 3rd party event scripts may also be available.
+	      These are shown in a separate section after those
+	      provided by CTDB.
+	    </para>
+	    <para>
+	      Example
+	    </para>
+	    <screen>
+# ctdb event script list legacy
+* 00.ctdb             
+* 01.reclock          
+* 05.system           
+* 06.nfs              
+* 10.interface        
+  11.natgw            
+  11.routing          
+  13.per_ip_routing   
+  20.multipathd       
+  31.clamd            
+  40.vsftpd           
+  41.httpd            
+* 49.winbind          
+* 50.samba            
+* 60.nfs              
+  70.iscsi            
+  91.lvs              
+
+* 02.local            
+	    </screen>
+	  </listitem>
+	</varlistentry>
+
+	<varlistentry>
+	  <term>script enable <parameter>COMPONENT</parameter> <parameter>SCRIPT</parameter></term>
+	  <listitem>
+	    <para>
+	      Enable the specified event SCRIPT in COMPONENT.  Only
+	      enabled scripts will be executed when running any event.
+	    </para>
+	  </listitem>
+	</varlistentry>
+
+	<varlistentry>
+	  <term>script disable <parameter>COMPONENT</parameter> <parameter>SCRIPT</parameter></term>
+	  <listitem>
+	    <para>
+	      Disable the specified event SCRIPT in COMPONENT.  This
+	      will prevent the script from executing when running any
+	      event.
+	    </para>
+	  </listitem>
+	</varlistentry>
+      </variablelist>
+    </refsect2>
+
+    <refsect2>
       <title>scriptstatus</title>
       <para>
-	This command displays which scripts where run in the previous monitoring cycle and the result of each script. If a script failed with an error, causing the node to become unhealthy, the output from that script is also shown.
+	This command displays which event scripts where run in the previous
+	monitoring cycle and the result of each script. If a script
+	failed with an error, causing the node to become unhealthy,
+	the output from that script is also shown.
+      </para>
+      <para>
+	This command is deprecated.  It's provided for backward
+	compatibility.  In place of <command>ctdb scriptstatus</command>,
+	use <command>ctdb event status</command>.
       </para>
       <refsect3>
 	<title>Example</title>
 	<screen>
 # ctdb scriptstatus
-7 scripts were executed last monitoring cycle
-00.ctdb              Status:OK    Duration:0.056 Tue Mar 24 18:56:57 2009
-10.interface         Status:OK    Duration:0.077 Tue Mar 24 18:56:57 2009
-11.natgw             Status:OK    Duration:0.039 Tue Mar 24 18:56:57 2009
-20.multipathd        Status:OK    Duration:0.038 Tue Mar 24 18:56:57 2009
-31.clamd             Status:DISABLED
-40.vsftpd            Status:OK    Duration:0.045 Tue Mar 24 18:56:57 2009
-41.httpd             Status:OK    Duration:0.039 Tue Mar 24 18:56:57 2009
-50.samba             Status:ERROR    Duration:0.082 Tue Mar 24 18:56:57 2009
-OUTPUT:ERROR: Samba tcp port 445 is not responding
+00.ctdb              OK         0.011 Sat Dec 17 19:40:46 2016
+01.reclock           OK         0.010 Sat Dec 17 19:40:46 2016
+05.system            OK         0.030 Sat Dec 17 19:40:46 2016
+06.nfs               OK         0.014 Sat Dec 17 19:40:46 2016
+10.interface         OK         0.041 Sat Dec 17 19:40:46 2016
+11.natgw             OK         0.008 Sat Dec 17 19:40:46 2016
+11.routing           OK         0.007 Sat Dec 17 19:40:46 2016
+13.per_ip_routing    OK         0.007 Sat Dec 17 19:40:46 2016
+20.multipathd        OK         0.007 Sat Dec 17 19:40:46 2016
+31.clamd             OK         0.007 Sat Dec 17 19:40:46 2016
+40.vsftpd            OK         0.013 Sat Dec 17 19:40:46 2016
+41.httpd             OK         0.015 Sat Dec 17 19:40:46 2016
+49.winbind           OK         0.022 Sat Dec 17 19:40:46 2016
+50.samba             ERROR      0.077 Sat Dec 17 19:40:46 2016
+  OUTPUT: ERROR: samba tcp port 445 is not responding
       </screen>
       </refsect3>
-    </refsect2>
-
-    <refsect2>
-      <title>disablescript <parameter>SCRIPT</parameter></title>
-      <para>
-	This command is used to disable an eventscript.
-      </para>
-      <para>
-	This will take effect the next time the eventscripts are being executed so it can take a short while until this is reflected in 'scriptstatus'.
-      </para>
-    </refsect2>
-
-    <refsect2>
-      <title>enablescript <parameter>SCRIPT</parameter></title>
-      <para>
-	This command is used to enable an eventscript.
-      </para>
-      <para>
-	This will take effect the next time the eventscripts are being executed so it can take a short while until this is reflected in 'scriptstatus'.
-      </para>
     </refsect2>
 
     <refsect2>
@@ -651,31 +782,26 @@ OUTPUT:ERROR: Samba tcp port 445 is not responding
 	<title>Example</title>
 	<screen>
 # ctdb listvars
-MaxRedirectCount        = 3
 SeqnumInterval          = 1000
 ControlTimeout          = 60
 TraverseTimeout         = 20
 KeepaliveInterval       = 5
 KeepaliveLimit          = 5
-RecoverTimeout          = 20
+RecoverTimeout          = 120
 RecoverInterval         = 1
 ElectionTimeout         = 3
 TakeoverTimeout         = 9
 MonitorInterval         = 15
 TickleUpdateInterval    = 20
 EventScriptTimeout      = 30
-EventScriptTimeoutCount = 1
+MonitorTimeoutCount     = 20
 RecoveryGracePeriod     = 120
 RecoveryBanPeriod       = 300
 DatabaseHashSize        = 100001
 DatabaseMaxDead         = 5
 RerecoveryTimeout       = 10
 EnableBans              = 1
-DeterministicIPs        = 0
-LCP2PublicIPs           = 1
-ReclockPingPeriod       = 60
 NoIPFailback            = 0
-DisableIPFailover       = 0
 VerboseMemoryNames      = 0
 RecdPingTimeout         = 60
 RecdFailCount           = 10
@@ -683,17 +809,29 @@ LogLatencyMs            = 0
 RecLockLatencyMs        = 1000
 RecoveryDropAllIPs      = 120
 VacuumInterval          = 10
-VacuumMaxRunTime        = 30
+VacuumMaxRunTime        = 120
 RepackLimit             = 10000
-VacuumLimit             = 5000
 VacuumFastPathCount     = 60
 MaxQueueDropMsg         = 1000000
-UseStatusEvents         = 0
 AllowUnhealthyDBRead    = 0
 StatHistoryInterval     = 1
 DeferredAttachTO        = 120
 AllowClientDBAttach     = 1
-RecoverPDBBySeqNum      = 0
+RecoverPDBBySeqNum      = 1
+DeferredRebalanceOnNodeAdd = 300
+FetchCollapse           = 1
+HopcountMakeSticky      = 50
+StickyDuration          = 600
+StickyPindown           = 200
+NoIPTakeover            = 0
+DBRecordCountWarn       = 100000
+DBRecordSizeWarn        = 10000000
+DBSizeWarn              = 100000000
+PullDBPreallocation     = 10485760
+LockProcessesPerDB      = 200
+RecBufferSizeLimit      = 1000000
+QueueBufferSize         = 1024
+IPAllocAlgorithm        = 2
 	</screen>
       </refsect3>
     </refsect2>
@@ -706,8 +844,8 @@ RecoverPDBBySeqNum      = 0
       <refsect3>
 	<title>Example</title>
 	<screen>
-# ctdb getvar MaxRedirectCount
-MaxRedirectCount    = 3
+# ctdb getvar MonitorInterval
+MonitorInterval         = 15
 	</screen>
       </refsect3>
     </refsect2>
@@ -717,51 +855,72 @@ MaxRedirectCount    = 3
       <para>
 	Set the runtime value of a tuneable variable.
       </para>
-      <para>
-	Example: ctdb setvar MaxRedirectCount 5
-      </para>
+      <refsect3>
+	<title>Example</title>
+	<screen>
+# ctdb setvar MonitorInterval 20
+	</screen>
+      </refsect3>
     </refsect2>
 
     <refsect2>
-      <title>lvsmaster</title>
+      <title>lvs {master|list|status}</title>
       <para>
-	This command shows which node is currently the LVSMASTER. The
-	LVSMASTER is the node in the cluster which drives the LVS system and
-	which receives all incoming traffic from clients.
-      </para>
-      <para>
-	LVS is the mode where the entire CTDB/Samba cluster uses a single
-	ip address for the entire cluster. In this mode all clients connect to
-	one specific node which will then multiplex/loadbalance the clients
-	evenly onto the other nodes in the cluster. This is an alternative to using
-	public ip addresses. See the manpage for ctdbd for more information
-	about LVS.
-      </para>
-    </refsect2>
-
-    <refsect2>
-      <title>lvs</title>
-      <para>
-	This command shows which nodes in the cluster are currently active in the
-	LVS configuration. I.e. which nodes we are currently loadbalancing
-	the single ip address across.
+	This command shows different aspects of LVS status.  For an
+	overview of CTDB's LVS functionality please see the
+	<citetitle>LVS</citetitle> section in
+	<citerefentry><refentrytitle>ctdb</refentrytitle>
+	<manvolnum>7</manvolnum></citerefentry>.
       </para>
 
-      <para>
-	LVS will by default only loadbalance across those nodes that are both
-	LVS capable and also HEALTHY. Except if all nodes are UNHEALTHY in which
-	case LVS will loadbalance across all UNHEALTHY nodes as well.
-	LVS will never use nodes that are DISCONNECTED, STOPPED, BANNED or
-	DISABLED.
-      </para>
-
+      <variablelist>
+	<varlistentry>
+	  <term>master</term>
+	  <listitem>
+	    <para>
+	      Shows the PNN of the current LVS master node.
+	    </para>
       <para>
 	Example output:
       </para>
       <screen>
-2:10.0.0.13
-3:10.0.0.14
+2
       </screen>
+	  </listitem>
+	</varlistentry>
+	<varlistentry>
+	  <term>list</term>
+	  <listitem>
+	    <para>
+	      Lists the currently usable LVS nodes.
+	    </para>
+      <para>
+	Example output:
+      </para>
+      <screen>
+2 10.0.0.13
+3 10.0.0.14
+      </screen>
+	  </listitem>
+	</varlistentry>
+	<varlistentry>
+	  <term>status</term>
+	  <listitem>
+	    <para>
+	      List the nodes in the current LVS group and their status.
+	    </para>
+      <para>
+	Example output:
+      </para>
+      <screen>
+pnn:0 10.0.0.11        UNHEALTHY (THIS NODE)
+pnn:1 10.0.0.12        UNHEALTHY
+pnn:2 10.0.0.13        OK
+pnn:3 10.0.0.14        OK
+      </screen>
+	  </listitem>
+	</varlistentry>
+      </variablelist>
 
     </refsect2>
 
@@ -782,8 +941,6 @@ MaxRedirectCount    = 3
       <screen>
 RECMASTER: YES
 LMASTER: YES
-LVS: NO
-NATGW: YES
       </screen>
 
     </refsect2>
@@ -802,40 +959,55 @@ NATGW: YES
 	<screen>
 # ctdb statistics
 CTDB version 1
-num_clients                        3
-frozen                             0
-recovering                         0
-client_packets_sent           360489
-client_packets_recv           360466
-node_packets_sent             480931
-node_packets_recv             240120
-keepalive_packets_sent             4
-keepalive_packets_recv             3
-node
-req_call                       2
-reply_call                     2
-req_dmaster                    0
-reply_dmaster                  0
-reply_error                    0
-req_message                   42
-req_control               120408
-reply_control             360439
-client
-req_call                       2
-req_message                   24
-req_control               360440
-timeouts
-call                           0
-control                        0
-traverse                       0
-total_calls                        2
-pending_calls                      0
-lockwait_calls                     0
-pending_lockwait_calls             0
-memory_used                     5040
-max_hop_count                      0
-max_call_latency                   4.948321 sec
-max_lockwait_latency               0.000000 sec
+Current time of statistics  :                Tue Mar  8 15:18:51 2016
+Statistics collected since  : (003 21:31:32) Fri Mar  4 17:47:19 2016
+ num_clients                        9
+ frozen                             0
+ recovering                         0
+ num_recoveries                     2
+ client_packets_sent          8170534
+ client_packets_recv          7166132
+ node_packets_sent           16549998
+ node_packets_recv            5244418
+ keepalive_packets_sent        201969
+ keepalive_packets_recv        201969
+ node
+     req_call                      26
+     reply_call                     0
+     req_dmaster                    9
+     reply_dmaster                 12
+     reply_error                    0
+     req_message              1339231
+     req_control              8177506
+     reply_control            6831284
+ client
+     req_call                      15
+     req_message               334809
+     req_control              6831308
+ timeouts
+     call                           0
+     control                        0
+     traverse                       0
+ locks
+     num_calls                      8
+     num_current                    0
+     num_pending                    0
+     num_failed                     0
+ total_calls                       15
+ pending_calls                      0
+ childwrite_calls                   0
+ pending_childwrite_calls             0
+ memory_used                   394879
+ max_hop_count                      1
+ total_ro_delegations               0
+ total_ro_revokes                   0
+ hop_count_buckets: 8 5 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+ lock_buckets: 0 0 8 0 0 0 0 0 0 0 0 0 0 0 0 0
+ locks_latency      MIN/AVG/MAX     0.010005/0.010418/0.011010 sec out of 8
+ reclock_ctdbd      MIN/AVG/MAX     0.002538/0.002538/0.002538 sec out of 1
+ reclock_recd       MIN/AVG/MAX     0.000000/0.000000/0.000000 sec out of 0
+ call_latency       MIN/AVG/MAX     0.000044/0.002142/0.011702 sec out of 15
+ childwrite_latency MIN/AVG/MAX     0.000000/0.000000/0.000000 sec out of 0
 	</screen>
       </refsect3>
     </refsect2>
@@ -873,6 +1045,7 @@ DB Statistics: locking.tdb
  hop_count_buckets: 28087 2 1 0 0 0 0 0 0 0 0 0 0 0 0 0
  lock_buckets: 0 14188 38 76 32 19 3 0 0 0 0 0 0 0 0 0
  locks_latency      MIN/AVG/MAX     0.001066/0.012686/4.202292 sec out of 14356
+ vacuum_latency     MIN/AVG/MAX     0.000472/0.002207/15.243570 sec out of 224530
  Num Hot Keys:     1
      Count:8 Key:ff5bd7cb3ee3822edc1f0000000000000000000000000000
 	</screen>
@@ -882,55 +1055,17 @@ DB Statistics: locking.tdb
     <refsect2>
       <title>getreclock</title>
       <para>
-	Show the name of the recovery lock file, if any.
+	Show details of the recovery lock, if any.
       </para>
 
       <para>
 	Example output:
       </para>
       <screen>
-	Reclock file:/clusterfs/.ctdb/recovery.lock
+	/clusterfs/.ctdb/recovery.lock
       </screen>
 
     </refsect2>
-
-    <refsect2>
-      <title>
-	setreclock <optional><parameter>FILE</parameter></optional>
-      </title>
-
-      <para>
-	FILE specifies the name of the recovery lock file.  If the
-	recovery lock file is changed at run-time then this will cause
-	a recovery, which in turn causes the recovery lock to be
-	retaken.
-      </para>
-
-      <para>
-	If no FILE is specified then a recovery lock file will no
-	longer be used.
-      </para>
-
-      <para>
-	This command only affects the run-time setting of a single
-	CTDB node.  This setting <emphasis>must</emphasis> be changed
-	on all nodes simultaneously by specifying <option>-n
-	all</option> (or similar).  For information about configuring
-	the recovery lock file please see the
-	<citetitle>CTDB_RECOVERY_LOCK</citetitle> entry in
-	<citerefentry><refentrytitle>ctdbd.conf</refentrytitle>
-	<manvolnum>5</manvolnum></citerefentry> and the
-	<citetitle>--reclock</citetitle> entry in
-	<citerefentry><refentrytitle>ctdbd</refentrytitle>
-	<manvolnum>1</manvolnum></citerefentry>.  For information
-	about the recovery lock please see the <citetitle>RECOVERY
-	LOCK</citetitle> section in
-	<citerefentry><refentrytitle>ctdb</refentrytitle>
-	<manvolnum>7</manvolnum></citerefentry>.
-      </para>
-    </refsect2>
-
-
 
     <refsect2>
       <title>getdebug</title>
@@ -946,7 +1081,7 @@ DB Statistics: locking.tdb
 	The list of debug levels from highest to lowest are :
       </para>
       <para>
-	ERR WARNING NOTICE INFO DEBUG
+	ERROR WARNING NOTICE INFO DEBUG
       </para>
     </refsect2>
 
@@ -956,7 +1091,7 @@ DB Statistics: locking.tdb
 	Set the debug level of a node. This controls what information will be logged.
       </para>
       <para>
-	The debuglevel is one of ERR WARNING NOTICE INFO DEBUG
+	The debuglevel is one of ERROR WARNING NOTICE INFO DEBUG
       </para>
     </refsect2>
 
@@ -1006,25 +1141,35 @@ DB Statistics: locking.tdb
     <refsect2>
       <title>addip <parameter>IPADDR</parameter>/<parameter>mask</parameter> <parameter>IFACE</parameter></title>
       <para>
-	This command is used to add a new public ip to a node during runtime.
-	This allows public addresses to be added to a cluster without having
-	to restart the ctdb daemons.
+	This command is used to add a new public ip to a node
+	during runtime.  It should be followed by a <command>ctdb
+	ipreallocate</command>.  This allows public addresses to be
+	added to a cluster without having to restart the ctdb daemons.
       </para>
       <para>
-	Note that this only updates the runtime instance of ctdb. Any changes will be lost next time ctdb is restarted and the public addresses file is re-read.
-	If you want this change to be permanent you must also update the public addresses file manually.
+	Note that this only updates the runtime instance of ctdb. Any
+	changes will be lost next time ctdb is restarted and the public
+	addresses file is re-read.  If you want this change to be
+	permanent you must also update the public addresses file manually.
       </para>
     </refsect2>
 
     <refsect2>
       <title>delip <parameter>IPADDR</parameter></title>
       <para>
-	This command is used to remove a public ip from a node during runtime.
-	If this public ip is currently hosted by the node it being removed from, the ip will first be failed over to another node, if possible, before it is removed.
+	This command flags IPADDR for deletion from a node at runtime.
+	It should be followed by a <command>ctdb
+	ipreallocate</command>.  If IPADDR is currently hosted by the
+	node it is being removed from, this ensures that the IP will
+	first be failed over to another node, if possible, and that it
+	is then actually removed.
       </para>
       <para>
-	Note that this only updates the runtime instance of ctdb. Any changes will be lost next time ctdb is restarted and the public addresses file is re-read.
-	If you want this change to be permanent you must also update the public addresses file manually.
+	Note that this only updates the runtime instance of CTDB.  Any
+	changes will be lost next time CTDB is restarted and the
+	public addresses file is re-read.  If you want this change to
+	be permanent you must also update the public addresses file
+	manually.
       </para>
     </refsect2>
 
@@ -1040,7 +1185,7 @@ DB Statistics: locking.tdb
 	when you have changed the tunables for the daemon to:
       </para>
       <para>
-	DeterministicIPs = 0
+	IPAllocAlgorithm != 0
       </para>
       <para>
 	NoIPFailback = 1
@@ -1057,7 +1202,7 @@ DB Statistics: locking.tdb
     <refsect2>
       <title>setlmasterrole on|off</title>
       <para>
-	This command is used ot enable/disable the LMASTER capability for a node at runtime. This capability determines whether or not a node can be used as an LMASTER for records in the database. A node that does not have the LMASTER capability will not show up in the vnnmap.
+	This command is used to enable/disable the LMASTER capability for a node at runtime. This capability determines whether or not a node can be used as an LMASTER for records in the database. A node that does not have the LMASTER capability will not show up in the vnnmap.
       </para>
 
       <para>
@@ -1074,7 +1219,7 @@ DB Statistics: locking.tdb
     <refsect2>
       <title>setrecmasterrole on|off</title>
       <para>
-	This command is used ot enable/disable the RECMASTER capability for a node at runtime. This capability determines whether or not a node can be used as an RECMASTER for the cluster. A node that does not have the RECMASTER capability can not win a recmaster election. A node that already is the recmaster for the cluster when the capability is stripped off the node will remain the recmaster until the next cluster election.
+	This command is used to enable/disable the RECMASTER capability for a node at runtime. This capability determines whether or not a node can be used as an RECMASTER for the cluster. A node that does not have the RECMASTER capability can not win a recmaster election. A node that already is the recmaster for the cluster when the capability is stripped off the node will remain the recmaster until the next cluster election.
       </para>
 
       <para>
@@ -1088,54 +1233,94 @@ DB Statistics: locking.tdb
     <refsect2>
       <title>reloadnodes</title>
       <para>
-	This command is used when adding new nodes, or removing existing nodes from an existing cluster.
+	This command is used when adding new nodes, or removing
+	existing nodes from an existing cluster.
       </para>
       <para>
-	Procedure to add a node:
+	Procedure to add nodes:
       </para>
+      <orderedlist>
+	<listitem>
+	  <para>
+	     To expand an existing cluster, first ensure with
+	     <command>ctdb status</command> that all nodes are up and
+	     running and that they are all healthy.  Do not try to
+	     expand a cluster unless it is completely healthy!
+	  </para>
+	</listitem>
+	<listitem>
+	  <para>
+	    On all nodes, edit <filename>/usr/local/etc/ctdb/nodes</filename>
+	    and <emphasis>add the new nodes at the end of this
+	    file</emphasis>.
+	  </para>
+	</listitem>
+	<listitem>
+	  <para>
+	    Verify that all the nodes have identical
+	    <filename>/usr/local/etc/ctdb/nodes</filename> files after adding
+	    the new nodes.
+	  </para>
+	</listitem>
+	<listitem>
+	  <para>
+	    Run <command>ctdb reloadnodes</command> to force all nodes
+	    to reload the nodes file.
+	  </para>
+	</listitem>
+	<listitem>
+	  <para>
+	    Use <command>ctdb status</command> on all nodes and verify
+	    that they now show the additional nodes.
+	  </para>
+	</listitem>
+	<listitem>
+	  <para>
+	    Install and configure the new node and bring it online.
+	  </para>
+	</listitem>
+      </orderedlist>
       <para>
-	1, To expand an existing cluster, first ensure with 'ctdb status' that
-	all nodes are up and running and that they are all healthy.
-	Do not try to expand a cluster unless it is completely healthy!
+	Procedure to remove nodes:
       </para>
-      <para>
-	2, On all nodes, edit /etc/ctdb/nodes and add the new node as the last
-	entry to the file. The new node MUST be added to the end of this file!
-      </para>
-      <para>
-	3, Verify that all the nodes have identical /etc/ctdb/nodes files after you edited them and added the new node!
-      </para>
-      <para>
-	4, Run 'ctdb reloadnodes' to force all nodes to reload the nodesfile.
-      </para>
-      <para>
-	5, Use 'ctdb status' on all nodes and verify that they now show the additional node.
-      </para>
-      <para>
-	6, Install and configure the new node and bring it online.
-      </para>
-      <para>
-	Procedure to remove a node:
-      </para>
-      <para>
-	1, To remove a node from an existing cluster, first ensure with 'ctdb status' that
-	all nodes, except the node to be deleted, are up and running and that they are all healthy.
-	Do not try to remove a node from a cluster unless the cluster is completely healthy!
-      </para>
-      <para>
-	2, Shutdown and poweroff the node to be removed.
-      </para>
-      <para>
-	3, On all other nodes, edit the /etc/ctdb/nodes file and comment out the node to be removed. Do not delete the line for that node, just comment it out by adding a '#' at the beginning of the line.
-      </para>
-      <para>
-	4, Run 'ctdb reloadnodes' to force all nodes to reload the nodesfile.
-      </para>
-      <para>
-	5, Use 'ctdb status' on all nodes and verify that the deleted node no longer shows up in the list..
-      </para>
-      <para>
-      </para>
+      <orderedlist>
+	<listitem>
+	  <para>
+	    To remove nodes from an existing cluster, first ensure
+	    with <command>ctdb status</command> that all nodes, except
+	    the node to be deleted, are up and running and that they
+	    are all healthy.  Do not try to remove nodes from a
+	    cluster unless the cluster is completely healthy!
+	  </para>
+	</listitem>
+	<listitem>
+	  <para>
+	    Shutdown and power off the node to be removed.
+	  </para>
+	</listitem>
+	<listitem>
+	  <para>
+	    On all other nodes, edit the
+	    <filename>/usr/local/etc/ctdb/nodes</filename> file and
+	    <emphasis>comment out</emphasis> the nodes to be removed.
+	    <emphasis>Do not delete the lines for the deleted
+	    nodes</emphasis>, just comment them out by adding a '#' at
+	    the beginning of the lines.
+	  </para>
+	</listitem>
+	<listitem>
+	  <para>
+	    Run <command>ctdb reloadnodes</command> to force all nodes
+	    to reload the nodes file.
+	  </para>
+	</listitem>
+	<listitem>
+	  <para>
+	    Use <command>ctdb status</command> on all nodes and verify
+	    that the deleted nodes are no longer listed.
+	  </para>
+	</listitem>
+      </orderedlist>
 
     </refsect2>
 
@@ -1149,19 +1334,35 @@ DB Statistics: locking.tdb
 	on the specified nodes.  When it completes addresses will be
 	reconfigured and reassigned across the cluster as necessary.
       </para>
+
+      <para>
+	This command is currently unable to make changes to the
+	netmask or interfaces associated with existing addresses.
+	Such changes must be made in 2 steps by deleting addresses in
+	question and re-adding then.  Unfortunately this will disrupt
+	connections to the changed addresses.
+      </para>
     </refsect2>
 
     <refsect2>
       <title>getdbmap</title>
       <para>
-	This command lists all clustered TDB databases that the CTDB daemon has attached to. Some databases are flagged as PERSISTENT, this means that the database stores data persistently and the data will remain across reboots. One example of such a database is secrets.tdb where information about how the cluster was joined to the domain is stored.
+	This command lists all clustered TDB databases that the CTDB
+	daemon has attached to. Some databases are flagged as PERSISTENT,
+	this means that the database stores data persistently and the
+	data will remain across reboots. One example of such a database
+	is secrets.tdb where information about how the cluster was joined
+	to the domain is stored.  Some database are flagged as REPLICATED,
+	this means that the data in that database is replicated across all
+	the nodes.  But the data will not remain across reboots.  This
+	type of database is used by CTDB to store it's internal state.
       </para>
       <para>
-	If a PERSISTENT database is not in a healthy state the database is
-	flagged as UNHEALTHY. If there's at least one completely healthy node running in
-	the cluster, it's possible that the content is restored by a recovery
-	run automaticly. Otherwise an administrator needs to analyze the
-	problem.
+	If a PERSISTENT database is not in a healthy state the database
+	is flagged as UNHEALTHY. If there's at least one completely
+	healthy node running in the cluster, it's possible that the
+	content is restored by a recovery run automatically. Otherwise an
+	administrator needs to analyze the problem.
       </para>
       <para>
 	See also "ctdb getdbstatus", "ctdb backupdb", "ctdb restoredb",
@@ -1169,7 +1370,10 @@ DB Statistics: locking.tdb
 	and (if samba or tdb-utils are installed) "tdbtool check".
       </para>
       <para>
-	Most databases are not persistent and only store the state information that the currently running samba daemons need. These databases are always wiped when ctdb/samba starts and when a node is rebooted.
+	Most databases are not persistent and only store the state
+	information that the currently running samba daemons need. These
+	databases are always wiped when ctdb/samba starts and when a
+	node is rebooted.
       </para>
 
       <refsect3>
@@ -1177,24 +1381,24 @@ DB Statistics: locking.tdb
 	<screen>
 # ctdb getdbmap
 Number of databases:10
-dbid:0x435d3410 name:notify.tdb path:/var/ctdb/notify.tdb.0 
-dbid:0x42fe72c5 name:locking.tdb path:/var/ctdb/locking.tdb.0
-dbid:0x1421fb78 name:brlock.tdb path:/var/ctdb/brlock.tdb.0 
-dbid:0x17055d90 name:connections.tdb path:/var/ctdb/connections.tdb.0 
-dbid:0xc0bdde6a name:sessionid.tdb path:/var/ctdb/sessionid.tdb.0 
-dbid:0x122224da name:test.tdb path:/var/ctdb/test.tdb.0 
-dbid:0x2672a57f name:idmap2.tdb path:/var/ctdb/persistent/idmap2.tdb.0 PERSISTENT
-dbid:0xb775fff6 name:secrets.tdb path:/var/ctdb/persistent/secrets.tdb.0 PERSISTENT
-dbid:0xe98e08b6 name:group_mapping.tdb path:/var/ctdb/persistent/group_mapping.tdb.0 PERSISTENT
-dbid:0x7bbbd26c name:passdb.tdb path:/var/ctdb/persistent/passdb.tdb.0 PERSISTENT
+dbid:0x435d3410 name:notify.tdb path:/usr/local/var/lib/ctdb/notify.tdb.0
+dbid:0x42fe72c5 name:locking.tdb path:/usr/local/var/lib/ctdb/locking.tdb.0
+dbid:0x1421fb78 name:brlock.tdb path:/usr/local/var/lib/ctdb/brlock.tdb.0
+dbid:0x17055d90 name:connections.tdb path:/usr/local/var/lib/ctdb/connections.tdb.0
+dbid:0xc0bdde6a name:sessionid.tdb path:/usr/local/var/lib/ctdb/sessionid.tdb.0
+dbid:0x122224da name:test.tdb path:/usr/local/var/lib/ctdb/test.tdb.0
+dbid:0x2672a57f name:idmap2.tdb path:/usr/local/var/lib/ctdb/persistent/idmap2.tdb.0 PERSISTENT
+dbid:0xb775fff6 name:secrets.tdb path:/usr/local/var/lib/ctdb/persistent/secrets.tdb.0 PERSISTENT
+dbid:0xe98e08b6 name:group_mapping.tdb path:/usr/local/var/lib/ctdb/persistent/group_mapping.tdb.0 PERSISTENT
+dbid:0x7bbbd26c name:passdb.tdb path:/usr/local/var/lib/ctdb/persistent/passdb.tdb.0 PERSISTENT
 
 # ctdb getdbmap  # example for unhealthy database
 Number of databases:1
-dbid:0xb775fff6 name:secrets.tdb path:/var/ctdb/persistent/secrets.tdb.0 PERSISTENT UNHEALTHY
+dbid:0xb775fff6 name:secrets.tdb path:/usr/local/var/lib/ctdb/persistent/secrets.tdb.0 PERSISTENT UNHEALTHY
 
 # ctdb -X getdbmap
 |ID|Name|Path|Persistent|Unhealthy|
-|0x7bbbd26c|passdb.tdb|/var/ctdb/persistent/passdb.tdb.0|1|0|
+|0x7bbbd26c|passdb.tdb|/usr/local/var/lib/ctdb/persistent/passdb.tdb.0|1|0|
 	</screen>
       </refsect3>
     </refsect2>
@@ -1270,31 +1474,11 @@ dbid:0xb775fff6 name:secrets.tdb path:/var/ctdb/persistent/secrets.tdb.0 PERSIST
     </refsect2>
 
     <refsect2>
-      <title>gratiousarp <parameter>IPADDR</parameter> <parameter>INTERFACE</parameter></title>
+      <title>gratarp <parameter>IPADDR</parameter> <parameter>INTERFACE</parameter></title>
       <para>
-	Send out a gratious ARP for the specified interface through
+	Send out a gratuitous ARP for the specified interface through
 	the specified interface. This command is mainly used by the
 	ctdb eventscripts.
-      </para>
-    </refsect2>
-
-    <refsect2>
-      <title>killtcp</title>
-      <para>
-	Read a list of TCP connections, one per line, from standard
-	input and terminate each connection.  A connection is
-	specified as:
-      </para>
-      <synopsis>
-	<parameter>SRC-IPADDR</parameter>:<parameter>SRC-PORT</parameter> <parameter>DST-IPADDR</parameter>:<parameter>DST-PORT</parameter>
-      </synopsis>
-      <para>
-	Each connection is terminated by issuing a TCP RST to the
-	SRC-IPADDR:SRC-PORT endpoint.
-      </para>
-      <para>
-	A single connection can be specified on the command-line
-	rather than on standard input.
       </para>
     </refsect2>
 
@@ -1380,24 +1564,28 @@ RUNNING
     </refsect2>
 
     <refsect2>
-      <title>setnatgwstate on|off</title>
+      <title>tickle</title>
       <para>
-	Enable or disable the NAT gateway master capability on a node.
+	Read a list of TCP connections, one per line, from standard
+	input and send a TCP tickle to the source host for each
+	connection.  A connection is specified as:
       </para>
-    </refsect2>
-
-    <refsect2>
-      <title>tickle <parameter>SRC-IPADDR</parameter>:<parameter>SRC-PORT</parameter> <parameter>DST-IPADDR</parameter>:<parameter>DST-PORT</parameter></title>
+      <synopsis>
+	<parameter>SRC-IPADDR</parameter>:<parameter>SRC-PORT</parameter> <parameter>DST-IPADDR</parameter>:<parameter>DST-PORT</parameter>
+      </synopsis>
       <para>
-	Send a TCP tickle to the source host for the specified TCP
-	connection.  A TCP tickle is a TCP ACK packet with an invalid
-	sequence and acknowledge number and will when received by the
-	source host result in it sending an immediate correct ACK back
-	to the other end.
+	A single connection can be specified on the command-line
+	rather than on standard input.
+      </para>
+      <para>
+	A TCP tickle is a TCP ACK packet with an invalid sequence and
+	acknowledge number and will when received by the source host
+	result in it sending an immediate correct ACK back to the
+	other end.
       </para>
       <para>
 	TCP tickles are useful to "tickle" clients after a IP failover has
-	occured since this will make the client immediately recognize the
+	occurred since this will make the client immediately recognize the
 	TCP connection has been disrupted and that the client will need
 	to reestablish. This greatly speeds up the time it takes for a client
 	to detect and reestablish after an IP failover in the ctdb cluster.
@@ -1477,9 +1665,13 @@ RUNNING
     </refsect2>
 
     <refsect2>
-      <title>process-exists <parameter>PID</parameter></title>
+      <title>process-exists <parameter>PID</parameter> <parameter>[SRVID]</parameter></title>
       <para>
-	This command checks if a specific process exists on the CTDB host. This is mainly used by Samba to check if remote instances of samba are still running or not.
+	This command checks if a specific process exists on the CTDB
+	host. This is mainly used by Samba to check if remote instances
+	of samba are still running or not.  When the optional SRVID
+	argument is specified, the command check if a specific process
+	exists on the CTDB host and has registered for specified SRVID.
       </para>
     </refsect2>
 
@@ -1494,16 +1686,16 @@ RUNNING
 # ctdb getdbstatus test.tdb.0
 dbid: 0x122224da
 name: test.tdb
-path: /var/ctdb/test.tdb.0
+path: /usr/local/var/lib/ctdb/test.tdb.0
 PERSISTENT: no
 HEALTH: OK
 
 # ctdb getdbstatus registry.tdb  # with a corrupted TDB
 dbid: 0xf2a58948
 name: registry.tdb
-path: /var/ctdb/persistent/registry.tdb.0
+path: /usr/local/var/lib/ctdb/persistent/registry.tdb.0
 PERSISTENT: yes
-HEALTH: NO-HEALTHY-NODES - ERROR - Backup of corrupted TDB in '/var/ctdb/persistent/registry.tdb.0.corrupted.20091208091949.0Z'
+HEALTH: NO-HEALTHY-NODES - ERROR - Backup of corrupted TDB in '/usr/local/var/lib/ctdb/persistent/registry.tdb.0.corrupted.20091208091949.0Z'
 	</screen>
       </refsect3>
     </refsect2>
@@ -1553,28 +1745,7 @@ HEALTH: NO-HEALTHY-NODES - ERROR - Backup of corrupted TDB in '/var/ctdb/persist
     </refsect2>
 
     <refsect2>
-      <title>getmonmode</title>
-      <para>
-	This command returns the monutoring mode of a node. The monitoring mode is either ACTIVE or DISABLED. Normally a node will continuously monitor that all other nodes that are expected are in fact connected and that they respond to commands.
-      </para>
-      <para>
-	ACTIVE - This is the normal mode. The node is actively monitoring all other nodes, both that the transport is connected and also that the node responds to commands. If a node becomes unavailable, it will be marked as DISCONNECTED and a recovery is initiated to restore the cluster.
-      </para>
-      <para>
-	DISABLED - This node is not monitoring that other nodes are available. In this mode a node failure will not be detected and no recovery will be performed. This mode is useful when for debugging purposes one wants to attach GDB to a ctdb process but wants to prevent the rest of the cluster from marking this node as DISCONNECTED and do a recovery.
-      </para>
-    </refsect2>
-
-
-    <refsect2>
-      <title>setmonmode 0|1</title>
-      <para>
-	This command can be used to explicitly disable/enable monitoring mode on a node. The main purpose is if one wants to attach GDB to a running ctdb daemon but wants to prevent the other nodes from marking it as DISCONNECTED and issuing a recovery. To do this, set monitoring mode to 0 on all nodes before attaching with GDB. Remember to set monitoring mode back to 1 afterwards.
-      </para>
-    </refsect2>
-
-    <refsect2>
-      <title>attach <parameter>DBNAME</parameter> [persistent]</title>
+      <title>attach <parameter>DBNAME</parameter> [persistent|replicated]</title>
       <para>
 	Create a new CTDB database called DBNAME and attach to it on
 	all nodes.
@@ -1612,22 +1783,6 @@ HEALTH: NO-HEALTHY-NODES - ERROR - Backup of corrupted TDB in '/var/ctdb/persist
     </refsect2>
 
     <refsect2>
-      <title>thaw</title>
-      <para>
-	Thaw a previously frozen node.
-      </para>
-    </refsect2>
-
-
-    <refsect2>
-      <title>eventscript <parameter>ARGUMENTS</parameter></title>
-      <para>
-	This is a debugging command. This command can be used to manually
-	invoke and run the eventscritps with arbitrary arguments.
-      </para>
-    </refsect2>
-
-    <refsect2>
       <title>ban <parameter>BANTIME</parameter></title>
       <para>
 	Administratively ban a node for BANTIME seconds.  The node
@@ -1658,45 +1813,12 @@ HEALTH: NO-HEALTHY-NODES - ERROR - Backup of corrupted TDB in '/var/ctdb/persist
       </para>
     </refsect2>
 
-    <refsect2>
-      <title>
-	rebalancenode
-	<optional><parameter>PNN-LIST</parameter></optional>
-      </title>
-      <para>
-	This command marks the given nodes as rebalance targets in the
-	LCP2 IP allocation algorithm.  The
-	<command>reloadips</command> command will do this as necessary
-	so this command should not be needed.
-      </para>
-    </refsect2>
-
-    <refsect2>
-      <title>check_srvids <parameter>SRVID</parameter> ...</title>
-      <para>
-	This command checks whether a set of srvid message ports are
-	registered on the node or not. The command takes a list of
-	values to check.
-      </para>
-      <refsect3>
-	<title>Example</title>
-	<screen>
-# ctdb check_srvids 1 2 3 14765
-Server id 0:1 does not exist
-Server id 0:2 does not exist
-Server id 0:3 does not exist
-Server id 0:14765 exists
-	</screen>
-      </refsect3>
-    </refsect2>
-
   </refsect1>
 
-  <!-- UNDOCUMENTED: showban stats disablemonitor enablemonitor
-       isnotrecmaster addtickle deltickle regsrvid unregsrvid chksrvid
-       getsrvids rebalanceip setdbprio getdbprio msglisten msgsend
+  <!-- UNDOCUMENTED: stats
+       isnotrecmaster addtickle deltickle
        tfetch tstore readkey writekey
-       checktcpport getdbseqnum ipiface
+       checktcpport getdbseqnum
   -->
 
   <refsect1>

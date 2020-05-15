@@ -603,7 +603,14 @@ static NTSTATUS rpc_registry_setvalue_internal(struct net_context *c,
 	}
 
 	if (strequal(argv[2], "dword")) {
-		uint32_t v = strtoul(argv[3], NULL, 10);
+		int error = 0;
+		uint32_t v;
+
+		v = smb_strtoul(argv[3], NULL, 10, &error, SMB_STR_STANDARD);
+		if (error != 0) {
+			goto error;
+		}
+
 		value.type = REG_DWORD;
 		value.data = data_blob_talloc(mem_ctx, NULL, 4);
 		SIVAL(value.data.data, 0, v);
@@ -1111,7 +1118,7 @@ static NTSTATUS rpc_registry_save_internal(struct net_context *c,
 					int argc,
 					const char **argv )
 {
-	WERROR result = WERR_GENERAL_FAILURE;
+	WERROR result = WERR_GEN_FAILURE;
 	struct policy_handle pol_hive, pol_key;
 	NTSTATUS status = NT_STATUS_UNSUCCESSFUL;
 	struct winreg_String filename;
@@ -1723,7 +1730,7 @@ static WERROR import_create_key(struct import_ctx* ctx,
 
 	key = talloc_zero(mem_ctx, struct policy_handle);
 	if (key == NULL) {
-		werr = WERR_NOMEM;
+		werr = WERR_NOT_ENOUGH_MEMORY;
 		goto done;
 	}
 
@@ -1864,7 +1871,7 @@ static WERROR import_close_key(struct import_ctx* ctx,
 		goto done;
 	}
 
-	werr = (talloc_free(key) == 0) ? WERR_OK : WERR_GENERAL_FAILURE;
+	werr = (talloc_free(key) == 0) ? WERR_OK : WERR_GEN_FAILURE;
 done:
 	talloc_free(mem_ctx);
 	return werr;
@@ -1881,7 +1888,7 @@ static WERROR import_create_val(struct import_ctx* ctx,
 	struct dcerpc_binding_handle *b = ctx->pipe_hnd->binding_handle;
 
 	if (parent == NULL) {
-		return WERR_INVALID_PARAM;
+		return WERR_INVALID_PARAMETER;
 	}
 
 	ZERO_STRUCT(valuename);
@@ -1917,7 +1924,7 @@ static WERROR import_delete_val(struct import_ctx* ctx,
 	struct dcerpc_binding_handle *b = ctx->pipe_hnd->binding_handle;
 
 	if (parent == NULL) {
-		return WERR_INVALID_PARAM;
+		return WERR_INVALID_PARAMETER;
 	}
 
 	ZERO_STRUCT(valuename);
@@ -2094,7 +2101,7 @@ int net_rpc_registry(struct net_context *c, int argc, const char **argv)
 			NET_TRANSPORT_RPC,
 			N_("Get security descriptor"),
 			N_("net rpc registry getsd\n"
-			   "    Get security descriptior")
+			   "    Get security descriptor")
 		},
 		{
 			"import",

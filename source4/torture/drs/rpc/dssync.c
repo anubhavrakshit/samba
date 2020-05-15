@@ -34,6 +34,7 @@
 #include "torture/drs/proto.h"
 #include "lib/tsocket/tsocket.h"
 #include "libcli/resolve/resolve.h"
+#include "lib/util/util_paths.h"
 
 struct DsSyncBindInfo {
 	struct dcerpc_pipe *drs_pipe;
@@ -123,7 +124,7 @@ static struct DsSyncTest *test_create_context(struct torture_context *tctx)
 	}
 
 	/* ctx->admin ...*/
-	ctx->admin.credentials				= cmdline_credentials;
+	ctx->admin.credentials	= popt_get_cmdline_credentials();
 
 	our_bind_info28				= &ctx->admin.drsuapi.our_bind_info28;
 	our_bind_info28->supported_extensions	= 0xFFFFFFFF;
@@ -143,7 +144,7 @@ static struct DsSyncTest *test_create_context(struct torture_context *tctx)
 	ctx->admin.drsuapi.req.out.bind_handle		= &ctx->admin.drsuapi.bind_handle;
 
 	/* ctx->new_dc ...*/
-	ctx->new_dc.credentials			= cmdline_credentials;
+	ctx->new_dc.credentials	= popt_get_cmdline_credentials();
 
 	our_bind_info28				= &ctx->new_dc.drsuapi.our_bind_info28;
 	our_bind_info28->supported_extensions	|= DRSUAPI_SUPPORTED_EXTENSION_BASE;
@@ -358,6 +359,9 @@ static bool test_analyse_objects(struct torture_context *tctx,
 	struct dsdb_extended_replicated_objects *objs;
 	struct ldb_extended_dn_control *extended_dn_ctrl;
 	struct dsdb_schema *ldap_schema;
+	struct ldb_dn *partition_dn = ldb_dn_new(tctx, ldb, partition);
+
+	torture_assert_not_null(tctx, partition_dn, "Failed to parse partition DN as as DN");
 
 	/* load dsdb_schema using remote prefixMap */
 	torture_assert(tctx,
@@ -367,7 +371,7 @@ static bool test_analyse_objects(struct torture_context *tctx,
 
 	status = dsdb_replicated_objects_convert(ldb,
 						 ldap_schema,
-						 partition,
+						 partition_dn,
 						 mapping_ctr,
 						 object_count,
 						 first_object,
@@ -384,11 +388,12 @@ static bool test_analyse_objects(struct torture_context *tctx,
 	deleted_dn = ldb_dn_new(objs, ldb, partition);
 	ldb_dn_add_child_fmt(deleted_dn, "CN=Deleted Objects");
 
-	for (i=0; i < object_count; i++) {
+	for (i=0; i < objs->num_objects; i++) {
 		struct ldb_request *search_req;
 		struct ldb_result *res;
 		struct ldb_message *new_msg, *drs_msg, *ldap_msg;
-		const char **attrs = talloc_array(objs, const char *, objs->objects[i].msg->num_elements+1);
+		size_t num_attrs = objs->objects[i].msg->num_elements+1;
+		const char **attrs = talloc_array(objs, const char *, num_attrs);
 		for (j=0; j < objs->objects[i].msg->num_elements; j++) {
 			attrs[j] = objs->objects[i].msg->elements[j].name;
 		}
@@ -461,6 +466,7 @@ static bool test_analyse_objects(struct torture_context *tctx,
 				j--;
 			} else if (ldb_attr_cmp(drs_msg->elements[j].name, "unicodePwd") == 0 ||
 				   ldb_attr_cmp(drs_msg->elements[j].name, "dBCSPwd") == 0 ||
+				   ldb_attr_cmp(drs_msg->elements[j].name, "userPassword") == 0 ||
 				   ldb_attr_cmp(drs_msg->elements[j].name, "ntPwdHistory") == 0 ||
 				   ldb_attr_cmp(drs_msg->elements[j].name, "lmPwdHistory") == 0 ||
 				   ldb_attr_cmp(drs_msg->elements[j].name, "supplementalCredentials") == 0 ||
@@ -671,7 +677,6 @@ static bool test_GetNCChanges(struct torture_context *tctx,
 	struct drsuapi_DsGetNCChangesCtr1 *ctr1 = NULL;
 	struct drsuapi_DsGetNCChangesCtr6 *ctr6 = NULL;
 	uint32_t out_level = 0;
-	struct GUID null_guid;
 	struct dom_sid null_sid;
 	DATA_BLOB gensec_skey;
 	struct {
@@ -685,7 +690,6 @@ static bool test_GetNCChanges(struct torture_context *tctx,
 		}
 	};
 
-	ZERO_STRUCT(null_guid);
 	ZERO_STRUCT(null_sid);
 
 	highest_usn = lpcfg_parm_int(tctx->lp_ctx, NULL, "dssync", "highest_usn", 0);
@@ -715,13 +719,13 @@ static bool test_GetNCChanges(struct torture_context *tctx,
 
 		switch (r.in.level) {
 		case 5:
-			nc.guid	= null_guid;
+			nc.guid	= GUID_zero();
 			nc.sid	= null_sid;
 			nc.dn	= nc_dn_str;
 
 			r.in.req					= &req;
 			r.in.req->req5.destination_dsa_guid		= ctx->new_dc.invocation_id;
-			r.in.req->req5.source_dsa_invocation_id		= null_guid;
+			r.in.req->req5.source_dsa_invocation_id = GUID_zero();
 			r.in.req->req5.naming_context			= &nc;
 			r.in.req->req5.highwatermark.tmp_highest_usn	= highest_usn;
 			r.in.req->req5.highwatermark.reserved_usn	= 0;
@@ -746,14 +750,14 @@ static bool test_GetNCChanges(struct torture_context *tctx,
 
 			break;
 		case 8:
-			nc.guid	= null_guid;
+			nc.guid	= GUID_zero();
 			nc.sid	= null_sid;
 			nc.dn	= nc_dn_str;
 			/* nc.dn can be set to any other ad partition */
 
 			r.in.req					= &req;
 			r.in.req->req8.destination_dsa_guid		= ctx->new_dc.invocation_id;
-			r.in.req->req8.source_dsa_invocation_id		= null_guid;
+			r.in.req->req8.source_dsa_invocation_id	= GUID_zero();
 			r.in.req->req8.naming_context			= &nc;
 			r.in.req->req8.highwatermark.tmp_highest_usn	= highest_usn;
 			r.in.req->req8.highwatermark.reserved_usn	= 0;
@@ -928,12 +932,8 @@ static bool test_FetchNT4Data(struct torture_context *tctx,
 	union drsuapi_DsGetNT4ChangeLogRequest req;
 	union drsuapi_DsGetNT4ChangeLogInfo info;
 	uint32_t level_out = 0;
-	struct GUID null_guid;
-	struct dom_sid null_sid;
 	DATA_BLOB cookie;
 
-	ZERO_STRUCT(null_guid);
-	ZERO_STRUCT(null_sid);
 	ZERO_STRUCT(cookie);
 
 	ZERO_STRUCT(r);

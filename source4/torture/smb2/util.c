@@ -33,6 +33,10 @@
 
 #include "torture/torture.h"
 #include "torture/smb2/proto.h"
+#include "source4/torture/util.h"
+#include "libcli/security/dom_sid.h"
+#include "librpc/gen_ndr/lsa.h"
+#include "libcli/util/clilsa.h"
 
 
 /*
@@ -55,8 +59,11 @@ NTSTATUS smb2_util_write(struct smb2_tree *tree,
 /*
   create a complex file/dir using the SMB2 protocol
 */
-static NTSTATUS smb2_create_complex(struct smb2_tree *tree, const char *fname, 
-					 struct smb2_handle *handle, bool dir)
+static NTSTATUS smb2_create_complex(struct torture_context *tctx,
+				    struct smb2_tree *tree,
+				    const char *fname,
+				    struct smb2_handle *handle,
+				    bool dir)
 {
 	TALLOC_CTX *tmp_ctx = talloc_new(tree);
 	char buf[7] = "abc";
@@ -98,6 +105,13 @@ static NTSTATUS smb2_create_complex(struct smb2_tree *tree, const char *fname,
 	}
 
 	status = smb2_create(tree, tmp_ctx, &io);
+	if (NT_STATUS_EQUAL(status, NT_STATUS_EAS_NOT_SUPPORTED)) {
+		torture_comment(
+			tctx, "EAs not supported, creating: %s\n", fname);
+		io.in.eas.num_eas = 0;
+		status = smb2_create(tree, tmp_ctx, &io);
+	}
+
 	talloc_free(tmp_ctx);
 	NT_STATUS_NOT_OK_RETURN(status);
 
@@ -121,7 +135,7 @@ static NTSTATUS smb2_create_complex(struct smb2_tree *tree, const char *fname,
 
 	status = smb2_setinfo_file(tree, &setfile);
 	if (!NT_STATUS_IS_OK(status)) {
-		printf("Failed to setup file times - %s\n", nt_errstr(status));
+		torture_comment(tctx, "Failed to setup file times - %s\n", nt_errstr(status));
 		return status;
 	}
 
@@ -131,14 +145,14 @@ static NTSTATUS smb2_create_complex(struct smb2_tree *tree, const char *fname,
 
 	status = smb2_getinfo_file(tree, tree, &fileinfo);
 	if (!NT_STATUS_IS_OK(status)) {
-		printf("Failed to query file times - %s\n", nt_errstr(status));
+		torture_comment(tctx, "Failed to query file times - %s\n", nt_errstr(status));
 		return status;
 		
 	}
 
 #define CHECK_TIME(field) do {\
 	if (setfile.basic_info.in.field != fileinfo.all_info2.out.field) { \
-		printf("(%s) " #field " not setup correctly: %s(%llu) => %s(%llu)\n", \
+		torture_comment(tctx, "(%s) " #field " not setup correctly: %s(%llu) => %s(%llu)\n", \
 			__location__, \
 			nt_time_string(tree, setfile.basic_info.in.field), \
 			(unsigned long long)setfile.basic_info.in.field, \
@@ -159,25 +173,28 @@ static NTSTATUS smb2_create_complex(struct smb2_tree *tree, const char *fname,
 /*
   create a complex file using the SMB2 protocol
 */
-NTSTATUS smb2_create_complex_file(struct smb2_tree *tree, const char *fname, 
-					 struct smb2_handle *handle)
+NTSTATUS smb2_create_complex_file(struct torture_context *tctx,
+				  struct smb2_tree *tree, const char *fname,
+				  struct smb2_handle *handle)
 {
-	return smb2_create_complex(tree, fname, handle, false);
+	return smb2_create_complex(tctx, tree, fname, handle, false);
 }
 
 /*
   create a complex dir using the SMB2 protocol
 */
-NTSTATUS smb2_create_complex_dir(struct smb2_tree *tree, const char *fname, 
+NTSTATUS smb2_create_complex_dir(struct torture_context *tctx,
+				 struct smb2_tree *tree, const char *fname,
 				 struct smb2_handle *handle)
 {
-	return smb2_create_complex(tree, fname, handle, true);
+	return smb2_create_complex(tctx, tree, fname, handle, true);
 }
 
 /*
   show lots of information about a file
 */
-void torture_smb2_all_info(struct smb2_tree *tree, struct smb2_handle handle)
+void torture_smb2_all_info(struct torture_context *tctx,
+			   struct smb2_tree *tree, struct smb2_handle handle)
 {
 	NTSTATUS status;
 	TALLOC_CTX *tmp_ctx = talloc_new(tree);
@@ -193,29 +210,29 @@ void torture_smb2_all_info(struct smb2_tree *tree, struct smb2_handle handle)
 		return;
 	}
 
-	d_printf("all_info for '%s'\n", io.all_info2.out.fname.s);
-	d_printf("\tcreate_time:    %s\n", nt_time_string(tmp_ctx, io.all_info2.out.create_time));
-	d_printf("\taccess_time:    %s\n", nt_time_string(tmp_ctx, io.all_info2.out.access_time));
-	d_printf("\twrite_time:     %s\n", nt_time_string(tmp_ctx, io.all_info2.out.write_time));
-	d_printf("\tchange_time:    %s\n", nt_time_string(tmp_ctx, io.all_info2.out.change_time));
-	d_printf("\tattrib:         0x%x\n", io.all_info2.out.attrib);
-	d_printf("\tunknown1:       0x%x\n", io.all_info2.out.unknown1);
-	d_printf("\talloc_size:     %llu\n", (long long)io.all_info2.out.alloc_size);
-	d_printf("\tsize:           %llu\n", (long long)io.all_info2.out.size);
-	d_printf("\tnlink:          %u\n", io.all_info2.out.nlink);
-	d_printf("\tdelete_pending: %u\n", io.all_info2.out.delete_pending);
-	d_printf("\tdirectory:      %u\n", io.all_info2.out.directory);
-	d_printf("\tfile_id:        %llu\n", (long long)io.all_info2.out.file_id);
-	d_printf("\tea_size:        %u\n", io.all_info2.out.ea_size);
-	d_printf("\taccess_mask:    0x%08x\n", io.all_info2.out.access_mask);
-	d_printf("\tposition:       0x%llx\n", (long long)io.all_info2.out.position);
-	d_printf("\tmode:           0x%llx\n", (long long)io.all_info2.out.mode);
+	torture_comment(tctx, "all_info for '%s'\n", io.all_info2.out.fname.s);
+	torture_comment(tctx, "\tcreate_time:    %s\n", nt_time_string(tmp_ctx, io.all_info2.out.create_time));
+	torture_comment(tctx, "\taccess_time:    %s\n", nt_time_string(tmp_ctx, io.all_info2.out.access_time));
+	torture_comment(tctx, "\twrite_time:     %s\n", nt_time_string(tmp_ctx, io.all_info2.out.write_time));
+	torture_comment(tctx, "\tchange_time:    %s\n", nt_time_string(tmp_ctx, io.all_info2.out.change_time));
+	torture_comment(tctx, "\tattrib:         0x%x\n", io.all_info2.out.attrib);
+	torture_comment(tctx, "\tunknown1:       0x%x\n", io.all_info2.out.unknown1);
+	torture_comment(tctx, "\talloc_size:     %llu\n", (long long)io.all_info2.out.alloc_size);
+	torture_comment(tctx, "\tsize:           %llu\n", (long long)io.all_info2.out.size);
+	torture_comment(tctx, "\tnlink:          %u\n", io.all_info2.out.nlink);
+	torture_comment(tctx, "\tdelete_pending: %u\n", io.all_info2.out.delete_pending);
+	torture_comment(tctx, "\tdirectory:      %u\n", io.all_info2.out.directory);
+	torture_comment(tctx, "\tfile_id:        %llu\n", (long long)io.all_info2.out.file_id);
+	torture_comment(tctx, "\tea_size:        %u\n", io.all_info2.out.ea_size);
+	torture_comment(tctx, "\taccess_mask:    0x%08x\n", io.all_info2.out.access_mask);
+	torture_comment(tctx, "\tposition:       0x%llx\n", (long long)io.all_info2.out.position);
+	torture_comment(tctx, "\tmode:           0x%llx\n", (long long)io.all_info2.out.mode);
 
 	/* short name, if any */
 	io.generic.level = RAW_FILEINFO_ALT_NAME_INFORMATION;
 	status = smb2_getinfo_file(tree, tmp_ctx, &io);
 	if (NT_STATUS_IS_OK(status)) {
-		d_printf("\tshort name:     '%s'\n", io.alt_name_info.out.fname.s);
+		torture_comment(tctx, "\tshort name:     '%s'\n", io.alt_name_info.out.fname.s);
 	}
 
 	/* the EAs, if any */
@@ -224,7 +241,7 @@ void torture_smb2_all_info(struct smb2_tree *tree, struct smb2_handle handle)
 	if (NT_STATUS_IS_OK(status)) {
 		int i;
 		for (i=0;i<io.all_eas.out.num_eas;i++) {
-			d_printf("\tEA[%d] flags=%d len=%d '%s'\n", i,
+			torture_comment(tctx, "\tEA[%d] flags=%d len=%d '%s'\n", i,
 				 io.all_eas.out.eas[i].flags,
 				 (int)io.all_eas.out.eas[i].value.length,
 				 io.all_eas.out.eas[i].name.s);
@@ -237,12 +254,12 @@ void torture_smb2_all_info(struct smb2_tree *tree, struct smb2_handle handle)
 	if (NT_STATUS_IS_OK(status)) {
 		int i;
 		for (i=0;i<io.stream_info.out.num_streams;i++) {
-			d_printf("\tstream %d:\n", i);
-			d_printf("\t\tsize       %ld\n", 
+			torture_comment(tctx, "\tstream %d:\n", i);
+			torture_comment(tctx, "\t\tsize       %ld\n",
 				 (long)io.stream_info.out.streams[i].size);
-			d_printf("\t\talloc size %ld\n", 
+			torture_comment(tctx, "\t\talloc size %ld\n",
 				 (long)io.stream_info.out.streams[i].alloc_size);
-			d_printf("\t\tname       %s\n", io.stream_info.out.streams[i].stream_name.s);
+			torture_comment(tctx, "\t\tname       %s\n", io.stream_info.out.streams[i].stream_name.s);
 		}
 	}	
 
@@ -259,6 +276,33 @@ void torture_smb2_all_info(struct smb2_tree *tree, struct smb2_handle handle)
 	}
 
 	talloc_free(tmp_ctx);	
+}
+
+/*
+  get granted access of a file handle
+*/
+NTSTATUS torture_smb2_get_allinfo_access(struct smb2_tree *tree,
+					 struct smb2_handle handle,
+					 uint32_t *granted_access)
+{
+	NTSTATUS status;
+	TALLOC_CTX *tmp_ctx = talloc_new(tree);
+	union smb_fileinfo io;
+
+	io.generic.level = RAW_FILEINFO_SMB2_ALL_INFORMATION;
+	io.generic.in.file.handle = handle;
+
+	status = smb2_getinfo_file(tree, tmp_ctx, &io);
+	if (!NT_STATUS_IS_OK(status)) {
+		DEBUG(0, ("getinfo failed - %s\n", nt_errstr(status)));
+		goto out;
+	}
+
+	*granted_access = io.all_info2.out.access_mask;
+
+out:
+	talloc_free(tmp_ctx);
+	return status;
 }
 
 /**
@@ -318,7 +362,6 @@ bool torture_smb2_session_setup(struct torture_context *tctx,
 {
 	NTSTATUS status;
 	struct smb2_session *session;
-	struct cli_credentials *credentials = cmdline_credentials;
 
 	session = smb2_session_init(transport,
 				    lpcfg_gensec_settings(tctx, tctx->lp_ctx),
@@ -328,10 +371,11 @@ bool torture_smb2_session_setup(struct torture_context *tctx,
 		return false;
 	}
 
-	status = smb2_session_setup_spnego(session, credentials,
+	status = smb2_session_setup_spnego(session,
+					   popt_get_cmdline_credentials(),
 					   previous_session_id);
 	if (!NT_STATUS_IS_OK(status)) {
-		printf("session setup failed: %s\n", nt_errstr(status));
+		torture_comment(tctx, "session setup failed: %s\n", nt_errstr(status));
 		talloc_free(session);
 		return false;
 	}
@@ -352,14 +396,36 @@ bool torture_smb2_connection_ext(struct torture_context *tctx,
 	NTSTATUS status;
 	const char *host = torture_setting_string(tctx, "host", NULL);
 	const char *share = torture_setting_string(tctx, "share", NULL);
-	struct cli_credentials *credentials = cmdline_credentials;
+	const char *p = torture_setting_string(tctx, "unclist", NULL);
+	TALLOC_CTX *mem_ctx = NULL;
+	bool ok;
+
+	if (p != NULL) {
+		char *host2 = NULL;
+		char *share2 = NULL;
+
+		mem_ctx = talloc_new(tctx);
+		if (mem_ctx == NULL) {
+			return false;
+		}
+
+		ok = torture_get_conn_index(tctx->conn_index++, mem_ctx, tctx,
+					    &host2, &share2);
+		if (!ok) {
+			TALLOC_FREE(mem_ctx);
+			return false;
+		}
+
+		host = host2;
+		share = share2;
+	}
 
 	status = smb2_connect_ext(tctx,
 				  host,
 				  lpcfg_smb_ports(tctx->lp_ctx),
 				  share,
 				  lpcfg_resolve_context(tctx->lp_ctx),
-				  credentials,
+				  popt_get_cmdline_credentials(),
 				  previous_session_id,
 				  tree,
 				  tctx->ev,
@@ -368,10 +434,13 @@ bool torture_smb2_connection_ext(struct torture_context *tctx,
 				  lpcfg_gensec_settings(tctx, tctx->lp_ctx)
 				  );
 	if (!NT_STATUS_IS_OK(status)) {
-		printf("Failed to connect to SMB2 share \\\\%s\\%s - %s\n",
+		torture_comment(tctx, "Failed to connect to SMB2 share \\\\%s\\%s - %s\n",
 		       host, share, nt_errstr(status));
+		TALLOC_FREE(mem_ctx);
 		return false;
 	}
+
+	TALLOC_FREE(mem_ctx);
 	return true;
 }
 
@@ -398,12 +467,11 @@ bool torture_smb2_con_sopt(struct torture_context *tctx,
 	NTSTATUS status;
 	const char *host = torture_setting_string(tctx, "host", NULL);
 	const char *share = torture_setting_string(tctx, soption, NULL);
-	struct cli_credentials *credentials = cmdline_credentials;
 
 	lpcfg_smbcli_options(tctx->lp_ctx, &options);
 
 	if (share == NULL) {
-		printf("No share for option %s\n", soption);
+		torture_comment(tctx, "No share for option %s\n", soption);
 		return false;
 	}
 
@@ -412,7 +480,7 @@ bool torture_smb2_con_sopt(struct torture_context *tctx,
 				  lpcfg_smb_ports(tctx->lp_ctx),
 				  share,
 				  lpcfg_resolve_context(tctx->lp_ctx),
-				  credentials,
+				  popt_get_cmdline_credentials(),
 				  0,
 				  tree,
 				  tctx->ev,
@@ -421,26 +489,27 @@ bool torture_smb2_con_sopt(struct torture_context *tctx,
 				  lpcfg_gensec_settings(tctx, tctx->lp_ctx)
 				  );
 	if (!NT_STATUS_IS_OK(status)) {
-		printf("Failed to connect to SMB2 share \\\\%s\\%s - %s\n",
+		torture_comment(tctx, "Failed to connect to SMB2 share \\\\%s\\%s - %s\n",
 		       host, share, nt_errstr(status));
 		return false;
 	}
 	return true;
 }
 
-
 /*
   create and return a handle to a test file
+  with a specific access mask
 */
-NTSTATUS torture_smb2_testfile(struct smb2_tree *tree, const char *fname, 
-			       struct smb2_handle *handle)
+NTSTATUS torture_smb2_testfile_access(struct smb2_tree *tree, const char *fname,
+				      struct smb2_handle *handle,
+				      uint32_t desired_access)
 {
 	struct smb2_create io;
 	NTSTATUS status;
 
 	ZERO_STRUCT(io);
 	io.in.oplock_level = 0;
-	io.in.desired_access = SEC_RIGHTS_FILE_ALL;
+	io.in.desired_access = desired_access;
 	io.in.file_attributes   = FILE_ATTRIBUTE_NORMAL;
 	io.in.create_disposition = NTCREATEX_DISP_OPEN_IF;
 	io.in.share_access = 
@@ -459,17 +528,59 @@ NTSTATUS torture_smb2_testfile(struct smb2_tree *tree, const char *fname,
 }
 
 /*
-  create and return a handle to a test directory
+  create and return a handle to a test file
 */
-NTSTATUS torture_smb2_testdir(struct smb2_tree *tree, const char *fname, 
-			      struct smb2_handle *handle)
+NTSTATUS torture_smb2_testfile(struct smb2_tree *tree, const char *fname,
+			       struct smb2_handle *handle)
+{
+	return torture_smb2_testfile_access(tree, fname, handle,
+					    SEC_RIGHTS_FILE_ALL);
+}
+
+/*
+  create and return a handle to a test file
+  with a specific access mask
+*/
+NTSTATUS torture_smb2_open(struct smb2_tree *tree,
+			   const char *fname,
+			   uint32_t desired_access,
+			   struct smb2_handle *handle)
+{
+	struct smb2_create io;
+	NTSTATUS status;
+
+	io = (struct smb2_create) {
+		.in.fname = fname,
+		.in.desired_access = desired_access,
+		.in.file_attributes = FILE_ATTRIBUTE_NORMAL,
+		.in.create_disposition = NTCREATEX_DISP_OPEN,
+		.in.share_access = NTCREATEX_SHARE_ACCESS_MASK,
+	};
+
+	status = smb2_create(tree, tree, &io);
+	if (!NT_STATUS_IS_OK(status)) {
+		return status;
+	}
+
+	*handle = io.out.file.handle;
+
+	return NT_STATUS_OK;
+}
+
+/*
+  create and return a handle to a test directory
+  with specific desired access
+*/
+NTSTATUS torture_smb2_testdir_access(struct smb2_tree *tree, const char *fname,
+				     struct smb2_handle *handle,
+				     uint32_t desired_access)
 {
 	struct smb2_create io;
 	NTSTATUS status;
 
 	ZERO_STRUCT(io);
 	io.in.oplock_level = 0;
-	io.in.desired_access = SEC_RIGHTS_DIR_ALL;
+	io.in.desired_access = desired_access;
 	io.in.file_attributes   = FILE_ATTRIBUTE_DIRECTORY;
 	io.in.create_disposition = NTCREATEX_DISP_OPEN_IF;
 	io.in.share_access = NTCREATEX_SHARE_ACCESS_READ|NTCREATEX_SHARE_ACCESS_WRITE|NTCREATEX_SHARE_ACCESS_DELETE;
@@ -484,15 +595,59 @@ NTSTATUS torture_smb2_testdir(struct smb2_tree *tree, const char *fname,
 	return NT_STATUS_OK;
 }
 
+/*
+  create and return a handle to a test directory
+*/
+NTSTATUS torture_smb2_testdir(struct smb2_tree *tree, const char *fname,
+			      struct smb2_handle *handle)
+{
+	return torture_smb2_testdir_access(tree, fname, handle,
+					   SEC_RIGHTS_DIR_ALL);
+}
+
+/*
+  create a simple file using the SMB2 protocol
+*/
+NTSTATUS smb2_create_simple_file(struct torture_context *tctx,
+				 struct smb2_tree *tree, const char *fname,
+				 struct smb2_handle *handle)
+{
+	char buf[7] = "abc";
+	NTSTATUS status;
+
+	smb2_util_unlink(tree, fname);
+	status = torture_smb2_testfile_access(tree,
+					      fname, handle,
+					      SEC_FLAG_MAXIMUM_ALLOWED);
+	NT_STATUS_NOT_OK_RETURN(status);
+
+	status = smb2_util_write(tree, *handle, buf, 0, sizeof(buf));
+	NT_STATUS_NOT_OK_RETURN(status);
+
+	return NT_STATUS_OK;
+}
+
+/*
+  create a simple file using SMB2.
+*/
+NTSTATUS torture_setup_simple_file(struct torture_context *tctx,
+				   struct smb2_tree *tree, const char *fname)
+{
+	struct smb2_handle handle;
+	NTSTATUS status = smb2_create_simple_file(tctx, tree, fname, &handle);
+	NT_STATUS_NOT_OK_RETURN(status);
+	return smb2_util_close(tree, handle);
+}
 
 /*
   create a complex file using SMB2, to make it easier to
   find fields in SMB2 getinfo levels
 */
-NTSTATUS torture_setup_complex_file(struct smb2_tree *tree, const char *fname)
+NTSTATUS torture_setup_complex_file(struct torture_context *tctx,
+				    struct smb2_tree *tree, const char *fname)
 {
 	struct smb2_handle handle;
-	NTSTATUS status = smb2_create_complex_file(tree, fname, &handle);
+	NTSTATUS status = smb2_create_complex_file(tctx, tree, fname, &handle);
 	NT_STATUS_NOT_OK_RETURN(status);
 	return smb2_util_close(tree, handle);
 }
@@ -502,10 +657,11 @@ NTSTATUS torture_setup_complex_file(struct smb2_tree *tree, const char *fname)
   create a complex dir using SMB2, to make it easier to
   find fields in SMB2 getinfo levels
 */
-NTSTATUS torture_setup_complex_dir(struct smb2_tree *tree, const char *fname)
+NTSTATUS torture_setup_complex_dir(struct torture_context *tctx,
+				   struct smb2_tree *tree, const char *fname)
 {
 	struct smb2_handle handle;
-	NTSTATUS status = smb2_create_complex_dir(tree, fname, &handle);
+	NTSTATUS status = smb2_create_complex_dir(tctx, tree, fname, &handle);
 	NT_STATUS_NOT_OK_RETURN(status);
 	return smb2_util_close(tree, handle);
 }
@@ -826,3 +982,45 @@ void smb2_oplock_create(struct smb2_create *io, const char *name, uint8_t oplock
 				 oplock);
 }
 
+/*
+   a wrapper around smblsa_sid_check_privilege, that tries to take
+   account of the fact that the lsa privileges calls don't expand
+   group memberships, using an explicit check for administrator. There
+   must be a better way ...
+ */
+NTSTATUS torture_smb2_check_privilege(struct smb2_tree *tree,
+				     const char *sid_str,
+				     const char *privilege)
+{
+	struct dom_sid *sid = NULL;
+	TALLOC_CTX *tmp_ctx = NULL;
+	uint32_t rid;
+	NTSTATUS status;
+
+	tmp_ctx = talloc_new(tree);
+	if (tmp_ctx == NULL) {
+		return NT_STATUS_NO_MEMORY;
+	}
+
+	sid = dom_sid_parse_talloc(tmp_ctx, sid_str);
+	if (sid == NULL) {
+		talloc_free(tmp_ctx);
+		return NT_STATUS_INVALID_SID;
+	}
+
+	status = dom_sid_split_rid(tmp_ctx, sid, NULL, &rid);
+	if (!NT_STATUS_IS_OK(status)) {
+		TALLOC_FREE(tmp_ctx);
+		return status;
+	}
+
+	if (rid == DOMAIN_RID_ADMINISTRATOR) {
+		/* assume the administrator has them all */
+		TALLOC_FREE(tmp_ctx);
+		return NT_STATUS_OK;
+	}
+
+	talloc_free(tmp_ctx);
+
+	return smb2lsa_sid_check_privilege(tree, sid_str, privilege);
+}

@@ -32,113 +32,76 @@
 #include "rpc_client/cli_samr.h"
 #include "rpc_client/cli_lsarpc.h"
 #include "../libcli/security/security.h"
+#include "lsa.h"
 
 /* Query display info for a domain */
 NTSTATUS rpc_query_user_list(TALLOC_CTX *mem_ctx,
 			     struct rpc_pipe_client *samr_pipe,
 			     struct policy_handle *samr_policy,
 			     const struct dom_sid *domain_sid,
-			     uint32_t *pnum_info,
-			     struct wbint_userinfo **pinfo)
+			     uint32_t **prids)
 {
-	struct wbint_userinfo *info = NULL;
-	uint32_t num_info = 0;
-	uint32_t loop_count = 0;
-	uint32_t start_idx = 0;
-	uint32_t i = 0;
-	NTSTATUS status, result;
 	struct dcerpc_binding_handle *b = samr_pipe->binding_handle;
+	uint32_t *rids = NULL;
+	uint32_t num_rids = 0;
+	uint32_t i = 0;
+	uint32_t resume_handle = 0;
+	NTSTATUS result = NT_STATUS_UNSUCCESSFUL;
+	NTSTATUS status = NT_STATUS_UNSUCCESSFUL;
+	TALLOC_CTX *tmp_ctx;
 
-	*pnum_info = 0;
+	*prids = NULL;
+
+	tmp_ctx = talloc_stackframe();
+	if (tmp_ctx == NULL) {
+		return NT_STATUS_NO_MEMORY;
+	}
 
 	do {
-		uint32_t j;
-		uint32_t num_dom_users;
-		uint32_t max_entries, max_size;
-		uint32_t total_size, returned_size;
-		union samr_DispInfo disp_info;
+		struct samr_SamArray *sam_array = NULL;
+		uint32_t count = 0;
+		uint32_t *tmp;
 
-		dcerpc_get_query_dispinfo_params(loop_count,
-						 &max_entries,
-						 &max_size);
-
-		status = dcerpc_samr_QueryDisplayInfo(b,
-						      mem_ctx,
-						      samr_policy,
-						      1, /* level */
-						      start_idx,
-						      max_entries,
-						      max_size,
-						      &total_size,
-						      &returned_size,
-						      &disp_info,
-						      &result);
+		status = dcerpc_samr_EnumDomainUsers(
+			b, tmp_ctx, samr_policy, &resume_handle,
+			ACB_NORMAL, &sam_array, 0xffff, &count, &result);
 		if (!NT_STATUS_IS_OK(status)) {
-			return status;
+			goto done;
 		}
 		if (!NT_STATUS_IS_OK(result)) {
 			if (!NT_STATUS_EQUAL(result, STATUS_MORE_ENTRIES)) {
-				return result;
+				DBG_WARNING("EnumDomainUsers failed: %s\n",
+					    nt_errstr(result));
+				status = result;
+				goto done;
 			}
 		}
 
-		/* increment required start query values */
-		start_idx += disp_info.info1.count;
-		loop_count++;
-		num_dom_users = disp_info.info1.count;
-
-		num_info += num_dom_users;
-
-		info = talloc_realloc(mem_ctx,
-					    info,
-					    struct wbint_userinfo,
-					    num_info);
-		if (info == NULL) {
-			return NT_STATUS_NO_MEMORY;
+		if (num_rids + count < num_rids) {
+			status = NT_STATUS_INTEGER_OVERFLOW;
+			goto done;
 		}
 
-		for (j = 0; j < num_dom_users; i++, j++) {
-			uint32_t rid = disp_info.info1.entries[j].rid;
-			struct samr_DispEntryGeneral *src;
-			struct wbint_userinfo *dst;
-
-			src = &(disp_info.info1.entries[j]);
-			dst = &(info[i]);
-
-			dst->acct_name = talloc_strdup(info,
-						       src->account_name.string);
-			if (dst->acct_name == NULL) {
-				return NT_STATUS_NO_MEMORY;
-			}
-
-			dst->full_name = talloc_strdup(info, src->full_name.string);
-			if ((src->full_name.string != NULL) &&
-			    (dst->full_name == NULL))
-			{
-				return NT_STATUS_NO_MEMORY;
-			}
-
-			dst->homedir = NULL;
-			dst->shell = NULL;
-			dst->primary_gid = (gid_t)-1;
-			sid_compose(&dst->user_sid, domain_sid, rid);
-
-			/* For the moment we set the primary group for
-			   every user to be the Domain Users group.
-			   There are serious problems with determining
-			   the actual primary group for large domains.
-			   This should really be made into a 'winbind
-			   force group' smb.conf parameter or
-			   something like that. */
-			sid_compose(&dst->group_sid, domain_sid,
-				    DOMAIN_RID_USERS);
+		tmp = talloc_realloc(tmp_ctx, rids, uint32_t, num_rids+count);
+		if (tmp == NULL) {
+			status = NT_STATUS_NO_MEMORY;
+			goto done;
 		}
+		rids = tmp;
+
+		for (i=0; i<count; i++) {
+			rids[num_rids++] = sam_array->entries[i].idx;
+		}
+
+		TALLOC_FREE(sam_array);
 	} while (NT_STATUS_EQUAL(result, STATUS_MORE_ENTRIES));
 
-	*pnum_info = num_info;
-	*pinfo = info;
+	*prids = talloc_steal(mem_ctx, rids);
+	status = NT_STATUS_OK;
 
-	return NT_STATUS_OK;
+done:
+	TALLOC_FREE(tmp_ctx);
+	return status;
 }
 
 /* List all domain groups */
@@ -192,9 +155,13 @@ NTSTATUS rpc_enum_dom_groups(TALLOC_CTX *mem_ctx,
 		for (g = 0; g < count; g++) {
 			struct wb_acct_info *i = &info[num_info + g];
 
-			fstrcpy(i->acct_name,
+			i->acct_name = talloc_strdup(info,
 				sam_array->entries[g].name.string);
-			fstrcpy(i->acct_desc, "");
+			if (i->acct_name == NULL) {
+				TALLOC_FREE(info);
+				return NT_STATUS_NO_MEMORY;
+			}
+			i->acct_desc = NULL;
 			i->rid = sam_array->entries[g].idx;
 		}
 
@@ -254,9 +221,13 @@ NTSTATUS rpc_enum_local_groups(TALLOC_CTX *mem_ctx,
 		for (g = 0; g < count; g++) {
 			struct wb_acct_info *i = &info[num_info + g];
 
-			fstrcpy(i->acct_name,
+			i->acct_name = talloc_strdup(info,
 				sam_array->entries[g].name.string);
-			fstrcpy(i->acct_desc, "");
+			if (i->acct_name == NULL) {
+				TALLOC_FREE(info);
+				return NT_STATUS_NO_MEMORY;
+			}
+			i->acct_desc = NULL;
 			i->rid = sam_array->entries[g].idx;
 		}
 
@@ -276,6 +247,7 @@ NTSTATUS rpc_name_to_sid(TALLOC_CTX *mem_ctx,
 			 const char *domain_name,
 			 const char *name,
 			 uint32_t flags,
+			 const char **pdom_name,
 			 struct dom_sid *sid,
 			 enum lsa_SidType *type)
 {
@@ -283,6 +255,7 @@ NTSTATUS rpc_name_to_sid(TALLOC_CTX *mem_ctx,
 	struct dom_sid *sids = NULL;
 	char *full_name = NULL;
 	const char *names[1];
+	const char **domains;
 	char *mapped_name = NULL;
 	NTSTATUS status;
 
@@ -319,7 +292,7 @@ NTSTATUS rpc_name_to_sid(TALLOC_CTX *mem_ctx,
 					 lsa_policy,
 					 1, /* num_names */
 					 names,
-					 NULL, /* domains */
+					 &domains,
 					 1, /* level */
 					 &sids,
 					 &types);
@@ -327,6 +300,17 @@ NTSTATUS rpc_name_to_sid(TALLOC_CTX *mem_ctx,
 		DEBUG(2,("name_to_sid: failed to lookup name: %s\n",
 			nt_errstr(status)));
 		return status;
+	}
+
+	if (pdom_name != NULL) {
+		const char *dom_name;
+
+		dom_name = talloc_strdup(mem_ctx, domains[0]);
+		if (dom_name == NULL) {
+			return NT_STATUS_NO_MEMORY;
+		}
+
+		*pdom_name = dom_name;
 	}
 
 	sid_copy(sid, &sids[0]);
@@ -369,7 +353,7 @@ NTSTATUS rpc_sid_to_name(TALLOC_CTX *mem_ctx,
 	*ptype = (enum lsa_SidType) types[0];
 
 	map_status = normalize_name_map(mem_ctx,
-					domain,
+					domain->name,
 					names[0],
 					&mapped_name);
 	if (NT_STATUS_IS_OK(map_status) ||
@@ -447,7 +431,7 @@ NTSTATUS rpc_rids_to_names(TALLOC_CTX *mem_ctx,
 
 		if (types[i] != SID_NAME_UNKNOWN) {
 			map_status = normalize_name_map(mem_ctx,
-							domain,
+							domain->name,
 							names[i],
 							&mapped_name);
 			if (NT_STATUS_IS_OK(map_status) ||
@@ -466,82 +450,6 @@ NTSTATUS rpc_rids_to_names(TALLOC_CTX *mem_ctx,
 	*pdomain_name = domain_name;
 	*ptypes = types;
 	*pnames = names;
-
-	return NT_STATUS_OK;
-}
-
-/* Lookup user information from a rid or username. */
-NTSTATUS rpc_query_user(TALLOC_CTX *mem_ctx,
-			struct rpc_pipe_client *samr_pipe,
-			struct policy_handle *samr_policy,
-			const struct dom_sid *domain_sid,
-			const struct dom_sid *user_sid,
-			struct wbint_userinfo *user_info)
-{
-	struct policy_handle user_policy;
-	union samr_UserInfo *info = NULL;
-	uint32_t user_rid;
-	NTSTATUS status, result;
-	struct dcerpc_binding_handle *b = samr_pipe->binding_handle;
-
-	if (!sid_peek_check_rid(domain_sid, user_sid, &user_rid)) {
-		return NT_STATUS_UNSUCCESSFUL;
-	}
-
-	/* Get user handle */
-	status = dcerpc_samr_OpenUser(b,
-				      mem_ctx,
-				      samr_policy,
-				      SEC_FLAG_MAXIMUM_ALLOWED,
-				      user_rid,
-				      &user_policy,
-				      &result);
-	if (!NT_STATUS_IS_OK(status)) {
-		return status;
-	}
-	if (!NT_STATUS_IS_OK(result)) {
-		return result;
-	}
-
-	/* Get user info */
-	status = dcerpc_samr_QueryUserInfo(b,
-					   mem_ctx,
-					   &user_policy,
-					   0x15,
-					   &info,
-					   &result);
-	{
-		NTSTATUS _result;
-		dcerpc_samr_Close(b, mem_ctx, &user_policy, &_result);
-	}
-	if (!NT_STATUS_IS_OK(status)) {
-		return status;
-	}
-	if (!NT_STATUS_IS_OK(result)) {
-		return result;
-	}
-
-	sid_compose(&user_info->user_sid, domain_sid, user_rid);
-	sid_compose(&user_info->group_sid, domain_sid,
-		    info->info21.primary_gid);
-
-	user_info->acct_name = talloc_strdup(user_info,
-					info->info21.account_name.string);
-	if (user_info->acct_name == NULL) {
-		return NT_STATUS_NO_MEMORY;
-	}
-
-	user_info->full_name = talloc_strdup(user_info,
-					info->info21.full_name.string);
-	if ((info->info21.full_name.string != NULL) &&
-	    (user_info->full_name == NULL))
-	{
-		return NT_STATUS_NO_MEMORY;
-	}
-
-	user_info->homedir = NULL;
-	user_info->shell = NULL;
-	user_info->primary_gid = (gid_t)-1;
 
 	return NT_STATUS_OK;
 }
@@ -1044,25 +952,23 @@ NTSTATUS rpc_trusted_domains(TALLOC_CTX *mem_ctx,
 				return NT_STATUS_NO_MEMORY;
 			}
 
+			if (dom_list_ex.domains[i].sid == NULL) {
+				DBG_ERR("Trusted domain %s has no SID, "
+					"skipping!\n",
+					trust->dns_name);
+				continue;
+			}
+
 			if (has_ex) {
 				trust->netbios_name = talloc_move(array,
 								  &dom_list_ex.domains[i].netbios_name.string);
 				trust->dns_name = talloc_move(array,
 							      &dom_list_ex.domains[i].domain_name.string);
-				if (dom_list_ex.domains[i].sid == NULL) {
-					DEBUG(0, ("Trusted Domain %s has no SID, aborting!\n", trust->dns_name));
-					return NT_STATUS_INVALID_NETWORK_RESPONSE;
-				}
 				sid_copy(sid, dom_list_ex.domains[i].sid);
 			} else {
 				trust->netbios_name = talloc_move(array,
 								  &dom_list.domains[i].name.string);
 				trust->dns_name = NULL;
-
-				if (dom_list.domains[i].sid == NULL) {
-					DEBUG(0, ("Trusted Domain %s has no SID, aborting!\n", trust->netbios_name));
-					return NT_STATUS_INVALID_NETWORK_RESPONSE;
-				}
 
 				sid_copy(sid, dom_list.domains[i].sid);
 			}
@@ -1103,7 +1009,7 @@ static NTSTATUS rpc_try_lookup_sids3(TALLOC_CTX *mem_ctx,
 	if (!NT_STATUS_IS_OK(status)) {
 		return status;
 	}
-	if (NT_STATUS_IS_ERR(result)) {
+	if (NT_STATUS_LOOKUP_ERR(result)) {
 		return result;
 	}
 	if (sids->num_sids != lsa_names2.count) {
@@ -1132,7 +1038,7 @@ static NTSTATUS rpc_try_lookup_sids3(TALLOC_CTX *mem_ctx,
 			return NT_STATUS_INVALID_NETWORK_RESPONSE;
 		}
 	}
-	return result;
+	return NT_STATUS_OK;
 }
 
 NTSTATUS rpc_lookup_sids(TALLOC_CTX *mem_ctx,
@@ -1165,7 +1071,7 @@ NTSTATUS rpc_lookup_sids(TALLOC_CTX *mem_ctx,
 	if (!NT_STATUS_IS_OK(status)) {
 		return status;
 	}
-	if (NT_STATUS_IS_ERR(result)) {
+	if (NT_STATUS_LOOKUP_ERR(result)) {
 		return result;
 	}
 
@@ -1185,5 +1091,5 @@ NTSTATUS rpc_lookup_sids(TALLOC_CTX *mem_ctx,
 		}
 	}
 
-	return result;
+	return NT_STATUS_OK;
 }

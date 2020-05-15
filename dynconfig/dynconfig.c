@@ -18,8 +18,6 @@
    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-#include "includes.h"
-
 /**
  * @file dynconfig.c
  *
@@ -40,10 +38,9 @@
  * table?  There's kind of a chicken-and-egg situation there...
  **/
 
+#include "replace.h"
 #include "dynconfig.h"
-#ifdef strdup
-#undef strdup
-#endif
+#include "lib/util/memory.h"
 
 #define DEFINE_DYN_CONFIG_PARAM(name) \
 const char *dyn_##name = name; \
@@ -98,12 +95,13 @@ DEFINE_DYN_CONFIG_PARAM(PIDDIR)
 DEFINE_DYN_CONFIG_PARAM(NCALRPCDIR)
 DEFINE_DYN_CONFIG_PARAM(SMB_PASSWD_FILE)
 DEFINE_DYN_CONFIG_PARAM(PRIVATE_DIR)
+DEFINE_DYN_CONFIG_PARAM(BINDDNS_DIR)
 DEFINE_DYN_CONFIG_PARAM(LOCALEDIR)
 DEFINE_DYN_CONFIG_PARAM(NMBDSOCKETDIR)
 DEFINE_DYN_CONFIG_PARAM(DATADIR)
+DEFINE_DYN_CONFIG_PARAM(SAMBA_DATADIR)
 DEFINE_DYN_CONFIG_PARAM(SETUPDIR)
 DEFINE_DYN_CONFIG_PARAM(WINBINDD_SOCKET_DIR) /* from winbind_struct_protocol.h in s3 autoconf */
-DEFINE_DYN_CONFIG_PARAM(WINBINDD_PRIVILEGED_SOCKET_DIR)
 DEFINE_DYN_CONFIG_PARAM(NTP_SIGND_SOCKET_DIR)
 DEFINE_DYN_CONFIG_PARAM(PYTHONDIR)
 DEFINE_DYN_CONFIG_PARAM(PYTHONARCHDIR)

@@ -27,6 +27,7 @@
 #include "lib/tsocket/tsocket.h"
 #include "dfs_server/dfs_server_ad.h"
 #include "lib/util/util_net.h"
+#include "libds/common/roles.h"
 
 #define MAX_DFS_RESPONSE 56*1024 /* 56 Kb */
 
@@ -601,7 +602,7 @@ static NTSTATUS dodc_referral(struct loadparm_context *lp_ctx,
 		}
 	}
 
-	site_name = samdb_client_site_name(sam_ctx, r, client_str, NULL);
+	site_name = samdb_client_site_name(sam_ctx, r, client_str, NULL, true);
 
 	status = get_dcs(r, sam_ctx, site_name, need_fqdn, &set, 0);
 	if (!NT_STATUS_IS_OK(status)) {
@@ -712,7 +713,7 @@ static NTSTATUS dosysvol_referral(struct loadparm_context *lp_ctx,
 		}
 	}
 
-	site_name = samdb_client_site_name(sam_ctx, r, client_str, NULL);
+	site_name = samdb_client_site_name(sam_ctx, r, client_str, NULL, true);
 
 	status = get_dcs(r, sam_ctx, site_name, need_fqdn, &set, 0);
 	if (!NT_STATUS_IS_OK(status)) {

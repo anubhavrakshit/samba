@@ -26,24 +26,37 @@
 typedef struct {
 	PyObject_HEAD
 	TALLOC_CTX *talloc_ctx;
-	void *ptr;
+	void *ptr; /* eg the array element */
 } pytalloc_Object;
 
-/* Return the PyTypeObject for pytalloc_Object. Returns a new reference. */
+/* Return the PyTypeObject for pytalloc_Object. Returns a borrowed reference. */
 PyTypeObject *pytalloc_GetObjectType(void);
+
+/* Return the PyTypeObject for pytalloc_BaseObject. Returns a borrowed reference. */
+PyTypeObject *pytalloc_GetBaseObjectType(void);
 
 /* Check whether a specific object is a talloc Object. */
 int pytalloc_Check(PyObject *);
 
+int pytalloc_BaseObject_check(PyObject *);
+
+int _pytalloc_check_type(PyObject *py_obj, const char *type_name);
+#define pytalloc_check_type(py_obj, type) \
+	_pytalloc_check_type((PyObject *)(py_obj), #type)
+
 /* Retrieve the pointer for a pytalloc_object. Like talloc_get_type() 
  * but for pytalloc_Objects. */
+void *_pytalloc_get_type(PyObject *py_obj, const char *type_name);
+#define pytalloc_get_type(py_obj, type) ((type *)_pytalloc_get_type((PyObject *)(py_obj), #type))
 
-/* FIXME: Call PyErr_SetString(PyExc_TypeError, "expected " __STR(type) ") 
- * when talloc_get_type() returns NULL. */
-#define pytalloc_get_type(py_obj, type) (talloc_get_type(pytalloc_get_ptr(py_obj), type))
+void *_pytalloc_get_ptr(PyObject *py_obj);
+#define pytalloc_get_ptr(py_obj) _pytalloc_get_ptr((PyObject *)(py_obj))
+TALLOC_CTX *_pytalloc_get_mem_ctx(PyObject *py_obj);
+#define pytalloc_get_mem_ctx(py_obj) _pytalloc_get_mem_ctx((PyObject *)(py_obj))
 
-#define pytalloc_get_ptr(py_obj) (((pytalloc_Object *)py_obj)->ptr)
-#define pytalloc_get_mem_ctx(py_obj)  ((pytalloc_Object *)py_obj)->talloc_ctx
+const char *_pytalloc_get_name(PyObject *py_obj);
+#define pytalloc_get_name(py_obj) _pytalloc_get_name((PyObject *)(py_obj))
+
 
 PyObject *pytalloc_steal_ex(PyTypeObject *py_type, TALLOC_CTX *mem_ctx, void *ptr);
 PyObject *pytalloc_steal(PyTypeObject *py_type, void *ptr);
@@ -52,8 +65,19 @@ PyObject *pytalloc_reference_ex(PyTypeObject *py_type, TALLOC_CTX *mem_ctx, void
 
 #define pytalloc_new(type, typeobj) pytalloc_steal(typeobj, talloc_zero(NULL, type))
 
-#if PY_MAJOR_VERSION < 3
-PyObject *pytalloc_CObject_FromTallocPtr(void *);
-#endif
+/*
+ * Wrap a generic talloc pointer into a talloc.GenericObject,
+ * this is a subclass of talloc.BaseObject.
+ */
+PyObject *pytalloc_GenericObject_steal_ex(TALLOC_CTX *mem_ctx, void *ptr);
+#define pytalloc_GenericObject_steal(talloc_ptr) \
+	pytalloc_GenericObject_steal_ex(talloc_ptr, talloc_ptr)
+PyObject *pytalloc_GenericObject_reference_ex(TALLOC_CTX *mem_ctx, void *ptr);
+#define pytalloc_GenericObject_reference(talloc_ptr) \
+	pytalloc_GenericObject_reference_ex(talloc_ptr, talloc_ptr)
+
+size_t pytalloc_BaseObject_size(void);
+
+int pytalloc_BaseObject_PyType_Ready(PyTypeObject *type);
 
 #endif /* _PYTALLOC_H_ */

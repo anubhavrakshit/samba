@@ -28,6 +28,9 @@
 #include "auth/session.h"
 #include "rpc_server/drsuapi/dcesrv_drsuapi.h"
 
+#undef DBGC_CLASS
+#define DBGC_CLASS            DBGC_DRS_REPL
+
 int drsuapi_search_with_extended_dn(struct ldb_context *ldb,
 				    TALLOC_CTX *mem_ctx,
 				    struct ldb_result **_res,
@@ -92,6 +95,8 @@ WERROR drs_security_level_check(struct dcesrv_call_state *dce_call,
 				enum security_user_level minimum_level,
 				const struct dom_sid *domain_sid)
 {
+	struct auth_session_info *session_info =
+		dcesrv_call_session_info(dce_call);
 	enum security_user_level level;
 
 	if (lpcfg_parm_bool(dce_call->conn->dce_ctx->lp_ctx, NULL,
@@ -99,12 +104,12 @@ WERROR drs_security_level_check(struct dcesrv_call_state *dce_call,
 		return WERR_OK;
 	}
 
-	level = security_session_user_level(dce_call->conn->auth_state.session_info, domain_sid);
+	level = security_session_user_level(session_info, domain_sid);
 	if (level < minimum_level) {
 		if (call) {
 			DEBUG(0,("%s refused for security token (level=%u)\n",
 				 call, (unsigned)level));
-			security_token_debug(0, 2, dce_call->conn->auth_state.session_info->security_token);
+			security_token_debug(DBGC_DRS_REPL, 2, session_info->security_token);
 		}
 		return WERR_DS_DRA_ACCESS_DENIED;
 	}
@@ -167,7 +172,7 @@ static WERROR drs_security_access_check_log(struct ldb_context *sam_ctx,
 	if (ret == LDB_ERR_INSUFFICIENT_ACCESS_RIGHTS) {
 		DEBUG(3,("%s refused for security token on %s\n",
 			 ext_right, ldb_dn_get_linearized(dn)));
-		security_token_debug(2, 0, token);
+		security_token_debug(DBGC_DRS_REPL, 3, token);
 		return WERR_DS_DRA_ACCESS_DENIED;
 	} else if (ret != LDB_SUCCESS) {
 		DEBUG(1,("Failed to perform access check on %s: %s\n", ldb_dn_get_linearized(dn), ldb_strerror(ret)));

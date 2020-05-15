@@ -1,6 +1,7 @@
 <samba:parameter name="name resolve order"
                  context="G"
                  type="cmdlist"
+                 handler="handle_name_resolve_order"
                  xmlns:samba="http://www.samba.org/samba/DTD/samba-doc"> 
 <description>
     <para>This option is used by the programs in the Samba 
@@ -60,7 +61,7 @@
     <para><command moreinfo="none">name resolve order = wins bcast</command></para>
 
     <para>DC lookups will still be done via DNS, but fallbacks to netbios names will
-		not inundate your DNS servers with needless querys for DOMAIN&lt;0x1c&gt; lookups.</para>
+		not inundate your DNS servers with needless queries for DOMAIN&lt;0x1c&gt; lookups.</para>
  
 </description>
 

@@ -1,11 +1,23 @@
 #!/usr/bin/env python
-import Options
+from waflib import Logs, Options
+
+import os, sys
 
 if Options.options.disable_fault_handling:
     conf.DEFINE('HAVE_DISABLE_FAULT_HANDLING',1)
 
 # backtrace could be in libexecinfo or in libc
 conf.CHECK_FUNCS_IN('backtrace backtrace_symbols', 'execinfo', checklibc=True, headers='execinfo.h')
+conf.CHECK_HEADERS('execinfo.h')
+
+conf.SET_TARGET_TYPE('LIBUNWIND', 'EMPTY')
+if conf.check_cfg(package='libunwind-generic',
+                  args='--cflags --libs',
+                  msg='Checking for libunwind',
+                  uselib_store='LIBUNWIND',
+                  mandatory=False):
+    if conf.CHECK_HEADERS('libunwind.h'):
+        conf.SET_TARGET_TYPE('LIBUNWIND', 'SYSLIB')
 
 conf.CHECK_STRUCTURE_MEMBER('struct statvfs', 'f_frsize', define='HAVE_FRSIZE', headers='sys/statvfs.h')
 
@@ -110,19 +122,22 @@ conf.SET_TARGET_TYPE('systemd-journal', 'EMPTY')
 conf.SET_TARGET_TYPE('systemd', 'EMPTY')
 
 if Options.options.enable_systemd != False:
-    conf.check_cfg(package='libsystemd-daemon', args='--cflags --libs',
+    r_daemon = conf.CHECK_CFG(package='libsystemd-daemon', args='--cflags --libs',
                    msg='Checking for libsystemd-daemon')
-    if not conf.CHECK_LIB('systemd-daemon', shlib=True):
-        conf.CHECK_LIB('systemd', shlib=True)
-
-if Options.options.enable_systemd != False:
-    conf.check_cfg(package='libsystemd-journal', args='--cflags --libs',
+    r_journal = conf.CHECK_CFG(package='libsystemd-journal', args='--cflags --libs',
                    msg='Checking for libsystemd-journal')
-    if not conf.CHECK_LIB('systemd-journal', shlib=True):
+    if r_daemon is None and r_journal is None:
+        conf.CHECK_CFG(package='libsystemd', args='--cflags --libs',
+                   msg='Checking for libsystemd')
         conf.CHECK_LIB('systemd', shlib=True)
+    else:
+        conf.CHECK_LIB('systemd-daemon', shlib=True)
+        conf.CHECK_LIB('systemd-journal', shlib=True)
+
+conf.SET_TARGET_TYPE('lttng-ust', 'EMPTY')
 
 if Options.options.enable_lttng != False:
-    conf.check_cfg(package='lttng-ust', args='--cflags --libs',
+    conf.CHECK_CFG(package='lttng-ust', args='--cflags --libs',
                    msg='Checking for lttng-ust', uselib_store="LTTNG-UST")
     conf.CHECK_HEADERS('lttng/tracef.h', lib='lttng-st')
     conf.CHECK_LIB('lttng-ust', shlib=True)
@@ -131,10 +146,20 @@ if (conf.CONFIG_SET('HAVE_LTTNG_TRACEF_H') and
     conf.CONFIG_SET('HAVE_LTTNG_UST')):
     conf.DEFINE('HAVE_LTTNG_TRACEF', '1')
     conf.env['HAVE_LTTNG_TRACEF'] = True
-else:
-    conf.SET_TARGET_TYPE('lttng-ust', 'EMPTY')
-    conf.undefine('HAVE_LTTNG_TRACEF')
 
-conf.env['CPPPATH_GPFS'] = Options.options.gpfs_headers_dir
-if conf.CHECK_HEADERS('gpfs.h', False, False, "gpfs"):
-    conf.DEFINE('HAVE_GPFS', '1')
+if Options.options.gpfs_headers_dir:
+    conf.env['CPPPATH_GPFS'] = Options.options.gpfs_headers_dir
+    if conf.CHECK_HEADERS('gpfs.h', False, False, "gpfs"):
+        Logs.info('Using gpfs.h from %s' % Options.options.gpfs_headers_dir)
+        conf.DEFINE('HAVE_GPFS', '1')
+else:
+    conf.env['CPPPATH_GPFS'] = "/usr/lpp/mmfs/include/"
+    if conf.CHECK_HEADERS('gpfs.h', False, False, "gpfs"):
+        Logs.info('Using gpfs.h from installed gpfs package.')
+        conf.DEFINE('HAVE_GPFS', '1')
+    else:
+        if sys.platform.startswith('linux'):
+            conf.env['CPPPATH_GPFS'] = os.path.abspath("third_party/gpfs")
+            if conf.CHECK_HEADERS('gpfs.h', False, False, "gpfs"):
+                Logs.info('Using gpfs.h from third_party directory.')
+                conf.DEFINE('HAVE_GPFS', '1')

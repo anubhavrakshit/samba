@@ -47,12 +47,14 @@
 #define TORTURE_WELLKNOWN_PRINTER_EX	"torture_wkn_printer_ex"
 #define TORTURE_PRINTER_EX		"torture_printer_ex"
 #define TORTURE_DRIVER			"torture_driver"
+#define TORTURE_DRIVER_ADD		"torture_driver_add"
 #define TORTURE_DRIVER_EX		"torture_driver_ex"
 #define TORTURE_DRIVER_ADOBE		"torture_driver_adobe"
 #define TORTURE_DRIVER_EX_ADOBE		"torture_driver_ex_adobe"
 #define TORTURE_DRIVER_ADOBE_CUPSADDSMB	"torture_driver_adobe_cupsaddsmb"
 #define TORTURE_DRIVER_TIMESTAMPS	"torture_driver_timestamps"
 #define TORTURE_DRIVER_DELETER		"torture_driver_deleter"
+#define TORTURE_DRIVER_COPY_DIR		"torture_driver_copy_from_directory"
 #define TORTURE_DRIVER_DELETERIN	"torture_driver_deleterin"
 #define TORTURE_PRINTER_STATIC1		"print1"
 
@@ -100,6 +102,7 @@ struct torture_driver_context {
 	} local;
 	struct {
 		const char *driver_directory;
+		const char *driver_upload_directory;
 		const char *environment;
 	} remote;
 	struct spoolss_AddDriverInfo8 info8;
@@ -244,12 +247,12 @@ static bool PrinterInfo_to_SetPrinterInfo(struct torture_context *tctx,
 		s->info2->drivername		= i->info2.drivername;
 		s->info2->comment		= i->info2.comment;
 		s->info2->location		= i->info2.location;
-		s->info2->devmode_ptr		= NULL;
+		s->info2->devmode_ptr		= 0;
 		s->info2->sepfile		= i->info2.sepfile;
 		s->info2->printprocessor	= i->info2.printprocessor;
 		s->info2->datatype		= i->info2.datatype;
 		s->info2->parameters		= i->info2.parameters;
-		s->info2->secdesc_ptr		= NULL;
+		s->info2->secdesc_ptr		= 0;
 		s->info2->attributes		= i->info2.attributes;
 		s->info2->priority		= i->info2.priority;
 		s->info2->defaultpriority	= i->info2.defaultpriority;
@@ -284,7 +287,7 @@ static bool test_OpenPrinter_server(struct torture_context *tctx,
 	op.in.printername	= talloc_asprintf(tctx, "\\\\%s", dcerpc_server_name(p));
 	op.in.datatype		= NULL;
 	op.in.devmode_ctr.devmode= NULL;
-	op.in.access_mask	= 0;
+	op.in.access_mask	= SEC_FLAG_MAXIMUM_ALLOWED;
 	op.out.handle		= server_handle;
 
 	torture_comment(tctx, "Testing OpenPrinter(%s)\n", op.in.printername);
@@ -711,7 +714,7 @@ static bool test_EnumPrinterDrivers(struct torture_context *tctx,
 
 		for (j=0;j<ctx->driver_count[level - 1];j++) {
 			union spoolss_DriverInfo *cur = &ctx->drivers[level - 1][j];
-			union spoolss_DriverInfo *ref = &ctx->drivers[7][j];
+			union spoolss_DriverInfo *ref = &ctx->drivers[8][j];
 
 			switch (level) {
 			case 1:
@@ -861,6 +864,7 @@ static bool test_EnumMonitors(struct torture_context *tctx,
 				COMPARE_STRING(tctx, cur->info1, ref->info2, monitor_name);
 				break;
 			case 2:
+				torture_assert_str_equal(tctx, ref->info2.environment, ctx->environment, "invalid environment");
 				/* level 2 is our reference, and it makes no sense to compare it to itself */
 				break;
 			}
@@ -951,15 +955,15 @@ static bool test_EnumPrintProcessors(struct torture_context *tctx,
 	return true;
 }
 
-static bool test_EnumPrintProcDataTypes_level(struct torture_context *tctx,
-					      struct dcerpc_binding_handle *b,
-					      const char *print_processor_name,
-					      uint32_t level,
-					      uint32_t *count_p,
-					      union spoolss_PrintProcDataTypesInfo **info_p,
-					      WERROR expected_result)
+static bool test_EnumPrintProcessorDataTypes_level(struct torture_context *tctx,
+						   struct dcerpc_binding_handle *b,
+						   const char *print_processor_name,
+						   uint32_t level,
+						   uint32_t *count_p,
+						   union spoolss_PrintProcDataTypesInfo **info_p,
+						   WERROR expected_result)
 {
-	struct spoolss_EnumPrintProcDataTypes r;
+	struct spoolss_EnumPrintProcessorDataTypes r;
 	DATA_BLOB blob;
 	uint32_t needed;
 	uint32_t count;
@@ -974,24 +978,24 @@ static bool test_EnumPrintProcDataTypes_level(struct torture_context *tctx,
 	r.out.count = &count;
 	r.out.info = &info;
 
-	torture_comment(tctx, "Testing EnumPrintProcDataTypes(%s) level %u\n",
+	torture_comment(tctx, "Testing EnumPrintProcessorDataTypes(%s) level %u\n",
 		r.in.print_processor_name, r.in.level);
 
 	torture_assert_ntstatus_ok(tctx,
-		dcerpc_spoolss_EnumPrintProcDataTypes_r(b, tctx, &r),
-		"EnumPrintProcDataTypes failed");
+		dcerpc_spoolss_EnumPrintProcessorDataTypes_r(b, tctx, &r),
+		"EnumPrintProcessorDataTypes failed");
 	if (W_ERROR_EQUAL(r.out.result, WERR_INSUFFICIENT_BUFFER)) {
 		blob = data_blob_talloc_zero(tctx, needed);
 		r.in.buffer = &blob;
 		r.in.offered = needed;
 		torture_assert_ntstatus_ok(tctx,
-			dcerpc_spoolss_EnumPrintProcDataTypes_r(b, tctx, &r),
-			"EnumPrintProcDataTypes failed");
+			dcerpc_spoolss_EnumPrintProcessorDataTypes_r(b, tctx, &r),
+			"EnumPrintProcessorDataTypes failed");
 	}
 	torture_assert_werr_equal(tctx, r.out.result, expected_result,
-		"EnumPrintProcDataTypes failed");
+		"EnumPrintProcessorDataTypes failed");
 
-	CHECK_NEEDED_SIZE_ENUM_LEVEL(spoolss_EnumPrintProcDataTypes, info, level, count, needed, 4);
+	CHECK_NEEDED_SIZE_ENUM_LEVEL(spoolss_EnumPrintProcessorDataTypes, info, level, count, needed, 4);
 
 	if (count_p) {
 		*count_p = count;
@@ -1003,8 +1007,8 @@ static bool test_EnumPrintProcDataTypes_level(struct torture_context *tctx,
 	return true;
 }
 
-static bool test_EnumPrintProcDataTypes(struct torture_context *tctx,
-					void *private_data)
+static bool test_EnumPrintProcessorDataTypes(struct torture_context *tctx,
+					     void *private_data)
 {
 	struct test_spoolss_context *ctx =
 		talloc_get_type_abort(private_data, struct test_spoolss_context);
@@ -1016,12 +1020,12 @@ static bool test_EnumPrintProcDataTypes(struct torture_context *tctx,
 	struct dcerpc_binding_handle *b = p->binding_handle;
 
 	torture_assert(tctx,
-		test_EnumPrintProcDataTypes_level(tctx, b, NULL, 1, NULL, NULL, WERR_UNKNOWN_PRINTPROCESSOR),
-		"test_EnumPrintProcDataTypes_level failed");
+		test_EnumPrintProcessorDataTypes_level(tctx, b, NULL, 1, NULL, NULL, WERR_UNKNOWN_PRINTPROCESSOR),
+		"test_EnumPrintProcessorDataTypes_level failed");
 
 	torture_assert(tctx,
-		test_EnumPrintProcDataTypes_level(tctx, b, "nonexisting", 1, NULL, NULL, WERR_UNKNOWN_PRINTPROCESSOR),
-		"test_EnumPrintProcDataTypes_level failed");
+		test_EnumPrintProcessorDataTypes_level(tctx, b, "nonexisting", 1, NULL, NULL, WERR_UNKNOWN_PRINTPROCESSOR),
+		"test_EnumPrintProcessorDataTypes_level failed");
 
 	for (i=0;i<ARRAY_SIZE(levels);i++) {
 		int level = levels[i];
@@ -1030,8 +1034,8 @@ static bool test_EnumPrintProcDataTypes(struct torture_context *tctx,
 		WERROR expected_result = ok[i] ? WERR_OK : WERR_INVALID_LEVEL;
 
 		torture_assert(tctx,
-			test_EnumPrintProcDataTypes_level(tctx, b, "winprint", level, &count, &info, expected_result),
-			"test_EnumPrintProcDataTypes_level failed");
+			test_EnumPrintProcessorDataTypes_level(tctx, b, "winprint", level, &count, &info, expected_result),
+			"test_EnumPrintProcessorDataTypes_level failed");
 	}
 
 	{
@@ -1044,8 +1048,8 @@ static bool test_EnumPrintProcDataTypes(struct torture_context *tctx,
 
 		for (i=0; i < count; i++) {
 			torture_assert(tctx,
-				test_EnumPrintProcDataTypes_level(tctx, b, info[i].info1.print_processor_name, 1, NULL, NULL, WERR_OK),
-				"test_EnumPrintProcDataTypes_level failed");
+				test_EnumPrintProcessorDataTypes_level(tctx, b, info[i].info1.print_processor_name, 1, NULL, NULL, WERR_OK),
+				"test_EnumPrintProcessorDataTypes_level failed");
 		}
 	}
 
@@ -1189,11 +1193,12 @@ static bool test_GetPrinterDriver2(struct torture_context *tctx,
 				   const char *driver_name,
 				   const char *environment);
 
-bool test_GetPrinter_level(struct torture_context *tctx,
-			   struct dcerpc_binding_handle *b,
-			   struct policy_handle *handle,
-			   uint32_t level,
-			   union spoolss_PrinterInfo *info)
+bool test_GetPrinter_level_exp(struct torture_context *tctx,
+			       struct dcerpc_binding_handle *b,
+			       struct policy_handle *handle,
+			       uint32_t level,
+			       WERROR expected_werror,
+			       union spoolss_PrinterInfo *info)
 {
 	struct spoolss_GetPrinter r;
 	uint32_t needed;
@@ -1218,7 +1223,9 @@ bool test_GetPrinter_level(struct torture_context *tctx,
 			"GetPrinter failed");
 	}
 
-	torture_assert_werr_ok(tctx, r.out.result, "GetPrinter failed");
+	torture_assert_werr_equal(tctx,
+		r.out.result, expected_werror,
+		"GetPrinter failed");
 
 	CHECK_NEEDED_SIZE_LEVEL(spoolss_PrinterInfo, r.out.info, r.in.level, needed, 4);
 
@@ -1229,6 +1236,14 @@ bool test_GetPrinter_level(struct torture_context *tctx,
 	return true;
 }
 
+bool test_GetPrinter_level(struct torture_context *tctx,
+			   struct dcerpc_binding_handle *b,
+			   struct policy_handle *handle,
+			   uint32_t level,
+			   union spoolss_PrinterInfo *info)
+{
+	return test_GetPrinter_level_exp(tctx, b, handle, level, WERR_OK, info);
+}
 
 static bool test_GetPrinter(struct torture_context *tctx,
 			    struct dcerpc_binding_handle *b,
@@ -1312,7 +1327,7 @@ static bool test_SetPrinter_errors(struct torture_context *tctx,
 
 	torture_assert_ntstatus_ok(tctx, dcerpc_spoolss_SetPrinter_r(b, tctx, &r),
 		"failed to call SetPrinter");
-	torture_assert_werr_equal(tctx, r.out.result, WERR_INVALID_PARAM,
+	torture_assert_werr_equal(tctx, r.out.result, WERR_INVALID_PARAMETER,
 		"failed to call SetPrinter");
 
  again:
@@ -1387,6 +1402,8 @@ static bool test_SetPrinter_errors(struct torture_context *tctx,
 				/* ignored then */
 				break;
 			}
+
+			FALL_THROUGH;
 		case SPOOLSS_PRINTER_CONTROL_PAUSE: /* 1 */
 		case SPOOLSS_PRINTER_CONTROL_RESUME: /* 2 */
 		case SPOOLSS_PRINTER_CONTROL_PURGE: /* 3 */
@@ -1412,7 +1429,7 @@ static bool test_SetPrinter_errors(struct torture_context *tctx,
 
 		switch (info_ctr.level) {
 		case 1:
-			torture_assert_werr_equal(tctx, r.out.result, WERR_UNKNOWN_LEVEL,
+			torture_assert_werr_equal(tctx, r.out.result, WERR_INVALID_LEVEL,
 				"unexpected error code returned");
 			break;
 		case 2:
@@ -1423,7 +1440,7 @@ static bool test_SetPrinter_errors(struct torture_context *tctx,
 		case 4:
 		case 5:
 		case 7:
-			torture_assert_werr_equal(tctx, r.out.result, WERR_INVALID_PARAM,
+			torture_assert_werr_equal(tctx, r.out.result, WERR_INVALID_PARAMETER,
 				"unexpected error code returned");
 			break;
 		case 9:
@@ -1448,8 +1465,8 @@ static bool test_SetPrinter_errors(struct torture_context *tctx,
 static void clear_info2(struct spoolss_SetPrinterInfoCtr *r)
 {
 	if ((r->level == 2) && (r->info.info2)) {
-		r->info.info2->secdesc_ptr = NULL;
-		r->info.info2->devmode_ptr = NULL;
+		r->info.info2->secdesc_ptr = 0;
+		r->info.info2->devmode_ptr = 0;
 	}
 }
 
@@ -1922,7 +1939,7 @@ static bool test_sd_set_level(struct torture_context *tctx,
 	}
 	case 3: {
 
-		info3.sec_desc_ptr = NULL;
+		info3.sec_desc_ptr = 0;
 
 		info_ctr.level = 3;
 		info_ctr.info.info3 = &info3;
@@ -2093,7 +2110,7 @@ static bool test_devmode_set_level(struct torture_context *tctx,
 	case 8: {
 		struct spoolss_SetPrinterInfo8 info8;
 
-		info8.devmode_ptr = NULL;
+		info8.devmode_ptr = 0;
 
 		info_ctr.level = 8;
 		info_ctr.info.info8 = &info8;
@@ -2230,10 +2247,10 @@ static bool test_devicemode_full(struct torture_context *tctx,
 	uint16_t __driverextra_length;/* [value(r->driverextra_data.length)] */
 	uint32_t fields;
 #endif
-	TEST_DEVMODE_INT_EXP(8, size,		8, size, __LINE__, WERR_INVALID_PARAM);
-	TEST_DEVMODE_INT_EXP(8, size,		8, size, 0, WERR_INVALID_PARAM);
-	TEST_DEVMODE_INT_EXP(8, size,		8, size, 0xffff, WERR_INVALID_PARAM);
-	TEST_DEVMODE_INT_EXP(8, size,		8, size, ndr_size_spoolss_DeviceMode(devmode_ctr.devmode, 0), (devmode_ctr.devmode->__driverextra_length > 0 ) ? WERR_INVALID_PARAM : WERR_OK);
+	TEST_DEVMODE_INT_EXP(8, size,		8, size, __LINE__, WERR_INVALID_PARAMETER);
+	TEST_DEVMODE_INT_EXP(8, size,		8, size, 0, WERR_INVALID_PARAMETER);
+	TEST_DEVMODE_INT_EXP(8, size,		8, size, 0xffff, WERR_INVALID_PARAMETER);
+	TEST_DEVMODE_INT_EXP(8, size,		8, size, ndr_size_spoolss_DeviceMode(devmode_ctr.devmode, 0), (devmode_ctr.devmode->__driverextra_length > 0 ) ? WERR_INVALID_PARAMETER : WERR_OK);
 	TEST_DEVMODE_INT(8, size,		8, size, ndr_size_spoolss_DeviceMode(devmode_ctr.devmode, 0) - devmode_ctr.devmode->__driverextra_length);
 
 	devmode_ctr.devmode->driverextra_data = data_blob_string_const("foobar");
@@ -2241,7 +2258,7 @@ static bool test_devicemode_full(struct torture_context *tctx,
 		test_devmode_set_level(tctx, b, handle, 8, devmode_ctr.devmode),
 		"failed to set devmode");
 
-	TEST_DEVMODE_INT_EXP(8, size,		8, size, ndr_size_spoolss_DeviceMode(devmode_ctr.devmode, 0), (devmode_ctr.devmode->__driverextra_length > 0 ) ? WERR_INVALID_PARAM : WERR_OK);
+	TEST_DEVMODE_INT_EXP(8, size,		8, size, ndr_size_spoolss_DeviceMode(devmode_ctr.devmode, 0), (devmode_ctr.devmode->__driverextra_length > 0 ) ? WERR_INVALID_PARAMETER : WERR_OK);
 	TEST_DEVMODE_INT(8, size,		8, size, ndr_size_spoolss_DeviceMode(devmode_ctr.devmode, 0) - devmode_ctr.devmode->__driverextra_length);
 
 	TEST_DEVMODE_INT(8, orientation,	8, orientation, __LINE__);
@@ -2584,11 +2601,11 @@ static bool test_EnumForms(struct torture_context *tctx,
 		dcerpc_spoolss_EnumForms_r(b, tctx, &r),
 		"EnumForms failed");
 
-	if ((r.in.level == 2) && (W_ERROR_EQUAL(r.out.result, WERR_UNKNOWN_LEVEL))) {
+	if ((r.in.level == 2) && (W_ERROR_EQUAL(r.out.result, WERR_INVALID_LEVEL))) {
 		torture_skip(tctx, "EnumForms level 2 not supported");
 	}
 
-	if (print_server && W_ERROR_EQUAL(r.out.result, WERR_BADFID)) {
+	if (print_server && W_ERROR_EQUAL(r.out.result, WERR_INVALID_HANDLE)) {
 		torture_fail(tctx, "EnumForms on the PrintServer isn't supported by test server (NT4)");
 	}
 
@@ -2653,8 +2670,8 @@ static bool test_EnumForms_find_one(struct torture_context *tctx,
 				    bool print_server,
 				    const char *form_name)
 {
-	union spoolss_FormInfo *info;
-	uint32_t count;
+	union spoolss_FormInfo *info = NULL;
+	uint32_t count = 0;
 	bool found = false;
 	int i;
 
@@ -2732,8 +2749,8 @@ static bool test_AddForm(struct torture_context *tctx,
 
 	torture_assert_ntstatus_ok(tctx, dcerpc_spoolss_AddForm_r(b, tctx, &r),
 		"2nd AddForm failed");
-	if (W_ERROR_EQUAL(expected_result, WERR_INVALID_PARAM)) {
-		torture_assert_werr_equal(tctx, r.out.result, WERR_INVALID_PARAM,
+	if (W_ERROR_EQUAL(expected_result, WERR_INVALID_PARAMETER)) {
+		torture_assert_werr_equal(tctx, r.out.result, WERR_INVALID_PARAMETER,
 			"2nd AddForm gave unexpected result");
 	} else {
 		torture_assert_werr_equal(tctx, r.out.result, WERR_FILE_EXISTS,
@@ -2879,12 +2896,12 @@ static bool test_Forms_args(struct torture_context *tctx,
 			"failed to set form");
 		torture_assert(tctx,
 			test_GetForm_args(tctx, b, handle, form_name, 1, &info),
-			"failed to get setted form");
+			"failed to get set form");
 
 		torture_assert_int_equal(tctx, info.info1.size.width, add_info.info1->size.width, "width mismatch");
 	}
 
-	if (!W_ERROR_EQUAL(expected_add_result, WERR_INVALID_PARAM)) {
+	if (!W_ERROR_EQUAL(expected_add_result, WERR_INVALID_PARAMETER)) {
 		torture_assert(tctx,
 			test_EnumForms_find_one(tctx, b, handle, print_server, form_name),
 			"Newly added form not found in enum call");
@@ -2944,7 +2961,7 @@ static bool test_Forms(struct torture_context *tctx,
 				.area		= area,
 			},
 			.expected_add_result	= WERR_OK,
-			.expected_delete_result	= WERR_INVALID_PARAM,
+			.expected_delete_result	= WERR_INVALID_PARAMETER,
 		},
 */
 		{
@@ -2965,7 +2982,7 @@ static bool test_Forms(struct torture_context *tctx,
 				.area		= area,
 			},
 			.expected_add_result	= WERR_FILE_EXISTS,
-			.expected_delete_result	= WERR_INVALID_PARAM
+			.expected_delete_result	= WERR_INVALID_PARAMETER
 		},
 		{
 			.info1 = {
@@ -2975,7 +2992,7 @@ static bool test_Forms(struct torture_context *tctx,
 				.area		= area,
 			},
 			.expected_add_result	= WERR_FILE_EXISTS,
-			.expected_delete_result	= WERR_INVALID_PARAM
+			.expected_delete_result	= WERR_INVALID_PARAMETER
 		},
 		{
 			.info1 = {
@@ -2985,7 +3002,7 @@ static bool test_Forms(struct torture_context *tctx,
 				.area		= area,
 			},
 			.expected_add_result	= WERR_FILE_EXISTS,
-			.expected_delete_result	= WERR_INVALID_PARAM
+			.expected_delete_result	= WERR_INVALID_PARAMETER
 		},
 		{
 			.info1 = {
@@ -2994,7 +3011,7 @@ static bool test_Forms(struct torture_context *tctx,
 				.size		= size,
 				.area		= area,
 			},
-			.expected_add_result	= WERR_INVALID_PARAM,
+			.expected_add_result	= WERR_INVALID_PARAMETER,
 			.expected_delete_result	= WERR_INVALID_FORM_NAME
 		}
 
@@ -3123,7 +3140,7 @@ static bool test_GetJob_args(struct torture_context *tctx,
 	status = dcerpc_spoolss_GetJob_r(b, tctx, &r);
 	torture_assert_ntstatus_ok(tctx, status, "GetJob failed");
 	if (level == 0) {
-		torture_assert_werr_equal(tctx, r.out.result, WERR_UNKNOWN_LEVEL, "Unexpected return code");
+		torture_assert_werr_equal(tctx, r.out.result, WERR_INVALID_LEVEL, "Unexpected return code");
 	}
 
 	if (W_ERROR_EQUAL(r.out.result, WERR_INSUFFICIENT_BUFFER)) {
@@ -3239,13 +3256,13 @@ static bool test_AddJob(struct torture_context *tctx,
 
 	status = dcerpc_spoolss_AddJob_r(b, tctx, &r);
 	torture_assert_ntstatus_ok(tctx, status, "AddJob failed");
-	torture_assert_werr_equal(tctx, r.out.result, WERR_UNKNOWN_LEVEL, "AddJob failed");
+	torture_assert_werr_equal(tctx, r.out.result, WERR_INVALID_LEVEL, "AddJob failed");
 
 	r.in.level = 1;
 
 	status = dcerpc_spoolss_AddJob_r(b, tctx, &r);
 	torture_assert_ntstatus_ok(tctx, status, "AddJob failed");
-	torture_assert_werr_equal(tctx, r.out.result, WERR_INVALID_PARAM, "AddJob failed");
+	torture_assert_werr_equal(tctx, r.out.result, WERR_INVALID_PARAMETER, "AddJob failed");
 
 	return true;
 }
@@ -3315,22 +3332,22 @@ static bool test_JobPropertiesEnum(struct torture_context *tctx,
 				   struct policy_handle *handle,
 				   uint32_t job_id)
 {
-	struct spoolss_RpcEnumJobNamedProperties r;
+	struct spoolss_EnumJobNamedProperties r;
 	uint32_t pcProperties = 0;
-	struct RPC_PrintNamedProperty *ppProperties = NULL;
+	struct spoolss_PrintNamedProperty *ppProperties = NULL;
 
 	r.in.hPrinter = handle;
 	r.in.JobId = job_id;
 	r.out.pcProperties = &pcProperties;
 	r.out.ppProperties = &ppProperties;
 
-	torture_comment(tctx, "Testing RpcEnumJobNamedProperties(%d)\n", job_id);
+	torture_comment(tctx, "Testing EnumJobNamedProperties(%d)\n", job_id);
 
 	torture_assert_ntstatus_ok(tctx,
-		dcerpc_spoolss_RpcEnumJobNamedProperties_r(b, tctx, &r),
-		"spoolss_RpcEnumJobNamedProperties failed");
+		dcerpc_spoolss_EnumJobNamedProperties_r(b, tctx, &r),
+		"spoolss_EnumJobNamedProperties failed");
 	torture_assert_werr_ok(tctx, r.out.result,
-		"spoolss_RpcEnumJobNamedProperties failed");
+		"spoolss_EnumJobNamedProperties failed");
 
 	return true;
 }
@@ -3339,23 +3356,23 @@ static bool test_JobPropertySet(struct torture_context *tctx,
 				struct dcerpc_binding_handle *b,
 				struct policy_handle *handle,
 				uint32_t job_id,
-				struct RPC_PrintNamedProperty *property)
+				struct spoolss_PrintNamedProperty *property)
 {
-	struct spoolss_RpcSetJobNamedProperty r;
+	struct spoolss_SetJobNamedProperty r;
 
 	r.in.hPrinter = handle;
 	r.in.JobId = job_id;
 	r.in.pProperty = property;
 
-	torture_comment(tctx, "Testing RpcSetJobNamedProperty(%d) %s - %d\n",
+	torture_comment(tctx, "Testing SetJobNamedProperty(%d) %s - %d\n",
 		job_id, property->propertyName,
 		property->propertyValue.ePropertyType);
 
 	torture_assert_ntstatus_ok(tctx,
-		dcerpc_spoolss_RpcSetJobNamedProperty_r(b, tctx, &r),
-		"spoolss_RpcSetJobNamedProperty failed");
+		dcerpc_spoolss_SetJobNamedProperty_r(b, tctx, &r),
+		"spoolss_SetJobNamedProperty failed");
 	torture_assert_werr_ok(tctx, r.out.result,
-		"spoolss_RpcSetJobNamedProperty failed");
+		"spoolss_SetJobNamedProperty failed");
 
 	return true;
 }
@@ -3365,23 +3382,23 @@ static bool test_JobPropertyGetValue(struct torture_context *tctx,
 				     struct policy_handle *handle,
 				     uint32_t job_id,
 				     const char *property_name,
-				     struct RPC_PrintPropertyValue *value)
+				     struct spoolss_PrintPropertyValue *value)
 {
-	struct spoolss_RpcGetJobNamedPropertyValue r;
+	struct spoolss_GetJobNamedPropertyValue r;
 
 	r.in.hPrinter = handle;
 	r.in.JobId = job_id;
 	r.in.pszName = property_name;
 	r.out.pValue = value;
 
-	torture_comment(tctx, "Testing RpcGetJobNamedPropertyValue(%d) %s\n",
+	torture_comment(tctx, "Testing GetJobNamedPropertyValue(%d) %s\n",
 		job_id, property_name);
 
 	torture_assert_ntstatus_ok(tctx,
-		dcerpc_spoolss_RpcGetJobNamedPropertyValue_r(b, tctx, &r),
-		"spoolss_RpcGetJobNamedPropertyValue failed");
+		dcerpc_spoolss_GetJobNamedPropertyValue_r(b, tctx, &r),
+		"spoolss_GetJobNamedPropertyValue failed");
 	torture_assert_werr_ok(tctx, r.out.result,
-		"spoolss_RpcGetJobNamedPropertyValue failed");
+		"spoolss_GetJobNamedPropertyValue failed");
 
 	return true;
 }
@@ -3392,20 +3409,20 @@ static bool test_JobPropertyDelete(struct torture_context *tctx,
 				   uint32_t job_id,
 				   const char *property_name)
 {
-	struct spoolss_RpcDeleteJobNamedProperty r;
+	struct spoolss_DeleteJobNamedProperty r;
 
 	r.in.hPrinter = handle;
 	r.in.JobId = job_id;
 	r.in.pszName = property_name;
 
-	torture_comment(tctx, "Testing RpcDeleteJobNamedProperty(%d) %s\n",
+	torture_comment(tctx, "Testing DeleteJobNamedProperty(%d) %s\n",
 		job_id, property_name);
 
 	torture_assert_ntstatus_ok(tctx,
-		dcerpc_spoolss_RpcDeleteJobNamedProperty_r(b, tctx, &r),
-		"spoolss_RpcDeleteJobNamedProperty failed");
+		dcerpc_spoolss_DeleteJobNamedProperty_r(b, tctx, &r),
+		"spoolss_DeleteJobNamedProperty failed");
 	torture_assert_werr_ok(tctx, r.out.result,
-		"spoolss_RpcDeleteJobNamedProperty failed");
+		"spoolss_DeleteJobNamedProperty failed");
 
 	return true;
 }
@@ -3663,8 +3680,8 @@ static bool test_DoPrintTest_extended(struct torture_context *tctx,
 }
 
 static bool test_JobPrintProperties_equal(struct torture_context *tctx,
-					  struct RPC_PrintPropertyValue *got,
-					  struct RPC_PrintNamedProperty *exp)
+					  struct spoolss_PrintPropertyValue *got,
+					  struct spoolss_PrintNamedProperty *exp)
 {
 	torture_assert_int_equal(tctx,
 				 got->ePropertyType,
@@ -3719,14 +3736,14 @@ static bool test_JobPrintProperties(struct torture_context *tctx,
 				    struct policy_handle *handle,
 				    uint32_t job_id)
 {
-	struct RPC_PrintNamedProperty in;
-	struct RPC_PrintPropertyValue out;
+	struct spoolss_PrintNamedProperty in;
+	struct spoolss_PrintPropertyValue out;
 	int i;
 	DATA_BLOB blob = data_blob_string_const("blob");
 	struct {
 		const char *property_name;
-		enum RPC_EPrintPropertyType type;
-		union RPC_PrintPropertyValueUnion value;
+		enum spoolss_EPrintPropertyType type;
+		union spoolss_PrintPropertyValueUnion value;
 		WERROR expected_result;
 	} tests[] = {
 		{
@@ -4119,19 +4136,27 @@ static bool test_GetPrinterData_list(struct torture_context *tctx,
 
 	for (i=0; i < ARRAY_SIZE(list); i++) {
 		enum winreg_Type type = REG_NONE;
-		enum winreg_Type type_ex= REG_NONE;
+		enum winreg_Type type_ex1 = REG_NONE;
+		enum winreg_Type type_ex2 = REG_NONE;
 		uint8_t *data;
-		uint8_t *data_ex = NULL;
+		uint8_t *data_ex1 = NULL;
+		uint8_t *data_ex2 = NULL;
 		uint32_t needed;
-		uint32_t needed_ex = 0;
+		uint32_t needed_ex1 = 0;
+		uint32_t needed_ex2 = 0;
 
 		torture_assert(tctx, test_GetPrinterData(tctx, b, &ctx->server_handle, list[i], &type, &data, &needed),
 			talloc_asprintf(tctx, "GetPrinterData failed on %s\n", list[i]));
-		torture_assert(tctx, test_GetPrinterDataEx(tctx, p, &ctx->server_handle, "random_string", list[i], &type_ex, &data_ex, &needed_ex),
+		torture_assert(tctx, test_GetPrinterDataEx(tctx, p, &ctx->server_handle, "random_string", list[i], &type_ex1, &data_ex1, &needed_ex1),
 			talloc_asprintf(tctx, "GetPrinterDataEx failed on %s\n", list[i]));
-		torture_assert_int_equal(tctx, type, type_ex, "type mismatch");
-		torture_assert_int_equal(tctx, needed, needed_ex, "needed mismatch");
-		torture_assert_mem_equal(tctx, data, data_ex, needed, "data mismatch");
+		torture_assert(tctx, test_GetPrinterDataEx(tctx, p, &ctx->server_handle, "", list[i], &type_ex2, &data_ex2, &needed_ex2),
+			talloc_asprintf(tctx, "GetPrinterDataEx failed on %s\n", list[i]));
+		torture_assert_int_equal(tctx, type, type_ex1, "type mismatch");
+		torture_assert_int_equal(tctx, type, type_ex2, "type mismatch");
+		torture_assert_int_equal(tctx, needed, needed_ex1, "needed mismatch");
+		torture_assert_int_equal(tctx, needed, needed_ex2, "needed mismatch");
+		torture_assert_mem_equal(tctx, data, data_ex1, needed, "data mismatch");
+		torture_assert_mem_equal(tctx, data, data_ex2, needed, "data mismatch");
 	}
 
 	return true;
@@ -4933,12 +4958,45 @@ do {\
 	}
 
 #undef test_dm
-#undef test_sd
 
 	torture_comment(tctx, "Printer Info and winreg consistency test succeeded\n\n");
 
 	return true;
 }
+
+static bool test_GetPrintserverInfo_winreg(struct torture_context *tctx,
+					   struct dcerpc_binding_handle *b,
+					   struct policy_handle *handle,
+					   struct dcerpc_binding_handle *winreg_handle,
+					   struct policy_handle *hive_handle)
+{
+	union spoolss_PrinterInfo info;
+	struct policy_handle key_handle;
+
+	torture_comment(tctx,
+		"Testing Printserver Info and winreg consistency\n");
+
+	torture_assert(tctx,
+		test_GetPrinter_level(tctx, b, handle, 3, &info),
+		"failed to get printer info level 2");
+
+	torture_assert(tctx,
+		test_winreg_OpenKey(tctx, winreg_handle, hive_handle,
+				    TOP_LEVEL_CONTROL_KEY, &key_handle), "");
+
+	test_sd("ServerSecurityDescriptor", info.info3.secdesc);
+
+	torture_assert(tctx,
+		test_winreg_CloseKey(tctx, winreg_handle, &key_handle), "");
+
+#undef test_sd
+
+	torture_comment(tctx,
+		"Printserver Info and winreg consistency test succeeded\n\n");
+
+	return true;
+}
+
 
 static bool test_PrintProcessors(struct torture_context *tctx,
 				 struct dcerpc_binding_handle *b,
@@ -5499,11 +5557,12 @@ static bool test_SetPrinterDataEx_values(struct torture_context *tctx,
 
 	for (i=0; i < ARRAY_SIZE(values); i++) {
 
-		enum winreg_Type type;
-		DATA_BLOB blob_in, blob_out;
+		enum winreg_Type type = REG_NONE;
+		DATA_BLOB blob_in = data_blob_null;
+		DATA_BLOB blob_out = data_blob_null;
 		uint32_t ecount;
 		struct spoolss_PrinterEnumValues *einfo;
-		uint32_t needed;
+		uint32_t needed = 0;
 
 		if (torture_setting_bool(tctx, "samba3", false)) {
 			char *q;
@@ -5571,7 +5630,7 @@ static bool test_SetPrinterDataEx_matrix(struct torture_context *tctx,
 		REG_BINARY
 	};
 	const char *str = "abcdefghi";
-	int t, s;
+	size_t t, s;
 
 	for (t=0; t < ARRAY_SIZE(types); t++) {
 	for (s=0; s < strlen(str); s++) {
@@ -5750,6 +5809,33 @@ static bool test_PrinterInfo_winreg(struct torture_context *tctx,
 
 	return ret;
 }
+
+static bool test_PrintserverInfo_winreg(struct torture_context *tctx,
+					struct dcerpc_pipe *p,
+					struct policy_handle *handle)
+{
+	struct dcerpc_binding_handle *b = p->binding_handle;
+	struct dcerpc_pipe *p2;
+	bool ret = true;
+	struct policy_handle hive_handle;
+	struct dcerpc_binding_handle *b2;
+
+	torture_assert_ntstatus_ok(tctx,
+		torture_rpc_connection(tctx, &p2, &ndr_table_winreg),
+		"could not open winreg pipe");
+	b2 = p2->binding_handle;
+
+	torture_assert(tctx, test_winreg_OpenHKLM(tctx, b2, &hive_handle), "");
+
+	ret = test_GetPrintserverInfo_winreg(tctx, b, handle, b2, &hive_handle);
+
+	test_winreg_CloseKey(tctx, b2, &hive_handle);
+
+	talloc_free(p2);
+
+	return ret;
+}
+
 
 static bool test_DriverInfo_winreg(struct torture_context *tctx,
 				   struct dcerpc_pipe *p,
@@ -6041,6 +6127,206 @@ static bool test_add_print_processor(struct torture_context *tctx,
 	return true;
 }
 
+static bool test_AddPerMachineConnection(struct torture_context *tctx,
+					 struct dcerpc_binding_handle *b,
+					 const char *servername,
+					 const char *printername,
+					 const char *printserver,
+					 const char *provider,
+					 WERROR expected_error)
+{
+	struct spoolss_AddPerMachineConnection r;
+	const char *composed_printername = printername;
+
+	if (servername != NULL) {
+		composed_printername = talloc_asprintf(tctx, "%s\\%s",
+						servername,
+						printername);
+	}
+	r.in.server = servername;
+	r.in.printername = composed_printername;
+	r.in.printserver = printserver;
+	r.in.provider = provider;
+
+	torture_comment(tctx, "Testing AddPerMachineConnection(%s|%s|%s)\n",
+		printername, printserver, provider);
+
+	torture_assert_ntstatus_ok(tctx,
+		dcerpc_spoolss_AddPerMachineConnection_r(b, tctx, &r),
+		"spoolss_AddPerMachineConnection failed");
+	torture_assert_werr_equal(tctx, r.out.result, expected_error,
+		"spoolss_AddPerMachineConnection failed");
+
+	return true;
+}
+
+static bool test_DeletePerMachineConnection(struct torture_context *tctx,
+					    struct dcerpc_binding_handle *b,
+					    const char *servername,
+					    const char *printername,
+					    WERROR expected_error)
+{
+	struct spoolss_DeletePerMachineConnection r;
+	const char *composed_printername = printername;
+
+	if (servername != NULL) {
+		composed_printername = talloc_asprintf(tctx, "%s\\%s",
+						servername,
+						printername);
+	}
+
+	r.in.server = servername;
+	r.in.printername = composed_printername;
+
+	torture_comment(tctx, "Testing DeletePerMachineConnection(%s)\n",
+		printername);
+
+	torture_assert_ntstatus_ok(tctx,
+		dcerpc_spoolss_DeletePerMachineConnection_r(b, tctx, &r),
+		"spoolss_DeletePerMachineConnection failed");
+	torture_assert_werr_equal(tctx, r.out.result, expected_error,
+		"spoolss_DeletePerMachineConnection failed");
+
+	return true;
+}
+
+static bool test_EnumPerMachineConnections(struct torture_context *tctx,
+					   struct dcerpc_binding_handle *b,
+					   const char *servername)
+{
+	struct spoolss_EnumPerMachineConnections r;
+	DATA_BLOB blob = data_blob_null;
+	struct spoolss_PrinterInfo4 *info;
+	uint32_t needed;
+	uint32_t count;
+
+	r.in.server = servername;
+	r.in.buffer = &blob;
+	r.in.offered = 0;
+
+	r.out.info = &info;
+	r.out.needed = &needed;
+	r.out.count = &count;
+
+	torture_comment(tctx, "Testing EnumPerMachineConnections(%s)\n",
+		servername);
+
+	torture_assert_ntstatus_ok(tctx,
+		dcerpc_spoolss_EnumPerMachineConnections_r(b, tctx, &r),
+		"spoolss_EnumPerMachineConnections failed");
+	if (W_ERROR_EQUAL(r.out.result, WERR_INSUFFICIENT_BUFFER)) {
+		blob = data_blob_talloc_zero(tctx, needed);
+		r.in.buffer = &blob;
+		r.in.offered = needed;
+
+		torture_assert_ntstatus_ok(tctx,
+			dcerpc_spoolss_EnumPerMachineConnections_r(b, tctx, &r),
+			"spoolss_EnumPerMachineConnections failed");
+	}
+	torture_assert_werr_ok(tctx, r.out.result,
+		"spoolss_EnumPerMachineConnections failed");
+
+	return true;
+}
+
+static bool test_addpermachineconnection(struct torture_context *tctx,
+					 void *private_data)
+{
+	struct test_spoolss_context *ctx =
+		talloc_get_type_abort(private_data, struct test_spoolss_context);
+	struct dcerpc_pipe *p = ctx->spoolss_pipe;
+	struct dcerpc_binding_handle *b = p->binding_handle;
+	const char *server_name_slash = talloc_asprintf(tctx, "\\\\%s", dcerpc_server_name(p));
+	int i;
+
+	struct {
+		const char *servername;
+		const char *printername;
+		const char *printserver;
+		const char *provider;
+		WERROR expected_add_result;
+		WERROR expected_del_result;
+	} tests[] = {
+		{
+			.servername		= NULL,
+			.printername		= "foo",
+			.printserver		= "",
+			.provider		= "unknown",
+			.expected_add_result	= WERR_INVALID_PRINTER_NAME,
+			.expected_del_result	= WERR_INVALID_PRINTER_NAME
+		},{
+			.servername		= NULL,
+			.printername		= "Microsoft Print to PDF",
+			.printserver		= "samba.org",
+			.provider		= "unknown",
+			.expected_add_result	= WERR_INVALID_PRINTER_NAME,
+			.expected_del_result	= WERR_INVALID_PRINTER_NAME
+		},{
+			.servername		= NULL,
+			.printername		= "Microsoft Print to PDF",
+			.printserver		= "samba.org",
+			.provider		= "",
+			.expected_add_result	= WERR_INVALID_PRINTER_NAME,
+			.expected_del_result	= WERR_INVALID_PRINTER_NAME
+		},{
+			.servername		= server_name_slash,
+			.printername		= "foo",
+			.printserver		= "",
+			.provider		= "unknown",
+			.expected_add_result	= WERR_FILE_NOT_FOUND,
+			.expected_del_result	= WERR_INVALID_PRINTER_NAME
+		},{
+			.servername		= server_name_slash,
+			.printername		= "foo",
+			.printserver		= "",
+			.provider		= "",
+			.expected_add_result	= WERR_OK,
+			.expected_del_result	= WERR_OK
+		},{
+			.servername		= server_name_slash,
+			.printername		= "Microsoft Print to PDF",
+			.printserver		= "samba.org",
+			.provider		= "unknown",
+			.expected_add_result	= WERR_FILE_NOT_FOUND,
+			.expected_del_result	= WERR_INVALID_PRINTER_NAME
+		},{
+			.servername		= server_name_slash,
+			.printername		= "Microsoft Print to PDF",
+			.printserver		= "samba.org",
+			.provider		= "",
+			.expected_add_result	= WERR_OK,
+			.expected_del_result	= WERR_OK
+		}
+	};
+
+	for (i=0; i < ARRAY_SIZE(tests); i++) {
+		torture_assert(tctx,
+			test_AddPerMachineConnection(tctx, b,
+						     tests[i].servername,
+						     tests[i].printername,
+						     tests[i].printserver,
+						     tests[i].provider,
+						     tests[i].expected_add_result),
+			"add per machine connection failed");
+		torture_assert(tctx,
+			test_EnumPerMachineConnections(tctx, b,
+						       tests[i].servername),
+			"enum per machine connections failed");
+		torture_assert(tctx,
+			test_DeletePerMachineConnection(tctx, b,
+							tests[i].servername,
+							tests[i].printername,
+							tests[i].expected_del_result),
+			"delete per machine connection failed");
+		torture_assert(tctx,
+			test_EnumPerMachineConnections(tctx, b,
+						       tests[i].servername),
+			"enum per machine connections failed");
+	}
+
+	return true;
+}
+
 static bool test_GetChangeID_PrinterData(struct torture_context *tctx,
 					 struct dcerpc_binding_handle *b,
 					 struct policy_handle *handle,
@@ -6281,7 +6567,7 @@ static bool test_OpenPrinter_badname(struct torture_context *tctx,
 
 	status = dcerpc_spoolss_OpenPrinterEx_r(b, tctx, &opEx);
 	torture_assert_ntstatus_ok(tctx, status, "OpenPrinterEx failed");
-	torture_assert_werr_equal(tctx, opEx.out.result, WERR_INVALID_PARAM,
+	torture_assert_werr_equal(tctx, opEx.out.result, WERR_INVALID_PARAMETER,
 		"unexpected result");
 
 	if (W_ERROR_IS_OK(opEx.out.result)) {
@@ -7475,7 +7761,7 @@ static bool test_AddPrinter_normal(struct torture_context *tctx,
 		"failed to add printer");
 	result = ex ? rex.out.result : r.out.result;
 
-	/* w2k8r2 allows to add printer w/o defining printprocessor */
+	/* w2k8r2 allows one to add printer w/o defining printprocessor */
 
 	if (!W_ERROR_IS_OK(result)) {
 		torture_assert_werr_equal(tctx, result, WERR_UNKNOWN_PRINTPROCESSOR,
@@ -7740,11 +8026,11 @@ static bool compose_local_driver_directory(struct torture_context *tctx,
 	}
 	p++;
 
-	if (strequal(environment, "Windows x64")) {
+	if (strequal(environment, SPOOLSS_ARCHITECTURE_x64)) {
 		if (!strequal(p, "x64")) {
 			*path = talloc_asprintf(tctx, "%s/x64", local_dir);
 		}
-	} else if (strequal(environment, "Windows NT x86")) {
+	} else if (strequal(environment, SPOOLSS_ARCHITECTURE_NT_X86)) {
 		if (!strequal(p, "i386")) {
 			*path = talloc_asprintf(tctx, "%s/i386", local_dir);
 		}
@@ -7873,6 +8159,339 @@ static bool test_architecture_buffer(struct torture_context *tctx,
 
 	return true;
 }
+
+static bool test_get_core_printer_drivers_arch_guid(struct torture_context *tctx,
+						    struct dcerpc_pipe *p,
+						    const char *architecture,
+						    const char *guid_str,
+						    const char **package_id)
+{
+	struct spoolss_GetCorePrinterDrivers r;
+	struct spoolss_CorePrinterDriver core_printer_drivers;
+	DATA_BLOB blob = data_blob_talloc_zero(tctx, 2);
+	const char **s;
+	struct dcerpc_binding_handle *b = p->binding_handle;
+	struct GUID guid;
+
+	s = talloc_zero_array(tctx, const char *, 2);
+
+	r.in.servername	= talloc_asprintf(tctx, "\\\\%s", dcerpc_server_name(p));
+	r.in.architecture = "foobar";
+	r.in.core_driver_size = 0;
+	r.in.core_driver_dependencies = (uint16_t *)blob.data;
+	r.in.core_printer_driver_count = 0;
+	r.out.core_printer_drivers = &core_printer_drivers;
+
+	torture_assert_ntstatus_ok(tctx,
+		dcerpc_spoolss_GetCorePrinterDrivers_r(b, tctx, &r),
+		"spoolss_GetCorePrinterDrivers failed");
+	torture_assert_hresult_equal(tctx, r.out.result, HRES_E_INVALIDARG,
+		"spoolss_GetCorePrinterDrivers failed");
+
+	guid = GUID_random();
+	s[0] = GUID_string2(tctx, &guid);
+
+	torture_assert(tctx,
+		push_reg_multi_sz(tctx, &blob, s),
+		"push_reg_multi_sz failed");
+
+	r.in.core_driver_size = blob.length/2;
+	r.in.core_driver_dependencies = (uint16_t *)blob.data;
+	r.in.core_printer_driver_count = 1;
+	r.out.core_printer_drivers = talloc_zero_array(tctx, struct spoolss_CorePrinterDriver, r.in.core_printer_driver_count);
+
+	torture_assert_ntstatus_ok(tctx,
+		dcerpc_spoolss_GetCorePrinterDrivers_r(b, tctx, &r),
+		"spoolss_GetCorePrinterDrivers failed");
+	torture_assert_werr_equal(tctx,
+		W_ERROR(WIN32_FROM_HRESULT(r.out.result)), WERR_INVALID_ENVIRONMENT,
+		"spoolss_GetCorePrinterDrivers failed");
+
+	r.in.architecture = architecture;
+
+	torture_assert_ntstatus_ok(tctx,
+		dcerpc_spoolss_GetCorePrinterDrivers_r(b, tctx, &r),
+		"spoolss_GetCorePrinterDrivers failed");
+	torture_assert_werr_equal(tctx,
+		W_ERROR(WIN32_FROM_HRESULT(r.out.result)), WERR_NOT_FOUND,
+		"spoolss_GetCorePrinterDrivers failed");
+
+	s[0] = talloc_strdup(s, guid_str);
+
+	torture_assert(tctx,
+		push_reg_multi_sz(tctx, &blob, s),
+		"push_reg_multi_sz failed");
+
+	r.in.core_driver_size = blob.length/2;
+	r.in.core_driver_dependencies = (uint16_t *)blob.data;
+	r.in.core_printer_driver_count = 1;
+	r.out.core_printer_drivers = talloc_zero_array(tctx, struct spoolss_CorePrinterDriver, r.in.core_printer_driver_count);
+
+	torture_assert_ntstatus_ok(tctx,
+		dcerpc_spoolss_GetCorePrinterDrivers_r(b, tctx, &r),
+		"spoolss_GetCorePrinterDrivers failed");
+	torture_assert_hresult_ok(tctx, r.out.result,
+		"spoolss_GetCorePrinterDrivers failed");
+
+	if (package_id) {
+		*package_id = r.out.core_printer_drivers[0].szPackageID;
+	}
+
+	return true;
+}
+
+static bool test_get_core_printer_drivers(struct torture_context *tctx,
+					  void *private_data)
+{
+	struct test_spoolss_context *ctx =
+		talloc_get_type_abort(private_data, struct test_spoolss_context);
+
+	const char *architectures[] = {
+		SPOOLSS_ARCHITECTURE_NT_X86,
+		SPOOLSS_ARCHITECTURE_x64
+	};
+	int i;
+	struct dcerpc_pipe *p = ctx->spoolss_pipe;
+
+	for (i=0; i < ARRAY_SIZE(architectures); i++) {
+
+		torture_comment(tctx, "Testing GetCorePrinterDrivers(\"%s\",\"%s\")\n",
+			architectures[i],
+			SPOOLSS_CORE_PRINT_PACKAGE_FILES_XPSDRV);
+
+		torture_assert(tctx,
+			test_get_core_printer_drivers_arch_guid(tctx, p,
+				architectures[i],
+				SPOOLSS_CORE_PRINT_PACKAGE_FILES_XPSDRV,
+				NULL),
+			"");
+	}
+
+	return true;
+}
+
+static bool test_get_printer_driver_package_path(struct torture_context *tctx,
+						 void *private_data)
+{
+	struct test_spoolss_context *ctx =
+		talloc_get_type_abort(private_data, struct test_spoolss_context);
+
+	const char *architectures[] = {
+		SPOOLSS_ARCHITECTURE_NT_X86,
+		SPOOLSS_ARCHITECTURE_x64
+	};
+	int i;
+	struct dcerpc_pipe *p = ctx->spoolss_pipe;
+	struct dcerpc_binding_handle *b = p->binding_handle;
+
+	for (i=0; i < ARRAY_SIZE(architectures); i++) {
+		struct spoolss_GetPrinterDriverPackagePath r;
+		uint32_t required = 0;
+		const char *package_id = NULL;
+
+		test_get_core_printer_drivers_arch_guid(tctx, p,
+			architectures[i],
+			SPOOLSS_CORE_PRINT_PACKAGE_FILES_XPSDRV,
+			&package_id),
+
+		torture_comment(tctx, "Testing GetPrinterDriverPackagePath(\"%s\",\"%s\")\n",
+			architectures[i], package_id);
+
+		r.in.servername	= talloc_asprintf(tctx, "\\\\%s", dcerpc_server_name(p));
+		r.in.architecture = "foobar";
+		r.in.language = NULL;
+		r.in.package_id = "";
+		r.in.driver_package_cab_size = 0;
+		r.in.driver_package_cab = NULL;
+
+		r.out.required = &required;
+		r.out.driver_package_cab = NULL;
+
+		torture_assert_ntstatus_ok(tctx,
+			dcerpc_spoolss_GetPrinterDriverPackagePath_r(b, tctx, &r),
+			"spoolss_GetPrinterDriverPackagePath failed");
+		torture_assert_werr_equal(tctx,
+			W_ERROR(WIN32_FROM_HRESULT(r.out.result)), WERR_INVALID_ENVIRONMENT,
+			"spoolss_GetPrinterDriverPackagePath failed");
+
+		r.in.architecture = architectures[i];
+
+		torture_assert_ntstatus_ok(tctx,
+			dcerpc_spoolss_GetPrinterDriverPackagePath_r(b, tctx, &r),
+			"spoolss_GetPrinterDriverPackagePath failed");
+		torture_assert_werr_equal(tctx,
+			W_ERROR(WIN32_FROM_HRESULT(r.out.result)), WERR_FILE_NOT_FOUND,
+			"spoolss_GetPrinterDriverPackagePath failed");
+
+		r.in.package_id = package_id;
+
+		torture_assert_ntstatus_ok(tctx,
+			dcerpc_spoolss_GetPrinterDriverPackagePath_r(b, tctx, &r),
+			"spoolss_GetPrinterDriverPackagePath failed");
+		torture_assert_hresult_ok(tctx, r.out.result,
+			"spoolss_GetPrinterDriverPackagePath failed");
+
+		r.in.driver_package_cab_size = required;
+		r.in.driver_package_cab = talloc_zero_array(tctx, char, required);
+		r.out.driver_package_cab = talloc_zero_array(tctx, char, required);
+
+		torture_assert_ntstatus_ok(tctx,
+			dcerpc_spoolss_GetPrinterDriverPackagePath_r(b, tctx, &r),
+			"spoolss_GetPrinterDriverPackagePath failed");
+		torture_assert_hresult_ok(tctx, r.out.result,
+			"spoolss_GetPrinterDriverPackagePath failed");
+
+		r.in.servername = NULL;
+
+		torture_assert_ntstatus_ok(tctx,
+			dcerpc_spoolss_GetPrinterDriverPackagePath_r(b, tctx, &r),
+			"spoolss_GetPrinterDriverPackagePath failed");
+		torture_assert_werr_equal(tctx,
+			W_ERROR(WIN32_FROM_HRESULT(r.out.result)), WERR_INSUFFICIENT_BUFFER,
+			"spoolss_GetPrinterDriverPackagePath failed");
+
+		r.in.driver_package_cab_size = required;
+		r.in.driver_package_cab = talloc_zero_array(tctx, char, required);
+		r.out.driver_package_cab = talloc_zero_array(tctx, char, required);
+
+		torture_assert_ntstatus_ok(tctx,
+			dcerpc_spoolss_GetPrinterDriverPackagePath_r(b, tctx, &r),
+			"spoolss_GetPrinterDriverPackagePath failed");
+		torture_assert_hresult_ok(tctx, r.out.result,
+			"spoolss_GetPrinterDriverPackagePath failed");
+
+	}
+
+	return true;
+}
+
+static bool test_get_printer_printserverhandle(struct torture_context *tctx,
+					       void *private_data)
+{
+	struct test_spoolss_context *ctx =
+		talloc_get_type_abort(private_data, struct test_spoolss_context);
+
+	struct dcerpc_pipe *p = ctx->spoolss_pipe;
+	struct dcerpc_binding_handle *b = p->binding_handle;
+	uint32_t levels[] = {0, 1, 2, /* 3,*/ 4, 5, 6, 7, 8};
+	int i;
+
+	for (i=0;i<ARRAY_SIZE(levels);i++) {
+
+		torture_assert(tctx,
+			test_GetPrinter_level_exp(tctx, b, &ctx->server_handle,
+						  levels[i], WERR_INVALID_LEVEL,
+						  NULL),
+			"failed to call GetPrinter");
+	}
+
+	torture_assert(tctx,
+		test_GetPrinter_level(tctx, b, &ctx->server_handle, 3, NULL),
+		"failed to call GetPrinter");
+
+	return true;
+}
+
+#define TEST_SID "S-1-5-21-1234567890-1234567890-1234567890-500"
+
+static bool test_set_printer_printserverhandle(struct torture_context *tctx,
+					       void *private_data)
+{
+	struct test_spoolss_context *ctx =
+		talloc_get_type_abort(private_data, struct test_spoolss_context);
+
+	struct dcerpc_pipe *p = ctx->spoolss_pipe;
+	struct dcerpc_binding_handle *b = p->binding_handle;
+	union spoolss_PrinterInfo info;
+	struct spoolss_SetPrinterInfoCtr info_ctr;
+	struct spoolss_SetPrinterInfo3 info3;
+	struct spoolss_DevmodeContainer devmode_ctr;
+	struct sec_desc_buf secdesc_ctr;
+	struct security_descriptor *sd;
+	struct security_ace *ace;
+	struct dom_sid sid;
+	int i;
+
+	torture_assert(tctx,
+		test_GetPrinter_level(tctx, b, &ctx->server_handle, 3, &info),
+		"failed to call GetPrinter");
+
+	secdesc_ctr.sd = info.info3.secdesc;
+	secdesc_ctr.sd->owner_sid = NULL;
+	secdesc_ctr.sd->group_sid = NULL;
+
+	sd = security_descriptor_copy(tctx, secdesc_ctr.sd);
+	if (sd == NULL) {
+		return false;
+	}
+
+	ace = security_ace_create(tctx,
+				  TEST_SID,
+				  SEC_ACE_TYPE_ACCESS_ALLOWED,
+				  SEC_STD_REQUIRED,
+				  SEC_ACE_FLAG_CONTAINER_INHERIT);
+	torture_assert(tctx, ace, "failed to create ace");
+
+	torture_assert_ntstatus_ok(tctx,
+		security_descriptor_dacl_add(sd, ace),
+		"failed to add ace");
+
+	secdesc_ctr.sd = sd;
+
+	info3.sec_desc_ptr = 0;
+
+	info_ctr.level = 3;
+	info_ctr.info.info3 = &info3;
+
+	ZERO_STRUCT(devmode_ctr);
+
+	torture_assert(tctx,
+		test_SetPrinter(tctx, b, &ctx->server_handle, &info_ctr,
+				&devmode_ctr, &secdesc_ctr, 0),
+		"failed to call SetPrinter");
+
+	torture_assert(tctx,
+		test_GetPrinter_level(tctx, b, &ctx->server_handle, 3, &info),
+		"failed to call GetPrinter");
+
+	for (i = 0; i < info.info3.secdesc->dacl->num_aces; i++) {
+		if (security_ace_equal(&info.info3.secdesc->dacl->aces[i], ace)) {
+			break;
+		}
+	}
+
+	if (i == info.info3.secdesc->dacl->num_aces) {
+		torture_fail(tctx, "ace not present");
+	}
+
+	torture_assert(tctx,
+		dom_sid_parse(TEST_SID, &sid),
+		"failed to parse sid");
+
+	torture_assert_ntstatus_ok(tctx,
+		security_descriptor_dacl_del(info.info3.secdesc, &sid),
+		"failed to remove ace from sd");
+
+	secdesc_ctr.sd = info.info3.secdesc;
+
+	torture_assert(tctx,
+		test_SetPrinter(tctx, b, &ctx->server_handle, &info_ctr,
+				&devmode_ctr, &secdesc_ctr, 0),
+		"failed to call SetPrinter");
+
+	torture_assert(tctx,
+		test_GetPrinter_level(tctx, b, &ctx->server_handle, 3, &info),
+		"failed to call GetPrinter");
+
+	for (i = 0; i < info.info3.secdesc->dacl->num_aces; i++) {
+		if (security_ace_equal(&info.info3.secdesc->dacl->aces[i], ace)) {
+			torture_fail(tctx, "ace still present");
+		}
+	}
+
+	return true;
+}
+
 
 static bool test_PrintServer_Forms_Winreg(struct torture_context *tctx,
 					  void *private_data)
@@ -8144,35 +8763,79 @@ static bool torture_rpc_spoolss_printerdm_setup(struct torture_context *tctx, vo
 }
 #endif
 
+static bool test_DeletePrinterDriverEx_exp(struct torture_context *tctx,
+					   struct dcerpc_binding_handle *b,
+					   const char *server,
+					   const char *driver,
+					   const char *environment,
+					   uint32_t delete_flags,
+					   uint32_t version,
+					   WERROR expected_result);
+
 static bool torture_rpc_spoolss_printer_teardown_common(struct torture_context *tctx, struct torture_printer_context *t)
 {
 	bool found = false;
 	struct dcerpc_pipe *p = t->spoolss_pipe;
-	struct dcerpc_binding_handle *b;
-	const char *printer_name = t->info2.printername;
+	struct dcerpc_binding_handle *b = NULL;
+	const char *server_name_slash;
+	bool ok = true;
 
-	if (t->added_driver) {
-		torture_assert(tctx,
-			remove_printer_driver(tctx, dcerpc_server_name(t->spoolss_pipe), &t->driver),
-			"failed to remove printer driver");
+	if (p == NULL) {
+		return true;
 	}
+	b = p->binding_handle;
 
-	if (p && !t->wellknown) {
-		b = p->binding_handle;
+	server_name_slash = talloc_asprintf(tctx, "\\\\%s", dcerpc_server_name(p));
 
-		torture_assert(tctx,
+	if (!t->wellknown) {
+		const char *printer_name = t->info2.printername;
+
+		torture_assert_goto(tctx,
 			test_DeletePrinter(tctx, b, &t->handle),
+			ok,
+			remove_driver,
 			"failed to delete printer");
 
-		torture_assert(tctx,
+		torture_assert_goto(tctx,
 			test_EnumPrinters_findname(tctx, b, PRINTER_ENUM_LOCAL, 1,
 						   printer_name, &found),
+			ok,
+			remove_driver,
 			"failed to enumerate printers");
 
-		torture_assert(tctx, !found, "deleted printer still there");
+		torture_assert_goto(tctx,
+			!found,
+			ok,
+			remove_driver,
+			"deleted printer still there");
 	}
 
-	return true;
+
+remove_driver:
+	if (t->added_driver) {
+		ok = remove_printer_driver(tctx,
+					   dcerpc_server_name(p),
+					   &t->driver);
+		if (!ok) {
+			torture_warning(tctx,
+					"failed to remove printer driver\n");
+		}
+
+		ok = test_DeletePrinterDriverEx_exp(tctx, b,
+						    server_name_slash,
+						    t->driver.info8.driver_name,
+						    t->driver.info8.architecture,
+						    DPD_DELETE_ALL_FILES,
+						    t->driver.info8.version,
+						    WERR_OK);
+		if (!ok) {
+			torture_warning(tctx,
+					"failed to delete printer driver via "
+					"spoolss\n");
+		}
+	}
+
+	return ok;
 }
 
 static bool torture_rpc_spoolss_printer_teardown(struct torture_context *tctx, void *data)
@@ -8281,7 +8944,6 @@ static bool test_print_test_smbd(struct torture_context *tctx,
 
 	struct smb2_tree *tree;
 	struct smb2_handle job_h;
-	struct cli_credentials *credentials = cmdline_credentials;
 	struct smbcli_options options;
 	TALLOC_CTX *mem_ctx = talloc_new(tctx);
 	/*
@@ -8301,7 +8963,7 @@ static bool test_print_test_smbd(struct torture_context *tctx,
 			      lpcfg_smb_ports(tctx->lp_ctx),
 			      share,
 			      lpcfg_resolve_context(tctx->lp_ctx),
-			      credentials,
+			      popt_get_cmdline_credentials(),
 			      &tree,
 			      tctx->ev,
 			      &options,
@@ -8438,6 +9100,21 @@ static bool test_printer_info_winreg(struct torture_context *tctx,
 
 	return true;
 }
+
+static bool test_printserver_info_winreg(struct torture_context *tctx,
+					 void *private_data)
+{
+	struct test_spoolss_context *t =
+		(struct test_spoolss_context *)talloc_get_type_abort(private_data, struct test_spoolss_context);
+	struct dcerpc_pipe *p = t->spoolss_pipe;
+
+	torture_assert(tctx,
+		test_PrintserverInfo_winreg(tctx, p, &t->server_handle),
+		"failed to test printserver info winreg");
+
+	return true;
+}
+
 
 static bool test_printer_change_id(struct torture_context *tctx,
 				   void *private_data)
@@ -8606,7 +9283,7 @@ static bool test_printer_ic(struct torture_context *tctx,
 			torture_assert_ntstatus_ok(tctx,
 				dcerpc_spoolss_PlayGDIScriptOnPrinterIC_r(b, tctx, &r),
 				"PlayGDIScriptOnPrinterIC failed");
-			torture_assert_werr_equal(tctx, r.out.result, WERR_NOMEM,
+			torture_assert_werr_equal(tctx, r.out.result, WERR_NOT_ENOUGH_MEMORY,
 				"PlayGDIScriptOnPrinterIC failed");
 		}
 
@@ -8667,7 +9344,7 @@ static bool test_printer_bidi(struct torture_context *tctx,
 				      struct torture_printer_context);
 	struct dcerpc_pipe *p = t->spoolss_pipe;
 	struct dcerpc_binding_handle *b = p->binding_handle;
-	struct spoolss_RpcSendRecvBidiData r;
+	struct spoolss_SendRecvBidiData r;
 	struct RPC_BIDI_REQUEST_CONTAINER bidi_req;
 	struct RPC_BIDI_RESPONSE_CONTAINER *bidi_rep = NULL;
 
@@ -8683,10 +9360,10 @@ static bool test_printer_bidi(struct torture_context *tctx,
 	r.out.ppRespData = &bidi_rep;
 
 	torture_assert_ntstatus_ok(tctx,
-		dcerpc_spoolss_RpcSendRecvBidiData_r(b, tctx, &r),
-		"RpcSendRecvBidiData failed");
+		dcerpc_spoolss_SendRecvBidiData_r(b, tctx, &r),
+		"SendRecvBidiData failed");
 	torture_assert_werr_equal(tctx, r.out.result, WERR_NOT_SUPPORTED,
-		"RpcSendRecvBidiData failed");
+		"SendRecvBidiData failed");
 
 	if (!(t->info2.attributes & PRINTER_ATTRIBUTE_ENABLE_BIDI)) {
 		torture_skip(tctx, "skipping further tests as printer is not BIDI enabled");
@@ -8695,10 +9372,10 @@ static bool test_printer_bidi(struct torture_context *tctx,
 	r.in.pAction = BIDI_ACTION_ENUM_SCHEMA;
 
 	torture_assert_ntstatus_ok(tctx,
-		dcerpc_spoolss_RpcSendRecvBidiData_r(b, tctx, &r),
-		"RpcSendRecvBidiData failed");
+		dcerpc_spoolss_SendRecvBidiData_r(b, tctx, &r),
+		"SendRecvBidiData failed");
 	torture_assert_werr_ok(tctx, r.out.result,
-		"RpcSendRecvBidiData failed");
+		"SendRecvBidiData failed");
 
 	return true;
 }
@@ -8743,14 +9420,26 @@ static bool test_printer_set_publish(struct torture_context *tctx,
 					 "info7 publish flag not set");
 	} else {
 		struct GUID guid;
+		char *ref_guid;
 		torture_assert_int_equal(tctx,
 					 info.info7.action,
 					 DSPRINT_PUBLISH,
 					 "info7 publish flag not set");
+
+		/* GUID_from_string is able to parse both plain and
+		 * curly-braced guids */
 		torture_assert_ntstatus_ok(tctx,
 					   GUID_from_string(info.info7.guid,
 					   &guid),
 					   "invalid published printer GUID");
+
+		/* Build reference GUID string */
+		ref_guid = GUID_string2(tctx, &guid);
+		torture_assert_not_null(tctx, ref_guid, "ENOMEM");
+		ref_guid = talloc_strdup_upper(tctx, ref_guid);
+		torture_assert_not_null(tctx, ref_guid, "ENOMEM");
+		torture_assert_str_equal(tctx, info.info7.guid, ref_guid,
+			"invalid GUID format");
 	}
 
 	return true;
@@ -8943,6 +9632,115 @@ static bool test_print_job_enum(struct torture_context *tctx,
 	return true;
 }
 
+static bool test_printer_log_jobinfo(struct torture_context *tctx,
+				     void *private_data)
+{
+	struct torture_printer_context *t =
+		(struct torture_printer_context *)talloc_get_type_abort(private_data, struct torture_printer_context);
+	struct dcerpc_pipe *p = t->spoolss_pipe;
+	struct dcerpc_binding_handle *b = p->binding_handle;
+	struct spoolss_BranchOfficeJobDataContainer info;
+	int i;
+
+	struct spoolss_LogJobInfoForBranchOffice r;
+
+	torture_comment(tctx, "Testing LogJobInfoForBranchOffice\n");
+
+	info.cJobDataEntries = 0;
+	info.JobData = NULL;
+
+	r.in.hPrinter = &t->handle;
+	r.in.pBranchOfficeJobDataContainer = &info;
+
+	torture_assert_ntstatus_ok(tctx,
+		dcerpc_spoolss_LogJobInfoForBranchOffice_r(b, tctx, &r),
+		"LogJobInfoForBranchOffice failed");
+	torture_assert_werr_equal(tctx, r.out.result, WERR_INVALID_PARAMETER,
+		"LogJobInfoForBranchOffice failed");
+
+	info.cJobDataEntries = 1;
+	info.JobData = talloc_zero_array(tctx, struct spoolss_BranchOfficeJobData, info.cJobDataEntries);
+
+	info.JobData[0].eEventType = kLogOfflineFileFull;
+	info.JobData[0].JobId = 42;
+	info.JobData[0].JobInfo.LogOfflineFileFull.pMachineName = talloc_strdup(tctx, "mthelena");
+
+	torture_assert_ntstatus_ok(tctx,
+		dcerpc_spoolss_LogJobInfoForBranchOffice_r(b, tctx, &r),
+		"LogJobInfoForBranchOffice failed");
+	torture_assert_werr_equal(tctx, r.out.result, WERR_OK,
+		"LogJobInfoForBranchOffice failed");
+
+	info.cJobDataEntries = 42;
+	info.JobData = talloc_zero_array(tctx, struct spoolss_BranchOfficeJobData, info.cJobDataEntries);
+
+	for (i=0; i < info.cJobDataEntries; i++) {
+		info.JobData[i].eEventType = kLogOfflineFileFull;
+		info.JobData[i].JobId = i;
+		info.JobData[i].JobInfo.LogOfflineFileFull.pMachineName = talloc_asprintf(tctx, "torture_%d", i);
+	}
+
+	torture_assert_ntstatus_ok(tctx,
+		dcerpc_spoolss_LogJobInfoForBranchOffice_r(b, tctx, &r),
+		"LogJobInfoForBranchOffice failed");
+	torture_assert_werr_equal(tctx, r.out.result, WERR_OK,
+		"LogJobInfoForBranchOffice failed");
+
+	return true;
+}
+
+static bool test_printer_os_versions(struct torture_context *tctx,
+				     void *private_data)
+{
+	struct torture_printer_context *t =
+		(struct torture_printer_context *)talloc_get_type_abort(private_data, struct torture_printer_context);
+	struct dcerpc_pipe *p = t->spoolss_pipe;
+	struct dcerpc_binding_handle *b = p->binding_handle;
+	union spoolss_PrinterInfo info;
+	DATA_BLOB blob;
+	uint8_t *data;
+	uint32_t length;
+	struct spoolss_OSVersion osversion;
+	uint8_t os_major, os_minor;
+	uint16_t os_build;
+	struct policy_handle server_handle;
+
+	torture_comment(tctx, "Testing OSVersion vs. PRINTER_INFO_STRESS\n");
+
+	torture_assert(tctx,
+		test_GetPrinter_level(tctx, b, &t->handle, 0, &info),
+		"failed to get level 0 printer info");
+
+	torture_assert(tctx,
+		test_OpenPrinter_server(tctx, p, &server_handle),
+		"failed to open printserver");
+
+	torture_assert(tctx,
+		test_GetPrinterData_checktype(tctx, b, &server_handle, "OSVersion",
+					      NULL, NULL, &data, &length),
+		"failed to fetch OSVersion printer data");
+
+	test_ClosePrinter(tctx, b, &server_handle);
+
+	blob = data_blob_const(data, length);
+
+	torture_assert_ndr_success(tctx,
+		ndr_pull_struct_blob(&blob, tctx, &osversion,
+			(ndr_pull_flags_fn_t)ndr_pull_spoolss_OSVersion),
+		"failed to pull OSVersion");
+
+	os_major = CVAL(&info.info0.version, 0);
+	os_minor = CVAL(&info.info0.version, 1);
+	os_build = SVAL(&info.info0.version, 2);
+
+	torture_assert_int_equal(tctx, os_major, osversion.major, "major");
+	torture_assert_int_equal(tctx, os_minor, osversion.minor, "minor");
+	torture_assert_int_equal(tctx, os_build, osversion.build, "build");
+
+	return true;
+}
+
+
 void torture_tcase_printer(struct torture_tcase *tcase)
 {
 	torture_tcase_add_simple_test(tcase, "openprinter", test_openprinter_wrap);
@@ -8971,6 +9769,8 @@ void torture_tcase_printer(struct torture_tcase *tcase)
 	torture_tcase_add_simple_test(tcase, "publish_toggle",
 				      test_printer_publish_toggle);
 	torture_tcase_add_simple_test(tcase, "print_job_enum", test_print_job_enum);
+	torture_tcase_add_simple_test(tcase, "log_jobinfo", test_printer_log_jobinfo);
+	torture_tcase_add_simple_test(tcase, "os_versions", test_printer_os_versions);
 }
 
 struct torture_suite *torture_rpc_spoolss_printer(TALLOC_CTX *mem_ctx)
@@ -9042,13 +9842,19 @@ struct torture_suite *torture_rpc_spoolss(TALLOC_CTX *mem_ctx)
 	torture_tcase_add_simple_test(tcase, "enum_print_processors", test_EnumPrintProcessors);
 	torture_tcase_add_simple_test(tcase, "print_processors_winreg", test_print_processors_winreg);
 	torture_tcase_add_simple_test(tcase, "add_processor", test_add_print_processor);
-	torture_tcase_add_simple_test(tcase, "enum_printprocdata", test_EnumPrintProcDataTypes);
+	torture_tcase_add_simple_test(tcase, "enum_printprocdata", test_EnumPrintProcessorDataTypes);
 	torture_tcase_add_simple_test(tcase, "enum_printers", test_EnumPrinters);
 	torture_tcase_add_simple_test(tcase, "enum_ports_old", test_EnumPorts_old);
 	torture_tcase_add_simple_test(tcase, "enum_printers_old", test_EnumPrinters_old);
 	torture_tcase_add_simple_test(tcase, "enum_printers_servername", test_EnumPrinters_servername);
 	torture_tcase_add_simple_test(tcase, "enum_printer_drivers_old", test_EnumPrinterDrivers_old);
 	torture_tcase_add_simple_test(tcase, "architecture_buffer", test_architecture_buffer);
+	torture_tcase_add_simple_test(tcase, "get_core_printer_drivers", test_get_core_printer_drivers);
+	torture_tcase_add_simple_test(tcase, "get_printer_driver_package_path", test_get_printer_driver_package_path);
+	torture_tcase_add_simple_test(tcase, "get_printer", test_get_printer_printserverhandle);
+	torture_tcase_add_simple_test(tcase, "set_printer", test_set_printer_printserverhandle);
+	torture_tcase_add_simple_test(tcase, "printserver_info_winreg", test_printserver_info_winreg);
+	torture_tcase_add_simple_test(tcase, "addpermachineconnection", test_addpermachineconnection);
 
 	torture_suite_add_suite(suite, torture_rpc_spoolss_printer(suite));
 
@@ -9218,11 +10024,11 @@ static bool test_AddPrinterDriver_args_level_1(struct torture_context *tctx,
 
 	if (ex) {
 		torture_assert(tctx,
-			test_AddPrinterDriverEx_exp(tctx, b, server_name, &info_ctr, flags, WERR_UNKNOWN_LEVEL),
+			test_AddPrinterDriverEx_exp(tctx, b, server_name, &info_ctr, flags, WERR_INVALID_LEVEL),
 			"failed to test AddPrinterDriverEx level 1");
 	} else {
 		torture_assert(tctx,
-			test_AddPrinterDriver_exp(tctx, b, server_name, &info_ctr, WERR_UNKNOWN_LEVEL),
+			test_AddPrinterDriver_exp(tctx, b, server_name, &info_ctr, WERR_INVALID_LEVEL),
 			"failed to test AddPrinterDriver level 1");
 	}
 
@@ -9230,11 +10036,11 @@ static bool test_AddPrinterDriver_args_level_1(struct torture_context *tctx,
 
 	if (ex) {
 		torture_assert(tctx,
-			test_AddPrinterDriverEx_exp(tctx, b, server_name, &info_ctr, flags, WERR_UNKNOWN_LEVEL),
+			test_AddPrinterDriverEx_exp(tctx, b, server_name, &info_ctr, flags, WERR_INVALID_LEVEL),
 			"failed to test AddPrinterDriverEx level 1");
 	} else {
 		torture_assert(tctx,
-			test_AddPrinterDriver_exp(tctx, b, server_name, &info_ctr, WERR_UNKNOWN_LEVEL),
+			test_AddPrinterDriver_exp(tctx, b, server_name, &info_ctr, WERR_INVALID_LEVEL),
 			"failed to test AddPrinterDriver level 1");
 	}
 
@@ -9260,11 +10066,11 @@ static bool test_AddPrinterDriver_args_level_2(struct torture_context *tctx,
 
 	if (ex) {
 		torture_assert(tctx,
-			test_AddPrinterDriverEx_exp(tctx, b, server_name, &info_ctr, flags, WERR_INVALID_PARAM),
+			test_AddPrinterDriverEx_exp(tctx, b, server_name, &info_ctr, flags, WERR_INVALID_PARAMETER),
 			"failed to test AddPrinterDriverEx level 2");
 	} else {
 		torture_assert(tctx,
-			test_AddPrinterDriver_exp(tctx, b, server_name, &info_ctr, WERR_INVALID_PARAM),
+			test_AddPrinterDriver_exp(tctx, b, server_name, &info_ctr, WERR_INVALID_PARAMETER),
 			"failed to test AddPrinterDriver level 2");
 	}
 
@@ -9272,11 +10078,11 @@ static bool test_AddPrinterDriver_args_level_2(struct torture_context *tctx,
 
 	if (ex) {
 		torture_assert(tctx,
-			test_AddPrinterDriverEx_exp(tctx, b, server_name, &info_ctr, flags, WERR_INVALID_PARAM),
+			test_AddPrinterDriverEx_exp(tctx, b, server_name, &info_ctr, flags, WERR_INVALID_PARAMETER),
 			"failed to test AddPrinterDriverEx level 2");
 	} else {
 		torture_assert(tctx,
-			test_AddPrinterDriver_exp(tctx, b, server_name, &info_ctr, WERR_INVALID_PARAM),
+			test_AddPrinterDriver_exp(tctx, b, server_name, &info_ctr, WERR_INVALID_PARAMETER),
 			"failed to test AddPrinterDriver level 2");
 	}
 
@@ -9284,11 +10090,11 @@ static bool test_AddPrinterDriver_args_level_2(struct torture_context *tctx,
 
 	if (ex) {
 		torture_assert(tctx,
-			test_AddPrinterDriverEx_exp(tctx, b, server_name, &info_ctr, flags, WERR_INVALID_PARAM),
+			test_AddPrinterDriverEx_exp(tctx, b, server_name, &info_ctr, flags, WERR_INVALID_PARAMETER),
 			"failed to test AddPrinterDriverEx level 2");
 	} else {
 		torture_assert(tctx,
-			test_AddPrinterDriver_exp(tctx, b, server_name, &info_ctr, WERR_INVALID_PARAM),
+			test_AddPrinterDriver_exp(tctx, b, server_name, &info_ctr, WERR_INVALID_PARAMETER),
 			"failed to test AddPrinterDriver level 2");
 	}
 
@@ -9296,11 +10102,11 @@ static bool test_AddPrinterDriver_args_level_2(struct torture_context *tctx,
 
 	if (ex) {
 		torture_assert(tctx,
-			test_AddPrinterDriverEx_exp(tctx, b, server_name, &info_ctr, flags, WERR_INVALID_PARAM),
+			test_AddPrinterDriverEx_exp(tctx, b, server_name, &info_ctr, flags, WERR_INVALID_PARAMETER),
 			"failed to test AddPrinterDriverEx level 2");
 	} else {
 		torture_assert(tctx,
-			test_AddPrinterDriver_exp(tctx, b, server_name, &info_ctr, WERR_INVALID_PARAM),
+			test_AddPrinterDriver_exp(tctx, b, server_name, &info_ctr, WERR_INVALID_PARAMETER),
 			"failed to test AddPrinterDriver level 2");
 	}
 
@@ -9308,11 +10114,11 @@ static bool test_AddPrinterDriver_args_level_2(struct torture_context *tctx,
 
 	if (ex) {
 		torture_assert(tctx,
-			test_AddPrinterDriverEx_exp(tctx, b, server_name, &info_ctr, flags, WERR_INVALID_PARAM),
+			test_AddPrinterDriverEx_exp(tctx, b, server_name, &info_ctr, flags, WERR_INVALID_PARAMETER),
 			"failed to test AddPrinterDriverEx level 2");
 	} else {
 		torture_assert(tctx,
-			test_AddPrinterDriver_exp(tctx, b, server_name, &info_ctr, WERR_INVALID_PARAM),
+			test_AddPrinterDriver_exp(tctx, b, server_name, &info_ctr, WERR_INVALID_PARAMETER),
 			"failed to test AddPrinterDriver level 2");
 	}
 
@@ -9320,11 +10126,11 @@ static bool test_AddPrinterDriver_args_level_2(struct torture_context *tctx,
 
 	if (ex) {
 		torture_assert(tctx,
-			test_AddPrinterDriverEx_exp(tctx, b, server_name, &info_ctr, flags, WERR_INVALID_PARAM),
+			test_AddPrinterDriverEx_exp(tctx, b, server_name, &info_ctr, flags, WERR_INVALID_PARAMETER),
 			"failed to test AddPrinterDriverEx level 2");
 	} else {
 		torture_assert(tctx,
-			test_AddPrinterDriver_exp(tctx, b, server_name, &info_ctr, WERR_INVALID_PARAM),
+			test_AddPrinterDriver_exp(tctx, b, server_name, &info_ctr, WERR_INVALID_PARAMETER),
 			"failed to test AddPrinterDriver level 2");
 	}
 
@@ -9332,7 +10138,7 @@ static bool test_AddPrinterDriver_args_level_2(struct torture_context *tctx,
 
 	if (ex) {
 		torture_assert(tctx,
-			test_AddPrinterDriverEx_exp(tctx, b, server_name, &info_ctr, 0, WERR_INVALID_PARAM),
+			test_AddPrinterDriverEx_exp(tctx, b, server_name, &info_ctr, 0, WERR_INVALID_PARAMETER),
 			"failed to test AddPrinterDriverEx");
 	}
 
@@ -9512,7 +10318,7 @@ static bool test_AddPrinterDriver_args_level_6(struct torture_context *tctx,
 			"failed to test AddPrinterDriverEx level 6");
 	} else {
 		torture_assert(tctx,
-			test_AddPrinterDriver_exp(tctx, b, server_name, &info_ctr, WERR_UNKNOWN_LEVEL),
+			test_AddPrinterDriver_exp(tctx, b, server_name, &info_ctr, WERR_INVALID_LEVEL),
 			"failed to test AddPrinterDriver level 6");
 	}
 
@@ -9563,7 +10369,7 @@ static bool test_AddPrinterDriver_args_level_8(struct torture_context *tctx,
 			"failed to test AddPrinterDriverEx level 8");
 	} else {
 		torture_assert(tctx,
-			test_AddPrinterDriver_exp(tctx, b, server_name, &info_ctr, WERR_UNKNOWN_LEVEL),
+			test_AddPrinterDriver_exp(tctx, b, server_name, &info_ctr, WERR_INVALID_LEVEL),
 			"failed to test AddPrinterDriver level 8");
 	}
 
@@ -9837,24 +10643,77 @@ static const char *driver_directory_share(struct torture_context *tctx,
 	return tok;
 }
 
+#define CREATE_PRINTER_DRIVER_PATH(_d, _file) \
+	talloc_asprintf((_d), "%s\\%s\\%s", (_d)->remote.driver_directory, (_d)->remote.driver_upload_directory, (_file))
+
+
+static bool create_printer_driver_directory(struct torture_context *tctx,
+					    struct smbcli_state *cli,
+					    struct torture_driver_context *d)
+{
+	char *driver_dir;
+
+	if (d->remote.driver_upload_directory == NULL) {
+		return true;
+	}
+
+	driver_dir = talloc_asprintf(tctx,
+				     "%s\\%s",
+				     driver_directory_dir(d->remote.driver_directory),
+				     d->remote.driver_upload_directory);
+	torture_assert_not_null(tctx, driver_dir, "ENOMEM");
+
+	torture_comment(tctx,
+			"Create remote driver directory: %s\n",
+			driver_dir);
+
+	torture_assert_ntstatus_ok(tctx,
+				   smbcli_mkdir(cli->tree,
+				                driver_dir),
+				   "Failed to create driver directory");
+
+	return true;
+}
+
 static bool upload_printer_driver_file(struct torture_context *tctx,
 				       struct smbcli_state *cli,
 				       struct torture_driver_context *d,
 				       const char *file_name)
 {
-	XFILE *f;
+	FILE *f;
 	int fnum;
 	uint8_t *buf;
 	int maxwrite = 64512;
 	off_t nread = 0;
 	size_t start = 0;
 	const char *remote_dir = driver_directory_dir(d->remote.driver_directory);
-	const char *local_name = talloc_asprintf(tctx, "%s/%s", d->local.driver_directory, file_name);
-	const char *remote_name = talloc_asprintf(tctx, "%s\\%s", remote_dir, file_name);
+	const char *remote_name;
+	const char *local_name;
+	const char *p;
 
 	if (!file_name || strlen(file_name) == 0) {
 		return true;
 	}
+
+	p = strrchr(file_name, '\\');
+	if (p == NULL) {
+		p = file_name;
+	} else {
+		p++;
+	}
+
+	local_name = talloc_asprintf(tctx, "%s/%s", d->local.driver_directory, p);
+	torture_assert_not_null(tctx, local_name, "ENOMEM");
+	if (d->remote.driver_upload_directory != NULL) {
+		remote_name = talloc_asprintf(tctx,
+					      "%s\\%s\\%s",
+					      remote_dir,
+					      d->remote.driver_upload_directory,
+					      p);
+	} else {
+		remote_name = talloc_asprintf(tctx, "%s\\%s", remote_dir, p);
+	}
+	torture_assert_not_null(tctx, remote_name, "ENOMEM");
 
 	torture_comment(tctx, "Uploading %s to %s\n", local_name, remote_name);
 
@@ -9863,23 +10722,23 @@ static bool upload_printer_driver_file(struct torture_context *tctx,
 		torture_fail(tctx, talloc_asprintf(tctx, "failed to open remote file: %s\n", remote_name));
 	}
 
-	f = x_fopen(local_name, O_RDONLY, 0);
+	f = fopen(local_name, "r");
 	if (f == NULL) {
 		torture_fail(tctx, talloc_asprintf(tctx, "failed to open local file: %s\n", local_name));
 	}
 
 	buf = talloc_array(tctx, uint8_t, maxwrite);
 	if (!buf) {
-		x_fclose(f);
+		fclose(f);
 		return false;
 	}
 
-	while (!x_feof(f)) {
+	while (!feof(f)) {
 		int n = maxwrite;
 		int ret;
 
-		if ((n = x_fread(buf, 1, n, f)) < 1) {
-			if((n == 0) && x_feof(f))
+		if ((n = fread(buf, 1, n, f)) < 1) {
+			if((n == 0) && feof(f))
 				break; /* Empty local file. */
 
 			torture_warning(tctx,
@@ -9898,7 +10757,7 @@ static bool upload_printer_driver_file(struct torture_context *tctx,
 		nread += n;
 	}
 
-	x_fclose(f);
+	fclose(f);
 
 	torture_assert_ntstatus_ok(tctx,
 		smbcli_close(cli->tree, fnum),
@@ -9926,7 +10785,7 @@ static bool connect_printer_driver_share(struct torture_context *tctx,
 					lpcfg_smb_ports(tctx->lp_ctx),
 					share_name, NULL,
 					lpcfg_socket_options(tctx->lp_ctx),
-					cmdline_credentials,
+					popt_get_cmdline_credentials(),
 					lpcfg_resolve_context(tctx->lp_ctx),
 					tctx->ev,
 					&smb_options,
@@ -9951,6 +10810,10 @@ static bool upload_printer_driver(struct torture_context *tctx,
 
 	torture_comment(tctx, "Uploading printer driver files to \\\\%s\\%s\n",
 		server_name, share_name);
+
+	torture_assert(tctx,
+		       create_printer_driver_directory(tctx, cli, d),
+		       "failed to create driver directory");
 
 	torture_assert(tctx,
 		upload_printer_driver_file(tctx, cli, d, d->info8.driver_path),
@@ -10169,7 +11032,6 @@ static bool test_add_driver_arg(struct torture_context *tctx,
 			}
 		}
 	}
-	info8.architecture      = d->local.environment;
 
 	for (i=0; i < ARRAY_SIZE(levels); i++) {
 
@@ -10177,7 +11039,6 @@ static bool test_add_driver_arg(struct torture_context *tctx,
 			switch (levels[i]) {
 			case 2:
 			case 4:
-			case 8:
 				torture_comment(tctx, "skipping level %d against samba\n", levels[i]);
 				continue;
 			default:
@@ -10221,8 +11082,6 @@ static bool test_add_driver_arg(struct torture_context *tctx,
 			switch (levels[i]) {
 			case 2:
 			case 4:
-			case 8:
-				torture_comment(tctx, "skipping level %d against samba\n", levels[i]);
 				continue;
 			default:
 				break;
@@ -10261,14 +11120,15 @@ static bool test_add_driver_ex_64(struct torture_context *tctx,
 
 	d = talloc_zero(tctx, struct torture_driver_context);
 
+	d->local.environment		= talloc_strdup(d, SPOOLSS_ARCHITECTURE_x64);
+	d->local.driver_directory	= talloc_strdup(d, "/usr/share/cups/drivers/x64");
+
 	d->info8.version		= SPOOLSS_DRIVER_VERSION_200X;
 	d->info8.driver_name		= TORTURE_DRIVER_EX;
-	d->info8.architecture		= NULL;
+	d->info8.architecture		= d->local.environment;
 	d->info8.driver_path		= talloc_strdup(d, "pscript5.dll");
 	d->info8.data_file		= talloc_strdup(d, "cups6.ppd");
 	d->info8.config_file		= talloc_strdup(d, "cupsui6.dll");
-	d->local.environment		= talloc_strdup(d, "Windows x64");
-	d->local.driver_directory	= talloc_strdup(d, "/usr/share/cups/drivers/x64");
 	d->ex				= true;
 
 	return test_add_driver_arg(tctx, p, d);
@@ -10281,14 +11141,15 @@ static bool test_add_driver_ex_32(struct torture_context *tctx,
 
 	d = talloc_zero(tctx, struct torture_driver_context);
 
+	d->local.environment		= talloc_strdup(d, SPOOLSS_ARCHITECTURE_NT_X86);
+	d->local.driver_directory	= talloc_strdup(d, "/usr/share/cups/drivers/i386");
+
 	d->info8.version		= SPOOLSS_DRIVER_VERSION_200X;
 	d->info8.driver_name		= TORTURE_DRIVER_EX;
-	d->info8.architecture		= NULL;
+	d->info8.architecture		= d->local.environment;
 	d->info8.driver_path		= talloc_strdup(d, "pscript5.dll");
 	d->info8.data_file		= talloc_strdup(d, "cups6.ppd");
 	d->info8.config_file		= talloc_strdup(d, "cupsui6.dll");
-	d->local.environment		= talloc_strdup(d, "Windows NT x86");
-	d->local.driver_directory	= talloc_strdup(d, "/usr/share/cups/drivers/i386");
 	d->ex				= true;
 
 	return test_add_driver_arg(tctx, p, d);
@@ -10301,14 +11162,15 @@ static bool test_add_driver_64(struct torture_context *tctx,
 
 	d = talloc_zero(tctx, struct torture_driver_context);
 
+	d->local.environment		= talloc_strdup(d, SPOOLSS_ARCHITECTURE_x64);
+	d->local.driver_directory	= talloc_strdup(d, "/usr/share/cups/drivers/x64");
+
 	d->info8.version		= SPOOLSS_DRIVER_VERSION_200X;
-	d->info8.driver_name		= TORTURE_DRIVER;
-	d->info8.architecture		= NULL;
+	d->info8.driver_name		= TORTURE_DRIVER_ADD;
+	d->info8.architecture		= d->local.environment;
 	d->info8.driver_path		= talloc_strdup(d, "pscript5.dll");
 	d->info8.data_file		= talloc_strdup(d, "cups6.ppd");
 	d->info8.config_file		= talloc_strdup(d, "cupsui6.dll");
-	d->local.environment		= talloc_strdup(d, "Windows x64");
-	d->local.driver_directory	= talloc_strdup(d, "/usr/share/cups/drivers/x64");
 	d->ex				= false;
 
 	return test_add_driver_arg(tctx, p, d);
@@ -10321,14 +11183,15 @@ static bool test_add_driver_32(struct torture_context *tctx,
 
 	d = talloc_zero(tctx, struct torture_driver_context);
 
+	d->local.environment		= talloc_strdup(d, SPOOLSS_ARCHITECTURE_NT_X86);
+	d->local.driver_directory	= talloc_strdup(d, "/usr/share/cups/drivers/i386");
+
 	d->info8.version		= SPOOLSS_DRIVER_VERSION_200X;
-	d->info8.driver_name		= TORTURE_DRIVER;
-	d->info8.architecture		= NULL;
+	d->info8.driver_name		= TORTURE_DRIVER_ADD;
+	d->info8.architecture		= d->local.environment;
 	d->info8.driver_path		= talloc_strdup(d, "pscript5.dll");
 	d->info8.data_file		= talloc_strdup(d, "cups6.ppd");
 	d->info8.config_file		= talloc_strdup(d, "cupsui6.dll");
-	d->local.environment		= talloc_strdup(d, "Windows NT x86");
-	d->local.driver_directory	= talloc_strdup(d, "/usr/share/cups/drivers/i386");
 	d->ex				= false;
 
 	return test_add_driver_arg(tctx, p, d);
@@ -10345,9 +11208,12 @@ static bool test_add_driver_adobe(struct torture_context *tctx,
 
 	d = talloc_zero(tctx, struct torture_driver_context);
 
+	d->local.environment		= talloc_strdup(d, "Windows 4.0");
+	d->local.driver_directory	= talloc_strdup(d, "/usr/share/cups/drivers/adobe/");
+
 	d->info8.version		= SPOOLSS_DRIVER_VERSION_9X;
 	d->info8.driver_name		= TORTURE_DRIVER_ADOBE;
-	d->info8.architecture		= NULL;
+	d->info8.architecture		= d->local.environment;
 	d->info8.driver_path		= talloc_strdup(d, "ADOBEPS4.DRV");
 	d->info8.data_file		= talloc_strdup(d, "DEFPRTR2.PPD");
 	d->info8.config_file		= talloc_strdup(d, "ADOBEPS4.DRV");
@@ -10355,8 +11221,6 @@ static bool test_add_driver_adobe(struct torture_context *tctx,
 	d->info8.help_file		= talloc_strdup(d, "ADOBEPS4.HLP");
 	d->info8.monitor_name		= talloc_strdup(d, "PSMON.DLL");
 #endif
-	d->local.environment		= talloc_strdup(d, "Windows 4.0");
-	d->local.driver_directory	= talloc_strdup(d, "/usr/share/cups/drivers/adobe/");
 	d->ex				= false;
 
 	return test_add_driver_arg(tctx, p, d);
@@ -10374,9 +11238,12 @@ static bool test_add_driver_adobe_cupsaddsmb(struct torture_context *tctx,
 
 	d = talloc_zero(tctx, struct torture_driver_context);
 
+	d->local.environment		= talloc_strdup(d, "Windows 4.0");
+	d->local.driver_directory	= talloc_strdup(d, "/usr/share/cups/drivers/adobe/");
+
 	d->info8.version		= SPOOLSS_DRIVER_VERSION_9X;
 	d->info8.driver_name		= TORTURE_DRIVER_ADOBE_CUPSADDSMB;
-	d->info8.architecture		= NULL;
+	d->info8.architecture		= d->local.environment;
 	d->info8.driver_path		= talloc_strdup(d, "ADOBEPS4.DRV");
 	d->info8.data_file		= talloc_strdup(d, "DEFPRTR2.PPD");
 	d->info8.config_file		= NULL;
@@ -10394,8 +11261,6 @@ static bool test_add_driver_adobe_cupsaddsmb(struct torture_context *tctx,
 	a->string[5]			= talloc_strdup(a->string, "ICONLIB.DLL");
 
 	d->info8.dependent_files	= a;
-	d->local.environment		= talloc_strdup(d, "Windows 4.0");
-	d->local.driver_directory	= talloc_strdup(d, "/usr/share/cups/drivers/adobe/");
 	d->ex				= false;
 
 	return test_add_driver_arg(tctx, p, d);
@@ -10409,15 +11274,16 @@ static bool test_add_driver_timestamps(struct torture_context *tctx,
 
 	d = talloc_zero(tctx, struct torture_driver_context);
 
+	d->local.environment		= talloc_strdup(d, SPOOLSS_ARCHITECTURE_NT_X86);
+	d->local.driver_directory	= talloc_strdup(d, "/usr/share/cups/drivers/i386");
+
 	d->info8.version		= SPOOLSS_DRIVER_VERSION_200X;
 	d->info8.driver_name		= TORTURE_DRIVER_TIMESTAMPS;
-	d->info8.architecture		= NULL;
+	d->info8.architecture		= d->local.environment;
 	d->info8.driver_path		= talloc_strdup(d, "pscript5.dll");
 	d->info8.data_file		= talloc_strdup(d, "cups6.ppd");
 	d->info8.config_file		= talloc_strdup(d, "cupsui6.dll");
 	d->info8.driver_date		= timeval_to_nttime(&t);
-	d->local.environment		= talloc_strdup(d, "Windows NT x86");
-	d->local.driver_directory	= talloc_strdup(d, "/usr/share/cups/drivers/i386");
 	d->ex				= true;
 
 	torture_assert(tctx,
@@ -10446,12 +11312,14 @@ static bool test_multiple_drivers(struct torture_context *tctx,
 
 	d = talloc_zero(tctx, struct torture_driver_context);
 
+	d->local.environment		= talloc_strdup(d, SPOOLSS_ARCHITECTURE_NT_X86);
+	d->local.driver_directory	= talloc_strdup(d, "/usr/share/cups/drivers/i386");
+
 	d->info8.version		= SPOOLSS_DRIVER_VERSION_200X;
 	d->info8.driver_path		= talloc_strdup(d, "pscript5.dll");
 	d->info8.data_file		= talloc_strdup(d, "cups6.ppd");
 	d->info8.config_file		= talloc_strdup(d, "cupsui6.dll");
-	d->local.environment		= talloc_strdup(d, "Windows NT x86");
-	d->local.driver_directory	= talloc_strdup(d, "/usr/share/cups/drivers/i386");
+	d->info8.architecture           = d->local.environment;
 	d->ex				= true;
 
 	torture_assert(tctx,
@@ -10467,7 +11335,6 @@ static bool test_multiple_drivers(struct torture_context *tctx,
 		"failed to upload printer driver");
 
 	info8 = d->info8;
-	info8.architecture      = d->local.environment;
 
 	for (i=0; i < 3; i++) {
 		info8.driver_name		= talloc_asprintf(d, "torture_test_driver_%d", i);
@@ -10508,6 +11375,123 @@ static bool test_multiple_drivers(struct torture_context *tctx,
 	return true;
 }
 
+static bool test_driver_copy_from_directory(struct torture_context *tctx,
+					    struct dcerpc_pipe *p,
+					    const char *architecture)
+{
+	struct torture_driver_context *d;
+	struct spoolss_StringArray *a;
+	uint32_t add_flags = APD_COPY_NEW_FILES|APD_COPY_FROM_DIRECTORY|APD_RETURN_BLOCKING_STATUS_CODE;
+	uint32_t delete_flags = DPD_DELETE_ALL_FILES;
+	struct dcerpc_binding_handle *b = p->binding_handle;
+	const char *server_name_slash = talloc_asprintf(tctx,
+							"\\\\%s",
+							dcerpc_server_name(p));
+	struct GUID guid = GUID_random();
+	bool ok = false;
+
+	d = talloc_zero(tctx, struct torture_driver_context);
+	torture_assert_not_null(tctx, d, "ENOMEM");
+
+	d->local.environment		= talloc_strdup(d, architecture);
+	torture_assert_not_null_goto(tctx, d->local.environment, ok, done, "ENOMEM");
+
+	if (strequal(architecture, SPOOLSS_ARCHITECTURE_x64)) {
+		d->local.driver_directory =
+			talloc_strdup(d, "/usr/share/cups/drivers/x64");
+	} else {
+		d->local.driver_directory =
+			talloc_strdup(d, "/usr/share/cups/drivers/i386");
+	}
+	torture_assert_not_null_goto(tctx, d->local.driver_directory, ok, done, "ENOMEM");
+
+	d->remote.driver_upload_directory = GUID_string2(d, &guid);
+	torture_assert_not_null_goto(tctx, d->remote.driver_upload_directory, ok, done, "ENOMEM");
+
+	torture_assert(tctx,
+		       fillup_printserver_info(tctx, p, d),
+		       "failed to fillup printserver info");
+
+	d->ex				= true;
+	d->info8.version		= SPOOLSS_DRIVER_VERSION_200X;
+	d->info8.driver_name		= TORTURE_DRIVER_COPY_DIR;
+	d->info8.architecture		= d->local.environment;
+
+	d->info8.driver_path		= CREATE_PRINTER_DRIVER_PATH(d, "pscript5.dll");
+	torture_assert_not_null_goto(tctx, d->info8.driver_path, ok, done, "ENOMEM");
+	d->info8.data_file		= CREATE_PRINTER_DRIVER_PATH(d, "cups6.ppd");
+	torture_assert_not_null_goto(tctx, d->info8.data_file, ok, done, "ENOMEM");
+	d->info8.config_file		= CREATE_PRINTER_DRIVER_PATH(d, "cupsui6.dll");
+	torture_assert_not_null_goto(tctx, d->info8.config_file, ok, done, "ENOMEM");
+	d->info8.help_file		= CREATE_PRINTER_DRIVER_PATH(d, "pscript.hlp");
+	torture_assert_not_null_goto(tctx, d->info8.help_file, ok, done, "ENOMEM");
+
+	a				= talloc_zero(d, struct spoolss_StringArray);
+	torture_assert_not_null_goto(tctx, a, ok, done, "ENOMEM");
+	a->string			= talloc_zero_array(a, const char *, 3);
+	torture_assert_not_null_goto(tctx, a->string, ok, done, "ENOMEM");
+	a->string[0]			= CREATE_PRINTER_DRIVER_PATH(d, "cups6.inf");
+	torture_assert_not_null_goto(tctx, a->string[0], ok, done, "ENOMEM");
+	a->string[1]			= CREATE_PRINTER_DRIVER_PATH(d, "cups6.ini");
+	torture_assert_not_null_goto(tctx, a->string[1], ok, done, "ENOMEM");
+
+	d->info8.dependent_files	= a;
+
+	if (!directory_exist(d->local.driver_directory)) {
+		torture_skip(tctx,
+			     "Skipping Printer Driver test as no local drivers "
+			     "are available");
+	}
+
+	torture_assert(tctx,
+		       upload_printer_driver(tctx, dcerpc_server_name(p), d),
+		       "failed to upload printer driver");
+
+	torture_assert(tctx,
+		       test_AddPrinterDriver_args_level_3(tctx,
+							  b,
+							  server_name_slash,
+							  &d->info8,
+							  add_flags,
+							  true,
+							  NULL),
+		       "failed to add driver");
+
+	torture_assert(tctx,
+		       test_DeletePrinterDriverEx(tctx,
+			                          b,
+						  server_name_slash,
+						  d->info8.driver_name,
+						  d->local.environment,
+						  delete_flags,
+						  d->info8.version),
+		       "failed to delete driver");
+
+	torture_assert(tctx,
+		       check_printer_driver_files(tctx,
+						  dcerpc_server_name(p),
+						  d,
+						  false),
+		       "printer driver file check failed");
+
+	ok = true;
+done:
+	talloc_free(d);
+	return ok;
+}
+
+static bool test_driver_copy_from_directory_64(struct torture_context *tctx,
+					       struct dcerpc_pipe *p)
+{
+	return test_driver_copy_from_directory(tctx, p, SPOOLSS_ARCHITECTURE_x64);
+}
+
+static bool test_driver_copy_from_directory_32(struct torture_context *tctx,
+					       struct dcerpc_pipe *p)
+{
+	return test_driver_copy_from_directory(tctx, p, SPOOLSS_ARCHITECTURE_NT_X86);
+}
+
 static bool test_del_driver_all_files(struct torture_context *tctx,
 				      struct dcerpc_pipe *p)
 {
@@ -10520,16 +11504,17 @@ static bool test_del_driver_all_files(struct torture_context *tctx,
 
 	d = talloc_zero(tctx, struct torture_driver_context);
 
+	d->local.environment		= talloc_strdup(d, SPOOLSS_ARCHITECTURE_x64);
+	d->local.driver_directory	= talloc_strdup(d, "/usr/share/cups/drivers/x64");
+
 	d->ex				= true;
 	d->info8.version		= SPOOLSS_DRIVER_VERSION_200X;
 	d->info8.driver_name		= TORTURE_DRIVER_DELETER;
-	d->info8.architecture		= NULL;
+	d->info8.architecture		= d->local.environment;
 	d->info8.driver_path		= talloc_strdup(d, "pscript5.dll");
 	d->info8.data_file		= talloc_strdup(d, "cups6.ppd");
 	d->info8.config_file		= talloc_strdup(d, "cupsui6.dll");
 	d->info8.help_file		= talloc_strdup(d, "pscript.hlp");
-	d->local.environment		= talloc_strdup(d, SPOOLSS_ARCHITECTURE_x64);
-	d->local.driver_directory	= talloc_strdup(d, "/usr/share/cups/drivers/x64");
 
 	a				= talloc_zero(d, struct spoolss_StringArray);
 	a->string			= talloc_zero_array(a, const char *, 3);
@@ -10537,7 +11522,6 @@ static bool test_del_driver_all_files(struct torture_context *tctx,
 	a->string[1]			= talloc_strdup(a->string, "cups6.ini");
 
 	d->info8.dependent_files	= a;
-	d->info8.architecture		= d->local.environment;
 
 	torture_assert(tctx,
 		fillup_printserver_info(tctx, p, d),
@@ -10558,7 +11542,7 @@ static bool test_del_driver_all_files(struct torture_context *tctx,
 	torture_assert(tctx,
 		test_DeletePrinterDriverEx(tctx, b, server_name_slash,
 					   d->info8.driver_name,
-					   d->local.environment,
+					   d->info8.architecture,
 					   delete_flags,
 					   d->info8.version),
 		"failed to delete driver");
@@ -10582,6 +11566,10 @@ static bool test_del_driver_unused_files(struct torture_context *tctx,
 
 	d1 = talloc_zero(tctx, struct torture_driver_context);
 	d1->ex				= true;
+
+	d1->local.environment		= talloc_strdup(d1, SPOOLSS_ARCHITECTURE_x64);
+	d1->local.driver_directory	= talloc_strdup(d1, "/usr/share/cups/drivers/x64");
+
 	d1->info8.version		= SPOOLSS_DRIVER_VERSION_200X;
 	d1->info8.driver_name		= TORTURE_DRIVER_DELETER;
 	d1->info8.architecture		= NULL;
@@ -10589,12 +11577,14 @@ static bool test_del_driver_unused_files(struct torture_context *tctx,
 	d1->info8.data_file		= talloc_strdup(d1, "cups6.ppd");
 	d1->info8.config_file		= talloc_strdup(d1, "cupsui6.dll");
 	d1->info8.help_file		= talloc_strdup(d1, "pscript.hlp");
-	d1->local.environment		= talloc_strdup(d1, SPOOLSS_ARCHITECTURE_x64);
-	d1->local.driver_directory	= talloc_strdup(d1, "/usr/share/cups/drivers/x64");
 	d1->info8.architecture		= d1->local.environment;
 
 	d2 = talloc_zero(tctx, struct torture_driver_context);
 	d2->ex				= true;
+
+	d2->local.environment		= talloc_strdup(d2, SPOOLSS_ARCHITECTURE_x64);
+	d2->local.driver_directory	= talloc_strdup(d2, "/usr/share/cups/drivers/x64");
+
 	d2->info8.version		= SPOOLSS_DRIVER_VERSION_200X;
 	d2->info8.driver_name		= TORTURE_DRIVER_DELETERIN;
 	d2->info8.architecture		= NULL;
@@ -10602,8 +11592,6 @@ static bool test_del_driver_unused_files(struct torture_context *tctx,
 	d2->info8.data_file		= talloc_strdup(d2, "cupsps6.dll");
 	d2->info8.config_file		= talloc_strdup(d2, "cups6.ini");
 	d2->info8.help_file		= talloc_strdup(d2, "pscript.hlp");	/* overlapping */
-	d2->local.environment		= talloc_strdup(d2, SPOOLSS_ARCHITECTURE_x64);
-	d2->local.driver_directory	= talloc_strdup(d2, "/usr/share/cups/drivers/x64");
 	d2->info8.architecture		= d2->local.environment;
 
 	torture_assert(tctx,
@@ -10635,7 +11623,7 @@ static bool test_del_driver_unused_files(struct torture_context *tctx,
 	torture_assert(tctx,
 		test_DeletePrinterDriverEx_exp(tctx, b, server_name_slash,
 					       d1->info8.driver_name,
-					       d1->local.environment,
+					       d1->info8.architecture,
 					       DPD_DELETE_ALL_FILES,
 					       d1->info8.version,
 					       WERR_PRINTER_DRIVER_IN_USE),
@@ -10645,7 +11633,7 @@ static bool test_del_driver_unused_files(struct torture_context *tctx,
 	torture_assert(tctx,
 		test_DeletePrinterDriverEx_exp(tctx, b, server_name_slash,
 					       d1->info8.driver_name,
-					       d1->local.environment,
+					       d1->info8.architecture,
 					       DPD_DELETE_UNUSED_FILES,
 					       d1->info8.version,
 					       WERR_OK),
@@ -10665,7 +11653,7 @@ static bool test_del_driver_unused_files(struct torture_context *tctx,
 	torture_assert(tctx,
 		test_DeletePrinterDriverEx_exp(tctx, b, server_name_slash,
 					       d2->info8.driver_name,
-					       d2->local.environment,
+					       d2->info8.architecture,
 					       DPD_DELETE_ALL_FILES,
 					       d2->info8.version,
 					       WERR_OK),
@@ -10699,6 +11687,14 @@ struct torture_suite *torture_rpc_spoolss_driver(TALLOC_CTX *mem_ctx)
 	torture_rpc_tcase_add_test(tcase, "add_driver_timestamps", test_add_driver_timestamps);
 
 	torture_rpc_tcase_add_test(tcase, "multiple_drivers", test_multiple_drivers);
+
+	torture_rpc_tcase_add_test(tcase,
+				   "test_driver_copy_from_directory_64",
+				   test_driver_copy_from_directory_64);
+
+	torture_rpc_tcase_add_test(tcase,
+				   "test_driver_copy_from_directory_32",
+				   test_driver_copy_from_directory_32);
 
 	torture_rpc_tcase_add_test(tcase, "del_driver_all_files", test_del_driver_all_files);
 

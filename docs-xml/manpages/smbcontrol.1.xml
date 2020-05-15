@@ -7,7 +7,7 @@
 	<manvolnum>1</manvolnum>
 	<refmiscinfo class="source">Samba</refmiscinfo>
 	<refmiscinfo class="manual">User Commands</refmiscinfo>
-	<refmiscinfo class="version">4.3</refmiscinfo>
+	<refmiscinfo class="version">&doc.version;</refmiscinfo>
 </refmeta>
 
 
@@ -50,7 +50,6 @@
 
 	<variablelist>
 		&popt.autohelp;
-		&stdarg.configfile;
 		&popt.common.samba.client;
 		<varlistentry>
 		<term>-t|--timeout</term>
@@ -117,6 +116,16 @@
 	"*" character which will close all currently open shares.
 	This may be useful if you made changes to the access controls on the share.
 	This message can only be sent to <constant>smbd</constant>.</para>
+	</listitem>
+	</varlistentry>
+
+	<varlistentry><term>close-denied-share</term>
+	<listitem><para>Behave like <constant>close-share</constant>,
+	but don't disconnect users that are still allowed to access
+	the share. It can safely be sent to all smbds after changing
+	share access controls. It will only affect users who have been
+	denied access since having connected initially. This message
+	can only be sent to <constant>smbd</constant>.</para>
 	</listitem>
 	</varlistentry>
 
@@ -258,6 +267,13 @@
 	</varlistentry>
 
 	<varlistentry>
+	<term>ringbuf-log</term>
+	<listitem><para>Fetch and print the ringbuf log. Requires
+	<parameter>logging = ringbuf</parameter>. Available for smbd, winbindd
+	and nmbd.</para></listitem>
+	</varlistentry>
+
+	<varlistentry>
 	<term>drvupgrade</term>
 	<listitem><para>Force clients of printers using specified driver 
 	to update their local version of the driver. Can only be 
@@ -317,7 +333,7 @@
 <refsect1>
 	<title>VERSION</title>
 
-	<para>This man page is correct for version 3 of 
+	<para>This man page is part of version &doc.version; of
 	the Samba suite.</para>
 </refsect1>
 
@@ -335,14 +351,6 @@
 	were created by Andrew Tridgell. Samba is now developed
 	by the Samba Team as an Open Source project similar 
 	to the way the Linux kernel is developed.</para>
-	
-	<para>The original Samba man pages were written by Karl Auer. 
-	The man page sources were converted to YODL format (another 
-	excellent piece of Open Source software, available at <ulink url="ftp://ftp.icce.rug.nl/pub/unix/">
-	ftp://ftp.icce.rug.nl/pub/unix/</ulink>) and updated for the Samba 2.0 
-	release by Jeremy Allison.  The conversion to DocBook for 
-	Samba 2.2 was done by Gerald Carter. The conversion to DocBook XML 4.2 for
-	Samba 3.0 was done by Alexander Bokovoy.</para>
 </refsect1>
 
 </refentry>

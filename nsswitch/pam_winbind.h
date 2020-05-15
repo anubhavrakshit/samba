@@ -156,6 +156,7 @@ do {                             \
 #define WINBIND_DEBUG_STATE		0x00001000
 #define WINBIND_WARN_PWD_EXPIRE		0x00002000
 #define WINBIND_MKHOMEDIR		0x00004000
+#define WINBIND_TRY_AUTHTOK_ARG		0x00008000
 
 #if defined(HAVE_GETTEXT) && !defined(__LCLINT__)
 #define _(string) dgettext(MODULE_NAME, string)
@@ -213,12 +214,7 @@ struct pwb_context {
 	const char **argv;
 	struct tiniparser_dictionary *dict;
 	uint32_t ctrl;
+	struct wbcContext *wbc_ctx;
 };
-
-#ifndef TALLOC_FREE
-#define TALLOC_FREE(ctx) do { talloc_free(ctx); ctx=NULL; } while(0)
-#endif
-#define TALLOC_ZERO_P(ctx, type) (type *)_talloc_zero(ctx, sizeof(type), #type)
-#define TALLOC_P(ctx, type) (type *)talloc_named_const(ctx, sizeof(type), #type)
 
 #endif /* _NSSWITCH_PAM_WINBIND_H_ */

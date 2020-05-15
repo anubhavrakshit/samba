@@ -243,13 +243,7 @@ bool msrpc_parse(TALLOC_CTX *mem_ctx,
 	uint16_t len1, len2;
 	uint32_t ptr;
 	uint32_t *v;
-	size_t p_len = 1024;
-	char *p = talloc_array(mem_ctx, char, p_len);
 	bool ret = true;
-
-	if (!p) {
-		return false;
-	}
 
 	va_start(ap, format);
 	for (i=0; format[i]; i++) {
@@ -262,7 +256,11 @@ bool msrpc_parse(TALLOC_CTX *mem_ctx,
 
 			ps = va_arg(ap, char **);
 			if (len1 == 0 && len2 == 0) {
-				*ps = (char *)discard_const("");
+				*ps = talloc_strdup(mem_ctx, "");
+				if (*ps == NULL) {
+					ret = false;
+					goto cleanup;
+				}
 			} else {
 				/* make sure its in the right format - be strict */
 				if ((len1 != len2) || (ptr + len1 < ptr) || (ptr + len1 < len1) || (ptr + len1 > blob->length)) {
@@ -289,7 +287,11 @@ bool msrpc_parse(TALLOC_CTX *mem_ctx,
 						goto cleanup;
 					}
 				} else {
-					(*ps) = (char *)discard_const("");
+					*ps = talloc_strdup(mem_ctx, "");
+					if (*ps == NULL) {
+						ret = false;
+						goto cleanup;
+					}
 				}
 			}
 			break;
@@ -302,7 +304,11 @@ bool msrpc_parse(TALLOC_CTX *mem_ctx,
 			ps = (char **)va_arg(ap, char **);
 			/* make sure its in the right format - be strict */
 			if (len1 == 0 && len2 == 0) {
-				*ps = (char *)discard_const("");
+				*ps = talloc_strdup(mem_ctx, "");
+				if (*ps == NULL) {
+					ret = false;
+					goto cleanup;
+				}
 			} else {
 				if ((len1 != len2) || (ptr + len1 < ptr) || (ptr + len1 < len1) || (ptr + len1 > blob->length)) {
 					ret = false;
@@ -325,7 +331,11 @@ bool msrpc_parse(TALLOC_CTX *mem_ctx,
 						goto cleanup;
 					}
 				} else {
-					(*ps) = (char *)discard_const("");
+					*ps = talloc_strdup(mem_ctx, "");
+					if (*ps == NULL) {
+						ret = false;
+						goto cleanup;
+					}
 				}
 			}
 			break;
@@ -395,6 +405,5 @@ bool msrpc_parse(TALLOC_CTX *mem_ctx,
 
 cleanup:
 	va_end(ap);
-	talloc_free(p);
 	return ret;
 }

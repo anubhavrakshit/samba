@@ -20,21 +20,39 @@
 #include "includes.h"
 #include "system/network.h"
 #include "system/filesys.h"
+#include "system/time.h"
 #include "../util/tevent_unix.h"
 #include "../lib/tsocket/tsocket.h"
 #include "../lib/tsocket/tsocket_internal.h"
+#include "../lib/util/util_net.h"
 #include "lib/tls/tls.h"
 
-#if ENABLE_GNUTLS
 #include <gnutls/gnutls.h>
+#include <gnutls/x509.h>
 
 #define DH_BITS 2048
 
-#if defined(HAVE_GNUTLS_DATUM) && !defined(HAVE_GNUTLS_DATUM_T)
-typedef gnutls_datum gnutls_datum_t;
-#endif
+const char *tls_verify_peer_string(enum tls_verify_peer_state verify_peer)
+{
+	switch (verify_peer) {
+	case TLS_VERIFY_PEER_NO_CHECK:
+		return TLS_VERIFY_PEER_NO_CHECK_STRING;
 
-#endif /* ENABLE_GNUTLS */
+	case TLS_VERIFY_PEER_CA_ONLY:
+		return TLS_VERIFY_PEER_CA_ONLY_STRING;
+
+	case TLS_VERIFY_PEER_CA_AND_NAME_IF_AVAILABLE:
+		return TLS_VERIFY_PEER_CA_AND_NAME_IF_AVAILABLE_STRING;
+
+	case TLS_VERIFY_PEER_CA_AND_NAME:
+		return TLS_VERIFY_PEER_CA_AND_NAME_STRING;
+
+	case TLS_VERIFY_PEER_AS_STRICT_AS_POSSIBLE:
+		return TLS_VERIFY_PEER_AS_STRICT_AS_POSSIBLE_STRING;
+	}
+
+	return "unknown tls_verify_peer_state";
+}
 
 static const struct tstream_context_ops tstream_tls_ops;
 
@@ -42,9 +60,10 @@ struct tstream_tls {
 	struct tstream_context *plain_stream;
 	int error;
 
-#if ENABLE_GNUTLS
-	gnutls_session tls_session;
-#endif /* ENABLE_GNUTLS */
+	gnutls_session_t tls_session;
+
+	enum tls_verify_peer_state verify_peer;
+	const char *peer_name;
 
 	struct tevent_context *current_ev;
 
@@ -140,12 +159,11 @@ static void tstream_tls_retry_trigger(struct tevent_context *ctx,
 	tstream_tls_retry(stream, true);
 }
 
-#if ENABLE_GNUTLS
 static void tstream_tls_push_trigger_write(struct tevent_context *ev,
 					   struct tevent_immediate *im,
 					   void *private_data);
 
-static ssize_t tstream_tls_push_function(gnutls_transport_ptr ptr,
+static ssize_t tstream_tls_push_function(gnutls_transport_ptr_t ptr,
 					 const void *buf, size_t size)
 {
 	struct tstream_context *stream =
@@ -284,7 +302,7 @@ static void tstream_tls_push_done(struct tevent_req *subreq)
 
 static void tstream_tls_pull_done(struct tevent_req *subreq);
 
-static ssize_t tstream_tls_pull_function(gnutls_transport_ptr ptr,
+static ssize_t tstream_tls_pull_function(gnutls_transport_ptr_t ptr,
 					 void *buf, size_t size)
 {
 	struct tstream_context *stream =
@@ -378,16 +396,14 @@ static void tstream_tls_pull_done(struct tevent_req *subreq)
 
 	tstream_tls_retry(stream, false);
 }
-#endif /* ENABLE_GNUTLS */
 
 static int tstream_tls_destructor(struct tstream_tls *tlss)
 {
-#if ENABLE_GNUTLS
 	if (tlss->tls_session) {
 		gnutls_deinit(tlss->tls_session);
 		tlss->tls_session = NULL;
 	}
-#endif /* ENABLE_GNUTLS */
+
 	return 0;
 }
 
@@ -403,13 +419,9 @@ static ssize_t tstream_tls_pending_bytes(struct tstream_context *stream)
 		return -1;
 	}
 
-#if ENABLE_GNUTLS
 	ret = gnutls_record_check_pending(tlss->tls_session);
 	ret += tlss->read.left;
-#else /* ENABLE_GNUTLS */
-	errno = ENOSYS;
-	ret = -1;
-#endif /* ENABLE_GNUTLS */
+
 	return ret;
 }
 
@@ -519,7 +531,6 @@ static void tstream_tls_retry_read(struct tstream_context *stream)
 		tstream_context_data(stream,
 		struct tstream_tls);
 	struct tevent_req *req = tlss->read.req;
-#if ENABLE_GNUTLS
 	int ret;
 
 	if (tlss->error != 0) {
@@ -554,9 +565,6 @@ static void tstream_tls_retry_read(struct tstream_context *stream)
 
 	tlss->read.left = ret;
 	tstream_tls_readv_crypt_next(req);
-#else /* ENABLE_GNUTLS */
-	tevent_req_error(req, ENOSYS);
-#endif /* ENABLE_GNUTLS */
 }
 
 static int tstream_tls_readv_recv(struct tevent_req *req,
@@ -693,7 +701,6 @@ static void tstream_tls_retry_write(struct tstream_context *stream)
 		tstream_context_data(stream,
 		struct tstream_tls);
 	struct tevent_req *req = tlss->write.req;
-#if ENABLE_GNUTLS
 	int ret;
 
 	if (tlss->error != 0) {
@@ -733,9 +740,6 @@ static void tstream_tls_retry_write(struct tstream_context *stream)
 	}
 
 	tstream_tls_writev_crypt_next(req);
-#else /* ENABLE_GNUTLS */
-	tevent_req_error(req, ENOSYS);
-#endif /* ENABLE_GNUTLS */
 }
 
 static int tstream_tls_writev_recv(struct tevent_req *req,
@@ -803,7 +807,6 @@ static void tstream_tls_retry_disconnect(struct tstream_context *stream)
 		tstream_context_data(stream,
 		struct tstream_tls);
 	struct tevent_req *req = tlss->disconnect.req;
-#if ENABLE_GNUTLS
 	int ret;
 
 	if (tlss->error != 0) {
@@ -833,9 +836,6 @@ static void tstream_tls_retry_disconnect(struct tstream_context *stream)
 	}
 
 	tevent_req_done(req);
-#else /* ENABLE_GNUTLS */
-	tevent_req_error(req, ENOSYS);
-#endif /* ENABLE_GNUTLS */
 }
 
 static int tstream_tls_disconnect_recv(struct tevent_req *req,
@@ -865,17 +865,16 @@ static const struct tstream_context_ops tstream_tls_ops = {
 };
 
 struct tstream_tls_params {
-#if ENABLE_GNUTLS
-	gnutls_certificate_credentials x509_cred;
-	gnutls_dh_params dh_params;
+	gnutls_certificate_credentials_t x509_cred;
+	gnutls_dh_params_t dh_params;
 	const char *tls_priority;
-#endif /* ENABLE_GNUTLS */
 	bool tls_enabled;
+	enum tls_verify_peer_state verify_peer;
+	const char *peer_name;
 };
 
 static int tstream_tls_params_destructor(struct tstream_tls_params *tlsp)
 {
-#if ENABLE_GNUTLS
 	if (tlsp->x509_cred) {
 		gnutls_certificate_free_credentials(tlsp->x509_cred);
 		tlsp->x509_cred = NULL;
@@ -884,7 +883,7 @@ static int tstream_tls_params_destructor(struct tstream_tls_params *tlsp)
 		gnutls_dh_params_deinit(tlsp->dh_params);
 		tlsp->dh_params = NULL;
 	}
-#endif /* ENABLE_GNUTLS */
+
 	return 0;
 }
 
@@ -897,22 +896,32 @@ NTSTATUS tstream_tls_params_client(TALLOC_CTX *mem_ctx,
 				   const char *ca_file,
 				   const char *crl_file,
 				   const char *tls_priority,
+				   enum tls_verify_peer_state verify_peer,
+				   const char *peer_name,
 				   struct tstream_tls_params **_tlsp)
 {
-#if ENABLE_GNUTLS
 	struct tstream_tls_params *tlsp;
 	int ret;
-
-	ret = gnutls_global_init();
-	if (ret != GNUTLS_E_SUCCESS) {
-		DEBUG(0,("TLS %s - %s\n", __location__, gnutls_strerror(ret)));
-		return NT_STATUS_NOT_SUPPORTED;
-	}
 
 	tlsp = talloc_zero(mem_ctx, struct tstream_tls_params);
 	NT_STATUS_HAVE_NO_MEMORY(tlsp);
 
 	talloc_set_destructor(tlsp, tstream_tls_params_destructor);
+
+	tlsp->verify_peer = verify_peer;
+	if (peer_name != NULL) {
+		tlsp->peer_name = talloc_strdup(tlsp, peer_name);
+		if (tlsp->peer_name == NULL) {
+			talloc_free(tlsp);
+			return NT_STATUS_NO_MEMORY;
+		}
+	} else if (tlsp->verify_peer >= TLS_VERIFY_PEER_CA_AND_NAME) {
+		DEBUG(0,("TLS failed to missing peer_name - "
+			 "with 'tls verify peer = %s'\n",
+			 tls_verify_peer_string(tlsp->verify_peer)));
+		talloc_free(tlsp);
+		return NT_STATUS_INVALID_PARAMETER_MIX;
+	}
 
 	ret = gnutls_certificate_allocate_credentials(&tlsp->x509_cred);
 	if (ret != GNUTLS_E_SUCCESS) {
@@ -931,6 +940,13 @@ NTSTATUS tstream_tls_params_client(TALLOC_CTX *mem_ctx,
 			talloc_free(tlsp);
 			return NT_STATUS_CANT_ACCESS_DOMAIN_INFO;
 		}
+	} else if (tlsp->verify_peer >= TLS_VERIFY_PEER_CA_ONLY) {
+		DEBUG(0,("TLS failed to missing cafile %s - "
+			 "with 'tls verify peer = %s'\n",
+			 ca_file,
+			 tls_verify_peer_string(tlsp->verify_peer)));
+		talloc_free(tlsp);
+		return NT_STATUS_INVALID_PARAMETER_MIX;
 	}
 
 	if (crl_file && *crl_file && file_exist(crl_file)) {
@@ -943,6 +959,13 @@ NTSTATUS tstream_tls_params_client(TALLOC_CTX *mem_ctx,
 			talloc_free(tlsp);
 			return NT_STATUS_CANT_ACCESS_DOMAIN_INFO;
 		}
+	} else if (tlsp->verify_peer >= TLS_VERIFY_PEER_AS_STRICT_AS_POSSIBLE) {
+		DEBUG(0,("TLS failed to missing crlfile %s - "
+			 "with 'tls verify peer = %s'\n",
+			 crl_file,
+			 tls_verify_peer_string(tlsp->verify_peer)));
+		talloc_free(tlsp);
+		return NT_STATUS_INVALID_PARAMETER_MIX;
 	}
 
 	tlsp->tls_priority = talloc_strdup(tlsp, tls_priority);
@@ -955,9 +978,6 @@ NTSTATUS tstream_tls_params_client(TALLOC_CTX *mem_ctx,
 
 	*_tlsp = tlsp;
 	return NT_STATUS_OK;
-#else /* ENABLE_GNUTLS */
-	return NT_STATUS_NOT_IMPLEMENTED;
-#endif /* ENABLE_GNUTLS */
 }
 
 struct tstream_tls_connect_state {
@@ -973,10 +993,8 @@ struct tevent_req *_tstream_tls_connect_send(TALLOC_CTX *mem_ctx,
 	struct tevent_req *req;
 	struct tstream_tls_connect_state *state;
 	const char *error_pos;
-#if ENABLE_GNUTLS
 	struct tstream_tls *tlss;
 	int ret;
-#endif /* ENABLE_GNUTLS */
 
 	req = tevent_req_create(mem_ctx, &state,
 				struct tstream_tls_connect_state);
@@ -984,7 +1002,6 @@ struct tevent_req *_tstream_tls_connect_send(TALLOC_CTX *mem_ctx,
 		return NULL;
 	}
 
-#if ENABLE_GNUTLS
 	state->tls_stream = tstream_context_create(state,
 						   &tstream_tls_ops,
 						   &tlss,
@@ -997,6 +1014,13 @@ struct tevent_req *_tstream_tls_connect_send(TALLOC_CTX *mem_ctx,
 	talloc_set_destructor(tlss, tstream_tls_destructor);
 
 	tlss->plain_stream = plain_stream;
+	tlss->verify_peer = tls_params->verify_peer;
+	if (tls_params->peer_name != NULL) {
+		tlss->peer_name = talloc_strdup(tlss, tls_params->peer_name);
+		if (tevent_req_nomem(tlss->peer_name, req)) {
+			return tevent_req_post(req, ev);
+		}
+	}
 
 	tlss->current_ev = ev;
 	tlss->retry_im = tevent_create_immediate(tlss);
@@ -1030,14 +1054,12 @@ struct tevent_req *_tstream_tls_connect_send(TALLOC_CTX *mem_ctx,
 		return tevent_req_post(req, ev);
 	}
 
-	gnutls_transport_set_ptr(tlss->tls_session, (gnutls_transport_ptr)state->tls_stream);
+	gnutls_transport_set_ptr(tlss->tls_session,
+				 (gnutls_transport_ptr_t)state->tls_stream);
 	gnutls_transport_set_pull_function(tlss->tls_session,
 					   (gnutls_pull_func)tstream_tls_pull_function);
 	gnutls_transport_set_push_function(tlss->tls_session,
 					   (gnutls_push_func)tstream_tls_push_function);
-#if GNUTLS_VERSION_MAJOR < 3
-	gnutls_transport_set_lowat(tlss->tls_session, 0);
-#endif
 
 	tlss->handshake.req = req;
 	tstream_tls_retry_handshake(state->tls_stream);
@@ -1046,10 +1068,6 @@ struct tevent_req *_tstream_tls_connect_send(TALLOC_CTX *mem_ctx,
 	}
 
 	return req;
-#else /* ENABLE_GNUTLS */
-	tevent_req_error(req, ENOSYS);
-	return tevent_req_post(req, ev);
-#endif /* ENABLE_GNUTLS */
 }
 
 int tstream_tls_connect_recv(struct tevent_req *req,
@@ -1086,7 +1104,6 @@ NTSTATUS tstream_tls_params_server(TALLOC_CTX *mem_ctx,
 				   struct tstream_tls_params **_tlsp)
 {
 	struct tstream_tls_params *tlsp;
-#if ENABLE_GNUTLS
 	int ret;
 	struct stat st;
 
@@ -1098,12 +1115,6 @@ NTSTATUS tstream_tls_params_server(TALLOC_CTX *mem_ctx,
 
 		*_tlsp = tlsp;
 		return NT_STATUS_OK;
-	}
-
-	ret = gnutls_global_init();
-	if (ret != GNUTLS_E_SUCCESS) {
-		DEBUG(0,("TLS %s - %s\n", __location__, gnutls_strerror(ret)));
-		return NT_STATUS_NOT_SUPPORTED;
 	}
 
 	tlsp = talloc_zero(mem_ctx, struct tstream_tls_params);
@@ -1221,13 +1232,6 @@ NTSTATUS tstream_tls_params_server(TALLOC_CTX *mem_ctx,
 
 	tlsp->tls_enabled = true;
 
-#else /* ENABLE_GNUTLS */
-	tlsp = talloc_zero(mem_ctx, struct tstream_tls_params);
-	NT_STATUS_HAVE_NO_MEMORY(tlsp);
-	talloc_set_destructor(tlsp, tstream_tls_params_destructor);
-	tlsp->tls_enabled = false;
-#endif /* ENABLE_GNUTLS */
-
 	*_tlsp = tlsp;
 	return NT_STATUS_OK;
 }
@@ -1246,9 +1250,7 @@ struct tevent_req *_tstream_tls_accept_send(TALLOC_CTX *mem_ctx,
 	struct tstream_tls_accept_state *state;
 	struct tstream_tls *tlss;
 	const char *error_pos;
-#if ENABLE_GNUTLS
 	int ret;
-#endif /* ENABLE_GNUTLS */
 
 	req = tevent_req_create(mem_ctx, &state,
 				struct tstream_tls_accept_state);
@@ -1267,7 +1269,6 @@ struct tevent_req *_tstream_tls_accept_send(TALLOC_CTX *mem_ctx,
 	ZERO_STRUCTP(tlss);
 	talloc_set_destructor(tlss, tstream_tls_destructor);
 
-#if ENABLE_GNUTLS
 	tlss->plain_stream = plain_stream;
 
 	tlss->current_ev = ev;
@@ -1305,14 +1306,12 @@ struct tevent_req *_tstream_tls_accept_send(TALLOC_CTX *mem_ctx,
 					      GNUTLS_CERT_REQUEST);
 	gnutls_dh_set_prime_bits(tlss->tls_session, DH_BITS);
 
-	gnutls_transport_set_ptr(tlss->tls_session, (gnutls_transport_ptr)state->tls_stream);
+	gnutls_transport_set_ptr(tlss->tls_session,
+				 (gnutls_transport_ptr_t)state->tls_stream);
 	gnutls_transport_set_pull_function(tlss->tls_session,
 					   (gnutls_pull_func)tstream_tls_pull_function);
 	gnutls_transport_set_push_function(tlss->tls_session,
 					   (gnutls_push_func)tstream_tls_push_function);
-#if GNUTLS_VERSION_MAJOR < 3
-	gnutls_transport_set_lowat(tlss->tls_session, 0);
-#endif
 
 	tlss->handshake.req = req;
 	tstream_tls_retry_handshake(state->tls_stream);
@@ -1321,10 +1320,6 @@ struct tevent_req *_tstream_tls_accept_send(TALLOC_CTX *mem_ctx,
 	}
 
 	return req;
-#else /* ENABLE_GNUTLS */
-	tevent_req_error(req, ENOSYS);
-	return tevent_req_post(req, ev);
-#endif /* ENABLE_GNUTLS */
 }
 
 static void tstream_tls_retry_handshake(struct tstream_context *stream)
@@ -1333,7 +1328,6 @@ static void tstream_tls_retry_handshake(struct tstream_context *stream)
 		tstream_context_data(stream,
 		struct tstream_tls);
 	struct tevent_req *req = tlss->handshake.req;
-#if ENABLE_GNUTLS
 	int ret;
 
 	if (tlss->error != 0) {
@@ -1362,10 +1356,75 @@ static void tstream_tls_retry_handshake(struct tstream_context *stream)
 		return;
 	}
 
+	if (tlss->verify_peer >= TLS_VERIFY_PEER_CA_ONLY) {
+		unsigned int status = UINT32_MAX;
+		bool ip = true;
+		const char *hostname = NULL;
+
+		if (tlss->peer_name != NULL) {
+			ip = is_ipaddress(tlss->peer_name);
+		}
+
+		if (!ip) {
+			hostname = tlss->peer_name;
+		}
+
+		if (tlss->verify_peer == TLS_VERIFY_PEER_CA_ONLY) {
+			hostname = NULL;
+		}
+
+		if (tlss->verify_peer >= TLS_VERIFY_PEER_CA_AND_NAME) {
+			if (hostname == NULL) {
+				DEBUG(1,("TLS %s - no hostname available for "
+					 "verify_peer[%s] and peer_name[%s]\n",
+					 __location__,
+					 tls_verify_peer_string(tlss->verify_peer),
+					 tlss->peer_name));
+				tlss->error = EINVAL;
+				tevent_req_error(req, tlss->error);
+				return;
+			}
+		}
+
+		ret = gnutls_certificate_verify_peers3(tlss->tls_session,
+						       hostname,
+						       &status);
+		if (ret != GNUTLS_E_SUCCESS) {
+			DEBUG(1,("TLS %s - %s\n", __location__, gnutls_strerror(ret)));
+			tlss->error = EIO;
+			tevent_req_error(req, tlss->error);
+			return;
+		}
+
+		if (status != 0) {
+			DEBUG(1,("TLS %s - check failed for "
+				 "verify_peer[%s] and peer_name[%s] "
+				 "status 0x%x (%s%s%s%s%s%s%s%s)\n",
+				 __location__,
+				 tls_verify_peer_string(tlss->verify_peer),
+				 tlss->peer_name,
+				 status,
+				 status & GNUTLS_CERT_INVALID ? "invalid " : "",
+				 status & GNUTLS_CERT_REVOKED ? "revoked " : "",
+				 status & GNUTLS_CERT_SIGNER_NOT_FOUND ?
+					"signer_not_found " : "",
+				 status & GNUTLS_CERT_SIGNER_NOT_CA ?
+					"signer_not_ca " : "",
+				 status & GNUTLS_CERT_INSECURE_ALGORITHM ?
+					"insecure_algorithm " : "",
+				 status & GNUTLS_CERT_NOT_ACTIVATED ?
+					"not_activated " : "",
+				 status & GNUTLS_CERT_EXPIRED ?
+					"expired " : "",
+				 status & GNUTLS_CERT_UNEXPECTED_OWNER ?
+					"unexptected_owner " : ""));
+			tlss->error = EINVAL;
+			tevent_req_error(req, tlss->error);
+			return;
+		}
+	}
+
 	tevent_req_done(req);
-#else /* ENABLE_GNUTLS */
-	tevent_req_error(req, ENOSYS);
-#endif /* ENABLE_GNUTLS */
 }
 
 int tstream_tls_accept_recv(struct tevent_req *req,

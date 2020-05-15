@@ -45,12 +45,6 @@ static const struct gpo_stringmap gpo_flags [] = {
 	{ "GPO_FLAG_MACHINE_DISABLE", GPO_FLAG_MACHINE_DISABLE },
 	{ NULL, 0 }
 };
-static const struct gpo_stringmap gpo_inheritance [] = {
-	{ "GPO_INHERIT", GPO_INHERIT },
-	{ "GPO_BLOCK_INHERITANCE", GPO_BLOCK_INHERITANCE },
-	{ NULL, 0 }
-};
-
 
 static NTSTATUS parse_gpo(TALLOC_CTX *mem_ctx, struct ldb_message *msg, struct gp_object **ret)
 {
@@ -404,7 +398,7 @@ NTSTATUS gp_get_gplinks(struct gp_context *gp_ctx, const char *dn_str, struct gp
 	struct gp_link **gplinks;
 	char *gplink_str;
 	int rv;
-	unsigned int i, j;
+	unsigned int i;
 	NTSTATUS status;
 
 	/* Create a forked memory context, as a base for everything here */
@@ -421,18 +415,18 @@ NTSTATUS gp_get_gplinks(struct gp_context *gp_ctx, const char *dn_str, struct gp
 	}
 
 	for (i = 0; i < result->count; i++) {
-		for (j = 0; j < result->msgs[i]->num_elements; j++) {
-			struct ldb_message_element *element = &result->msgs[i]->elements[j];
-
-			if (strcmp(element->name, "gPLink") == 0) {
-				SMB_ASSERT(element->num_values > 0);
-				gplink_str = talloc_strdup(mem_ctx, (char *) element->values[0].data);
-				if (gplink_str == NULL) {
-					TALLOC_FREE(mem_ctx);
-					return NT_STATUS_NO_MEMORY;
-				}
-				goto found;
+		struct ldb_message_element *element = \
+			ldb_msg_find_element(result->msgs[i], "gPLink");
+		if (element != NULL) {
+			SMB_ASSERT(element->num_values > 0);
+			gplink_str = talloc_strdup(
+				mem_ctx,
+				(char *) element->values[0].data);
+			if (gplink_str == NULL) {
+				TALLOC_FREE(mem_ctx);
+				return NT_STATUS_NO_MEMORY;
 			}
+			goto found;
 		}
 	}
 	gplink_str = talloc_strdup(mem_ctx, "");

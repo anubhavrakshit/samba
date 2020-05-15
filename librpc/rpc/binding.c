@@ -98,13 +98,15 @@ static const struct ncacn_option {
 	{"spnego", DCERPC_AUTH_SPNEGO},
 	{"ntlm", DCERPC_AUTH_NTLM},
 	{"krb5", DCERPC_AUTH_KRB5},
-	{"schannel", DCERPC_SCHANNEL},
+	{"schannel", DCERPC_SCHANNEL | DCERPC_SCHANNEL_AUTO},
 	{"validate", DCERPC_DEBUG_VALIDATE_BOTH},
 	{"print", DCERPC_DEBUG_PRINT_BOTH},
 	{"padcheck", DCERPC_DEBUG_PAD_CHECK},
 	{"bigendian", DCERPC_PUSH_BIGENDIAN},
+	{"smb1", DCERPC_SMB1},
 	{"smb2", DCERPC_SMB2},
 	{"ndr64", DCERPC_NDR64},
+	{"packet", DCERPC_PACKET},
 };
 
 static const struct ncacn_option *ncacn_option_by_name(const char *name)
@@ -590,8 +592,10 @@ _PUBLIC_ void dcerpc_binding_get_auth_info(const struct dcerpc_binding *b,
 		auth_level = DCERPC_AUTH_LEVEL_INTEGRITY;
 	} else if (b->flags & DCERPC_CONNECT) {
 		auth_level = DCERPC_AUTH_LEVEL_CONNECT;
+	} else if (b->flags & DCERPC_PACKET) {
+		auth_level = DCERPC_AUTH_LEVEL_PACKET;
 	} else if (auth_type != DCERPC_AUTH_TYPE_NONE) {
-		auth_level = DCERPC_AUTH_LEVEL_CONNECT;
+		auth_level = DCERPC_AUTH_LEVEL_INTEGRITY;
 	} else {
 		auth_level = DCERPC_AUTH_LEVEL_NONE;
 	}
@@ -1226,7 +1230,7 @@ _PUBLIC_ enum dcerpc_transport_t dcerpc_transport_by_tower(const struct epm_towe
 			continue; 
 		}
 
-		for (j = 0; j < transports[i].num_protocols; j++) {
+		for (j = 0; j < transports[i].num_protocols && j < MAX_PROTSEQ; j++) {
 			if (transports[i].protseq[j] != tower->floors[j+2].lhs.protocol) {
 				break;
 			}

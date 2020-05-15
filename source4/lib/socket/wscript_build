@@ -10,7 +10,7 @@ bld.SAMBA_LIBRARY('netif',
 bld.SAMBA_MODULE('socket_ip',
     source='socket_ip.c',
     subsystem='samba_socket',
-    deps='errors',
+    deps='samba-errors',
     internal_module=True
     )
 
@@ -24,6 +24,6 @@ bld.SAMBA_MODULE('socket_unix',
 bld.SAMBA_SUBSYSTEM('samba_socket',
     source='socket.c access.c connect_multi.c connect.c',
     public_deps='talloc LIBTSOCKET',
-    deps='cli_composite LIBCLI_RESOLVE socket_ip socket_unix'
+    deps='cli_composite LIBCLI_RESOLVE socket_ip socket_unix access'
     )
 

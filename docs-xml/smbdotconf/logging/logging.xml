@@ -1,6 +1,7 @@
 <samba:parameter name="logging"
                  type="string"
                  context="G"
+                 substitution="1"
                  xmlns:samba="http://www.samba.org/samba/DTD/samba-doc">
 <description>
 
@@ -31,7 +32,12 @@
     <listitem><para><parameter moreinfo="none">systemd</parameter></para></listitem>
     <listitem><para><parameter moreinfo="none">lttng</parameter></para></listitem>
     <listitem><para><parameter moreinfo="none">gpfs</parameter></para></listitem>
+    <listitem><para><parameter moreinfo="none">ringbuf</parameter></para></listitem>
   </itemizedlist>
+
+  <para>The <parameter moreinfo="none">ringbuf</parameter> backend supports an
+  optional size argument to change the buffer size used, the default is 1 MB:
+  <parameter moreinfo="none">ringbuf:size=NBYTES</parameter></para>
 
 </description>
 <value type="default"></value>

@@ -81,7 +81,6 @@ static bool set_my_netbios_names(const char *name, int i)
 void gfree_names(void)
 {
 	free_netbios_names_array();
-	free_local_machine_name();
 }
 
 const char *my_netbios_names(int i)
@@ -147,8 +146,6 @@ bool init_names(void)
 		return False;
 	}
 
-	set_local_machine_name(lp_netbios_name(),false);
-
 	DEBUG( 5, ("Netbios name list:-\n") );
 	for( n=0; my_netbios_names(n); n++ ) {
 		DEBUGADD( 5, ("my_netbios_names[%d]=\"%s\"\n",
@@ -171,3 +168,17 @@ const char *get_global_sam_name(void)
 	return lp_netbios_name();
 }
 
+
+/******************************************************************
+ Get the default domain/netbios name to be used when
+ testing authentication.
+******************************************************************/
+
+const char *my_sam_name(void)
+{
+	if (lp_server_role() == ROLE_STANDALONE) {
+		return lp_netbios_name();
+	}
+
+	return lp_workgroup();
+}

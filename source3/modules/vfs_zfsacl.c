@@ -27,7 +27,7 @@
 #include "smbd/smbd.h"
 #include "nfs4_acls.h"
 
-#if HAVE_FREEBSD_SUNACL_H
+#ifdef HAVE_FREEBSD_SUNACL_H
 #include "sunacl.h"
 #endif
 
@@ -36,26 +36,54 @@
 
 #define ZFSACL_MODULE_NAME "zfsacl"
 
+struct zfsacl_config_data {
+	struct smbacl4_vfs_params nfs4_params;
+	bool zfsacl_map_dacl_protected;
+	bool zfsacl_denymissingspecial;
+};
+
 /* zfs_get_nt_acl()
  * read the local file's acls and return it in NT form
  * using the NFSv4 format conversion
  */
-static NTSTATUS zfs_get_nt_acl_common(TALLOC_CTX *mem_ctx,
-				      const char *name,
-				      struct SMB4ACL_T **ppacl)
+static NTSTATUS zfs_get_nt_acl_common(struct connection_struct *conn,
+				      TALLOC_CTX *mem_ctx,
+				      const struct smb_filename *smb_fname,
+				      struct SMB4ACL_T **ppacl,
+				      struct zfsacl_config_data *config)
 {
 	int naces, i;
 	ace_t *acebuf;
 	struct SMB4ACL_T *pacl;
+	SMB_STRUCT_STAT sbuf;
+	const SMB_STRUCT_STAT *psbuf = NULL;
+	int ret;
+	bool inherited_is_present = false;
+	bool is_dir;
+
+	if (VALID_STAT(smb_fname->st)) {
+		psbuf = &smb_fname->st;
+	}
+
+	if (psbuf == NULL) {
+		ret = vfs_stat_smb_basename(conn, smb_fname, &sbuf);
+		if (ret != 0) {
+			DBG_INFO("stat [%s]failed: %s\n",
+				 smb_fname_str_dbg(smb_fname), strerror(errno));
+			return map_nt_error_from_unix(errno);
+		}
+		psbuf = &sbuf;
+	}
+	is_dir = S_ISDIR(psbuf->st_ex_mode);
 
 	/* read the number of file aces */
-	if((naces = acl(name, ACE_GETACLCNT, 0, NULL)) == -1) {
+	if((naces = acl(smb_fname->base_name, ACE_GETACLCNT, 0, NULL)) == -1) {
 		if(errno == ENOSYS) {
 			DEBUG(9, ("acl(ACE_GETACLCNT, %s): Operation is not "
 				  "supported on the filesystem where the file "
-				  "reside\n", name));
+				  "reside\n", smb_fname->base_name));
 		} else {
-			DEBUG(9, ("acl(ACE_GETACLCNT, %s): %s ", name,
+			DEBUG(9, ("acl(ACE_GETACLCNT, %s): %s ", smb_fname->base_name,
 					strerror(errno)));
 		}
 		return map_nt_error_from_unix(errno);
@@ -67,8 +95,8 @@ static NTSTATUS zfs_get_nt_acl_common(TALLOC_CTX *mem_ctx,
 		return NT_STATUS_NO_MEMORY;
 	}
 	/* read the aces into the field */
-	if(acl(name, ACE_GETACL, naces, acebuf) < 0) {
-		DEBUG(9, ("acl(ACE_GETACL, %s): %s ", name,
+	if(acl(smb_fname->base_name, ACE_GETACL, naces, acebuf) < 0) {
+		DEBUG(9, ("acl(ACE_GETACL, %s): %s ", smb_fname->base_name,
 				strerror(errno)));
 		return map_nt_error_from_unix(errno);
 	}
@@ -84,6 +112,24 @@ static NTSTATUS zfs_get_nt_acl_common(TALLOC_CTX *mem_ctx,
 		aceprop.aceMask  = (uint32_t) acebuf[i].a_access_mask;
 		aceprop.who.id   = (uint32_t) acebuf[i].a_who;
 
+		/*
+		 * Windows clients expect SYNC on acls to correctly allow
+		 * rename, cf bug #7909. But not on DENY ace entries, cf bug
+		 * #8442.
+		 */
+		if (aceprop.aceType == SMB_ACE4_ACCESS_ALLOWED_ACE_TYPE) {
+			aceprop.aceMask |= SMB_ACE4_SYNCHRONIZE;
+		}
+
+		if (is_dir && (aceprop.aceMask & SMB_ACE4_ADD_FILE)) {
+			aceprop.aceMask |= SMB_ACE4_DELETE_CHILD;
+		}
+
+#ifdef ACE_INHERITED_ACE
+		if (aceprop.aceFlags & ACE_INHERITED_ACE) {
+			inherited_is_present = true;
+		}
+#endif
 		if(aceprop.aceFlags & ACE_OWNER) {
 			aceprop.flags = SMB_ACE4_ID_SPECIAL;
 			aceprop.who.special_id = SMB_ACE4_WHO_OWNER;
@@ -100,6 +146,15 @@ static NTSTATUS zfs_get_nt_acl_common(TALLOC_CTX *mem_ctx,
 			return NT_STATUS_NO_MEMORY;
 	}
 
+#ifdef ACE_INHERITED_ACE
+	if (!inherited_is_present && config->zfsacl_map_dacl_protected) {
+		DBG_DEBUG("Setting SEC_DESC_DACL_PROTECTED on [%s]\n",
+			  smb_fname_str_dbg(smb_fname));
+		smbacl4_set_controlflags(pacl,
+					 SEC_DESC_DACL_PROTECTED |
+					 SEC_DESC_SELF_RELATIVE);
+	}
+#endif
 	*ppacl = pacl;
 	return NT_STATUS_OK;
 }
@@ -113,6 +168,11 @@ static bool zfs_process_smbacl(vfs_handle_struct *handle, files_struct *fsp,
 	struct SMB4ACE_T *smbace;
 	TALLOC_CTX	*mem_ctx;
 	bool have_special_id = false;
+	struct zfsacl_config_data *config = NULL;
+
+	SMB_VFS_HANDLE_GET_DATA(handle, config,
+				struct zfsacl_config_data,
+				return False);
 
 	/* allocate the field of ZFS aces */
 	mem_ctx = talloc_tos();
@@ -154,9 +214,7 @@ static bool zfs_process_smbacl(vfs_handle_struct *handle, files_struct *fsp,
 		}
 	}
 
-	if (!have_special_id
-	    && lp_parm_bool(fsp->conn->params->service, "zfsacl",
-			    "denymissingspecial", false)) {
+	if (!have_special_id && config->zfsacl_denymissingspecial) {
 		errno = EACCES;
 		return false;
 	}
@@ -187,8 +245,18 @@ static NTSTATUS zfs_set_nt_acl(vfs_handle_struct *handle, files_struct *fsp,
 			   uint32_t security_info_sent,
 			   const struct security_descriptor *psd)
 {
-        return smb_set_nt_acl_nfs4(handle, fsp, security_info_sent, psd,
-				   zfs_process_smbacl);
+	struct zfsacl_config_data *config = NULL;
+
+	SMB_VFS_HANDLE_GET_DATA(handle, config,
+				struct zfsacl_config_data,
+				return NT_STATUS_INTERNAL_ERROR);
+
+	return smb_set_nt_acl_nfs4(handle,
+				fsp,
+				&config->nfs4_params,
+				security_info_sent,
+				psd,
+				zfs_process_smbacl);
 }
 
 static NTSTATUS zfsacl_fget_nt_acl(struct vfs_handle_struct *handle,
@@ -199,39 +267,97 @@ static NTSTATUS zfsacl_fget_nt_acl(struct vfs_handle_struct *handle,
 {
 	struct SMB4ACL_T *pacl;
 	NTSTATUS status;
+	struct zfsacl_config_data *config = NULL;
+
+	SMB_VFS_HANDLE_GET_DATA(handle, config,
+				struct zfsacl_config_data,
+				return NT_STATUS_INTERNAL_ERROR);
+
 	TALLOC_CTX *frame = talloc_stackframe();
 
-	status = zfs_get_nt_acl_common(frame,
-				       fsp->fsp_name->base_name,
-				       &pacl);
+	status = zfs_get_nt_acl_common(handle->conn, frame,
+				       fsp->fsp_name, &pacl, config);
 	if (!NT_STATUS_IS_OK(status)) {
 		TALLOC_FREE(frame);
-		return status;
+		if (!NT_STATUS_EQUAL(status, NT_STATUS_NOT_SUPPORTED)) {
+			return status;
+		}
+
+		status = make_default_filesystem_acl(mem_ctx,
+						     DEFAULT_ACL_POSIX,
+						     fsp->fsp_name->base_name,
+						     &fsp->fsp_name->st,
+						     ppdesc);
+		if (!NT_STATUS_IS_OK(status)) {
+			return status;
+		}
+		(*ppdesc)->type |= SEC_DESC_DACL_PROTECTED;
+		return NT_STATUS_OK;
 	}
 
-	status = smb_fget_nt_acl_nfs4(fsp, security_info, mem_ctx, ppdesc, pacl);
+	status = smb_fget_nt_acl_nfs4(fsp, NULL, security_info, mem_ctx,
+				      ppdesc, pacl);
 	TALLOC_FREE(frame);
 	return status;
 }
 
-static NTSTATUS zfsacl_get_nt_acl(struct vfs_handle_struct *handle,
-				  const char *name, uint32_t security_info,
-				  TALLOC_CTX *mem_ctx,
-				  struct security_descriptor **ppdesc)
+static NTSTATUS zfsacl_get_nt_acl_at(struct vfs_handle_struct *handle,
+				struct files_struct *dirfsp,
+				const struct smb_filename *smb_fname,
+				uint32_t security_info,
+				TALLOC_CTX *mem_ctx,
+				struct security_descriptor **ppdesc)
 {
-	struct SMB4ACL_T *pacl;
+	struct SMB4ACL_T *pacl = NULL;
 	NTSTATUS status;
-	TALLOC_CTX *frame = talloc_stackframe();
+	struct zfsacl_config_data *config = NULL;
+	TALLOC_CTX *frame = NULL;
 
-	status = zfs_get_nt_acl_common(frame, name, &pacl);
+	SMB_ASSERT(dirfsp == handle->conn->cwd_fsp);
+
+	SMB_VFS_HANDLE_GET_DATA(handle,
+				config,
+				struct zfsacl_config_data,
+				return NT_STATUS_INTERNAL_ERROR);
+
+	frame = talloc_stackframe();
+
+	status = zfs_get_nt_acl_common(handle->conn,
+				frame,
+				smb_fname,
+				&pacl,
+				config);
 	if (!NT_STATUS_IS_OK(status)) {
 		TALLOC_FREE(frame);
-		return status;
+		if (!NT_STATUS_EQUAL(status, NT_STATUS_NOT_SUPPORTED)) {
+			return status;
+		}
+
+		if (!VALID_STAT(smb_fname->st)) {
+			DBG_ERR("No stat info for [%s]\n",
+				smb_fname_str_dbg(smb_fname));
+			return NT_STATUS_INTERNAL_ERROR;
+		}
+
+		status = make_default_filesystem_acl(mem_ctx,
+						     DEFAULT_ACL_POSIX,
+						     smb_fname->base_name,
+						     &smb_fname->st,
+						     ppdesc);
+		if (!NT_STATUS_IS_OK(status)) {
+			return status;
+		}
+		(*ppdesc)->type |= SEC_DESC_DACL_PROTECTED;
+		return NT_STATUS_OK;
 	}
 
-	status = smb_get_nt_acl_nfs4(handle->conn, name, security_info,
-				     mem_ctx, ppdesc,
-				     pacl);
+	status = smb_get_nt_acl_nfs4(handle->conn,
+					smb_fname,
+					NULL,
+					security_info,
+					mem_ctx,
+					ppdesc,
+					pacl);
 	TALLOC_FREE(frame);
 	return status;
 }
@@ -276,9 +402,9 @@ static NTSTATUS zfsacl_fset_nt_acl(vfs_handle_struct *handle,
 */
 
 static SMB_ACL_T zfsacl_fail__sys_acl_get_file(vfs_handle_struct *handle,
-					       const char *path_p,
-					       SMB_ACL_TYPE_T type,
-					       TALLOC_CTX *mem_ctx)
+					const struct smb_filename *smb_fname,
+					SMB_ACL_TYPE_T type,
+					TALLOC_CTX *mem_ctx)
 {
 	return (SMB_ACL_T)NULL;
 }
@@ -291,7 +417,7 @@ static SMB_ACL_T zfsacl_fail__sys_acl_get_fd(vfs_handle_struct *handle,
 }
 
 static int zfsacl_fail__sys_acl_set_file(vfs_handle_struct *handle,
-					 const char *name,
+					 const struct smb_filename *smb_fname,
 					 SMB_ACL_TYPE_T type,
 					 SMB_ACL_T theacl)
 {
@@ -306,12 +432,16 @@ static int zfsacl_fail__sys_acl_set_fd(vfs_handle_struct *handle,
 }
 
 static int zfsacl_fail__sys_acl_delete_def_file(vfs_handle_struct *handle,
-						const char *path)
+			const struct smb_filename *smb_fname)
 {
 	return -1;
 }
 
-static int zfsacl_fail__sys_acl_blob_get_file(vfs_handle_struct *handle, const char *path_p, TALLOC_CTX *mem_ctx, char **blob_description, DATA_BLOB *blob)
+static int zfsacl_fail__sys_acl_blob_get_file(vfs_handle_struct *handle,
+			const struct smb_filename *smb_fname,
+			TALLOC_CTX *mem_ctx,
+			char **blob_description,
+			DATA_BLOB *blob)
 {
 	return -1;
 }
@@ -321,9 +451,47 @@ static int zfsacl_fail__sys_acl_blob_get_fd(vfs_handle_struct *handle, files_str
 	return -1;
 }
 
+static int zfsacl_connect(struct vfs_handle_struct *handle,
+			    const char *service, const char *user)
+{
+	struct zfsacl_config_data *config = NULL;
+	int ret;
+
+	ret = SMB_VFS_NEXT_CONNECT(handle, service, user);
+	if (ret < 0) {
+		return ret;
+	}
+
+	config = talloc_zero(handle->conn, struct zfsacl_config_data);
+	if (!config) {
+		DBG_ERR("talloc_zero() failed\n");
+		errno = ENOMEM;
+		return -1;
+	}
+
+	config->zfsacl_map_dacl_protected = lp_parm_bool(SNUM(handle->conn),
+				"zfsacl", "map_dacl_protected", false);
+
+	config->zfsacl_denymissingspecial = lp_parm_bool(SNUM(handle->conn),
+				"zfsacl", "denymissingspecial", false);
+
+	ret = smbacl4_get_vfs_params(handle->conn, &config->nfs4_params);
+	if (ret < 0) {
+		TALLOC_FREE(config);
+		return ret;
+	}
+
+	SMB_VFS_HANDLE_SET_DATA(handle, config,
+				NULL, struct zfsacl_config_data,
+				return -1);
+
+	return 0;
+}
+
 /* VFS operations structure */
 
 static struct vfs_fn_pointers zfsacl_fns = {
+	.connect_fn = zfsacl_connect,
 	.sys_acl_get_file_fn = zfsacl_fail__sys_acl_get_file,
 	.sys_acl_get_fd_fn = zfsacl_fail__sys_acl_get_fd,
 	.sys_acl_blob_get_file_fn = zfsacl_fail__sys_acl_blob_get_file,
@@ -332,12 +500,12 @@ static struct vfs_fn_pointers zfsacl_fns = {
 	.sys_acl_set_fd_fn = zfsacl_fail__sys_acl_set_fd,
 	.sys_acl_delete_def_file_fn = zfsacl_fail__sys_acl_delete_def_file,
 	.fget_nt_acl_fn = zfsacl_fget_nt_acl,
-	.get_nt_acl_fn = zfsacl_get_nt_acl,
+	.get_nt_acl_at_fn = zfsacl_get_nt_acl_at,
 	.fset_nt_acl_fn = zfsacl_fset_nt_acl,
 };
 
-NTSTATUS vfs_zfsacl_init(void);
-NTSTATUS vfs_zfsacl_init(void)
+static_decl_vfs;
+NTSTATUS vfs_zfsacl_init(TALLOC_CTX *ctx)
 {
 	return smb_register_vfs(SMB_VFS_INTERFACE_VERSION, "zfsacl",
 				&zfsacl_fns);

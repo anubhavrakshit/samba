@@ -64,7 +64,7 @@ struct async_info {
 	void *parms;
 };
 
-NTSTATUS ntvfs_cifs_init(void);
+NTSTATUS ntvfs_cifs_init(TALLOC_CTX *);
 
 #define CHECK_UPSTREAM_OPEN do { \
 	if (!smbXcli_conn_is_connected(p->transport->conn)) { \
@@ -296,6 +296,7 @@ static NTSTATUS cvfs_connect(struct ntvfs_module_context *ntvfs,
 	io.in.dest_ports = lpcfg_smb_ports(ntvfs->ctx->lp_ctx);
 	io.in.socket_options = lpcfg_socket_options(ntvfs->ctx->lp_ctx);
 	io.in.called_name = host;
+	io.in.existing_conn = NULL;
 	io.in.credentials = credentials;
 	io.in.fallback_to_anonymous = false;
 	io.in.workgroup = lpcfg_workgroup(ntvfs->ctx->lp_ctx);
@@ -597,9 +598,15 @@ static void async_open(struct smbcli_request *c_req)
 	struct cvfs_file *f = async->f;
 	union smb_open *io = async->parms;
 	union smb_handle *file;
+	if (f == NULL) {
+		goto failed;
+	}
 	talloc_free(async);
 	req->async_states->status = smb_raw_open_recv(c_req, req, io);
 	SMB_OPEN_OUT_FILE(io, file);
+	if (file == NULL) {
+		goto failed;
+	}
 	f->fnum = file->fnum;
 	file->ntvfs = NULL;
 	if (!NT_STATUS_IS_OK(req->async_states->status)) goto failed;
@@ -644,6 +651,9 @@ static NTSTATUS cvfs_open(struct ntvfs_module_context *ntvfs,
 		NT_STATUS_NOT_OK_RETURN(status);
 
 		SMB_OPEN_OUT_FILE(io, file);
+		if (file == NULL) {
+			return NT_STATUS_INVALID_PARAMETER;
+		}
 		f->fnum = file->fnum;
 		file->ntvfs = NULL;
 		status = ntvfs_handle_set_backend_data(f->h, p->ntvfs, f);
@@ -1201,7 +1211,7 @@ static NTSTATUS cvfs_notify(struct ntvfs_module_context *ntvfs,
 /*
   initialise the CIFS->CIFS backend, registering ourselves with the ntvfs subsystem
  */
-NTSTATUS ntvfs_cifs_init(void)
+NTSTATUS ntvfs_cifs_init(TALLOC_CTX *ctx)
 {
 	NTSTATUS ret;
 	struct ntvfs_ops ops;

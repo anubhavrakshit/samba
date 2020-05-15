@@ -19,14 +19,16 @@
 
 #include "includes.h"
 #include "winbindd.h"
+#include "libcli/security/dom_sid.h"
 
 struct winbindd_getgrgid_state {
 	struct tevent_context *ev;
-	struct dom_sid sid;
+	struct unixid xid;
+	struct dom_sid *sid;
 	const char *domname;
 	const char *name;
 	gid_t gid;
-	struct talloc_dict *members;
+	struct db_context *members;
 };
 
 static void winbindd_getgrgid_gid2sid_done(struct tevent_req *subreq);
@@ -47,9 +49,15 @@ struct tevent_req *winbindd_getgrgid_send(TALLOC_CTX *mem_ctx,
 	}
 	state->ev = ev;
 
-	DEBUG(3, ("getgrgid %d\n", (int)request->data.gid));
+	DBG_NOTICE("[%s (%u)] getgrgid %d\n",
+		   cli->client_name,
+		   (unsigned int)cli->pid,
+		   (int)request->data.gid);
 
-	subreq = wb_gid2sid_send(state, ev, request->data.gid);
+	state->xid = (struct unixid) {
+		.id = request->data.uid, .type = ID_TYPE_GID };
+
+	subreq = wb_xids2sids_send(state, ev, &state->xid, 1);
 	if (tevent_req_nomem(subreq, req)) {
 		return tevent_req_post(req, ev);
 	}
@@ -66,13 +74,17 @@ static void winbindd_getgrgid_gid2sid_done(struct tevent_req *subreq)
 		req, struct winbindd_getgrgid_state);
 	NTSTATUS status;
 
-	status = wb_gid2sid_recv(subreq, &state->sid);
+	status = wb_xids2sids_recv(subreq, state, &state->sid);
 	TALLOC_FREE(subreq);
 	if (tevent_req_nterror(req, status)) {
 		return;
 	}
+	if (is_null_sid(state->sid)) {
+		tevent_req_nterror(req, NT_STATUS_NO_SUCH_GROUP);
+		return;
+	}
 
-	subreq = wb_getgrsid_send(state, state->ev, &state->sid,
+	subreq = wb_getgrsid_send(state, state->ev, state->sid,
 				  lp_winbind_expand_groups());
 	if (tevent_req_nomem(subreq, req)) {
 		return;
@@ -107,8 +119,10 @@ NTSTATUS winbindd_getgrgid_recv(struct tevent_req *req,
 	char *buf;
 
 	if (tevent_req_is_nterror(req, &status)) {
+		struct dom_sid_buf sidbuf;
 		DEBUG(5, ("Could not convert sid %s: %s\n",
-			  sid_string_dbg(&state->sid), nt_errstr(status)));
+			  dom_sid_str_buf(state->sid, &sidbuf),
+			  nt_errstr(status)));
 		return status;
 	}
 

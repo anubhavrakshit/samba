@@ -63,7 +63,7 @@ struct smbpasswd_privates
 	unsigned char smbpwd[16];
 	unsigned char smbntpwd[16];
 
-	/* retrive-once info */
+	/* retrieve-once info */
 	const char *smbpasswd_file;
 };
 
@@ -367,7 +367,6 @@ static struct smb_passwd *getsmbfilepwent(struct smbpasswd_privates *smbpasswd_s
 	unsigned char *smbpwd = smbpasswd_state->smbpwd;
 	unsigned char *smbntpwd = smbpasswd_state->smbntpwd;
 	char linebuf[256];
-	int c;
 	unsigned char *p;
 	long uidval;
 	size_t linebuf_len;
@@ -402,8 +401,8 @@ static struct smb_passwd *getsmbfilepwent(struct smbpasswd_privates *smbpasswd_s
 		}
 
 		if (linebuf[linebuf_len - 1] != '\n') {
-			c = '\0';
 			while (!ferror(fp) && !feof(fp)) {
+				int c;
 				c = fgetc(fp);
 				if (c == '\n') {
 					break;
@@ -740,8 +739,7 @@ static bool mod_smbfilepwd_entry(struct smbpasswd_privates *smbpasswd_state, con
 #define LINEBUF_SIZE 255
 	char linebuf[LINEBUF_SIZE + 1];
 	char readbuf[1024];
-	int c;
-	fstring ascii_p16;
+	char ascii_p16[FSTRING_LEN + 20];
 	fstring encode_bits;
 	unsigned char *p = NULL;
 	size_t linebuf_len = 0;
@@ -806,8 +804,8 @@ static bool mod_smbfilepwd_entry(struct smbpasswd_privates *smbpasswd_state, con
 		 */
 		linebuf_len = strlen(linebuf);
 		if (linebuf[linebuf_len - 1] != '\n') {
-			c = '\0';
 			while (!ferror(fp) && !feof(fp)) {
+				int c;
 				c = fgetc(fp);
 				if (c == '\n') {
 					break;
@@ -1332,11 +1330,12 @@ static NTSTATUS smbpasswd_getsampwsid(struct pdb_methods *my_methods, struct sam
 	NTSTATUS nt_status = NT_STATUS_UNSUCCESSFUL;
 	struct smbpasswd_privates *smbpasswd_state = (struct smbpasswd_privates*)my_methods->private_data;
 	struct smb_passwd *smb_pw;
+	struct dom_sid_buf buf;
 	FILE *fp = NULL;
 	uint32_t rid;
 
 	DEBUG(10, ("smbpasswd_getsampwrid: search by sid: %s\n",
-		   sid_string_dbg(sid)));
+		   dom_sid_str_buf(sid, &buf)));
 
 	if (!sid_peek_check_rid(get_global_sam_sid(), sid, &rid))
 		return NT_STATUS_UNSUCCESSFUL;
@@ -1345,7 +1344,7 @@ static NTSTATUS smbpasswd_getsampwsid(struct pdb_methods *my_methods, struct sam
 	if (rid == DOMAIN_RID_GUEST) {
 		const char *guest_account = lp_guest_account();
 		if (!(guest_account && *guest_account)) {
-			DEBUG(1, ("Guest account not specfied!\n"));
+			DEBUG(1, ("Guest account not specified!\n"));
 			return nt_status;
 		}
 		return smbpasswd_getsampwnam(my_methods, sam_acct, guest_account);
@@ -1382,9 +1381,11 @@ static NTSTATUS smbpasswd_getsampwsid(struct pdb_methods *my_methods, struct sam
 
 	/* build_sam_account might change the SID on us, if the name was for the guest account */
 	if (NT_STATUS_IS_OK(nt_status) && !dom_sid_equal(pdb_get_user_sid(sam_acct), sid)) {
+		struct dom_sid_buf buf1, buf2;
 		DEBUG(1, ("looking for user with sid %s instead returned %s "
-			  "for account %s!?!\n", sid_string_dbg(sid),
-			  sid_string_dbg(pdb_get_user_sid(sam_acct)),
+			  "for account %s!?!\n",
+			  dom_sid_str_buf(sid, &buf1),
+			  dom_sid_str_buf(pdb_get_user_sid(sam_acct), &buf2),
 			  pdb_get_username(sam_acct)));
 		return NT_STATUS_NO_SUCH_USER;
 	}
@@ -1443,13 +1444,15 @@ static NTSTATUS smbpasswd_rename_sam_account (struct pdb_methods *my_methods,
 					      struct samu *old_acct,
 					      const char *newname)
 {
+	const struct loadparm_substitution *lp_sub =
+		loadparm_s3_global_substitution();
 	char *rename_script = NULL;
 	struct samu *new_acct = NULL;
 	bool interim_account = False;
 	TALLOC_CTX *ctx = talloc_tos();
 	NTSTATUS ret = NT_STATUS_UNSUCCESSFUL;
 
-	if (!*(lp_rename_user_script(talloc_tos())))
+	if (!*(lp_rename_user_script(talloc_tos(), lp_sub)))
 		goto done;
 
 	if ( !(new_acct = samu_new( NULL )) ) {
@@ -1469,7 +1472,7 @@ static NTSTATUS smbpasswd_rename_sam_account (struct pdb_methods *my_methods,
 	interim_account = True;
 
 	/* rename the posix user */
-	rename_script = lp_rename_user_script(ctx);
+	rename_script = lp_rename_user_script(ctx, lp_sub);
 	if (!rename_script) {
 		ret = NT_STATUS_NO_MEMORY;
 		goto done;
@@ -1501,7 +1504,7 @@ static NTSTATUS smbpasswd_rename_sam_account (struct pdb_methods *my_methods,
 			goto done;
 		}
 
-		rename_ret = smbrun(rename_script, NULL);
+		rename_ret = smbrun(rename_script, NULL, NULL);
 
 		DEBUG(rename_ret ? 0 : 3,("Running the command `%s' gave %d\n", rename_script, rename_ret));
 
@@ -1720,7 +1723,7 @@ static NTSTATUS pdb_init_smbpasswd( struct pdb_methods **pdb_method, const char 
 	return NT_STATUS_OK;
 }
 
-NTSTATUS pdb_smbpasswd_init(void) 
+NTSTATUS pdb_smbpasswd_init(TALLOC_CTX *ctx) 
 {
 	return smb_register_passdb(PASSDB_INTERFACE_VERSION, "smbpasswd", pdb_init_smbpasswd);
 }

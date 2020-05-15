@@ -397,7 +397,8 @@ NTSTATUS smbsrv_add_socket(TALLOC_CTX *mem_ctx,
 			   struct tevent_context *event_context,
 			   struct loadparm_context *lp_ctx,
 			   const struct model_ops *model_ops,
-			   const char *address);
+			   const char *address,
+			   void *process_context);
 
 struct loadparm_context;
 
@@ -475,7 +476,7 @@ struct loadparm_context;
 #define SMBSRV_CALL_NTVFS_BACKEND(cmd) do { \
 	req->ntvfs->async_states->status = cmd; \
 	if (req->ntvfs->async_states->state & NTVFS_ASYNC_STATE_ASYNC) { \
-		DLIST_ADD_END(req->smb_conn->requests, req, struct smbsrv_request *); \
+		DLIST_ADD_END(req->smb_conn->requests, req); \
 	} else { \
 		req->ntvfs->async_states->send_fn(req->ntvfs); \
 	} \

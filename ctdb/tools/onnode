@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # Run commands on CTDB nodes.
 
@@ -23,7 +23,7 @@
 # You should have received a copy of the GNU General Public License
 # along with this program; if not, see <http://www.gnu.org/licenses/>.
 
-prog=$(basename $0)
+prog=$(basename "$0")
 
 usage ()
 {
@@ -31,17 +31,14 @@ usage ()
 Usage: onnode [OPTION] ... <NODES> <COMMAND> ...
   options:
     -c          Run in current working directory on specified nodes.
-    -f          Specify nodes file, overrides CTDB_NODES_FILE.
+    -f          Specify nodes file, overriding default.
     -i          Keep standard input open - the default is to close it.
     -n          Allow nodes to be specified by name.
-    -o <prefix> Save standard output from each node to file <prefix>.<ip>
     -p          Run command in parallel on specified nodes.
     -P          Push given files to nodes instead of running commands.
     -q          Do not print node addresses (overrides -v).
     -v          Print node address even for a single node.
-  <NODES>       "all", "any", "ok" (or "healthy"), "con" (or "connected"),
-                "rm" (or "recmaster"), "lvs" (or "lvsmaster"),
-                "natgw" (or "natgwlist"); or
+  <NODES>       "all", "any", "ok" (or "healthy"), "con" (or "connected") ; or
                 a node number (0 base); or
                 a hostname (if -n is specified); or
                 list (comma separated) of <NODES>; or
@@ -59,60 +56,58 @@ invalid_nodespec ()
 
 # Defaults.
 current=false
+ctdb_nodes_file=""
 parallel=false
 verbose=false
 quiet=false
-prefix=""
 names_ok=false
 push=false
 stdin=false
 
-ctdb_base="${CTDB_BASE:-/etc/ctdb}"
+if [ -z "$CTDB_BASE" ] ; then
+    CTDB_BASE="/usr/local/etc/ctdb"
+fi
 
 parse_options ()
 {
-    # $POSIXLY_CORRECT means that the command passed to onnode can
-    # take options and getopt won't reorder things to make them
-    # options ot onnode.
-    local temp
-    # Not on the previous line - local returns 0!
-    temp=$(POSIXLY_CORRECT=1 getopt -n "$prog" -o "cf:hno:pqvPi" -l help -- "$@")
+	local opt
 
-    [ $? != 0 ] && usage
+	while getopts "cf:hnpqvPi?" opt ; do
+		case "$opt" in
+		c) current=true ;;
+		f) ctdb_nodes_file="$OPTARG" ;;
+		n) names_ok=true ;;
+		p) parallel=true ;;
+		q) quiet=true ;;
+		v) verbose=true ;;
+		P) push=true ;;
+		i) stdin=true ;;
+		\?|h) usage ;;
+		esac
+	done
+	shift $((OPTIND - 1))
 
-    eval set -- "$temp"
+	if [ $# -lt 2 ] ; then
+		usage
+	fi
 
-    while true ; do
-	case "$1" in
-	    -c) current=true ; shift ;;
-	    -f) CTDB_NODES_FILE="$2" ; shift 2 ;;
-	    -n) names_ok=true ; shift ;;
-	    -o) prefix="$2" ; shift 2 ;;
-	    -p) parallel=true ; shift ;;
-	    -q) quiet=true ; shift ;;
-	    -v) verbose=true ; shift ;;
-	    -P) push=true ; shift ;;
-	    -i) stdin=true ; shift ;;
-	    --) shift ; break ;;
-	    -h|--help|*) usage ;; # Shouldn't happen, so this is reasonable.
-	esac
-    done
-
-    [ $# -lt 2 ] && usage
-
-    nodespec="$1" ; shift
-    command="$@"
+	nodespec="$1" ; shift
+	command="$*"
 }
 
 echo_nth ()
 {
     local n="$1" ; shift
 
-    shift $n
-    local node="$1"
+    # Note that this is 0-based
+    local node=""
+    if [ "$n" -le $# ] ; then
+	    shift "$n"
+	    node="$1"
+    fi
 
-    if [ -n "$node" -a "$node" != "#DEAD" ] ; then
-	echo $node
+    if [ -n "$node" ] && [ "$node" != "#DEAD" ] ; then
+	echo "$node"
     else
 	echo "${prog}: \"node ${n}\" does not exist" >&2
 	exit 1
@@ -127,12 +122,10 @@ parse_nodespec ()
 	for i in $1 ; do
 	    case "$i" in
 		*-*) seq "${i%-*}" "${i#*-}" 2>/dev/null || invalid_nodespec ;;
-		# Separate lines for readability.
 		all|any|ok|healthy|con|connected) echo "$i" ;;
-		rm|recmaster|lvs|lvsmaster|natgw|natgwlist) echo "$i" ;;
 		*)
-		    [ $i -gt -1 ] 2>/dev/null || $names_ok || invalid_nodespec
-		    echo $i
+		    [ "$i" -gt -1 ] 2>/dev/null || $names_ok || invalid_nodespec
+		    echo "$i"
 	    esac
 	done
     )
@@ -146,6 +139,8 @@ get_nodes_with_status ()
 
     if [ -z "$ctdb_status_output" ] ; then
 	ctdb_status_output=$(ctdb -X status 2>&1)
+	# No! Checking the exit code afterwards is actually clearer...
+	# shellcheck disable=SC2181
 	if [ $? -ne 0 ] ; then
 	    echo "${prog}: unable to get status of CTDB nodes" >&2
 	    echo "$ctdb_status_output" >&2
@@ -161,10 +156,12 @@ get_nodes_with_status ()
 	IFS="${IFS}|"
 	while IFS="" read i ; do
 
+	    # Intentional word splitting
+	    # shellcheck disable=SC2086
 	    set -- $i # split line on colons
 	    shift     # line starts with : so 1st field is empty
 	    local pnn="$1" ; shift
-	    local ip="$1" ; shift
+	    shift # ignore IP address but need status bits below
 
 	    case "$status" in
 		healthy)
@@ -182,55 +179,11 @@ get_nodes_with_status ()
 		    invalid_nodespec
 	    esac
 
+	    # Intentional multi-word expansion
+	    # shellcheck disable=SC2086
 	    echo_nth "$pnn" $all_nodes
 	done <<<"$ctdb_status_output"
     )
-}
-
-ctdb_props="" # cache
-get_node_with_property ()
-{
-    local all_nodes="$1"
-    local prop="$2"
-
-    local prop_node=""
-    if [ "${ctdb_props##:${prop}:}" = "$ctdb_props" ] ; then
-	# Not in cache.
-	prop_node=$(ctdb "$prop" -X 2>/dev/null)
-	if [ $? -eq 0 ] ; then
-	    if [ "$prop" = "natgwlist" ] ; then
-		prop_node="${prop_node%% *}" # 1st word
-		if [ "$prop_node" = "-1" ] ; then
-		    # This works around natgwlist returning 0 even
-		    # when there's no natgw.
-		    prop_node=""
-		fi
-	    else
-		# We only want the first line.
-		local nl="
-"
-		prop_node="${prop_node%%${nl}*}"
-	    fi
-	else
-	    prop_node=""
-	fi
-
-	if [ -n "$prop_node" ] ; then
-	    # Add to cache.
-	    ctdb_props="${ctdb_props}${ctdb_props:+ }:${prop}:${prop_node}"
-	fi
-    else
-	# Get from cache.
-	prop_node="${ctdb_props##:${prop}:}"
-	prop_node="${prop_node%% *}"
-    fi
-
-    if [ -n "$prop_node" ] ; then
-	echo_nth "$prop_node" $all_nodes
-    else
-	echo "${prog}: No ${prop} available" >&2
-	exit 1
-    fi
 }
 
 get_any_available_node ()
@@ -238,11 +191,13 @@ get_any_available_node ()
     local all_nodes="$1"
 
     # We do a recursive onnode to find which nodes are up and running.
-    local out=$($0 -pq all ctdb pnn 2>&1)
-    local line
-    while read line ; do 
-	local pnn="${line#PNN:}"
-	if [ "$pnn" != "$line" ] ; then
+    local out line
+    out=$("$0" -pq all ctdb pnn 2>&1)
+    while read line ; do
+	if [[ "$line" =~ ^[0-9]+$ ]] ; then
+	    local pnn="$line"
+	    # Intentional multi-word expansion
+	    # shellcheck disable=SC2086
 	    echo_nth "$pnn" $all_nodes
 	    return 0
 	fi
@@ -253,62 +208,50 @@ get_any_available_node ()
 
 get_nodes ()
 {
-    local all_nodes
+	local all_nodes
 
-    if [ -n "$CTDB_NODES_SOCKETS" ] ; then 
-	all_nodes="$CTDB_NODES_SOCKETS"
-    else
-	local f="${ctdb_base}/nodes"
-	if [ -n "$CTDB_NODES_FILE" ] ; then
-	    f="$CTDB_NODES_FILE"
-	    if [ ! -e "$f" -a "${f#/}" = "$f" ] ; then
-		# $f is relative, try in $ctdb_base
-		f="${ctdb_base}/${f}"
-	    fi
+	local f="${CTDB_BASE}/nodes"
+	if [ -n "$ctdb_nodes_file" ] ; then
+		f="$ctdb_nodes_file"
+		if [ ! -e "$f" ] && [ "${f#/}" = "$f" ] ; then
+			# $f is relative, try in $CTDB_BASE
+			f="${CTDB_BASE}/${f}"
+		fi
 	fi
 
 	if [ ! -r "$f" ] ; then
-	    echo "${prog}: unable to open nodes file  \"${f}\"" >&2
-	    exit 1
+		echo "${prog}: unable to open nodes file  \"${f}\"" >&2
+		exit 1
 	fi
 
 	all_nodes=$(sed -e 's@#.*@@g' -e 's@ *@@g' -e 's@^$@#DEAD@' "$f")
-    fi
 
-    local nodes=""
-    local n
-    for n in $(parse_nodespec "$1") ; do
-	[ $? != 0 ] && exit 1  # Required to catch exit in above subshell.
-	case "$n" in
-	    all)
-		echo "${all_nodes//#DEAD/}"
-		;;
-	    any)
-		get_any_available_node "$all_nodes" || exit 1
-		;;
-	    ok|healthy) 
-		get_nodes_with_status "$all_nodes" "healthy" || exit 1
-		;;
-	    con|connected) 
-		get_nodes_with_status "$all_nodes" "connected" || exit 1
-		;;
-	    rm|recmaster)
-		get_node_with_property "$all_nodes" "recmaster" || exit 1
-		;;
-	    lvs|lvsmaster)
-		get_node_with_property "$all_nodes" "lvsmaster" || exit 1
-		;;
-	    natgw|natgwlist)
-		get_node_with_property "$all_nodes" "natgwlist" || exit 1
-		;;
-	    [0-9]|[0-9][0-9]|[0-9][0-9][0-9])
-		echo_nth $n $all_nodes
-		;;
-	    *)
-		$names_ok || invalid_nodespec
-		echo $n
-	esac
-    done
+	local n nodes
+	nodes=$(parse_nodespec "$1") || exit $?
+	for n in $nodes ; do
+		case "$n" in
+		all)
+			echo "${all_nodes//#DEAD/}"
+			;;
+		any)
+			get_any_available_node "$all_nodes" || exit 1
+			;;
+		ok|healthy)
+			get_nodes_with_status "$all_nodes" "healthy" || exit 1
+			;;
+		con|connected)
+			get_nodes_with_status "$all_nodes" "connected" || exit 1
+			;;
+		[0-9]|[0-9][0-9]|[0-9][0-9][0-9])
+			# Intentional multi-word expansion
+			# shellcheck disable=SC2086
+			echo_nth "$n" $all_nodes
+			;;
+		*)
+			$names_ok || invalid_nodespec
+			echo "$n"
+		esac
+	done
 }
 
 push()
@@ -326,63 +269,29 @@ push()
     done
 }
 
-fakessh ()
-{
-    CTDB_SOCKET="$1" sh -c "$2" 3>/dev/null
-}
-
-stdout_filter ()
-{
-    if [ -n "$prefix" ] ; then
-	cat >"${prefix}.${n//\//_}"
-    elif $verbose && $parallel ; then
-	sed -e "s@^@[$n] @"
-    else
-	cat
-    fi
-}
-
-stderr_filter ()
-{
-    if $verbose && $parallel ; then
-	sed -e "s@^@[$n] @"
-    else
-	cat
-    fi
-}
-
 ######################################################################
 
 parse_options "$@"
 
 ssh_opts=
 if $push ; then
-    SSH=push
-    EXTRA_SSH_OPTS=""
+	ONNODE_SSH=push
+	ONNODE_SSH_OPTS=""
 else
-    $current && command="cd $PWD && $command"
+	$current && command="cd $PWD && $command"
 
-    if [ -n "$CTDB_NODES_SOCKETS" ] ; then
-	SSH=fakessh
-	EXTRA_SSH_OPTS=""
-    else 
 	# Could "2>/dev/null || true" but want to see errors from typos in file.
-	[ -r "${ctdb_base}/onnode.conf" ] && . "${ctdb_base}/onnode.conf"
-	[ -n "$SSH" ] || SSH=ssh
-	if [ "$SSH" = "ssh" ] ; then
-	    if $parallel || ! $stdin ; then
+	[ -r "${CTDB_BASE}/onnode.conf" ] && . "${CTDB_BASE}/onnode.conf"
+	[ -n "$ONNODE_SSH" ] || ONNODE_SSH=ssh
+	# $ONNODE_SSH must accept the -n option - it can be ignored!
+	if $parallel || ! $stdin ; then
 		ssh_opts="-n"
-	    fi
-	else
-	    : # rsh? All bets are off!
 	fi
-    fi
 fi
 
 ######################################################################
 
-nodes=$(get_nodes "$nodespec")
-[ $? != 0 ] && exit 1   # Required to catch exit in above subshell.
+nodes=$(get_nodes "$nodespec") || exit $?
 
 if $quiet ; then
     verbose=false
@@ -394,31 +303,38 @@ else
 fi
 
 pids=""
+# Intentional multi-word expansion
+# shellcheck disable=SC2086
 trap 'kill -TERM $pids 2>/dev/null' INT TERM
 # There's a small race here where the kill can fail if no processes
 # have been added to $pids and the script is interrupted.  However,
 # the part of the window where it matter is very small.
 retcode=0
 for n in $nodes ; do
-    set -o pipefail 2>/dev/null
-    if $parallel ; then
-	{ exec 3>&1 ; { $SSH $ssh_opts $EXTRA_SSH_OPTS $n "$command" | stdout_filter >&3 ; } 2>&1 | stderr_filter ; } &
-	pids="${pids} $!"
-    else
-	if $verbose ; then
-	    echo >&2 ; echo ">> NODE: $n <<" >&2
-	fi
+	set -o pipefail 2>/dev/null
 
-	{ exec 3>&1 ; { $SSH $ssh_opts $EXTRA_SSH_OPTS $n "$command" | stdout_filter >&3 ; } 2>&1 | stderr_filter ; }
-	[ $? = 0 ] || retcode=$?
-    fi
+	ssh_cmd="$ONNODE_SSH $ssh_opts $ONNODE_SSH_OPTS"
+	if $parallel ; then
+		if $verbose ; then
+			$ssh_cmd "$n" "$command" 2>&1 | sed -e "s@^@[$n] @"
+		else
+			$ssh_cmd "$n" "$command"
+		fi &
+		pids="${pids} $!"
+	else
+		if $verbose ; then
+			echo >&2 ; echo ">> NODE: $n <<" >&2
+		fi
+		{
+			$ssh_cmd "$n" "$command"
+		} || retcode=$?
+	fi
 done
 
-$parallel && {
-    for p in $pids; do
-	wait $p
-	[ $? = 0 ] || retcode=$?
-    done
-}
+if $parallel ; then
+	for p in $pids; do
+		wait "$p" || retcode=$?
+	done
+fi
 
 exit $retcode

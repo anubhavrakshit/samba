@@ -298,7 +298,7 @@ SMBC_splice_ctx(SMBCCTX *context,
                 int (*splice_cb)(off_t n, void *priv),
                 void *priv)
 {
-	off_t written;
+	off_t written = 0;
 	TALLOC_CTX *frame = talloc_stackframe();
 	NTSTATUS status;
 
@@ -452,18 +452,19 @@ bool
 SMBC_getatr(SMBCCTX * context,
             SMBCSRV *srv,
             const char *path,
-            uint16_t *mode,
-            off_t *size,
-            struct timespec *create_time_ts,
-            struct timespec *access_time_ts,
-            struct timespec *write_time_ts,
-            struct timespec *change_time_ts,
-            SMB_INO_T *ino)
+	    struct stat *sb)
 {
 	char *fixedpath = NULL;
 	char *targetpath = NULL;
 	struct cli_state *targetcli = NULL;
-	time_t write_time;
+	uint16_t mode = 0;
+	off_t size = 0;
+	struct timespec create_time_ts = {0};
+	struct timespec access_time_ts = {0};
+	struct timespec write_time_ts = {0};
+	struct timespec change_time_ts = {0};
+	time_t write_time = 0;
+	SMB_INO_T ino = 0;
 	TALLOC_CTX *frame = talloc_stackframe();
 	NTSTATUS status;
 
@@ -503,28 +504,36 @@ SMBC_getatr(SMBCCTX * context,
 		return False;
 	}
 
-	if (!srv->no_pathinfo2 &&
-            NT_STATUS_IS_OK(cli_qpathinfo2(targetcli, targetpath,
-                           create_time_ts,
-                           access_time_ts,
-                           write_time_ts,
-                           change_time_ts,
-			   size, mode, ino))) {
-		TALLOC_FREE(frame);
-		return True;
+	if (!srv->no_pathinfo2) {
+		status = cli_qpathinfo2(targetcli,
+					targetpath,
+					&create_time_ts,
+					&access_time_ts,
+					&write_time_ts,
+					&change_time_ts,
+					&size,
+					&mode,
+					&ino);
+		if (NT_STATUS_IS_OK(status)) {
+			goto setup_stat;
+		}
         }
 
 	srv->no_pathinfo2 = True;
 
-	if (!srv->no_pathinfo3 &&
-            NT_STATUS_IS_OK(cli_qpathinfo3(targetcli, targetpath,
-                           create_time_ts,
-                           access_time_ts,
-                           write_time_ts,
-                           change_time_ts,
-			   size, mode, ino))) {
-		TALLOC_FREE(frame);
-		return True;
+	if (!srv->no_pathinfo3) {
+		status = cli_qpathinfo3(targetcli,
+					targetpath,
+					&create_time_ts,
+					&access_time_ts,
+					&write_time_ts,
+					&change_time_ts,
+					&size,
+					&mode,
+					&ino);
+		if (NT_STATUS_IS_OK(status)) {
+			goto setup_stat;
+		}
         }
 
 	srv->no_pathinfo3 = True;
@@ -534,28 +543,29 @@ SMBC_getatr(SMBCCTX * context,
 		goto all_failed;
         }
 
-	if (NT_STATUS_IS_OK(cli_getatr(targetcli, targetpath, mode, size, &write_time))) {
-                struct timespec w_time_ts;
+	status = cli_getatr(targetcli, targetpath, &mode, &size, &write_time);
+	if (NT_STATUS_IS_OK(status)) {
+		struct timespec w_time_ts =
+			convert_time_t_to_timespec(write_time);
 
-                w_time_ts = convert_time_t_to_timespec(write_time);
-                if (write_time_ts != NULL) {
-			*write_time_ts = w_time_ts;
-                }
-                if (create_time_ts != NULL) {
-                        *create_time_ts = w_time_ts;
-                }
-                if (access_time_ts != NULL) {
-                        *access_time_ts = w_time_ts;
-                }
-                if (change_time_ts != NULL) {
-                        *change_time_ts = w_time_ts;
-                }
-		if (ino) {
-			*ino = 0;
-		}
-		TALLOC_FREE(frame);
-		return True;
+		access_time_ts = change_time_ts = write_time_ts = w_time_ts;
+
+		goto setup_stat;
 	}
+
+setup_stat:
+	setup_stat(sb,
+		   path,
+		   size,
+		   mode,
+		   ino,
+		   srv->dev,
+		   access_time_ts,
+		   change_time_ts,
+		   write_time_ts);
+
+	TALLOC_FREE(frame);
+	return true;
 
 all_failed:
 	srv->no_pathinfo2 = False;
@@ -578,10 +588,10 @@ all_failed:
  */
 bool
 SMBC_setatr(SMBCCTX * context, SMBCSRV *srv, char *path,
-            time_t create_time,
-            time_t access_time,
-            time_t write_time,
-            time_t change_time,
+            struct timespec create_time,
+            struct timespec access_time,
+            struct timespec write_time,
+            struct timespec change_time,
             uint16_t mode)
 {
         uint16_t fd;
@@ -595,12 +605,12 @@ SMBC_setatr(SMBCCTX * context, SMBCSRV *srv, char *path,
          * attributes manipulated.
          */
         if (srv->no_pathinfo ||
-            !NT_STATUS_IS_OK(cli_setpathinfo_basic(srv->cli, path,
-						   create_time,
-						   access_time,
-						   write_time,
-						   change_time,
-						   mode))) {
+            !NT_STATUS_IS_OK(cli_setpathinfo_ext(srv->cli, path,
+						 create_time,
+						 access_time,
+						 write_time,
+						 change_time,
+						 mode))) {
 
                 /*
                  * setpathinfo is not supported; go to plan B.
@@ -619,14 +629,14 @@ SMBC_setatr(SMBCCTX * context, SMBCSRV *srv, char *path,
                 if (!NT_STATUS_IS_OK(cli_open(srv->cli, path, O_RDWR, DENY_NONE, &fd))) {
                         errno = SMBC_errno(context, srv->cli);
 			TALLOC_FREE(frame);
-                        return -1;
+                        return False;
                 }
 
                 /* Set the new attributes */
                 ret = NT_STATUS_IS_OK(cli_setattrE(srv->cli, fd,
-                                   change_time,
-                                   access_time,
-                                   write_time));
+                                   change_time.tv_sec,
+                                   access_time.tv_sec,
+                                   write_time.tv_sec));
 
                 /* Close the file */
                 cli_close(srv->cli, fd);

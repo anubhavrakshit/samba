@@ -68,7 +68,8 @@ run a command being careful about uid/gid handling and putting the output in
 outfd (or discard it if outfd is NULL).
 ****************************************************************************/
 
-static int smbrun_internal(const char *cmd, int *outfd, bool sanitize)
+static int smbrun_internal(const char *cmd, int *outfd, bool sanitize,
+	char * const *env)
 {
 	pid_t pid;
 	uid_t uid = current_user.ut.uid;
@@ -116,7 +117,7 @@ static int smbrun_internal(const char *cmd, int *outfd, bool sanitize)
 
 		
 		/* the parent just waits for the child to exit */
-		while((wpid = sys_waitpid(pid,&status,0)) < 0) {
+		while((wpid = waitpid(pid,&status,0)) < 0) {
 			if(errno == EINTR) {
 				errno = 0;
 				continue;
@@ -180,14 +181,9 @@ static int smbrun_internal(const char *cmd, int *outfd, bool sanitize)
 		}
 	}
 
-#ifndef __INSURE__
 	/* close all other file descriptors, leaving only 0, 1 and 2. 0 and
 	   2 point to /dev/null from the startup code */
-	{
-	int fd;
-	for (fd=3;fd<256;fd++) close(fd);
-	}
-#endif
+	closefrom(3);
 
 	{
 		char *newcmd = NULL;
@@ -197,8 +193,14 @@ static int smbrun_internal(const char *cmd, int *outfd, bool sanitize)
 				exit(82);
 		}
 
-		execl("/bin/sh","sh","-c",
-		    newcmd ? (const char *)newcmd : cmd, NULL);
+		if (env != NULL) {
+			execle("/bin/sh","sh","-c",
+				newcmd ? (const char *)newcmd : cmd, NULL,
+				env);
+		} else {
+			execl("/bin/sh","sh","-c",
+				newcmd ? (const char *)newcmd : cmd, NULL);
+		}
 
 		SAFE_FREE(newcmd);
 	}
@@ -212,18 +214,18 @@ static int smbrun_internal(const char *cmd, int *outfd, bool sanitize)
  Use only in known safe shell calls (printing).
 ****************************************************************************/
 
-int smbrun_no_sanitize(const char *cmd, int *outfd)
+int smbrun_no_sanitize(const char *cmd, int *outfd, char * const *env)
 {
-	return smbrun_internal(cmd, outfd, False);
+	return smbrun_internal(cmd, outfd, false, env);
 }
 
 /****************************************************************************
  By default this now sanitizes shell expansion.
 ****************************************************************************/
 
-int smbrun(const char *cmd, int *outfd)
+int smbrun(const char *cmd, int *outfd, char * const *env)
 {
-	return smbrun_internal(cmd, outfd, True);
+	return smbrun_internal(cmd, outfd, true, env);
 }
 
 /****************************************************************************
@@ -287,7 +289,7 @@ int smbrunsecret(const char *cmd, const char *secret)
 		close(ifd[1]);
 
 		/* the parent just waits for the child to exit */
-		while((wpid = sys_waitpid(pid, &status, 0)) < 0) {
+		while((wpid = waitpid(pid, &status, 0)) < 0) {
 			if(errno == EINTR) {
 				errno = 0;
 				continue;
@@ -340,14 +342,9 @@ int smbrunsecret(const char *cmd, const char *secret)
 		}
 	}
 
-#ifndef __INSURE__
 	/* close all other file descriptors, leaving only 0, 1 and 2. 0 and
 	   2 point to /dev/null from the startup code */
-	{
-		int fd;
-		for (fd = 3; fd < 256; fd++) close(fd);
-	}
-#endif
+	closefrom(3);
 
 	execl("/bin/sh", "sh", "-c", cmd, NULL);  
 

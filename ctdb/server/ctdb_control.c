@@ -16,15 +16,28 @@
    You should have received a copy of the GNU General Public License
    along with this program; if not, see <http://www.gnu.org/licenses/>.
 */
-#include "includes.h"
-#include "tdb.h"
+#include "replace.h"
 #include "system/network.h"
 #include "system/filesys.h"
 #include "system/wait.h"
-#include "../include/ctdb_private.h"
-#include "lib/util/dlinklist.h"
+
+#include <talloc.h>
+#include <tevent.h>
+
 #include "lib/tdb_wrap/tdb_wrap.h"
+#include "lib/util/dlinklist.h"
+#include "lib/util/debug.h"
+#include "lib/util/samba_util.h"
 #include "lib/util/talloc_report.h"
+
+#include "ctdb_private.h"
+#include "ctdb_client.h"
+
+#include "protocol/protocol_private.h"
+
+#include "common/reqid.h"
+#include "common/common.h"
+#include "common/logging.h"
 
 
 struct ctdb_control_state {
@@ -76,11 +89,95 @@ static int32_t control_not_implemented(const char *unsupported,
 	return -1;
 }
 
+struct ctdb_echo_data_state {
+	struct ctdb_context *ctdb;
+	struct ctdb_req_control_old *c;
+	struct ctdb_echo_data *data;
+};
+
+static void ctdb_echo_data_timeout(
+	struct tevent_context *ev,
+	struct tevent_timer *te,
+	struct timeval now,
+	void *private_data);
+
+static int32_t ctdb_control_echo_data(
+	struct ctdb_context *ctdb,
+	struct ctdb_req_control_old *c,
+	TDB_DATA indata,
+	bool *async_reply)
+{
+	struct ctdb_echo_data_state *state = NULL;
+	struct tevent_timer *te = NULL;
+	uint32_t delay = 0;
+	size_t np = 0;
+	int ret;
+
+	state = talloc_zero(ctdb, struct ctdb_echo_data_state);
+	CTDB_NO_MEMORY(ctdb, state);
+	state->ctdb = ctdb;
+
+	ret = ctdb_echo_data_pull(
+		indata.dptr, indata.dsize, state, &state->data, &np);
+	if (ret != 0) {
+		DBG_DEBUG("ctdb_echo_data_pull failed: %s\n",
+			  strerror(ret));
+		TALLOC_FREE(state);
+		return -1;
+	}
+
+	te = tevent_add_timer(
+		ctdb->ev,
+		state,
+		timeval_current_ofs_msec(delay),
+		ctdb_echo_data_timeout,
+		state);
+	if (te == NULL) {
+		DBG_DEBUG("tevent_add_timer failed\n");
+		TALLOC_FREE(state);
+		return -1;
+	}
+
+	state->c = talloc_move(state, &c);
+	*async_reply = true;
+
+	return 0;
+}
+
+static void ctdb_echo_data_timeout(
+	struct tevent_context *ev,
+	struct tevent_timer *te,
+	struct timeval now,
+	void *private_data)
+{
+	struct ctdb_echo_data_state *state = talloc_get_type_abort(
+		private_data, struct ctdb_echo_data_state);
+	size_t len = ctdb_echo_data_len(state->data);
+	uint8_t *buf = NULL;
+	size_t np;
+	TDB_DATA data;
+
+	DBG_DEBUG("reqid=%"PRIu32" len=%zu\n", state->c->hdr.reqid, len);
+
+	buf = talloc_array(state, uint8_t, len);
+	if (buf == NULL) {
+		DBG_WARNING("talloc_array(%zu) failed\n", len);
+		goto done;
+	}
+	ctdb_echo_data_push(state->data, buf, &np);
+	data = (TDB_DATA) { .dptr = buf, .dsize = np };
+
+	ctdb_request_control_reply(state->ctdb, state->c, &data, 0, NULL);
+
+done:
+	TALLOC_FREE(state);
+}
+
 /*
   process a control request
  */
 static int32_t ctdb_control_dispatch(struct ctdb_context *ctdb, 
-				     struct ctdb_req_control *c,
+				     struct ctdb_req_control_old *c,
 				     TDB_DATA indata,
 				     TDB_DATA *outdata, uint32_t srcnode,
 				     const char **errormsg,
@@ -89,6 +186,7 @@ static int32_t ctdb_control_dispatch(struct ctdb_context *ctdb,
 	uint32_t opcode = c->opcode;
 	uint64_t srvid = c->srvid;
 	uint32_t client_id = c->client_id;
+	static int level = DEBUG_ERR;
 
 	switch (opcode) {
 	case CTDB_CONTROL_PROCESS_EXISTS: {
@@ -97,29 +195,29 @@ static int32_t ctdb_control_dispatch(struct ctdb_context *ctdb,
 	}
 
 	case CTDB_CONTROL_SET_DEBUG: {
+		union {
+			uint8_t *ptr;
+			int32_t *level;
+		} debug;
 		CHECK_CONTROL_DATA_SIZE(sizeof(int32_t));
-		DEBUGLEVEL = *(int32_t *)indata.dptr;
+		debug.ptr = indata.dptr;
+		debuglevel_set(*debug.level);
 		return 0;
 	}
 
 	case CTDB_CONTROL_GET_DEBUG: {
 		CHECK_CONTROL_DATA_SIZE(0);
-		outdata->dptr = (uint8_t *)&(DEBUGLEVEL);
+		level = debuglevel_get();
+		outdata->dptr = (uint8_t *)&(level);
 		outdata->dsize = sizeof(DEBUGLEVEL);
 		return 0;
 	}
 
 	case CTDB_CONTROL_STATISTICS: {
-		int i;
 		CHECK_CONTROL_DATA_SIZE(0);
 		ctdb->statistics.memory_used = talloc_total_size(NULL);
 		ctdb->statistics.num_clients = ctdb->num_clients;
-		ctdb->statistics.frozen = 0;
-		for (i=1; i<= NUM_DB_PRIORITIES; i++) {
-			if (ctdb->freeze_mode[i] == CTDB_FREEZE_FROZEN) {
-				ctdb->statistics.frozen = 1;
-			}
-		}
+		ctdb->statistics.frozen = (ctdb_db_all_frozen(ctdb) ? 1 : 0);
 		ctdb->statistics.recovering = (ctdb->recovery_mode == CTDB_RECOVERY_ACTIVE);
 		ctdb->statistics.statistics_current_time = timeval_current();
 
@@ -188,7 +286,7 @@ static int32_t ctdb_control_dispatch(struct ctdb_context *ctdb,
 		return ctdb_control_setvnnmap(ctdb, opcode, indata, outdata);
 
 	case CTDB_CONTROL_PULL_DB: 
-		CHECK_CONTROL_DATA_SIZE(sizeof(struct ctdb_control_pulldb));
+		CHECK_CONTROL_DATA_SIZE(sizeof(struct ctdb_pulldb));
 		return ctdb_control_pull_db(ctdb, indata, outdata);
 
 	case CTDB_CONTROL_SET_DMASTER: 
@@ -262,10 +360,34 @@ static int32_t ctdb_control_dispatch(struct ctdb_context *ctdb,
 	}
 
 	case CTDB_CONTROL_DB_ATTACH:
-	  return ctdb_control_db_attach(ctdb, indata, outdata, srvid, false, client_id, c, async_reply);
+	  return ctdb_control_db_attach(ctdb,
+					indata,
+					outdata,
+					0,
+					srcnode,
+					client_id,
+					c,
+					async_reply);
 
 	case CTDB_CONTROL_DB_ATTACH_PERSISTENT:
-	  return ctdb_control_db_attach(ctdb, indata, outdata, srvid, true, client_id, c, async_reply);
+	  return ctdb_control_db_attach(ctdb,
+					indata,
+					outdata,
+					CTDB_DB_FLAGS_PERSISTENT,
+					srcnode,
+					client_id,
+					c,
+					async_reply);
+
+	case CTDB_CONTROL_DB_ATTACH_REPLICATED:
+	  return ctdb_control_db_attach(ctdb,
+					indata,
+					outdata,
+					CTDB_DB_FLAGS_REPLICATED,
+					srcnode,
+					client_id,
+					c,
+					async_reply);
 
 	case CTDB_CONTROL_SET_CALL:
 		return control_not_implemented("SET_CALL", NULL);
@@ -298,7 +420,7 @@ static int32_t ctdb_control_dispatch(struct ctdb_context *ctdb,
 		return daemon_deregister_message_handler(ctdb, client_id, srvid);
 
 	case CTDB_CONTROL_CHECK_SRVIDS:
-		return daemon_check_srvids(ctdb, indata, outdata);
+		return control_not_implemented("CHECK_SRVIDS", NULL);
 
 	case CTDB_CONTROL_ENABLE_SEQNUM:
 		CHECK_CONTROL_DATA_SIZE(sizeof(uint32_t));
@@ -313,29 +435,23 @@ static int32_t ctdb_control_dispatch(struct ctdb_context *ctdb,
 		return ctdb_control_freeze(ctdb, c, async_reply);
 
 	case CTDB_CONTROL_THAW:
-		CHECK_CONTROL_DATA_SIZE(0);
-		return ctdb_control_thaw(ctdb, (uint32_t)c->srvid, true);
+		return control_not_implemented("THAW", NULL);
 
 	case CTDB_CONTROL_SET_RECMODE:
 		CHECK_CONTROL_DATA_SIZE(sizeof(uint32_t));		
 		return ctdb_control_set_recmode(ctdb, c, indata, async_reply, errormsg);
 
-	case CTDB_CONTROL_GET_MONMODE: 
-		CHECK_CONTROL_DATA_SIZE(0);
-		return ctdb_monitoring_mode(ctdb);
-		
-	case CTDB_CONTROL_ENABLE_MONITOR: 
-		CHECK_CONTROL_DATA_SIZE(0);
-		ctdb_enable_monitoring(ctdb);
-		return 0;
-	
-	case CTDB_CONTROL_RUN_EVENTSCRIPTS: 
-		return ctdb_run_eventscripts(ctdb, c, indata, async_reply);
+	case CTDB_CONTROL_GET_MONMODE:
+		return control_not_implemented("GET_MONMODE", NULL);
 
-	case CTDB_CONTROL_DISABLE_MONITOR: 
-		CHECK_CONTROL_DATA_SIZE(0);
-		ctdb_disable_monitoring(ctdb);
-		return 0;
+	case CTDB_CONTROL_ENABLE_MONITOR:
+		return control_not_implemented("ENABLE_MONITOR", NULL);
+
+	case CTDB_CONTROL_RUN_EVENTSCRIPTS:
+		return control_not_implemented("RUN_EVENTSCRIPTS", NULL);
+
+	case CTDB_CONTROL_DISABLE_MONITOR:
+		return control_not_implemented("DISABLE_MONITOR", NULL);
 
 	case CTDB_CONTROL_SHUTDOWN:
 		DEBUG(DEBUG_NOTICE,("Received SHUTDOWN command.\n"));
@@ -370,7 +486,7 @@ static int32_t ctdb_control_dispatch(struct ctdb_context *ctdb,
 		return ctdb_control_get_public_ips(ctdb, c, outdata);
 
 	case CTDB_CONTROL_TCP_CLIENT:
-		CHECK_CONTROL_DATA_SIZE(sizeof(struct ctdb_control_tcp_addr));
+		CHECK_CONTROL_DATA_SIZE(sizeof(struct ctdb_connection));
 		return ctdb_control_tcp_client(ctdb, client_id, indata);
 
 	case CTDB_CONTROL_STARTUP: 
@@ -378,15 +494,15 @@ static int32_t ctdb_control_dispatch(struct ctdb_context *ctdb,
 		return ctdb_control_startup(ctdb, srcnode);
 
 	case CTDB_CONTROL_TCP_ADD: 
-		CHECK_CONTROL_DATA_SIZE(sizeof(struct ctdb_tcp_connection));
+		CHECK_CONTROL_DATA_SIZE(sizeof(struct ctdb_connection));
 		return ctdb_control_tcp_add(ctdb, indata, false);
 
 	case CTDB_CONTROL_TCP_ADD_DELAYED_UPDATE: 
-		CHECK_CONTROL_DATA_SIZE(sizeof(struct ctdb_tcp_connection));
+		CHECK_CONTROL_DATA_SIZE(sizeof(struct ctdb_connection));
 		return ctdb_control_tcp_add(ctdb, indata, true);
 
 	case CTDB_CONTROL_TCP_REMOVE: 
-		CHECK_CONTROL_DATA_SIZE(sizeof(struct ctdb_tcp_connection));
+		CHECK_CONTROL_DATA_SIZE(sizeof(struct ctdb_connection));
 		return ctdb_control_tcp_remove(ctdb, indata);
 
 	case CTDB_CONTROL_SET_TUNABLE:
@@ -402,9 +518,8 @@ static int32_t ctdb_control_dispatch(struct ctdb_context *ctdb,
 		CHECK_CONTROL_DATA_SIZE(sizeof(struct ctdb_node_flag_change));
 		return ctdb_control_modflags(ctdb, indata);
 
-	case CTDB_CONTROL_KILL_TCP: 
-		CHECK_CONTROL_DATA_SIZE(sizeof(struct ctdb_tcp_connection));
-		return ctdb_control_kill_tcp(ctdb, indata);
+	case CTDB_CONTROL_KILL_TCP:
+		return control_not_implemented("KILL_TCP", NULL);
 
 	case CTDB_CONTROL_GET_TCP_TICKLE_LIST:
 		CHECK_CONTROL_DATA_SIZE(sizeof(ctdb_sock_addr));
@@ -414,21 +529,17 @@ static int32_t ctdb_control_dispatch(struct ctdb_context *ctdb,
 		/* data size is verified in the called function */
 		return ctdb_control_set_tcp_tickle_list(ctdb, indata);
 
-	case CTDB_CONTROL_REGISTER_SERVER_ID: 
-		CHECK_CONTROL_DATA_SIZE(sizeof(struct ctdb_server_id));
-		return ctdb_control_register_server_id(ctdb, client_id, indata);
+	case CTDB_CONTROL_REGISTER_SERVER_ID:
+		return control_not_implemented("REGISTER_SERVER_ID", NULL);
 
-	case CTDB_CONTROL_UNREGISTER_SERVER_ID: 
-		CHECK_CONTROL_DATA_SIZE(sizeof(struct ctdb_server_id));
-		return ctdb_control_unregister_server_id(ctdb, indata);
+	case CTDB_CONTROL_UNREGISTER_SERVER_ID:
+		return control_not_implemented("UNREGISTER_SERVER_ID", NULL);
 
-	case CTDB_CONTROL_CHECK_SERVER_ID: 
-		CHECK_CONTROL_DATA_SIZE(sizeof(struct ctdb_server_id));
-		return ctdb_control_check_server_id(ctdb, indata);
+	case CTDB_CONTROL_CHECK_SERVER_ID:
+		return control_not_implemented("CHECK_SERVER_ID", NULL);
 
 	case CTDB_CONTROL_GET_SERVER_ID_LIST:
-		CHECK_CONTROL_DATA_SIZE(0);
-		return ctdb_control_get_server_id_list(ctdb, outdata);
+		return control_not_implemented("SERVER_ID_LIST", NULL);
 
 	case CTDB_CONTROL_PERSISTENT_STORE:
 		return control_not_implemented("PERSISTENT_STORE", NULL);
@@ -436,19 +547,17 @@ static int32_t ctdb_control_dispatch(struct ctdb_context *ctdb,
 	case CTDB_CONTROL_UPDATE_RECORD:
 		return ctdb_control_update_record(ctdb, c, indata, async_reply);
 
-	case CTDB_CONTROL_SEND_GRATIOUS_ARP:
+	case CTDB_CONTROL_SEND_GRATUITOUS_ARP:
 		return ctdb_control_send_gratious_arp(ctdb, indata);
 
 	case CTDB_CONTROL_TRANSACTION_START:
-		CHECK_CONTROL_DATA_SIZE(sizeof(uint32_t));
-		return ctdb_control_transaction_start(ctdb, *(uint32_t *)indata.dptr);
+		return control_not_implemented("TRANSACTION_START", NULL);
 
 	case CTDB_CONTROL_TRANSACTION_COMMIT:
-		CHECK_CONTROL_DATA_SIZE(sizeof(uint32_t));
-		return ctdb_control_transaction_commit(ctdb, *(uint32_t *)indata.dptr);
+		return control_not_implemented("TRANSACTION_COMMIT", NULL);
 
 	case CTDB_CONTROL_WIPE_DATABASE:
-		CHECK_CONTROL_DATA_SIZE(sizeof(struct ctdb_control_wipe_database));
+		CHECK_CONTROL_DATA_SIZE(sizeof(struct ctdb_transdb));
 		return ctdb_control_wipe_database(ctdb, indata);
 
 	case CTDB_CONTROL_UPTIME:
@@ -467,8 +576,7 @@ static int32_t ctdb_control_dispatch(struct ctdb_context *ctdb,
 		return ctdb_control_add_public_address(ctdb, indata);
 
 	case CTDB_CONTROL_DEL_PUBLIC_IP:
-		return ctdb_control_del_public_address(ctdb, c, indata,
-						       async_reply);
+		return ctdb_control_del_public_address(ctdb, indata);
 
 	case CTDB_CONTROL_GET_CAPABILITIES:
 		return ctdb_control_get_capabilities(ctdb, outdata);
@@ -500,8 +608,7 @@ static int32_t ctdb_control_dispatch(struct ctdb_context *ctdb,
 		return ctdb_control_recd_ping(ctdb);
 
 	case CTDB_CONTROL_GET_EVENT_SCRIPT_STATUS:
-		CHECK_CONTROL_DATA_SIZE(sizeof(uint32_t));
-		return ctdb_control_get_event_script_status(ctdb, *(uint32_t *)indata.dptr, outdata);
+		return control_not_implemented("GET_EVENT_SCRIPT_STATUS", NULL);
 
 	case CTDB_CONTROL_RECD_RECLOCK_LATENCY:
 		CHECK_CONTROL_DATA_SIZE(sizeof(double));
@@ -509,41 +616,13 @@ static int32_t ctdb_control_dispatch(struct ctdb_context *ctdb,
 		return 0;
 	case CTDB_CONTROL_GET_RECLOCK_FILE:
 		CHECK_CONTROL_DATA_SIZE(0);
-		if (ctdb->recovery_lock_file != NULL) {
-			outdata->dptr  = discard_const(ctdb->recovery_lock_file);
-			outdata->dsize = strlen(ctdb->recovery_lock_file) + 1;
+		if (ctdb->recovery_lock != NULL) {
+			outdata->dptr  = discard_const(ctdb->recovery_lock);
+			outdata->dsize = strlen(ctdb->recovery_lock) + 1;
 		}
 		return 0;
-	case CTDB_CONTROL_SET_RECLOCK_FILE: {
-		char *t;
-
-		if (indata.dsize == 0) {
-			TALLOC_FREE(ctdb->recovery_lock_file);
-			return 0;
-		}
-
-		/* Return silent success if unchanged.  Recovery
-		 * master updates all nodes on each recovery - we
-		 * don't need the extra memory allocation or log
-		 * message each time. */
-		if (ctdb->recovery_lock_file != NULL &&
-		    strcmp(discard_const(indata.dptr),
-			   ctdb->recovery_lock_file) == 0) {
-			return 0;
-		}
-
-		t = talloc_strdup(ctdb, discard_const(indata.dptr));
-		if (t == NULL) {
-			DEBUG(DEBUG_ERR, ("Out of memory in SET_RECLOCK_FILE\n"));
-			return -1;
-		}
-
-		talloc_free(ctdb->recovery_lock_file);
-		ctdb->recovery_lock_file = t;
-		DEBUG(DEBUG_NOTICE, ("Updated recovery lock file to %s\n", t));
-
-		return 0;
-	}
+	case CTDB_CONTROL_SET_RECLOCK_FILE:
+		return control_not_implemented("SET_RECLOCK", NULL);
 
 	case CTDB_CONTROL_STOP_NODE:
 		CHECK_CONTROL_DATA_SIZE(0);
@@ -553,18 +632,8 @@ static int32_t ctdb_control_dispatch(struct ctdb_context *ctdb,
 		CHECK_CONTROL_DATA_SIZE(0);
 		return ctdb_control_continue_node(ctdb);
 
-	case CTDB_CONTROL_SET_NATGWSTATE: {
-		uint32_t natgwstate;
-
-		CHECK_CONTROL_DATA_SIZE(sizeof(uint32_t));		
-		natgwstate = *(uint32_t *)indata.dptr;
-		if (natgwstate == 0) {
-			ctdb->capabilities &= ~CTDB_CAP_NATGW;
-		} else {
-			ctdb->capabilities |= CTDB_CAP_NATGW;
-		}
-		return 0;
-	}
+	case CTDB_CONTROL_SET_NATGWSTATE:
+		return control_not_implemented("SET_NATGWSTATE", NULL);
 
 	case CTDB_CONTROL_SET_LMASTERROLE: {
 		uint32_t lmasterrole;
@@ -593,13 +662,13 @@ static int32_t ctdb_control_dispatch(struct ctdb_context *ctdb,
 	}
 
 	case CTDB_CONTROL_ENABLE_SCRIPT:
-		return ctdb_control_enable_script(ctdb, indata);
+		return control_not_implemented("ENABLE_SCRIPT", NULL);
 
 	case CTDB_CONTROL_DISABLE_SCRIPT:
-		return ctdb_control_disable_script(ctdb, indata);
+		return control_not_implemented("DISABLE_SCRIPT", NULL);
 
 	case CTDB_CONTROL_SET_BAN_STATE:
-		CHECK_CONTROL_DATA_SIZE(sizeof(struct ctdb_ban_time));
+		CHECK_CONTROL_DATA_SIZE(sizeof(struct ctdb_ban_state));
 		return ctdb_control_set_ban_state(ctdb, indata);
 
 	case CTDB_CONTROL_GET_BAN_STATE:
@@ -607,29 +676,19 @@ static int32_t ctdb_control_dispatch(struct ctdb_context *ctdb,
 		return ctdb_control_get_ban_state(ctdb, outdata);
 
 	case CTDB_CONTROL_SET_DB_PRIORITY:
-		CHECK_CONTROL_DATA_SIZE(sizeof(struct ctdb_db_priority));
-		return ctdb_control_set_db_priority(ctdb, indata, client_id);
+		return control_not_implemented("SET_DB_PRIORITY", NULL);
 
-	case CTDB_CONTROL_GET_DB_PRIORITY: {
-		uint32_t db_id;
-		struct ctdb_db_context *ctdb_db;
-
-		CHECK_CONTROL_DATA_SIZE(sizeof(db_id));
-		db_id = *(uint32_t *)indata.dptr;
-		ctdb_db = find_ctdb_db(ctdb, db_id);
-		if (ctdb_db == NULL) return -1;
-		return ctdb_db->priority;
-	}
+	case CTDB_CONTROL_GET_DB_PRIORITY:
+		return control_not_implemented("GET_DB_PRIORITY", NULL);
 
 	case CTDB_CONTROL_TRANSACTION_CANCEL:
-		CHECK_CONTROL_DATA_SIZE(0);
-		return ctdb_control_transaction_cancel(ctdb);
+		return control_not_implemented("TRANSACTION_CANCEL", NULL);
 
 	case CTDB_CONTROL_REGISTER_NOTIFY:
 		return ctdb_control_register_notify(ctdb, client_id, indata);
 
 	case CTDB_CONTROL_DEREGISTER_NOTIFY:
-		CHECK_CONTROL_DATA_SIZE(sizeof(struct ctdb_client_notify_deregister));
+		CHECK_CONTROL_DATA_SIZE(sizeof(uint64_t));
 		return ctdb_control_deregister_notify(ctdb, client_id, indata);
 
 	case CTDB_CONTROL_GET_LOG:
@@ -659,7 +718,7 @@ static int32_t ctdb_control_dispatch(struct ctdb_context *ctdb,
 		return ctdb_control_get_ifaces(ctdb, c, outdata);
 
 	case CTDB_CONTROL_SET_IFACE_LINK_STATE:
-		CHECK_CONTROL_DATA_SIZE(sizeof(struct ctdb_control_iface_info));
+		CHECK_CONTROL_DATA_SIZE(sizeof(struct ctdb_iface));
 		return ctdb_control_set_iface_link(ctdb, c, indata);
 
 	case CTDB_CONTROL_GET_STAT_HISTORY:
@@ -684,10 +743,90 @@ static int32_t ctdb_control_dispatch(struct ctdb_context *ctdb,
 		return ctdb_control_reload_public_ips(ctdb, c, async_reply);
 
 	case CTDB_CONTROL_RECEIVE_RECORDS:
-		return ctdb_control_receive_records(ctdb, indata, outdata);
+		return control_not_implemented("RECEIVE_RECORDS", NULL);
 
 	case CTDB_CONTROL_DB_DETACH:
 		return ctdb_control_db_detach(ctdb, indata, client_id);
+
+	case CTDB_CONTROL_DB_FREEZE:
+		CHECK_CONTROL_DATA_SIZE(sizeof(uint32_t));
+		return ctdb_control_db_freeze(ctdb, c, *(uint32_t *)indata.dptr,
+					      async_reply);
+
+	case CTDB_CONTROL_DB_THAW:
+		CHECK_CONTROL_DATA_SIZE(sizeof(uint32_t));
+		return ctdb_control_db_thaw(ctdb, *(uint32_t *)indata.dptr);
+
+	case CTDB_CONTROL_DB_TRANSACTION_START:
+		CHECK_CONTROL_DATA_SIZE(sizeof(struct ctdb_transdb));
+		return ctdb_control_db_transaction_start(ctdb, indata);
+
+	case CTDB_CONTROL_DB_TRANSACTION_COMMIT:
+		CHECK_CONTROL_DATA_SIZE(sizeof(struct ctdb_transdb));
+		return ctdb_control_db_transaction_commit(ctdb, indata);
+
+	case CTDB_CONTROL_DB_TRANSACTION_CANCEL:
+		CHECK_CONTROL_DATA_SIZE(sizeof(uint32_t));
+		return ctdb_control_db_transaction_cancel(ctdb, indata);
+
+	case CTDB_CONTROL_DB_PULL:
+		CHECK_CONTROL_DATA_SIZE(sizeof(struct ctdb_pulldb_ext));
+		return ctdb_control_db_pull(ctdb, c, indata, outdata);
+
+	case CTDB_CONTROL_DB_PUSH_START:
+		CHECK_CONTROL_DATA_SIZE(sizeof(struct ctdb_pulldb_ext));
+		return ctdb_control_db_push_start(ctdb, indata);
+
+	case CTDB_CONTROL_DB_PUSH_CONFIRM:
+		CHECK_CONTROL_DATA_SIZE(sizeof(uint32_t));
+		return ctdb_control_db_push_confirm(ctdb, indata, outdata);
+
+	case CTDB_CONTROL_DB_OPEN_FLAGS: {
+		uint32_t db_id;
+		struct ctdb_db_context *ctdb_db;
+		int tdb_flags;
+
+		CHECK_CONTROL_DATA_SIZE(sizeof(db_id));
+		db_id = *(uint32_t *)indata.dptr;
+		ctdb_db = find_ctdb_db(ctdb, db_id);
+		if (ctdb_db == NULL) {
+			return -1;
+		}
+
+		tdb_flags = tdb_get_flags(ctdb_db->ltdb->tdb);
+
+		outdata->dptr = talloc_size(outdata, sizeof(tdb_flags));
+		if (outdata->dptr == NULL) {
+			return -1;
+		}
+
+		outdata->dsize = sizeof(tdb_flags);
+		memcpy(outdata->dptr, &tdb_flags, outdata->dsize);
+		return 0;
+	}
+
+	case CTDB_CONTROL_CHECK_PID_SRVID:
+		CHECK_CONTROL_DATA_SIZE((sizeof(pid_t) + sizeof(uint64_t)));
+		return ctdb_control_check_pid_srvid(ctdb, indata);
+
+	case CTDB_CONTROL_TUNNEL_REGISTER:
+		return ctdb_control_tunnel_register(ctdb, client_id, srvid);
+
+	case CTDB_CONTROL_TUNNEL_DEREGISTER:
+		return ctdb_control_tunnel_deregister(ctdb, client_id, srvid);
+
+	case CTDB_CONTROL_VACUUM_FETCH:
+		return ctdb_control_vacuum_fetch(ctdb, indata);
+
+	case CTDB_CONTROL_DB_VACUUM: {
+		struct ctdb_db_vacuum db_vacuum;
+
+		CHECK_CONTROL_DATA_SIZE(ctdb_db_vacuum_len(&db_vacuum));
+		return ctdb_control_db_vacuum(ctdb, c, indata, async_reply);
+	}
+	case CTDB_CONTROL_ECHO_DATA: {
+		return ctdb_control_echo_data(ctdb, c, indata, async_reply);
+	}
 
 	default:
 		DEBUG(DEBUG_CRIT,(__location__ " Unknown CTDB control opcode %u\n", opcode));
@@ -698,10 +837,10 @@ static int32_t ctdb_control_dispatch(struct ctdb_context *ctdb,
 /*
   send a reply for a ctdb control
  */
-void ctdb_request_control_reply(struct ctdb_context *ctdb, struct ctdb_req_control *c,
+void ctdb_request_control_reply(struct ctdb_context *ctdb, struct ctdb_req_control_old *c,
 				TDB_DATA *outdata, int32_t status, const char *errormsg)
 {
-	struct ctdb_reply_control *r;
+	struct ctdb_reply_control_old *r;
 	size_t len;
 	
 	/* some controls send no reply */
@@ -709,11 +848,11 @@ void ctdb_request_control_reply(struct ctdb_context *ctdb, struct ctdb_req_contr
 		return;
 	}
 
-	len = offsetof(struct ctdb_reply_control, data) + (outdata?outdata->dsize:0);
+	len = offsetof(struct ctdb_reply_control_old, data) + (outdata?outdata->dsize:0);
 	if (errormsg) {
 		len += strlen(errormsg);
 	}
-	r = ctdb_transport_allocate(ctdb, ctdb, CTDB_REPLY_CONTROL, len, struct ctdb_reply_control);
+	r = ctdb_transport_allocate(ctdb, ctdb, CTDB_REPLY_CONTROL, len, struct ctdb_reply_control_old);
 	if (r == NULL) {
 		DEBUG(DEBUG_ERR,(__location__ "Unable to allocate transport - OOM or transport is down\n"));
 		return;
@@ -741,7 +880,7 @@ void ctdb_request_control_reply(struct ctdb_context *ctdb, struct ctdb_req_contr
 */
 void ctdb_request_control(struct ctdb_context *ctdb, struct ctdb_req_header *hdr)
 {
-	struct ctdb_req_control *c = (struct ctdb_req_control *)hdr;
+	struct ctdb_req_control_old *c = (struct ctdb_req_control_old *)hdr;
 	TDB_DATA data, *outdata;
 	int32_t status;
 	bool async_reply = false;
@@ -765,12 +904,12 @@ void ctdb_request_control(struct ctdb_context *ctdb, struct ctdb_req_header *hdr
 */
 void ctdb_reply_control(struct ctdb_context *ctdb, struct ctdb_req_header *hdr)
 {
-	struct ctdb_reply_control *c = (struct ctdb_reply_control *)hdr;
+	struct ctdb_reply_control_old *c = (struct ctdb_reply_control_old *)hdr;
 	TDB_DATA data;
 	struct ctdb_control_state *state;
 	const char *errormsg = NULL;
 
-	state = ctdb_reqid_find(ctdb, hdr->reqid, struct ctdb_control_state);
+	state = reqid_find(ctdb->idr, hdr->reqid, struct ctdb_control_state);
 	if (state == NULL) {
 		DEBUG(DEBUG_ERR,("pnn %u Invalid reqid %u in ctdb_reply_control\n",
 			 ctdb->pnn, hdr->reqid));
@@ -799,15 +938,16 @@ void ctdb_reply_control(struct ctdb_context *ctdb, struct ctdb_req_header *hdr)
 
 static int ctdb_control_destructor(struct ctdb_control_state *state)
 {
-	ctdb_reqid_remove(state->ctdb, state->reqid);
+	reqid_remove(state->ctdb->idr, state->reqid);
 	return 0;
 }
 
 /*
   handle a timeout of a control
  */
-static void ctdb_control_timeout(struct event_context *ev, struct timed_event *te, 
-		       struct timeval t, void *private_data)
+static void ctdb_control_timeout(struct tevent_context *ev,
+				 struct tevent_timer *te,
+				 struct timeval t, void *private_data)
 {
 	struct ctdb_control_state *state = talloc_get_type(private_data, struct ctdb_control_state);
 	TALLOC_CTX *tmp_ctx = talloc_new(ev);
@@ -833,7 +973,7 @@ int ctdb_daemon_send_control(struct ctdb_context *ctdb, uint32_t destnode,
 			     ctdb_control_callback_fn_t callback,
 			     void *private_data)
 {
-	struct ctdb_req_control *c;
+	struct ctdb_req_control_old *c;
 	struct ctdb_control_state *state;
 	size_t len;
 
@@ -842,7 +982,7 @@ int ctdb_daemon_send_control(struct ctdb_context *ctdb, uint32_t destnode,
 		return -1;
 	}
 
-	if (((destnode == CTDB_BROADCAST_VNNMAP) || 
+	if (((destnode == CTDB_BROADCAST_ACTIVE) ||
 	     (destnode == CTDB_BROADCAST_ALL) ||
 	     (destnode == CTDB_BROADCAST_CONNECTED)) && 
 	    !(flags & CTDB_CTRL_FLAG_NOREPLY)) {
@@ -850,7 +990,7 @@ int ctdb_daemon_send_control(struct ctdb_context *ctdb, uint32_t destnode,
 		return -1;
 	}
 
-	if (destnode != CTDB_BROADCAST_VNNMAP && 
+	if (destnode != CTDB_BROADCAST_ACTIVE &&
 	    destnode != CTDB_BROADCAST_ALL && 
 	    destnode != CTDB_BROADCAST_CONNECTED && 
 	    (!ctdb_validate_pnn(ctdb, destnode) || 
@@ -866,7 +1006,7 @@ int ctdb_daemon_send_control(struct ctdb_context *ctdb, uint32_t destnode,
 	state = talloc(private_data?private_data:ctdb, struct ctdb_control_state);
 	CTDB_NO_MEMORY(ctdb, state);
 
-	state->reqid = ctdb_reqid_new(ctdb, state);
+	state->reqid = reqid_new(ctdb->idr, state);
 	state->callback = callback;
 	state->private_data = private_data;
 	state->ctdb = ctdb;
@@ -874,9 +1014,9 @@ int ctdb_daemon_send_control(struct ctdb_context *ctdb, uint32_t destnode,
 
 	talloc_set_destructor(state, ctdb_control_destructor);
 
-	len = offsetof(struct ctdb_req_control, data) + data.dsize;
+	len = offsetof(struct ctdb_req_control_old, data) + data.dsize;
 	c = ctdb_transport_allocate(ctdb, state, CTDB_REQ_CONTROL, len, 
-				    struct ctdb_req_control);
+				    struct ctdb_req_control_old);
 	CTDB_NO_MEMORY(ctdb, c);
 	talloc_set_name_const(c, "ctdb_req_control packet");
 
@@ -899,9 +1039,9 @@ int ctdb_daemon_send_control(struct ctdb_context *ctdb, uint32_t destnode,
 	}
 
 	if (ctdb->tunable.control_timeout) {
-		event_add_timed(ctdb->ev, state, 
-				timeval_current_ofs(ctdb->tunable.control_timeout, 0), 
-				ctdb_control_timeout, state);
+		tevent_add_timer(ctdb->ev, state,
+				 timeval_current_ofs(ctdb->tunable.control_timeout, 0),
+				 ctdb_control_timeout, state);
 	}
 
 	talloc_free(c);

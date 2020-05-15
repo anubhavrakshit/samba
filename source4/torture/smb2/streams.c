@@ -318,6 +318,9 @@ static bool test_stream_io(struct torture_context *tctx,
 	const char *three[] = { "::$DATA", ":Stream One:$DATA",
 				":Second Stream:$DATA" };
 
+	ZERO_STRUCT(h);
+	ZERO_STRUCT(h2);
+
 	sname1 = talloc_asprintf(mem_ctx, "%s:%s", fname, "Stream One");
 	sname2 = talloc_asprintf(mem_ctx, "%s:%s:$DaTa", fname,
 				 "Second Stream");
@@ -484,6 +487,79 @@ done:
 	return ret;
 }
 
+static bool test_zero_byte_stream(struct torture_context *tctx,
+				  struct smb2_tree *tree)
+{
+	TALLOC_CTX *mem_ctx = talloc_new(tctx);
+	NTSTATUS status;
+	union smb_open io;
+	const char *fname = DNAME "\\stream.txt";
+	const char *sname;
+	bool ret = true;
+	struct smb2_handle h, bh;
+	const char *streams[] = { "::$DATA", ":foo:$DATA" };
+
+	sname = talloc_asprintf(mem_ctx, "%s:%s", fname, "foo");
+
+	smb2_util_unlink(tree, fname);
+	smb2_deltree(tree, DNAME);
+
+	status = torture_smb2_testdir(tree, DNAME, &h);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done, "testdir");
+	smb2_util_close(tree, h);
+
+	torture_comment(tctx, "(%s) Check 0 byte named stream\n",
+	    __location__);
+
+	/* Create basefile */
+	ZERO_STRUCT(io);
+	io.smb2.in.create_disposition = NTCREATEX_DISP_CREATE;
+	io.smb2.in.fname = fname;
+	io.smb2.in.desired_access = SEC_FILE_READ_ATTRIBUTE |
+		SEC_FILE_WRITE_ATTRIBUTE |
+		SEC_FILE_READ_DATA |
+		SEC_FILE_WRITE_DATA;
+	status = smb2_create(tree, mem_ctx, &(io.smb2));
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done, "create");
+	smb2_util_close(tree, io.smb2.out.file.handle);
+
+	/* Create named stream and close it */
+	ZERO_STRUCT(io);
+	io.smb2.in.create_disposition = NTCREATEX_DISP_CREATE;
+	io.smb2.in.fname = sname;
+	io.smb2.in.desired_access = SEC_FILE_READ_ATTRIBUTE |
+		SEC_FILE_WRITE_ATTRIBUTE |
+		SEC_FILE_READ_DATA |
+		SEC_FILE_WRITE_DATA;
+	status = smb2_create(tree, mem_ctx, &(io.smb2));
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done, "create");
+	smb2_util_close(tree, io.smb2.out.file.handle);
+
+	/*
+	 * Check stream list, the 0 byte stream MUST be returned by
+	 * the server.
+	 */
+	ZERO_STRUCT(io);
+	io.smb2.in.fname = fname;
+	io.smb2.in.create_disposition = NTCREATEX_DISP_OPEN;
+	io.smb2.in.desired_access = SEC_FILE_READ_ATTRIBUTE |
+		SEC_FILE_WRITE_ATTRIBUTE |
+		SEC_FILE_READ_DATA |
+		SEC_FILE_WRITE_DATA;
+	status = smb2_create(tree, mem_ctx, &(io.smb2));
+	bh = io.smb2.out.file.handle;
+
+	ret = check_stream_list(tree,tctx, fname, 2, streams, bh);
+	torture_assert_goto(tctx, ret == true, ret, done, "smb2_create");
+	smb2_util_close(tree, bh);
+
+done:
+	smb2_deltree(tree, DNAME);
+	talloc_free(mem_ctx);
+
+	return ret;
+}
+
 /*
   test stream sharemodes
 */
@@ -497,6 +573,10 @@ static bool test_stream_sharemodes(struct torture_context *tctx,
 	const char *sname1, *sname2;
 	bool ret = true;
 	struct smb2_handle h, h1, h2;
+
+	ZERO_STRUCT(h);
+	ZERO_STRUCT(h1);
+	ZERO_STRUCT(h2);
 
 	sname1 = talloc_asprintf(mem_ctx, "%s:%s", fname, "Stream One");
 	sname2 = talloc_asprintf(mem_ctx, "%s:%s:$DaTa", fname,
@@ -595,7 +675,8 @@ static bool test_stream_delete(struct torture_context *tctx,
 	const char *fname = DNAME "\\stream_delete.txt";
 	const char *sname1;
 	bool ret = true;
-	struct smb2_handle h, h1;
+	struct smb2_handle h = {{0}};
+	struct smb2_handle h1 = {{0}};
 	struct smb2_read r;
 
 	if (torture_setting_bool(tctx, "samba4", false)) {
@@ -760,6 +841,11 @@ static bool test_stream_names(struct torture_context *tctx,
 		":MStream Two:$DATA",
 		":?Stream*:$DATA"
 	};
+
+	ZERO_STRUCT(h);
+	ZERO_STRUCT(h1);
+	ZERO_STRUCT(h2);
+	ZERO_STRUCT(h3);
 
 	sname1 = talloc_asprintf(mem_ctx, "%s:%s", fname, "\x05Stream\n One");
 	sname1b = talloc_asprintf(mem_ctx, "%s:", sname1);
@@ -1061,7 +1147,8 @@ static bool test_stream_names2(struct torture_context *tctx,
 	union smb_open io;
 	const char *fname = DNAME "\\stream_names2.txt";
 	bool ret = true;
-	struct smb2_handle h, h1;
+	struct smb2_handle h = {{0}};
+	struct smb2_handle h1 = {{0}};
 	uint8_t i;
 
 	smb2_util_unlink(tree, fname);
@@ -1127,6 +1214,120 @@ done:
 	return ret;
 }
 
+/*
+  test case insensitive stream names
+*/
+static bool test_stream_names3(struct torture_context *tctx,
+			       struct smb2_tree *tree)
+{
+	TALLOC_CTX *mem_ctx = talloc_new(tctx);
+	NTSTATUS status;
+	union smb_fsinfo info;
+	const char *fname = DNAME "\\stream_names3.txt";
+	const char *sname = NULL;
+	const char *snamel = NULL;
+	const char *snameu = NULL;
+	const char *sdname = NULL;
+	const char *sdnamel = NULL;
+	const char *sdnameu = NULL;
+	bool ret = true;
+	struct smb2_handle h = {{0}};
+	struct smb2_handle hf = {{0}};
+	struct smb2_handle hs = {{0}};
+	struct smb2_handle hsl = {{0}};
+	struct smb2_handle hsu = {{0}};
+	struct smb2_handle hsd = {{0}};
+	struct smb2_handle hsdl = {{0}};
+	struct smb2_handle hsdu = {{0}};
+	const char *streams[] = { "::$DATA", ":StreamName:$DATA", };
+
+	smb2_deltree(tree, DNAME);
+	status = torture_smb2_testdir(tree, DNAME, &h);
+	CHECK_STATUS(status, NT_STATUS_OK);
+
+	ZERO_STRUCT(info);
+	info.generic.level = RAW_QFS_ATTRIBUTE_INFORMATION;
+	info.generic.handle = h;
+	status = smb2_getinfo_fs(tree, tree, &info);
+	CHECK_STATUS(status, NT_STATUS_OK);
+	if (!(info.attribute_info.out.fs_attr & FILE_CASE_SENSITIVE_SEARCH)) {
+		torture_skip(tctx, "No FILE_CASE_SENSITIVE_SEARCH supported");
+	}
+
+	/*
+	 * We create the following file:
+	 *
+	 *   teststreams\\stream_names3.txt
+	 *
+	 * and add a stream named 'StreamName'
+	 *
+	 * Then we try to open the stream using the following names:
+	 *
+	 * teststreams\\stream_names3.txt:StreamName
+	 * teststreams\\stream_names3.txt:streamname
+	 * teststreams\\stream_names3.txt:STREAMNAME
+	 * teststreams\\stream_names3.txt:StreamName:$dAtA
+	 * teststreams\\stream_names3.txt:streamname:$data
+	 * teststreams\\stream_names3.txt:STREAMNAME:$DATA
+	 */
+	sname = talloc_asprintf(tctx, "%s:StreamName", fname);
+	torture_assert_not_null(tctx, sname, __location__);
+	snamel = strlower_talloc(tctx, sname);
+	torture_assert_not_null(tctx, snamel, __location__);
+	snameu = strupper_talloc(tctx, sname);
+	torture_assert_not_null(tctx, snameu, __location__);
+
+	sdname = talloc_asprintf(tctx, "%s:$dAtA", sname);
+	torture_assert_not_null(tctx, sdname, __location__);
+	sdnamel = strlower_talloc(tctx, sdname);
+	torture_assert_not_null(tctx, sdnamel, __location__);
+	sdnameu = strupper_talloc(tctx, sdname);
+	torture_assert_not_null(tctx, sdnameu, __location__);
+
+	torture_comment(tctx, "(%s) testing case insensitive stream names\n",
+			__location__);
+	status = torture_smb2_testfile(tree, fname, &hf);
+	CHECK_STATUS(status, NT_STATUS_OK);
+	status = torture_smb2_testfile(tree, sname, &hs);
+	CHECK_STATUS(status, NT_STATUS_OK);
+	smb2_util_close(tree, hs);
+
+	torture_assert(tctx,
+		       check_stream_list(tree, tctx, fname,
+					 ARRAY_SIZE(streams),
+					 streams,
+					 hf),
+		       "streams");
+
+	status = torture_smb2_open(tree, sname, SEC_RIGHTS_FILE_ALL, &hs);
+	CHECK_STATUS(status, NT_STATUS_OK);
+	status = torture_smb2_open(tree, snamel, SEC_RIGHTS_FILE_ALL, &hsl);
+	CHECK_STATUS(status, NT_STATUS_OK);
+	status = torture_smb2_open(tree, snameu, SEC_RIGHTS_FILE_ALL, &hsu);
+	CHECK_STATUS(status, NT_STATUS_OK);
+	status = torture_smb2_open(tree, sdname, SEC_RIGHTS_FILE_ALL, &hsd);
+	CHECK_STATUS(status, NT_STATUS_OK);
+	status = torture_smb2_open(tree, sdnamel, SEC_RIGHTS_FILE_ALL, &hsdl);
+	CHECK_STATUS(status, NT_STATUS_OK);
+	status = torture_smb2_open(tree, sdnameu, SEC_RIGHTS_FILE_ALL, &hsdu);
+	CHECK_STATUS(status, NT_STATUS_OK);
+
+done:
+	smb2_util_close(tree, hsdu);
+	smb2_util_close(tree, hsdl);
+	smb2_util_close(tree, hsd);
+	smb2_util_close(tree, hsu);
+	smb2_util_close(tree, hsl);
+	smb2_util_close(tree, hs);
+	smb2_util_close(tree, hf);
+	smb2_util_close(tree, h);
+	status = smb2_util_unlink(tree, fname);
+	smb2_deltree(tree, DNAME);
+	talloc_free(mem_ctx);
+
+	return ret;
+}
+
 #define CHECK_CALL_HANDLE(call, rightstatus) do { \
 	sfinfo.generic.level = RAW_SFILEINFO_ ## call; \
 	sfinfo.generic.in.file.handle = h1; \
@@ -1162,7 +1363,8 @@ static bool test_stream_rename(struct torture_context *tctx,
 	union smb_fileinfo finfo1;
 	union smb_setfileinfo sfinfo;
 	bool ret = true;
-	struct smb2_handle h, h1;
+	struct smb2_handle h = {{0}};
+	struct smb2_handle h1 = {{0}};
 
 	sname1 = talloc_asprintf(mem_ctx, "%s:%s", fname, "Stream One");
 	sname2 = talloc_asprintf(mem_ctx, "%s:%s:$DaTa", fname,
@@ -1248,6 +1450,9 @@ static bool test_stream_rename2(struct torture_context *tctx,
 	bool ret = true;
 	struct smb2_handle h, h1;
 	union smb_setfileinfo sinfo;
+
+	ZERO_STRUCT(h);
+	ZERO_STRUCT(h1);
 
 	sname1 = talloc_asprintf(mem_ctx, "%s:%s", fname1, "Stream One");
 	sname2 = talloc_asprintf(mem_ctx, "%s:%s", fname1, "Stream Two");
@@ -1418,7 +1623,8 @@ static bool test_stream_create_disposition(struct torture_context *tctx,
 	const char *default_stream_name = "::$DATA";
 	const char *stream_list[2];
 	bool ret = true;
-	struct smb2_handle h, h1;
+	struct smb2_handle h = {{0}};
+	struct smb2_handle h1 = {{0}};
 
 	/* clean slate .. */
 	smb2_util_unlink(tree, fname);
@@ -1597,6 +1803,9 @@ static bool test_stream_attributes(struct torture_context *tctx,
 	union smb_setfileinfo sfinfo;
 	time_t basetime = (time(NULL) - 86400) & ~1;
 
+	ZERO_STRUCT(h);
+	ZERO_STRUCT(h1);
+
 	torture_comment(tctx, "(%s) testing attribute setting on stream\n",
 			__location__);
 
@@ -1735,25 +1944,109 @@ done:
 	return ret;
 }
 
+static bool test_basefile_rename_with_open_stream(struct torture_context *tctx,
+						  struct smb2_tree *tree)
+{
+	bool ret = true;
+	NTSTATUS status;
+	struct smb2_tree *tree2 = NULL;
+	struct smb2_create create, create2;
+	struct smb2_handle h1 = {{0}}, h2 = {{0}};
+	const char *fname = "test_rename_openfile";
+	const char *sname = "test_rename_openfile:foo";
+	const char *fname_renamed = "test_rename_openfile_renamed";
+	union smb_setfileinfo sinfo;
+	const char *data = "test data";
+
+	ret = torture_smb2_connection(tctx, &tree2);
+	torture_assert_goto(tctx, ret == true, ret, done,
+			    "torture_smb2_connection failed\n");
+
+	torture_comment(tctx, "Creating file with stream\n");
+
+	ZERO_STRUCT(create);
+	create.in.desired_access = SEC_FILE_ALL;
+	create.in.share_access = NTCREATEX_SHARE_ACCESS_MASK;
+	create.in.file_attributes = FILE_ATTRIBUTE_NORMAL;
+	create.in.create_disposition = NTCREATEX_DISP_OPEN_IF;
+	create.in.impersonation_level = SMB2_IMPERSONATION_IMPERSONATION;
+	create.in.fname = sname;
+
+	status = smb2_create(tree, tctx, &create);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"smb2_create failed\n");
+
+	h1 = create.out.file.handle;
+
+	torture_comment(tctx, "Writing to stream\n");
+
+	status = smb2_util_write(tree, h1, data, 0, strlen(data));
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"smb2_util_write failed\n");
+
+	torture_comment(tctx, "Renaming base file\n");
+
+	ZERO_STRUCT(create2);
+	create2.in.desired_access = SEC_FILE_ALL;
+	create2.in.file_attributes = FILE_ATTRIBUTE_NORMAL;
+	create2.in.share_access = NTCREATEX_SHARE_ACCESS_MASK;
+	create2.in.create_disposition = NTCREATEX_DISP_OPEN;
+	create2.in.impersonation_level = SMB2_IMPERSONATION_IMPERSONATION;
+	create2.in.fname = fname;
+
+	status = smb2_create(tree2, tctx, &create2);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"smb2_create failed\n");
+
+	h2 = create2.out.file.handle;
+
+	ZERO_STRUCT(sinfo);
+	sinfo.rename_information.level = RAW_SFILEINFO_RENAME_INFORMATION;
+	sinfo.rename_information.in.file.handle = h2;
+	sinfo.rename_information.in.new_name = fname_renamed;
+
+	status = smb2_setinfo_file(tree2, &sinfo);
+	torture_assert_ntstatus_equal_goto(
+		tctx, status, NT_STATUS_ACCESS_DENIED, ret, done,
+		"smb2_setinfo_file didn't return NT_STATUS_ACCESS_DENIED\n");
+
+	smb2_util_close(tree2, h2);
+
+done:
+	if (!smb2_util_handle_empty(h1)) {
+		smb2_util_close(tree, h1);
+	}
+	if (!smb2_util_handle_empty(h2)) {
+		smb2_util_close(tree2, h2);
+	}
+	smb2_util_unlink(tree, fname);
+	smb2_util_unlink(tree, fname_renamed);
+
+	return ret;
+}
 
 /*
    basic testing of streams calls SMB2
 */
-struct torture_suite *torture_smb2_streams_init(void)
+struct torture_suite *torture_smb2_streams_init(TALLOC_CTX *ctx)
 {
 	struct torture_suite *suite =
-		torture_suite_create(talloc_autofree_context(), "streams");
+		torture_suite_create(ctx, "streams");
 
 	torture_suite_add_1smb2_test(suite, "dir", test_stream_dir);
 	torture_suite_add_1smb2_test(suite, "io", test_stream_io);
 	torture_suite_add_1smb2_test(suite, "sharemodes", test_stream_sharemodes);
 	torture_suite_add_1smb2_test(suite, "names", test_stream_names);
 	torture_suite_add_1smb2_test(suite, "names2", test_stream_names2);
+	torture_suite_add_1smb2_test(suite, "names3", test_stream_names3);
 	torture_suite_add_1smb2_test(suite, "rename", test_stream_rename);
 	torture_suite_add_1smb2_test(suite, "rename2", test_stream_rename2);
 	torture_suite_add_1smb2_test(suite, "create-disposition", test_stream_create_disposition);
 	torture_suite_add_1smb2_test(suite, "attributes", test_stream_attributes);
 	torture_suite_add_1smb2_test(suite, "delete", test_stream_delete);
+	torture_suite_add_1smb2_test(suite, "zero-byte", test_zero_byte_stream);
+	torture_suite_add_1smb2_test(suite, "basefile-rename-with-open-stream",
+					test_basefile_rename_with_open_stream);
 
 	suite->description = talloc_strdup(suite, "SMB2-STREAM tests");
 

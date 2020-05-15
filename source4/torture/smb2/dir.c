@@ -203,7 +203,8 @@ static bool test_fixed(struct torture_context *tctx,
 {
 	TALLOC_CTX *mem_ctx = talloc_new(tctx);
 	struct smb2_create create;
-	struct smb2_handle h, h2;
+	struct smb2_handle h = {{0}};
+	struct smb2_handle h2 = {{0}};
 	struct smb2_find f;
 	union smb_search_data *d;
 	struct file_elem files[NFILES] = {};
@@ -311,35 +312,59 @@ static struct {
 	NTSTATUS status;
 	union smb_search_data data;
 } levels[] = {
-	{"SMB2_FIND_DIRECTORY_INFO",
-	 SMB2_FIND_DIRECTORY_INFO, RAW_SEARCH_DATA_DIRECTORY_INFO,
-	 offsetof(union smb_search_data, directory_info.name.s),
-	 offsetof(union smb_search_data, directory_info.file_index),
+	{
+		.name              = "SMB2_FIND_DIRECTORY_INFO",
+		.level             = SMB2_FIND_DIRECTORY_INFO,
+		.data_level        = RAW_SEARCH_DATA_DIRECTORY_INFO,
+		.name_offset       = offsetof(union smb_search_data,
+					      directory_info.name.s),
+		.resume_key_offset = offsetof(union smb_search_data,
+					      directory_info.file_index),
 	},
-	{"SMB2_FIND_FULL_DIRECTORY_INFO",
-	 SMB2_FIND_FULL_DIRECTORY_INFO, RAW_SEARCH_DATA_FULL_DIRECTORY_INFO,
-	 offsetof(union smb_search_data, full_directory_info.name.s),
-	 offsetof(union smb_search_data, full_directory_info.file_index),
+	{
+		.name              = "SMB2_FIND_FULL_DIRECTORY_INFO",
+		.level             = SMB2_FIND_FULL_DIRECTORY_INFO,
+		.data_level        = RAW_SEARCH_DATA_FULL_DIRECTORY_INFO,
+		.name_offset       = offsetof(union smb_search_data,
+					      full_directory_info.name.s),
+		.resume_key_offset = offsetof(union smb_search_data,
+					      full_directory_info.file_index),
 	},
-	{"SMB2_FIND_NAME_INFO",
-	 SMB2_FIND_NAME_INFO, RAW_SEARCH_DATA_NAME_INFO,
-	 offsetof(union smb_search_data, name_info.name.s),
-	 offsetof(union smb_search_data, name_info.file_index),
+	{
+		.name              = "SMB2_FIND_NAME_INFO",
+		.level             = SMB2_FIND_NAME_INFO,
+		.data_level        = RAW_SEARCH_DATA_NAME_INFO,
+		.name_offset       = offsetof(union smb_search_data,
+					      name_info.name.s),
+		.resume_key_offset = offsetof(union smb_search_data,
+					      name_info.file_index),
 	},
-	{"SMB2_FIND_BOTH_DIRECTORY_INFO",
-	 SMB2_FIND_BOTH_DIRECTORY_INFO, RAW_SEARCH_DATA_BOTH_DIRECTORY_INFO,
-	 offsetof(union smb_search_data, both_directory_info.name.s),
-	 offsetof(union smb_search_data, both_directory_info.file_index),
+	{
+		.name              = "SMB2_FIND_BOTH_DIRECTORY_INFO",
+		.level             = SMB2_FIND_BOTH_DIRECTORY_INFO,
+		.data_level        = RAW_SEARCH_DATA_BOTH_DIRECTORY_INFO,
+		.name_offset       = offsetof(union smb_search_data,
+					      both_directory_info.name.s),
+		.resume_key_offset = offsetof(union smb_search_data,
+					      both_directory_info.file_index),
 	},
-	{"SMB2_FIND_ID_FULL_DIRECTORY_INFO",
-	 SMB2_FIND_ID_FULL_DIRECTORY_INFO, RAW_SEARCH_DATA_ID_FULL_DIRECTORY_INFO,
-	 offsetof(union smb_search_data, id_full_directory_info.name.s),
-	 offsetof(union smb_search_data, id_full_directory_info.file_index),
+	{
+		.name              = "SMB2_FIND_ID_FULL_DIRECTORY_INFO",
+		.level             = SMB2_FIND_ID_FULL_DIRECTORY_INFO,
+		.data_level        = RAW_SEARCH_DATA_ID_FULL_DIRECTORY_INFO,
+		.name_offset       = offsetof(union smb_search_data,
+					      id_full_directory_info.name.s),
+		.resume_key_offset = offsetof(union smb_search_data,
+				              id_full_directory_info.file_index),
 	},
-	{"SMB2_FIND_ID_BOTH_DIRECTORY_INFO",
-	 SMB2_FIND_ID_BOTH_DIRECTORY_INFO, RAW_SEARCH_DATA_ID_BOTH_DIRECTORY_INFO,
-	 offsetof(union smb_search_data, id_both_directory_info.name.s),
-	 offsetof(union smb_search_data, id_both_directory_info.file_index),
+	{
+		.name              = "SMB2_FIND_ID_BOTH_DIRECTORY_INFO",
+		.level             = SMB2_FIND_ID_BOTH_DIRECTORY_INFO,
+		.data_level        = RAW_SEARCH_DATA_ID_BOTH_DIRECTORY_INFO,
+		.name_offset       = offsetof(union smb_search_data,
+					      id_both_directory_info.name.s),
+		.resume_key_offset = offsetof(union smb_search_data,
+					      id_both_directory_info.file_index),
 	}
 };
 
@@ -441,7 +466,7 @@ static bool test_one_file(struct torture_context *tctx,
 	status = torture_smb2_testdir(tree, DNAME, &h);
 	torture_assert_ntstatus_ok_goto(tctx, status, ret, done, "");
 
-	status = smb2_create_complex_file(tree, DNAME "\\torture_search.txt",
+	status = smb2_create_complex_file(tctx, tree, DNAME "\\torture_search.txt",
 					  &h2);
 	torture_assert_ntstatus_ok_goto(tctx, status, ret, done, "");
 
@@ -674,7 +699,7 @@ bool fill_result(void *private_data,
 	return true;
 }
 
-enum continue_type {CONT_SINGLE, CONT_INDEX, CONT_RESTART};
+enum continue_type {CONT_SINGLE, CONT_INDEX, CONT_RESTART, CONT_REOPEN};
 
 static NTSTATUS multiple_smb2_search(struct smb2_tree *tree,
 				     TALLOC_CTX *tctx,
@@ -700,6 +725,9 @@ static NTSTATUS multiple_smb2_search(struct smb2_tree *tree,
 
 	/* The search should start from the beginning everytime */
 	f.in.continue_flags = SMB2_CONTINUE_FLAG_RESTART;
+	if (cont_type == CONT_REOPEN) {
+		f.in.continue_flags = SMB2_CONTINUE_FLAG_REOPEN;
+	}
 
 	do {
 		status = smb2_find_level(tree, tree, &f, &count, &d);
@@ -710,6 +738,10 @@ static NTSTATUS multiple_smb2_search(struct smb2_tree *tree,
 			return NT_STATUS_UNSUCCESSFUL;
 		}
 
+		if (count == 0 || result == NULL || result->count == 0) {
+			return NT_STATUS_UNSUCCESSFUL;
+		}
+
 		/*
 		 * After the first iteration is complete set the CONTINUE
 		 * FLAGS appropriately
@@ -717,6 +749,30 @@ static NTSTATUS multiple_smb2_search(struct smb2_tree *tree,
 		switch (cont_type) {
 			case CONT_INDEX:
 				f.in.continue_flags = SMB2_CONTINUE_FLAG_INDEX;
+				switch (data_level) {
+					case RAW_SEARCH_DATA_BOTH_DIRECTORY_INFO:
+						f.in.file_index =
+							result->list[result->count-1].both_directory_info.file_index;
+						break;
+					case RAW_SEARCH_DATA_DIRECTORY_INFO:
+						f.in.file_index =
+							result->list[result->count-1].directory_info.file_index;
+						break;
+					case RAW_SEARCH_DATA_FULL_DIRECTORY_INFO:
+						f.in.file_index =
+							result->list[result->count-1].full_directory_info.file_index;
+						break;
+					case RAW_SEARCH_DATA_ID_FULL_DIRECTORY_INFO:
+						f.in.file_index =
+							result->list[result->count-1].id_full_directory_info.file_index;
+						break;
+					case RAW_SEARCH_DATA_ID_BOTH_DIRECTORY_INFO:
+						f.in.file_index =
+							result->list[result->count-1].id_both_directory_info.file_index;
+						break;
+					default:
+						return NT_STATUS_INVALID_PARAMETER;
+				}
 				break;
 			case CONT_SINGLE:
 				f.in.continue_flags = SMB2_CONTINUE_FLAG_SINGLE;
@@ -775,18 +831,23 @@ static bool test_many_files(struct torture_context *tctx,
 		{"SMB2_FIND_BOTH_DIRECTORY_INFO",    "SINGLE",  SMB2_FIND_BOTH_DIRECTORY_INFO,    RAW_SEARCH_DATA_BOTH_DIRECTORY_INFO,    CONT_SINGLE},
 		{"SMB2_FIND_BOTH_DIRECTORY_INFO",    "INDEX",   SMB2_FIND_BOTH_DIRECTORY_INFO,    RAW_SEARCH_DATA_BOTH_DIRECTORY_INFO,    CONT_INDEX},
 		{"SMB2_FIND_BOTH_DIRECTORY_INFO",    "RESTART", SMB2_FIND_BOTH_DIRECTORY_INFO,    RAW_SEARCH_DATA_BOTH_DIRECTORY_INFO,    CONT_RESTART},
+		{"SMB2_FIND_BOTH_DIRECTORY_INFO",    "REOPEN",  SMB2_FIND_BOTH_DIRECTORY_INFO,    RAW_SEARCH_DATA_BOTH_DIRECTORY_INFO,    CONT_REOPEN},
 		{"SMB2_FIND_DIRECTORY_INFO",         "SINGLE",  SMB2_FIND_DIRECTORY_INFO,         RAW_SEARCH_DATA_DIRECTORY_INFO,         CONT_SINGLE},
 		{"SMB2_FIND_DIRECTORY_INFO",         "INDEX",   SMB2_FIND_DIRECTORY_INFO,         RAW_SEARCH_DATA_DIRECTORY_INFO,         CONT_INDEX},
 		{"SMB2_FIND_DIRECTORY_INFO",         "RESTART", SMB2_FIND_DIRECTORY_INFO,         RAW_SEARCH_DATA_DIRECTORY_INFO,         CONT_RESTART},
+		{"SMB2_FIND_DIRECTORY_INFO",         "REOPEN",  SMB2_FIND_DIRECTORY_INFO,         RAW_SEARCH_DATA_DIRECTORY_INFO,         CONT_REOPEN},
 		{"SMB2_FIND_FULL_DIRECTORY_INFO",    "SINGLE",  SMB2_FIND_FULL_DIRECTORY_INFO,    RAW_SEARCH_DATA_FULL_DIRECTORY_INFO,    CONT_SINGLE},
 		{"SMB2_FIND_FULL_DIRECTORY_INFO",    "INDEX",   SMB2_FIND_FULL_DIRECTORY_INFO,    RAW_SEARCH_DATA_FULL_DIRECTORY_INFO,    CONT_INDEX},
 		{"SMB2_FIND_FULL_DIRECTORY_INFO",    "RESTART", SMB2_FIND_FULL_DIRECTORY_INFO,    RAW_SEARCH_DATA_FULL_DIRECTORY_INFO,    CONT_RESTART},
+		{"SMB2_FIND_FULL_DIRECTORY_INFO",    "REOPEN",  SMB2_FIND_FULL_DIRECTORY_INFO,    RAW_SEARCH_DATA_FULL_DIRECTORY_INFO,    CONT_REOPEN},
 		{"SMB2_FIND_ID_FULL_DIRECTORY_INFO", "SINGLE",  SMB2_FIND_ID_FULL_DIRECTORY_INFO, RAW_SEARCH_DATA_ID_FULL_DIRECTORY_INFO, CONT_SINGLE},
 		{"SMB2_FIND_ID_FULL_DIRECTORY_INFO", "INDEX",   SMB2_FIND_ID_FULL_DIRECTORY_INFO, RAW_SEARCH_DATA_ID_FULL_DIRECTORY_INFO, CONT_INDEX},
 		{"SMB2_FIND_ID_FULL_DIRECTORY_INFO", "RESTART", SMB2_FIND_ID_FULL_DIRECTORY_INFO, RAW_SEARCH_DATA_ID_FULL_DIRECTORY_INFO, CONT_RESTART},
+		{"SMB2_FIND_ID_FULL_DIRECTORY_INFO", "REOPEN",  SMB2_FIND_ID_FULL_DIRECTORY_INFO, RAW_SEARCH_DATA_ID_FULL_DIRECTORY_INFO, CONT_REOPEN},
 		{"SMB2_FIND_ID_BOTH_DIRECTORY_INFO", "SINGLE",  SMB2_FIND_ID_BOTH_DIRECTORY_INFO, RAW_SEARCH_DATA_ID_BOTH_DIRECTORY_INFO, CONT_SINGLE},
 		{"SMB2_FIND_ID_BOTH_DIRECTORY_INFO", "INDEX",   SMB2_FIND_ID_BOTH_DIRECTORY_INFO, RAW_SEARCH_DATA_ID_BOTH_DIRECTORY_INFO, CONT_INDEX},
-		{"SMB2_FIND_ID_BOTH_DIRECTORY_INFO", "RESTART", SMB2_FIND_ID_BOTH_DIRECTORY_INFO, RAW_SEARCH_DATA_ID_BOTH_DIRECTORY_INFO, CONT_RESTART}
+		{"SMB2_FIND_ID_BOTH_DIRECTORY_INFO", "RESTART", SMB2_FIND_ID_BOTH_DIRECTORY_INFO, RAW_SEARCH_DATA_ID_BOTH_DIRECTORY_INFO, CONT_RESTART},
+		{"SMB2_FIND_ID_BOTH_DIRECTORY_INFO", "REOPEN",  SMB2_FIND_ID_BOTH_DIRECTORY_INFO, RAW_SEARCH_DATA_ID_BOTH_DIRECTORY_INFO, CONT_REOPEN},
 	};
 
 	smb2_deltree(tree, DNAME);
@@ -984,7 +1045,7 @@ static bool test_modify_search(struct torture_context *tctx,
 	smb2_util_close(tree, create.out.file.handle);
 
 	files[num_files + 2].name = talloc_asprintf(mem_ctx, "T013-13.txt.3");
-	status = smb2_create_complex_file(tree, DNAME "\\T013-13.txt.3", &h);
+	status = smb2_create_complex_file(tctx, tree, DNAME "\\T013-13.txt.3", &h);
 	torture_assert_ntstatus_ok_goto(tctx, status, ret, done, "");
 
 	smb2_util_unlink(tree, DNAME "\\T014-14.txt");
@@ -1237,7 +1298,7 @@ static bool test_large_files(struct torture_context *tctx,
 	NTSTATUS status;
 	struct smb2_create create;
 	struct smb2_find f;
-	struct smb2_handle h;
+	struct smb2_handle h = {{0}};
 	union smb_search_data *d;
 	int i, j, file_count = 0;
 	char **strs = NULL;
@@ -1343,10 +1404,10 @@ done:
 	return ret;
 }
 
-struct torture_suite *torture_smb2_dir_init(void)
+struct torture_suite *torture_smb2_dir_init(TALLOC_CTX *ctx)
 {
 	struct torture_suite *suite =
-	    torture_suite_create(talloc_autofree_context(), "dir");
+	    torture_suite_create(ctx, "dir");
 
 	torture_suite_add_1smb2_test(suite, "find", test_find);
 	torture_suite_add_1smb2_test(suite, "fixed", test_fixed);

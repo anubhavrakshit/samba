@@ -810,7 +810,8 @@ static int check_tdb_action(struct db_record *rec, void *check_ctx)
 					talloc_free(key);
 					key = p;
 				}
-			} /* fall through */
+				FALL_THROUGH;
+			}
 			case 'r': /* retry */
 				once_more = true;
 				break;
@@ -956,7 +957,7 @@ write_subkeylist(struct db_context *db, struct regkey *key, char sep)
 		struct regkey *subkey = key->subkeys[i];
 		const char *name = subkey->name;
 		if (name == NULL) {
-			printf("Warning: no explicite name for key %s\n",
+			printf("Warning: no explicit name for key %s\n",
 			       subkey->path);
 			name = strrchr_m(subkey->path, sep);
 			assert(name);

@@ -18,6 +18,7 @@
 */
 
 #include <Python.h>
+#include "python/py3compat.h"
 #include "includes.h"
 #include <ldb.h>
 #include <pyldb.h>
@@ -28,38 +29,37 @@
 #include "auth/kerberos/kerberos.h"
 #include "librpc/rpc/pyrpc_util.h"
 #include "lib/policy/policy.h"
+#include "param/pyparam.h"
+#include "lib/util/dlinklist.h"
+#include "dsdb/kcc/garbage_collect_tombstones.h"
+#include "dsdb/kcc/scavenge_dns_records.h"
 
-void initdsdb(void);
-
-/* There's no Py_ssize_t in 2.4, apparently */
-#if PY_MAJOR_VERSION == 2 && PY_MINOR_VERSION < 5
-typedef int Py_ssize_t;
-typedef inquiry lenfunc;
-typedef intargfunc ssizeargfunc;
-#endif
 
 /* FIXME: These should be in a header file somewhere */
 #define PyErr_LDB_OR_RAISE(py_ldb, ldb) \
 	if (!py_check_dcerpc_type(py_ldb, "ldb", "Ldb")) { \
-		PyErr_SetString(py_ldb_get_exception(), "Ldb connection object required"); \
+		PyErr_SetString(PyExc_TypeError, "Ldb connection object required"); \
 		return NULL; \
 	} \
-	ldb = pyldb_Ldb_AsLdbContext(py_ldb);
+	ldb = pyldb_Ldb_AS_LDBCONTEXT(py_ldb);
 
 #define PyErr_LDB_DN_OR_RAISE(py_ldb_dn, dn) \
 	if (!py_check_dcerpc_type(py_ldb_dn, "ldb", "Dn")) { \
-		PyErr_SetString(py_ldb_get_exception(), "ldb Dn object required"); \
+		PyErr_SetString(PyExc_TypeError, "ldb Dn object required"); \
 		return NULL; \
 	} \
-	dn = pyldb_Dn_AsDn(py_ldb_dn);
+	dn = pyldb_Dn_AS_DN(py_ldb_dn);
 
 static PyObject *py_ldb_get_exception(void)
 {
 	PyObject *mod = PyImport_ImportModule("ldb");
+	PyObject *result = NULL;
 	if (mod == NULL)
 		return NULL;
 
-	return PyObject_GetAttrString(mod, "LdbError");
+	result = PyObject_GetAttrString(mod, "LdbError");
+	Py_CLEAR(mod);
+	return result;
 }
 
 static void PyErr_SetLdbError(PyObject *error, int ret, struct ldb_context *ldb_ctx)
@@ -97,7 +97,7 @@ static PyObject *py_samdb_server_site_name(PyObject *self, PyObject *args)
 		return NULL;
 	}
 
-	result = PyString_FromString(site);
+	result = PyUnicode_FromString(site);
 	talloc_free(mem_ctx);
 	return result;
 }
@@ -123,24 +123,31 @@ static PyObject *py_dsdb_convert_schema_to_openldap(PyObject *self,
 		return NULL;
 	} 
 
-	ret = PyString_FromString(retstr);
+	ret = PyUnicode_FromString(retstr);
 	talloc_free(retstr);
 	return ret;
 }
 
 static PyObject *py_samdb_set_domain_sid(PyLdbObject *self, PyObject *args)
-{ 
+{
 	PyObject *py_ldb, *py_sid;
 	struct ldb_context *ldb;
 	struct dom_sid *sid;
 	bool ret;
+	const char *sid_str = NULL;
 
 	if (!PyArg_ParseTuple(args, "OO", &py_ldb, &py_sid))
 		return NULL;
-	
+
 	PyErr_LDB_OR_RAISE(py_ldb, ldb);
 
-	sid = dom_sid_parse_talloc(NULL, PyString_AsString(py_sid));
+	sid_str = PyUnicode_AsUTF8(py_sid);
+	if (sid_str == NULL) {
+		PyErr_NoMemory();
+		return NULL;
+	}
+
+	sid = dom_sid_parse_talloc(NULL, sid_str);
 	if (sid == NULL) {
 		PyErr_NoMemory();
 		return NULL;
@@ -194,8 +201,8 @@ static PyObject *py_samdb_get_domain_sid(PyLdbObject *self, PyObject *args)
 	PyObject *py_ldb;
 	struct ldb_context *ldb;
 	const struct dom_sid *sid;
+	struct dom_sid_buf buf;
 	PyObject *ret;
-	char *retstr;
 
 	if (!PyArg_ParseTuple(args, "O", &py_ldb))
 		return NULL;
@@ -208,13 +215,7 @@ static PyObject *py_samdb_get_domain_sid(PyLdbObject *self, PyObject *args)
 		return NULL;
 	}
 
-	retstr = dom_sid_string(NULL, sid);
-	if (retstr == NULL) {
-		PyErr_NoMemory();
-		return NULL;
-	}
-	ret = PyString_FromString(retstr);
-	talloc_free(retstr);
+	ret = PyUnicode_FromString(dom_sid_str_buf(sid, &buf));
 	return ret;
 }
 
@@ -243,7 +244,7 @@ static PyObject *py_samdb_ntds_invocation_id(PyObject *self, PyObject *args)
 		PyErr_NoMemory();
 		return NULL;
 	}
-	result = PyString_FromString(retstr);
+	result = PyUnicode_FromString(retstr);
 	talloc_free(retstr);
 	return result;
 }
@@ -285,7 +286,7 @@ static PyObject *py_dsdb_get_oid_from_attid(PyObject *self, PyObject *args)
 		return NULL;
 	}
 
-	ret = PyString_FromString(oid);
+	ret = PyUnicode_FromString(oid);
 
 	talloc_free(mem_ctx);
 
@@ -365,7 +366,7 @@ static PyObject *py_dsdb_get_systemFlags_from_lDAPDisplayName(PyObject *self, Py
 		return NULL;
 	}
 
-	return PyInt_FromLong(attribute->systemFlags);
+	return PyLong_FromLong(attribute->systemFlags);
 }
 
 /*
@@ -397,7 +398,7 @@ static PyObject *py_dsdb_get_linkId_from_lDAPDisplayName(PyObject *self, PyObjec
 		return NULL;
 	}
 
-	return PyInt_FromLong(attribute->linkID);
+	return PyLong_FromLong(attribute->linkID);
 }
 
 /*
@@ -440,7 +441,7 @@ static PyObject *py_dsdb_get_backlink_from_lDAPDisplayName(PyObject *self, PyObj
 		Py_RETURN_NONE;
 	}
 
-	return PyString_FromString(target_attr->lDAPDisplayName);
+	return PyUnicode_FromString(target_attr->lDAPDisplayName);
 }
 
 
@@ -470,7 +471,7 @@ static PyObject *py_dsdb_get_lDAPDisplayName_by_attid(PyObject *self, PyObject *
 		return NULL;
 	}
 
-	return PyString_FromString(a->lDAPDisplayName);
+	return PyUnicode_FromString(a->lDAPDisplayName);
 }
 
 
@@ -503,7 +504,7 @@ static PyObject *py_dsdb_get_syntax_oid_from_lDAPDisplayName(PyObject *self, PyO
 		return NULL;
 	}
 
-	return PyString_FromString(attribute->syntax->ldap_oid);
+	return PyUnicode_FromString(attribute->syntax->ldap_oid);
 }
 
 /*
@@ -529,11 +530,6 @@ static PyObject *py_dsdb_DsReplicaAttribute(PyObject *self, PyObject *args)
 
 	PyErr_LDB_OR_RAISE(py_ldb, ldb);
 
-	if (!PyList_Check(el_list)) {
-		PyErr_Format(PyExc_TypeError, "ldif_elements must be a list");
-		return NULL;
-	}
-
 	schema = dsdb_get_schema(ldb, NULL);
 	if (!schema) {
 		PyErr_SetString(PyExc_RuntimeError, "Failed to find a schema from ldb");
@@ -555,32 +551,51 @@ static PyObject *py_dsdb_DsReplicaAttribute(PyObject *self, PyObject *args)
 		return NULL;
 	}
 
-	el = talloc_zero(tmp_ctx, struct ldb_message_element);
-	if (el == NULL) {
-		PyErr_NoMemory();
-		talloc_free(tmp_ctx);
-		return NULL;
-	}
-
-	el->name = ldap_display_name;
-	el->num_values = PyList_Size(el_list);
-
-	el->values = talloc_array(el, struct ldb_val, el->num_values);
-	if (el->values == NULL) {
-		PyErr_NoMemory();
-		talloc_free(tmp_ctx);
-		return NULL;
-	}
-
-	for (i = 0; i < el->num_values; i++) {
-		PyObject *item = PyList_GetItem(el_list, i);
-		if (!PyString_Check(item)) {
-			PyErr_Format(PyExc_TypeError, "ldif_elements should be strings");
+	/* If we were not given an LdbMessageElement */
+	if (!PyList_Check(el_list)) {
+		if (!py_check_dcerpc_type(el_list, "ldb", "MessageElement")) {
+			PyErr_SetString(py_ldb_get_exception(),
+					"list of strings or ldb MessageElement object required");
+			return NULL;
+		}
+		/*
+		 * NOTE:
+		 * el may not be a valid talloc context, it
+		 * could be part of an array
+		 */
+		el = pyldb_MessageElement_AsMessageElement(el_list);
+	} else {
+		el = talloc_zero(tmp_ctx, struct ldb_message_element);
+		if (el == NULL) {
+			PyErr_NoMemory();
 			talloc_free(tmp_ctx);
 			return NULL;
 		}
-		el->values[i].data = (uint8_t *)PyString_AsString(item);
-		el->values[i].length = PyString_Size(item);
+
+		el->name = ldap_display_name;
+		el->num_values = PyList_Size(el_list);
+
+		el->values = talloc_array(el, struct ldb_val, el->num_values);
+		if (el->values == NULL) {
+			PyErr_NoMemory();
+			talloc_free(tmp_ctx);
+			return NULL;
+		}
+
+		for (i = 0; i < el->num_values; i++) {
+			PyObject *item = PyList_GetItem(el_list, i);
+			if (!(PyBytes_Check(item))) {
+				PyErr_Format(PyExc_TypeError,
+					     "ldif_element type should be "
+					     PY_DESC_PY3_BYTES
+					     );
+				talloc_free(tmp_ctx);
+				return NULL;
+			}
+			el->values[i].data =
+				(uint8_t *)PyBytes_AsString(item);
+			el->values[i].length = PyBytes_Size(item);
+		}
 	}
 
 	attr = talloc_zero(tmp_ctx, struct drsuapi_DsReplicaAttribute);
@@ -606,28 +621,26 @@ static PyObject *py_dsdb_DsReplicaAttribute(PyObject *self, PyObject *args)
  */
 static PyObject *py_dsdb_normalise_attributes(PyObject *self, PyObject *args)
 {
-	PyObject *py_ldb, *el_list, *ret;
+	PyObject *py_ldb, *el_list, *py_ret;
 	struct ldb_context *ldb;
 	char *ldap_display_name;
 	const struct dsdb_attribute *a;
 	struct dsdb_schema *schema;
 	struct dsdb_syntax_ctx syntax_ctx;
-	struct ldb_message_element *el;
+	struct ldb_message_element *el, *new_el;
 	struct drsuapi_DsReplicaAttribute *attr;
+	PyLdbMessageElementObject *ret;
 	TALLOC_CTX *tmp_ctx;
 	WERROR werr;
 	Py_ssize_t i;
+	PyTypeObject *py_type = NULL;
+	PyObject *module = NULL;
 
 	if (!PyArg_ParseTuple(args, "OsO", &py_ldb, &ldap_display_name, &el_list)) {
 		return NULL;
 	}
 
 	PyErr_LDB_OR_RAISE(py_ldb, ldb);
-
-	if (!PyList_Check(el_list)) {
-		PyErr_Format(PyExc_TypeError, "ldif_elements must be a list");
-		return NULL;
-	}
 
 	schema = dsdb_get_schema(ldb, NULL);
 	if (!schema) {
@@ -650,38 +663,62 @@ static PyObject *py_dsdb_normalise_attributes(PyObject *self, PyObject *args)
 		return NULL;
 	}
 
-	el = talloc_zero(tmp_ctx, struct ldb_message_element);
-	if (el == NULL) {
-		PyErr_NoMemory();
-		talloc_free(tmp_ctx);
-		return NULL;
-	}
-
-	el->name = ldap_display_name;
-	el->num_values = PyList_Size(el_list);
-
-	el->values = talloc_array(el, struct ldb_val, el->num_values);
-	if (el->values == NULL) {
-		PyErr_NoMemory();
-		talloc_free(tmp_ctx);
-		return NULL;
-	}
-
-	for (i = 0; i < el->num_values; i++) {
-		PyObject *item = PyList_GetItem(el_list, i);
-		if (!PyString_Check(item)) {
-			PyErr_Format(PyExc_TypeError, "ldif_elements should be strings");
+	if (!PyList_Check(el_list)) {
+		if (!py_check_dcerpc_type(el_list, "ldb", "MessageElement")) {
+			PyErr_SetString(py_ldb_get_exception(),
+					"list of strings or ldb MessageElement object required");
+			return NULL;
+		}
+		/*
+		 * NOTE:
+		 * el may not be a valid talloc context, it
+		 * could be part of an array
+		 */
+		el = pyldb_MessageElement_AsMessageElement(el_list);
+	} else {
+		el = talloc_zero(tmp_ctx, struct ldb_message_element);
+		if (el == NULL) {
+			PyErr_NoMemory();
 			talloc_free(tmp_ctx);
 			return NULL;
 		}
-		el->values[i].data = (uint8_t *)PyString_AsString(item);
-		el->values[i].length = PyString_Size(item);
+
+		el->name = ldap_display_name;
+		el->num_values = PyList_Size(el_list);
+
+		el->values = talloc_array(el, struct ldb_val, el->num_values);
+		if (el->values == NULL) {
+			PyErr_NoMemory();
+			talloc_free(tmp_ctx);
+			return NULL;
+		}
+
+		for (i = 0; i < el->num_values; i++) {
+			PyObject *item = PyList_GetItem(el_list, i);
+			if (!PyBytes_Check(item)) {
+				PyErr_Format(PyExc_TypeError,
+					     "ldif_element type should be "
+					     PY_DESC_PY3_BYTES
+					     );
+				talloc_free(tmp_ctx);
+				return NULL;
+			}
+			el->values[i].data = (uint8_t *)PyBytes_AsString(item);
+			el->values[i].length = PyBytes_Size(item);
+		}
+	}
+
+	new_el = talloc_zero(tmp_ctx, struct ldb_message_element);
+	if (new_el == NULL) {
+		PyErr_NoMemory();
+		talloc_free(tmp_ctx);
+		return NULL;
 	}
 
 	/* Normalise "objectClass" attribute if needed */
 	if (ldb_attr_cmp(a->lDAPDisplayName, "objectClass") == 0) {
 		int iret;
-		iret = dsdb_sort_objectClass_attr(ldb, schema, el, tmp_ctx, el);
+		iret = dsdb_sort_objectClass_attr(ldb, schema, el, new_el, new_el);
 		if (iret != LDB_SUCCESS) {
 			PyErr_SetString(PyExc_RuntimeError, ldb_errstring(ldb));
 			talloc_free(tmp_ctx);
@@ -704,14 +741,41 @@ static PyObject *py_dsdb_normalise_attributes(PyObject *self, PyObject *args)
 	PyErr_WERROR_NOT_OK_RAISE(werr);
 
 	/* now convert back again */
-	werr = a->syntax->drsuapi_to_ldb(&syntax_ctx, a, attr, el, el);
+	werr = a->syntax->drsuapi_to_ldb(&syntax_ctx, a, attr, new_el, new_el);
 	PyErr_WERROR_NOT_OK_RAISE(werr);
 
-	ret = py_return_ndr_struct("ldb", "MessageElement", el, el);
+	module = PyImport_ImportModule("ldb");
+	if (module == NULL) {
+		return NULL;
+	}
+
+	py_type = (PyTypeObject *)PyObject_GetAttrString(module, "MessageElement");
+	if (py_type == NULL) {
+		Py_DECREF(module);
+		return NULL;
+	}
+
+	Py_CLEAR(module);
+
+	py_ret = py_type->tp_alloc(py_type, 0);
+	Py_CLEAR(py_type);
+	if (py_ret == NULL) {
+		PyErr_NoMemory();
+		return NULL;
+	}
+	ret = (PyLdbMessageElementObject *)py_ret;
+
+	ret->mem_ctx = talloc_new(NULL);
+	if (talloc_reference(ret->mem_ctx, new_el) == NULL) {
+		Py_CLEAR(py_ret);
+		PyErr_NoMemory();
+		return NULL;
+	}
+	ret->el = new_el;
 
 	talloc_free(tmp_ctx);
 
-	return ret;
+	return py_ret;
 }
 
 
@@ -725,7 +789,7 @@ static PyObject *py_dsdb_set_ntds_invocation_id(PyObject *self, PyObject *args)
 		return NULL;
 
 	PyErr_LDB_OR_RAISE(py_ldb, ldb);
-	GUID_from_string(PyString_AsString(py_guid), &guid);
+	GUID_from_string(PyUnicode_AsUTF8(py_guid), &guid);
 
 	if (GUID_all_zero(&guid)) {
 		PyErr_SetString(PyExc_RuntimeError, "set_ntds_invocation_id rejected due to all-zero invocation ID");
@@ -764,7 +828,7 @@ static PyObject *py_samdb_ntds_objectGUID(PyObject *self, PyObject *args)
 		PyErr_NoMemory();
 		return NULL;
 	}
-	result = PyString_FromString(retstr);
+	result = PyUnicode_FromString(retstr);
 	talloc_free(retstr);
 	return result;
 }
@@ -823,11 +887,10 @@ static PyObject *py_dsdb_load_partition_usn(PyObject *self, PyObject *args)
 
 	talloc_free(mem_ctx);
 
-	result = PyDict_New();
-
-	PyDict_SetItemString(result, "uSNHighest", PyInt_FromLong((uint64_t)highest_uSN));
-	PyDict_SetItemString(result, "uSNUrgent", PyInt_FromLong((uint64_t)urgent_uSN));
-
+	result = Py_BuildValue(
+			"{s:l, s:l}",
+			"uSNHighest", (uint64_t)highest_uSN,
+			"uSNUrgent", (uint64_t)urgent_uSN);
 
 	return result;
 }
@@ -877,7 +940,7 @@ static PyObject *py_dsdb_set_schema_from_ldb(PyObject *self, PyObject *args)
 	struct ldb_context *from_ldb;
 	struct dsdb_schema *schema;
 	int ret;
-	char write_indices_and_attributes = true;
+	char write_indices_and_attributes = SCHEMA_WRITE;
 	if (!PyArg_ParseTuple(args, "OO|b",
 			      &py_ldb, &py_from_ldb, &write_indices_and_attributes))
 		return NULL;
@@ -1036,6 +1099,306 @@ static PyObject *py_dsdb_am_pdc(PyObject *self, PyObject *args)
 	return PyBool_FromLong(am_pdc);
 }
 
+/*
+  call DSDB_EXTENDED_CREATE_OWN_RID_SET to get a new RID set for this server
+ */
+static PyObject *py_dsdb_create_own_rid_set(PyObject *self, PyObject *args)
+{
+	PyObject *py_ldb;
+	struct ldb_context *ldb;
+	int ret;
+	struct ldb_result *ext_res;
+
+	if (!PyArg_ParseTuple(args, "O", &py_ldb))
+		return NULL;
+
+	PyErr_LDB_OR_RAISE(py_ldb, ldb);
+
+	/*
+	 * Run DSDB_EXTENDED_CREATE_OWN_RID_SET to get a RID set
+	 */
+
+	ret = ldb_extended(ldb, DSDB_EXTENDED_CREATE_OWN_RID_SET, NULL, &ext_res);
+
+	PyErr_LDB_ERROR_IS_ERR_RAISE(py_ldb_get_exception(), ret, ldb);
+
+	TALLOC_FREE(ext_res);
+
+	Py_RETURN_NONE;
+}
+
+/*
+  call DSDB_EXTENDED_ALLOCATE_RID to get a new RID set for this server
+ */
+static PyObject *py_dsdb_allocate_rid(PyObject *self, PyObject *args)
+{
+	PyObject *py_ldb;
+	struct ldb_context *ldb;
+	int ret;
+	uint32_t rid;
+	struct ldb_result *ext_res = NULL;
+	struct dsdb_extended_allocate_rid *rid_return = NULL;
+	if (!PyArg_ParseTuple(args, "O", &py_ldb)) {
+		return NULL;
+	}
+
+	PyErr_LDB_OR_RAISE(py_ldb, ldb);
+
+	rid_return = talloc_zero(ldb, struct dsdb_extended_allocate_rid);
+	if (rid_return == NULL) {
+		return PyErr_NoMemory();
+	}
+
+	/*
+	 * Run DSDB_EXTENDED_ALLOCATE_RID to get a new RID
+	 */
+
+	ret = ldb_extended(ldb, DSDB_EXTENDED_ALLOCATE_RID, rid_return, &ext_res);
+	if (ret != LDB_SUCCESS) {
+		TALLOC_FREE(rid_return);
+		TALLOC_FREE(ext_res);
+		PyErr_LDB_ERROR_IS_ERR_RAISE(py_ldb_get_exception(), ret, ldb);
+	}
+
+	rid = rid_return->rid;
+	TALLOC_FREE(rid_return);
+	TALLOC_FREE(ext_res);
+
+	return PyLong_FromLong(rid);
+}
+
+static PyObject *py_dns_delete_tombstones(PyObject *self, PyObject *args)
+{
+	PyObject *py_ldb;
+	NTSTATUS status;
+	struct ldb_context *ldb = NULL;
+	TALLOC_CTX *mem_ctx = NULL;
+	char *error_string = NULL;
+
+	if (!PyArg_ParseTuple(args, "O", &py_ldb)) {
+		return NULL;
+	}
+	PyErr_LDB_OR_RAISE(py_ldb, ldb);
+
+	mem_ctx = talloc_new(ldb);
+	if (mem_ctx == NULL) {
+		return PyErr_NoMemory();
+	}
+
+	status = dns_delete_tombstones(mem_ctx, ldb, &error_string);
+
+	if (!NT_STATUS_IS_OK(status)) {
+		if (error_string) {
+			PyErr_Format(PyExc_RuntimeError, "%s", error_string);
+		} else {
+			PyErr_SetNTSTATUS(status);
+		}
+		TALLOC_FREE(mem_ctx);
+		return NULL;
+	}
+
+	TALLOC_FREE(mem_ctx);
+	Py_RETURN_NONE;
+}
+
+static PyObject *py_scavenge_dns_records(PyObject *self, PyObject *args)
+{
+	PyObject *py_ldb;
+	NTSTATUS status;
+	struct ldb_context *ldb = NULL;
+	TALLOC_CTX *mem_ctx = NULL;
+	char *error_string = NULL;
+
+	if (!PyArg_ParseTuple(args, "O", &py_ldb)) {
+		return NULL;
+	}
+	PyErr_LDB_OR_RAISE(py_ldb, ldb);
+
+	mem_ctx = talloc_new(ldb);
+	if (mem_ctx == NULL) {
+		return PyErr_NoMemory();
+	}
+
+	status = dns_tombstone_records(mem_ctx, ldb, &error_string);
+
+	if (!NT_STATUS_IS_OK(status)) {
+		if (error_string) {
+			PyErr_Format(PyExc_RuntimeError, "%s", error_string);
+		} else {
+			PyErr_SetNTSTATUS(status);
+		}
+		TALLOC_FREE(mem_ctx);
+		return NULL;
+	}
+
+	TALLOC_FREE(mem_ctx);
+	Py_RETURN_NONE;
+}
+
+static PyObject *py_dsdb_garbage_collect_tombstones(PyObject *self, PyObject *args)
+{
+	PyObject *py_ldb, *py_list_dn;
+	struct ldb_context *ldb = NULL;
+        Py_ssize_t i;
+        Py_ssize_t length;
+	long long _current_time, _tombstone_lifetime = LLONG_MAX;
+	uint32_t tombstone_lifetime32;
+	struct dsdb_ldb_dn_list_node *part = NULL;
+	time_t current_time, tombstone_lifetime;
+	TALLOC_CTX *mem_ctx = NULL;
+	NTSTATUS status;
+	unsigned int num_objects_removed = 0;
+	unsigned int num_links_removed = 0;
+	char *error_string = NULL;
+
+	if (!PyArg_ParseTuple(args, "OOL|L", &py_ldb,
+			      &py_list_dn, &_current_time, &_tombstone_lifetime)) {
+		return NULL;
+	}
+
+
+	PyErr_LDB_OR_RAISE(py_ldb, ldb);
+
+	mem_ctx = talloc_new(ldb);
+	if (mem_ctx == NULL) {
+		return PyErr_NoMemory();
+	}
+
+	current_time = _current_time;
+
+	if (_tombstone_lifetime == LLONG_MAX) {
+		int ret = dsdb_tombstone_lifetime(ldb, &tombstone_lifetime32);
+		if (ret != LDB_SUCCESS) {
+			PyErr_Format(PyExc_RuntimeError,
+				     "Failed to get tombstone lifetime: %s",
+				     ldb_errstring(ldb));
+			TALLOC_FREE(mem_ctx);
+			return NULL;
+		}
+		tombstone_lifetime = tombstone_lifetime32;
+	} else {
+		tombstone_lifetime = _tombstone_lifetime;
+	}
+
+	if (!PyList_Check(py_list_dn)) {
+		PyErr_SetString(PyExc_TypeError, "A list of DNs were expected");
+		TALLOC_FREE(mem_ctx);
+		return NULL;
+	}
+
+	length = PyList_GET_SIZE(py_list_dn);
+
+	for (i = 0; i < length; i++) {
+		const char *part_str = PyUnicode_AsUTF8(PyList_GetItem(py_list_dn, i));
+		struct ldb_dn *p;
+		struct dsdb_ldb_dn_list_node *node;
+
+		if (part_str == NULL) {
+			TALLOC_FREE(mem_ctx);
+			return PyErr_NoMemory();
+		}
+
+		p = ldb_dn_new(mem_ctx, ldb, part_str);
+		if (p == NULL) {
+			PyErr_Format(PyExc_RuntimeError, "Failed to parse DN %s", part_str);
+			TALLOC_FREE(mem_ctx);
+			return NULL;
+		}
+		node = talloc_zero(mem_ctx, struct dsdb_ldb_dn_list_node);
+		node->dn = p;
+
+		DLIST_ADD_END(part, node);
+	}
+
+	status = dsdb_garbage_collect_tombstones(mem_ctx, ldb,
+						 part, current_time,
+						 tombstone_lifetime,
+						 &num_objects_removed,
+						 &num_links_removed,
+						 &error_string);
+
+	if (!NT_STATUS_IS_OK(status)) {
+		if (error_string) {
+			PyErr_Format(PyExc_RuntimeError, "%s", error_string);
+		} else {
+			PyErr_SetNTSTATUS(status);
+		}
+		TALLOC_FREE(mem_ctx);
+		return NULL;
+	}
+
+	TALLOC_FREE(mem_ctx);
+
+	return Py_BuildValue("(II)", num_objects_removed,
+			    num_links_removed);
+}
+
+static PyObject *py_dsdb_load_udv_v2(PyObject *self, PyObject *args)
+{
+	uint32_t count;
+	int ret, i;
+	bool ok;
+	PyObject *py_ldb = NULL, *py_dn = NULL, *pylist = NULL;
+	struct ldb_context *samdb = NULL;
+	struct ldb_dn *dn = NULL;
+	struct drsuapi_DsReplicaCursor2 *cursors = NULL;
+	TALLOC_CTX *tmp_ctx = NULL;
+
+	if (!PyArg_ParseTuple(args, "OO", &py_ldb, &py_dn)) {
+		return NULL;
+	}
+
+	PyErr_LDB_OR_RAISE(py_ldb, samdb);
+
+	tmp_ctx = talloc_new(samdb);
+	if (tmp_ctx == NULL) {
+		return PyErr_NoMemory();
+	}
+
+	ok = pyldb_Object_AsDn(tmp_ctx, py_dn, samdb, &dn);
+	if (!ok) {
+		TALLOC_FREE(tmp_ctx);
+		return NULL;
+	}
+
+	ret = dsdb_load_udv_v2(samdb, dn, tmp_ctx, &cursors, &count);
+	if (ret != LDB_SUCCESS) {
+		TALLOC_FREE(tmp_ctx);
+		PyErr_SetString(PyExc_RuntimeError,
+				"Failed to load udv from ldb");
+		return NULL;
+	}
+
+	pylist = PyList_New(count);
+	if (pylist == NULL) {
+		TALLOC_FREE(tmp_ctx);
+		return PyErr_NoMemory();
+	}
+
+	for (i = 0; i < count; i++) {
+		PyObject *py_cursor;
+		struct drsuapi_DsReplicaCursor2 *cursor;
+		cursor = talloc(tmp_ctx, struct drsuapi_DsReplicaCursor2);
+		if (cursor == NULL) {
+			TALLOC_FREE(tmp_ctx);
+			return PyErr_NoMemory();
+		}
+		*cursor = cursors[i];
+
+		py_cursor = py_return_ndr_struct("samba.dcerpc.drsuapi",
+						 "DsReplicaCursor2",
+						 cursor, cursor);
+		if (py_cursor == NULL) {
+			TALLOC_FREE(tmp_ctx);
+			return PyErr_NoMemory();
+		}
+
+		PyList_SetItem(pylist, i, py_cursor);
+	}
+
+	TALLOC_FREE(tmp_ctx);
+	return pylist;
+}
 
 static PyMethodDef py_dsdb_methods[] = {
 	{ "_samdb_server_site_name", (PyCFunction)py_samdb_server_site_name,
@@ -1102,19 +1465,41 @@ static PyMethodDef py_dsdb_methods[] = {
 	{ "_dsdb_get_wellknown_dn", (PyCFunction)py_dsdb_get_wellknown_dn, METH_VARARGS, NULL },
 	{ "_dsdb_DsReplicaAttribute", (PyCFunction)py_dsdb_DsReplicaAttribute, METH_VARARGS, NULL },
 	{ "_dsdb_normalise_attributes", (PyCFunction)py_dsdb_normalise_attributes, METH_VARARGS, NULL },
-	{ NULL }
+	{ "_dsdb_garbage_collect_tombstones", (PyCFunction)py_dsdb_garbage_collect_tombstones, METH_VARARGS,
+		"_dsdb_kcc_check_deleted(samdb, [dn], current_time, tombstone_lifetime)"
+		" -> (num_objects_expunged, num_links_expunged)" },
+	{ "_scavenge_dns_records", (PyCFunction)py_scavenge_dns_records,
+		METH_VARARGS, NULL},
+	{ "_dns_delete_tombstones", (PyCFunction)py_dns_delete_tombstones,
+		METH_VARARGS, NULL},
+	{ "_dsdb_create_own_rid_set", (PyCFunction)py_dsdb_create_own_rid_set, METH_VARARGS,
+		"_dsdb_create_own_rid_set(samdb)"
+		" -> None" },
+	{ "_dsdb_allocate_rid", (PyCFunction)py_dsdb_allocate_rid, METH_VARARGS,
+		"_dsdb_allocate_rid(samdb)"
+		" -> RID" },
+	{ "_dsdb_load_udv_v2", (PyCFunction)py_dsdb_load_udv_v2, METH_VARARGS, NULL },
+	{0}
 };
 
-void initdsdb(void)
+static struct PyModuleDef moduledef = {
+    PyModuleDef_HEAD_INIT,
+    .m_name = "dsdb",
+    .m_doc = "Python bindings for the directory service databases.",
+    .m_size = -1,
+    .m_methods = py_dsdb_methods,
+};
+
+MODULE_INIT_FUNC(dsdb)
 {
 	PyObject *m;
 
-	m = Py_InitModule3("dsdb", py_dsdb_methods, 
-			   "Python bindings for the directory service databases.");
-	if (m == NULL)
-		return;
+	m = PyModule_Create(&moduledef);
 
-#define ADD_DSDB_FLAG(val)  PyModule_AddObject(m, #val, PyInt_FromLong(val))
+	if (m == NULL)
+		return NULL;
+
+#define ADD_DSDB_FLAG(val)  PyModule_AddObject(m, #val, PyLong_FromLong(val))
 
 	/* "userAccountControl" flags */
 	ADD_DSDB_FLAG(UF_NORMAL_ACCOUNT);
@@ -1180,6 +1565,9 @@ void initdsdb(void)
 	ADD_DSDB_FLAG(DS_DOMAIN_FUNCTION_2003);
 	ADD_DSDB_FLAG(DS_DOMAIN_FUNCTION_2008);
 	ADD_DSDB_FLAG(DS_DOMAIN_FUNCTION_2008_R2);
+	ADD_DSDB_FLAG(DS_DOMAIN_FUNCTION_2012);
+	ADD_DSDB_FLAG(DS_DOMAIN_FUNCTION_2012_R2);
+	ADD_DSDB_FLAG(DS_DOMAIN_FUNCTION_2016);
 
         /* nc replica flags */
 	ADD_DSDB_FLAG(INSTANCE_TYPE_IS_NC_HEAD);
@@ -1275,14 +1663,21 @@ void initdsdb(void)
 	ADD_DSDB_FLAG(GPO_INHERIT);
 	ADD_DSDB_FLAG(GPO_BLOCK_INHERITANCE);
 
-#define ADD_DSDB_STRING(val)  PyModule_AddObject(m, #val, PyString_FromString(val))
+#define ADD_DSDB_STRING(val)  PyModule_AddObject(m, #val, PyUnicode_FromString(val))
 
 	ADD_DSDB_STRING(DSDB_SYNTAX_BINARY_DN);
 	ADD_DSDB_STRING(DSDB_SYNTAX_STRING_DN);
 	ADD_DSDB_STRING(DSDB_SYNTAX_OR_NAME);
 	ADD_DSDB_STRING(DSDB_CONTROL_DBCHECK);
 	ADD_DSDB_STRING(DSDB_CONTROL_DBCHECK_MODIFY_RO_REPLICA);
+	ADD_DSDB_STRING(DSDB_CONTROL_DBCHECK_FIX_DUPLICATE_LINKS);
+	ADD_DSDB_STRING(DSDB_CONTROL_DBCHECK_FIX_LINK_DN_NAME);
+	ADD_DSDB_STRING(DSDB_CONTROL_DBCHECK_FIX_LINK_DN_SID);
+	ADD_DSDB_STRING(DSDB_CONTROL_REPLMD_VANISH_LINKS);
 	ADD_DSDB_STRING(DSDB_CONTROL_PERMIT_INTERDOMAIN_TRUST_UAC_OID);
+	ADD_DSDB_STRING(DSDB_CONTROL_SKIP_DUPLICATES_CHECK_OID);
+	ADD_DSDB_STRING(DSDB_CONTROL_BYPASS_PASSWORD_HASH_OID);
+	ADD_DSDB_STRING(DSDB_CONTROL_INVALID_NOT_IMPLEMENTED);
 
 	ADD_DSDB_STRING(DS_GUID_COMPUTERS_CONTAINER);
 	ADD_DSDB_STRING(DS_GUID_DELETED_OBJECTS_CONTAINER);
@@ -1295,4 +1690,6 @@ void initdsdb(void)
 	ADD_DSDB_STRING(DS_GUID_PROGRAM_DATA_CONTAINER);
 	ADD_DSDB_STRING(DS_GUID_SYSTEMS_CONTAINER);
 	ADD_DSDB_STRING(DS_GUID_USERS_CONTAINER);
+
+	return m;
 }

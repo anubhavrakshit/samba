@@ -21,6 +21,8 @@
 #include "replace.h"
 #include "nsswitch/nsstest.h"
 
+#define SAFE_FREE(x) do { if ((x) != NULL) {free(x); (x)=NULL;} } while(0)
+
 static const char *so_path = "/lib/libnss_winbind.so";
 static const char *nss_name = "winbind";
 static int nss_errno;
@@ -48,10 +50,10 @@ static void *find_fn(const char *name)
 	if (!res) {
 		printf("Can't find function %s\n", s);
 		total_errors++;
-		free(s);
+		SAFE_FREE(s);
 		return NULL;
 	}
-	free(s);
+	SAFE_FREE(s);
 	return res;
 }
 
@@ -186,20 +188,22 @@ static struct group *nss_getgrent(void)
 again:
 	status = _nss_getgrent_r(&grp, buf, buflen, &nss_errno);
 	if (status == NSS_STATUS_TRYAGAIN) {
+		char *oldbuf = buf;
 		buflen *= 2;
 		buf = (char *)realloc(buf, buflen);
 		if (!buf) {
+			SAFE_FREE(oldbuf);
 			return NULL;
 		}
 		goto again;
 	}
 	if (status == NSS_STATUS_NOTFOUND) {
-		free(buf);
+		SAFE_FREE(buf);
 		return NULL;
 	}
 	if (status != NSS_STATUS_SUCCESS) {
 		report_nss_error("getgrent", status);
-		free(buf);
+		SAFE_FREE(buf);
 		return NULL;
 	}
 	return &grp;
@@ -224,20 +228,22 @@ static struct group *nss_getgrnam(const char *name)
 again:
 	status = _nss_getgrnam_r(name, &grp, buf, buflen, &nss_errno);
 	if (status == NSS_STATUS_TRYAGAIN) {
+		char *oldbuf = buf;
 		buflen *= 2;
 		buf = (char *)realloc(buf, buflen);
 		if (!buf) {
+			SAFE_FREE(oldbuf);
 			return NULL;
 		}
 		goto again;
 	}
 	if (status == NSS_STATUS_NOTFOUND) {
-		free(buf);
+		SAFE_FREE(buf);
 		return NULL;
 	}
 	if (status != NSS_STATUS_SUCCESS) {
 		report_nss_error("getgrnam", status);
-		free(buf);
+		SAFE_FREE(buf);
 		return NULL;
 	}
 	return &grp;
@@ -263,20 +269,22 @@ static struct group *nss_getgrgid(gid_t gid)
 again:
 	status = _nss_getgrgid_r(gid, &grp, buf, buflen, &nss_errno);
 	if (status == NSS_STATUS_TRYAGAIN) {
+		char *oldbuf = buf;
 		buflen *= 2;
 		buf = (char *)realloc(buf, buflen);
 		if (!buf) {
+			SAFE_FREE(oldbuf);
 			return NULL;
 		}
 		goto again;
 	}
 	if (status == NSS_STATUS_NOTFOUND) {
-		free(buf);
+		SAFE_FREE(buf);
 		return NULL;
 	}
 	if (status != NSS_STATUS_SUCCESS) {
 		report_nss_error("getgrgid", status);
-		free(buf);
+		SAFE_FREE(buf);
 		return NULL;
 	}
 	return &grp;

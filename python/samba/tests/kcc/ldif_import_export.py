@@ -22,10 +22,8 @@
 import samba
 import os
 import time
-import shutil
-import sys
 import subprocess
-
+import logging
 import samba.tests
 from samba.kcc import ldif_import_export, KCC
 from samba import ldb
@@ -40,6 +38,12 @@ unix_now = int(time.time())
 
 MULTISITE_LDIF = os.path.join(os.environ['SRCDIR_ABS'],
                               "testdata/ldif-utils-test-multisite.ldif")
+
+
+# UNCONNECTED_LDIF is a single site, unconnected 5DC database that was
+# created using samba-tool domain join in testenv.
+UNCONNECTED_LDIF = os.path.join(os.environ['SRCDIR_ABS'],
+                                "testdata/unconnected-intrasite.ldif")
 
 MULTISITE_LDIF_DSAS = (
     ("CN=WIN08,CN=Servers,CN=Site-4,CN=Sites,CN=Configuration,DC=ad,DC=samba,DC=example,DC=com",
@@ -98,7 +102,7 @@ class LdifImportExportTests(samba.tests.TestCaseInTempDir):
                                         scope=ldb.SCOPE_BASE,
                                         attrs=["dsServiceName"])
         dn = ldb.Dn(samdb,
-                    service_name_res[0]["dsServiceName"][0])
+                    service_name_res[0]["dsServiceName"][0].decode('utf8'))
         self.assertEqual(dn, ldb.Dn(samdb, "CN=NTDS Settings," + dsa))
         self.remove_files(dburl)
 
@@ -122,14 +126,32 @@ class LdifImportExportTests(samba.tests.TestCaseInTempDir):
                                             scope=ldb.SCOPE_BASE,
                                             attrs=["dsServiceName"])
             dn = ldb.Dn(samdb,
-                        service_name_res[0]["dsServiceName"][0])
+                        service_name_res[0]["dsServiceName"][0].decode('utf8'))
             self.assertEqual(dn, ldb.Dn(samdb, "CN=NTDS Settings," + dsa))
             self.remove_files(dburl)
 
-
-    def samdb_to_ldif_file(self):
-        #samdb_to_ldif_file(samdb, dburl, lp, creds, ldif_file):
-        pass
+    def test_samdb_to_ldif_file(self):
+        dburl = os.path.join(self.tempdir, "ldap")
+        dburl2 = os.path.join(self.tempdir, "ldap_roundtrip")
+        ldif_file = os.path.join(self.tempdir, "ldif")
+        samdb = ldif_import_export.ldif_to_samdb(dburl, self.lp,
+                                                 MULTISITE_LDIF)
+        self.assertIsInstance(samdb, SamDB)
+        ldif_import_export.samdb_to_ldif_file(samdb, dburl,
+                                              lp=self.lp, creds=None,
+                                              ldif_file=ldif_file)
+        self.assertGreater(os.path.getsize(ldif_file), 1000,
+                           "LDIF should be larger than 1000 bytes")
+        samdb = ldif_import_export.ldif_to_samdb(dburl2, self.lp,
+                                                 ldif_file)
+        self.assertIsInstance(samdb, SamDB)
+        dsa = ("CN=WIN01,CN=Servers,CN=Default-First-Site-Name,CN=Sites,"
+               "CN=Configuration,DC=ad,DC=samba,DC=example,DC=com")
+        res = samdb.search(ldb.Dn(samdb, "CN=NTDS Settings," + dsa),
+                           scope=ldb.SCOPE_BASE, attrs=["objectGUID"])
+        self.remove_files(dburl)
+        self.remove_files(dburl2)
+        self.remove_files(ldif_file)
 
 
 class KCCMultisiteLdifTests(samba.tests.TestCaseInTempDir):
@@ -150,7 +172,7 @@ class KCCMultisiteLdifTests(samba.tests.TestCaseInTempDir):
         my_kcc = KCC(unix_now, readonly=readonly, verify=verify,
                      dot_file_dir=dot_file_dir)
         tmpdb = os.path.join(self.tempdir, 'tmpdb')
-        my_kcc.import_ldif(tmpdb, self.lp, self.creds, MULTISITE_LDIF)
+        my_kcc.import_ldif(tmpdb, self.lp, MULTISITE_LDIF)
         self.remove_files(tmpdb)
         return my_kcc
 
@@ -166,12 +188,30 @@ class KCCMultisiteLdifTests(samba.tests.TestCaseInTempDir):
         """
         my_kcc = self._get_kcc('test-verify', verify=True)
         tmpdb = os.path.join(self.tempdir, 'verify-tmpdb')
-        my_kcc.import_ldif(tmpdb, self.lp, self.creds, MULTISITE_LDIF)
+        my_kcc.import_ldif(tmpdb, self.lp, MULTISITE_LDIF)
 
-        my_kcc.run("ldap://%s" % tmpdb,
+        my_kcc.run(None,
                    self.lp, self.creds,
                    attempt_live_connections=False)
         self.remove_files(tmpdb)
+
+    def test_unconnected_db(self):
+        """Check that the KCC generates errors on a unconnected db
+        """
+        my_kcc = self._get_kcc('test-verify', verify=True)
+        tmpdb = os.path.join(self.tempdir, 'verify-tmpdb')
+        my_kcc.import_ldif(tmpdb, self.lp, UNCONNECTED_LDIF)
+
+        try:
+            my_kcc.run(None,
+                       self.lp, self.creds,
+                       attempt_live_connections=False)
+        except samba.kcc.graph_utils.GraphError:
+            pass
+        except Exception:
+            self.fail("Did not expect this error.")
+        finally:
+            self.remove_files(tmpdb)
 
     def test_dotfiles(self):
         """Check that KCC writes dot_files when asked.
@@ -179,8 +219,8 @@ class KCCMultisiteLdifTests(samba.tests.TestCaseInTempDir):
         my_kcc = self._get_kcc('test-dotfiles', dot_file_dir=self.tempdir)
         tmpdb = os.path.join(self.tempdir, 'dotfile-tmpdb')
         files = [tmpdb]
-        my_kcc.import_ldif(tmpdb, self.lp, self.creds, MULTISITE_LDIF)
-        my_kcc.run("ldap://%s" % tmpdb,
+        my_kcc.import_ldif(tmpdb, self.lp, MULTISITE_LDIF)
+        my_kcc.run(None,
                    self.lp, self.creds,
                    attempt_live_connections=False)
 
@@ -192,7 +232,7 @@ class KCCMultisiteLdifTests(samba.tests.TestCaseInTempDir):
                     r = subprocess.call([dot, '-Tcanon', ffn])
                     self.assertEqual(r, 0)
 
-                #even if dot is not there, at least check the file is non-empty
+                # even if dot is not there, at least check the file is non-empty
                 size = os.stat(ffn).st_size
                 self.assertNotEqual(size, 0)
                 files.append(ffn)

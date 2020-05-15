@@ -350,7 +350,7 @@ bool remove_name_from_wins_namelist(struct name_record *namerec)
 static int traverse_fn(TDB_CONTEXT *tdb, TDB_DATA kbuf, TDB_DATA dbuf, void *state)
 {
 	struct name_record *namerec = NULL;
-	XFILE *fp = (XFILE *)state;
+	FILE *fp = (FILE *)state;
 
 	if (kbuf.dsize != sizeof(unstring) + 1) {
 		return 0;
@@ -368,7 +368,7 @@ static int traverse_fn(TDB_CONTEXT *tdb, TDB_DATA kbuf, TDB_DATA dbuf, void *sta
 	return 0;
 }
 
-void dump_wins_subnet_namelist(XFILE *fp)
+void dump_wins_subnet_namelist(FILE *fp)
 {
 	tdb_traverse(wins_tdb, traverse_fn, (void *)fp);
 }
@@ -454,8 +454,10 @@ static void get_global_id_and_update(uint64_t *current_id, bool update)
 
 static void wins_hook(const char *operation, struct name_record *namerec, int ttl)
 {
+	const struct loadparm_substitution *lp_sub =
+		loadparm_s3_global_substitution();
 	char *command = NULL;
-	char *cmd = lp_wins_hook(talloc_tos());
+	char *cmd = lp_wins_hook(talloc_tos(), lp_sub);
 	char *p, *namestr;
 	int i;
 	TALLOC_CTX *ctx = talloc_tos();
@@ -501,7 +503,7 @@ static void wins_hook(const char *operation, struct name_record *namerec, int tt
 	}
 
 	DEBUG(3,("calling wins hook for %s\n", nmb_namestr(&namerec->name)));
-	smbrun(command, NULL);
+	smbrun(command, NULL, NULL);
 	TALLOC_FREE(command);
 }
 
@@ -592,7 +594,7 @@ Load or create the WINS database.
 bool initialise_wins(void)
 {
 	time_t time_now = time(NULL);
-	XFILE *fp;
+	FILE *fp;
 	char line[1024];
 	char *db_path;
 	char *list_path;
@@ -601,7 +603,7 @@ bool initialise_wins(void)
 		return True;
 	}
 
-	db_path = state_path("wins.tdb");
+	db_path = state_path(talloc_tos(), "wins.tdb");
 	if (db_path == NULL) {
 		return false;
 	}
@@ -620,13 +622,13 @@ bool initialise_wins(void)
 
 	add_samba_names_to_subnet(wins_server_subnet);
 
-	list_path = state_path(WINS_LIST);
+	list_path = state_path(talloc_tos(), WINS_LIST);
 	if (list_path == NULL) {
 		tdb_close(wins_tdb);
 		return false;
 	}
 
-	fp = x_fopen(list_path, O_RDONLY, 0);
+	fp = fopen(list_path, "r");
 	TALLOC_FREE(list_path);
 	if (fp == NULL) {
 		DEBUG(2,("initialise_wins: Can't open wins database file %s. Error was %s\n",
@@ -634,7 +636,7 @@ bool initialise_wins(void)
 		return True;
 	}
 
-	while (!x_feof(fp)) {
+	while (!feof(fp)) {
 		char *name_str = NULL;
 		char *ip_str = NULL;
 		char *ttl_str = NULL, *nb_flags_str = NULL;
@@ -655,7 +657,7 @@ bool initialise_wins(void)
 
 		/* Read a line from the wins.dat file. Strips whitespace
 			from the beginning and end of the line.  */
-		if (!fgets_slash(line,sizeof(line),fp)) {
+		if (!fgets_slash(NULL, line, sizeof(line), fp)) {
 			continue;
 		}
 
@@ -667,7 +669,7 @@ bool initialise_wins(void)
 			if (sscanf(line,"VERSION %d %u", &version, &hash) != 2 ||
 						version != WINS_VERSION) {
 				DEBUG(0,("Discarding invalid wins.dat file [%s]\n",line));
-				x_fclose(fp);
+				fclose(fp);
 				return True;
 			}
 			continue;
@@ -724,7 +726,7 @@ bool initialise_wins(void)
 		/* Allocate the space for the ip_list. */
 		if((ip_list = SMB_MALLOC_ARRAY( struct in_addr, num_ips)) == NULL) {
 			DEBUG(0,("initialise_wins: Malloc fail !\n"));
-			x_fclose(fp);
+			fclose(fp);
 			TALLOC_FREE(frame);
 			return False;
 		}
@@ -788,7 +790,7 @@ bool initialise_wins(void)
 		SAFE_FREE(ip_list);
 	}
 
-	x_fclose(fp);
+	fclose(fp);
 	return True;
 }
 
@@ -1649,7 +1651,7 @@ received for name %s from IP %s on subnet %s. Error - should not be sent to WINS
 
 	if(group) {
 		DEBUG(0,("wins_process_multihomed_name_registration_request: group name registration request \
-received for name %s from IP %s on subnet %s. Errror - group names should not be multihomed.\n",
+received for name %s from IP %s on subnet %s. Error - group names should not be multihomed.\n",
 			nmb_namestr(question), inet_ntoa(from_ip), subrec->subnet_name));
 		return;
 	}
@@ -2385,7 +2387,7 @@ void initiate_wins_processing(time_t t)
  Write out one record.
 ******************************************************************/
 
-void wins_write_name_record(struct name_record *namerec, XFILE *fp)
+void wins_write_name_record(struct name_record *namerec, FILE *fp)
 {
 	int i;
 	struct tm *tm;
@@ -2420,12 +2422,13 @@ void wins_write_name_record(struct name_record *namerec, XFILE *fp)
 	if( namerec->data.source == REGISTER_NAME ) {
 		unstring name;
 		pull_ascii_nstring(name, sizeof(name), namerec->name.name);
-		x_fprintf(fp, "\"%s#%02x\" %d ", name,namerec->name.name_type, /* Ignore scope. */
+		fprintf(fp, "\"%s#%02x\" %d ", name,
+			namerec->name.name_type, /* Ignore scope. */
 			(int)namerec->data.death_time);
 
 		for (i = 0; i < namerec->data.num_ips; i++)
-			x_fprintf( fp, "%s ", inet_ntoa( namerec->data.ip[i] ) );
-		x_fprintf( fp, "%2xR\n", namerec->data.nb_flags );
+			fprintf(fp, "%s ", inet_ntoa(namerec->data.ip[i]));
+		fprintf(fp, "%2xR\n", namerec->data.nb_flags);
 	}
 }
 
@@ -2436,7 +2439,7 @@ void wins_write_name_record(struct name_record *namerec, XFILE *fp)
 static int wins_writedb_traverse_fn(TDB_CONTEXT *tdb, TDB_DATA kbuf, TDB_DATA dbuf, void *state)
 {
 	struct name_record *namerec = NULL;
-	XFILE *fp = (XFILE *)state;
+	FILE *fp = (FILE *)state;
 
 	if (kbuf.dsize != sizeof(unstring) + 1) {
 		return 0;
@@ -2461,7 +2464,8 @@ void wins_write_database(time_t t, bool background)
 	char *fname = NULL;
 	char *fnamenew = NULL;
 
-	XFILE *fp;
+	int fd;
+	FILE *fp;
 
 	if (background) {
 		if (!last_write_time) {
@@ -2491,7 +2495,7 @@ void wins_write_database(time_t t, bool background)
 		}
 	}
 
-	if (!(fname = state_path(WINS_LIST))) {
+	if (!(fname = state_path(talloc_tos(), WINS_LIST))) {
 		goto err_exit;
 	}
 	/* This is safe as the 0 length means "don't expand". */
@@ -2501,18 +2505,27 @@ void wins_write_database(time_t t, bool background)
 		goto err_exit;
 	}
 
-	if((fp = x_fopen(fnamenew,O_WRONLY|O_CREAT,0644)) == NULL) {
-		DEBUG(0,("wins_write_database: Can't open %s. Error was %s\n", fnamenew, strerror(errno)));
+	fd = open(fnamenew, O_WRONLY|O_CREAT, 0644);
+	if (fd == -1) {
+		DBG_ERR("Can't open %s: %s\n", fnamenew, strerror(errno));
 		goto err_exit;
 	}
 
+	fp = fdopen(fd, "w");
+	if (fp == NULL) {
+		DBG_ERR("fdopen failed: %s\n", strerror(errno));
+		close(fd);
+		goto err_exit;
+	}
+	fd = -1;
+
 	DEBUG(4,("wins_write_database: Dump of WINS name list.\n"));
 
-	x_fprintf(fp,"VERSION %d %u\n", WINS_VERSION, 0);
+	fprintf(fp,"VERSION %d %u\n", WINS_VERSION, 0);
 
 	tdb_traverse(wins_tdb, wins_writedb_traverse_fn, fp);
 
-	x_fclose(fp);
+	fclose(fp);
 	chmod(fnamenew,0644);
 	unlink(fname);
 	rename(fnamenew,fname);

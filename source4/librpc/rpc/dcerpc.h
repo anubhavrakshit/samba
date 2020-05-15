@@ -46,11 +46,21 @@ struct dcecli_connection;
 struct gensec_settings;
 struct cli_credentials;
 struct dcecli_security {
-	struct dcerpc_auth *auth_info;
+	enum dcerpc_AuthType auth_type;
+	enum dcerpc_AuthLevel auth_level;
+	uint32_t auth_context_id;
+	struct {
+		struct dcerpc_auth *out;
+		struct dcerpc_auth *in;
+		TALLOC_CTX *mem;
+	} tmp_auth_info;
 	struct gensec_security *generic_state;
 
 	/* get the session key */
 	NTSTATUS (*session_key)(struct dcecli_connection *, DATA_BLOB *);
+
+	bool verified_bitmask1;
+
 };
 
 /*
@@ -97,6 +107,12 @@ struct dcecli_connection {
 
 	/* the next context_id to be assigned */
 	uint32_t next_context_id;
+
+	/* The maximum total payload of reassembled response pdus */
+	size_t max_total_response_size;
+
+	/* the negotiated bind time features */
+	uint16_t bind_time_features;
 };
 
 /*
@@ -107,6 +123,7 @@ struct dcerpc_pipe {
 
 	uint32_t context_id;
 
+	struct GUID object;
 	struct ndr_syntax_id syntax;
 	struct ndr_syntax_id transfer_syntax;
 
@@ -126,6 +143,8 @@ struct dcerpc_pipe {
 	 */
 	bool inhibit_timeout_processing;
 	bool timed_out;
+
+	bool verified_pcontext;
 };
 
 /* default timeout for all rpc requests, in seconds */
@@ -190,15 +209,6 @@ NTSTATUS dcerpc_pipe_auth(TALLOC_CTX *mem_ctx,
 			  const struct ndr_interface_table *table,
 			  struct cli_credentials *credentials,
 			  struct loadparm_context *lp_ctx);
-NTSTATUS dcerpc_secondary_connection(struct dcerpc_pipe *p,
-				     struct dcerpc_pipe **p2,
-				     const struct dcerpc_binding *b);
-NTSTATUS dcerpc_bind_auth_schannel(TALLOC_CTX *tmp_ctx, 
-				   struct dcerpc_pipe *p,
-				   const struct ndr_interface_table *table,
-				   struct cli_credentials *credentials,
-				   struct loadparm_context *lp_ctx,
-				   uint8_t auth_level);
 NTSTATUS dcerpc_init(void);
 struct composite_context *dcerpc_secondary_smb_send(struct dcecli_connection *c1,
 						    struct dcecli_connection *c2,
@@ -248,9 +258,5 @@ NTSTATUS dcerpc_secondary_auth_connection(struct dcerpc_pipe *p,
 
 struct composite_context* dcerpc_secondary_connection_send(struct dcerpc_pipe *p,
 							   const struct dcerpc_binding *b);
-void dcerpc_log_packet(const char *lockdir, 
-		       const struct ndr_interface_table *ndr,
-		       uint32_t opnum, uint32_t flags,
-		       const DATA_BLOB *pkt);
 
 #endif /* __S4_DCERPC_H__ */

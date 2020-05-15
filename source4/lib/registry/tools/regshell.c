@@ -192,12 +192,12 @@ static WERROR cmd_set(struct regshell_context *ctx, int argc, const char **argv)
 
 	if (argc < 4) {
 		fprintf(stderr, "Usage: set value-name type value\n");
-		return WERR_INVALID_PARAM;
+		return WERR_INVALID_PARAMETER;
 	}
 
 	if (!reg_string_to_val(ctx, argv[2], argv[3], &val.data_type, &val.data)) {
 		fprintf(stderr, "Unable to interpret data\n");
-		return WERR_INVALID_PARAM;
+		return WERR_INVALID_PARAMETER;
 	}
 
 	error = reg_val_set(ctx->current, argv[1], val.data_type, val.data);
@@ -218,7 +218,7 @@ static WERROR cmd_ck(struct regshell_context *ctx, int argc, const char **argv)
 	if(argc == 2) {
 		if (!W_ERROR_IS_OK(get_full_path(ctx, argv[1], &full_path))) {
 			fprintf(stderr, "Unable to parse the supplied path\n");
-			return WERR_INVALID_PARAM;
+			return WERR_INVALID_PARAMETER;
 		}
 		error = reg_open_key(ctx->registry, ctx->root, full_path,
 				     &nkey);
@@ -246,7 +246,7 @@ static WERROR cmd_print(struct regshell_context *ctx, int argc, const char **arg
 
 	if (argc != 2) {
 		fprintf(stderr, "Usage: print <valuename>\n");
-		return WERR_INVALID_PARAM;
+		return WERR_INVALID_PARAMETER;
 	}
 
 	error = reg_key_get_value_by_name(ctx, ctx->current, argv[1],
@@ -299,7 +299,7 @@ static WERROR cmd_mkkey(struct regshell_context *ctx, int argc, const char **arg
 
 	if(argc < 2) {
 		fprintf(stderr, "Usage: mkkey <keyname>\n");
-		return WERR_INVALID_PARAM;
+		return WERR_INVALID_PARAMETER;
 	}
 
 	error = reg_key_add_name(ctx, ctx->current, argv[1], 0, NULL, &tmp);
@@ -320,7 +320,7 @@ static WERROR cmd_rmkey(struct regshell_context *ctx,
 
 	if(argc < 2) {
 		fprintf(stderr, "Usage: rmkey <name>\n");
-		return WERR_INVALID_PARAM;
+		return WERR_INVALID_PARAMETER;
 	}
 
 	error = reg_key_del(ctx, ctx->current, argv[1]);
@@ -340,7 +340,7 @@ static WERROR cmd_rmval(struct regshell_context *ctx, int argc, const char **arg
 
 	if(argc < 2) {
 		fprintf(stderr, "Usage: rmval <valuename>\n");
-		return WERR_INVALID_PARAM;
+		return WERR_INVALID_PARAMETER;
 	}
 
 	error = reg_del_value(ctx, ctx->current, argv[1]);
@@ -380,7 +380,7 @@ static struct {
 	{"help", "?", "Help", cmd_help },
 	{"exit", "quit", "Exit", cmd_exit },
 	{"predef", "predefined", "Go to predefined key", cmd_predef },
-	{NULL }
+	{0}
 };
 
 static WERROR cmd_help(struct regshell_context *ctx,
@@ -404,7 +404,7 @@ static WERROR process_cmd(struct regshell_context *ctx,
 
 	if ((ret = poptParseArgvString(line, &argc, &argv)) != 0) {
 		fprintf(stderr, "regshell: %s\n", poptStrerror(ret));
-		return WERR_INVALID_PARAM;
+		return WERR_INVALID_PARAMETER;
 	}
 
 	for(i = 0; regshell_cmds[i].name; i++) {
@@ -416,7 +416,7 @@ static WERROR process_cmd(struct regshell_context *ctx,
 
 	fprintf(stderr, "No such command '%s'\n", argv[0]);
 
-	return WERR_INVALID_PARAM;
+	return WERR_INVALID_PARAMETER;
 }
 
 #define MAX_COMPLETIONS 100
@@ -428,7 +428,7 @@ static char **reg_complete_command(const char *text, int start, int end)
 	/* Complete command */
 	char **matches;
 	size_t len, samelen=0;
-	int i, count=1;
+	size_t i, count = 1;
 
 	matches = malloc_array_p(char *, MAX_COMPLETIONS);
 	if (!matches) return NULL;
@@ -463,10 +463,8 @@ static char **reg_complete_command(const char *text, int start, int end)
 	return matches;
 
 cleanup:
-	count--;
-	while (count >= 0) {
-		free(matches[count]);
-		count--;
+	for (i = 0; i < count; i++) {
+		free(matches[i]);
 	}
 	free(matches);
 	return NULL;
@@ -482,6 +480,7 @@ static char **reg_complete_key(const char *text, int start, int end)
 	const char *base_n = "";
 	TALLOC_CTX *mem_ctx;
 	WERROR status;
+	int ret;
 
 	matches = malloc_array_p(char *, MAX_COMPLETIONS);
 	if (!matches) return NULL;
@@ -529,12 +528,16 @@ static char **reg_complete_key(const char *text, int start, int end)
 	}
 
 	if (j == 2) { /* Exact match */
-		asprintf(&matches[0], "%s%s", base_n, matches[1]);
+		ret = asprintf(&matches[0], "%s%s", base_n, matches[1]);
 	} else {
-		asprintf(&matches[0], "%s%s", base_n,
+		ret = asprintf(&matches[0], "%s%s", base_n,
 				talloc_strndup(mem_ctx, matches[1], samelen));
 	}
 	talloc_free(mem_ctx);
+	if (ret == -1) {
+		SAFE_FREE(matches);
+		return NULL;
+	}
 
 	matches[j] = NULL;
 	return matches;
@@ -567,7 +570,7 @@ int main(int argc, const char **argv)
 		POPT_COMMON_SAMBA
 		POPT_COMMON_CREDENTIALS
 		POPT_COMMON_VERSION
-		{ NULL }
+		{0}
 	};
 
 	pc = poptGetContext(argv[0], argc, argv, long_options,0);
@@ -581,9 +584,12 @@ int main(int argc, const char **argv)
 
 	if (remote != NULL) {
 		ctx->registry = reg_common_open_remote(remote, ev_ctx,
-					 cmdline_lp_ctx, cmdline_credentials);
+					 cmdline_lp_ctx,
+					popt_get_cmdline_credentials());
 	} else if (file != NULL) {
-		ctx->current = reg_common_open_file(file, ev_ctx, cmdline_lp_ctx, cmdline_credentials);
+		ctx->current = reg_common_open_file(file, ev_ctx,
+					cmdline_lp_ctx,
+					popt_get_cmdline_credentials());
 		if (ctx->current == NULL)
 			return 1;
 		ctx->registry = ctx->current->context;
@@ -591,7 +597,9 @@ int main(int argc, const char **argv)
 		ctx->predef = NULL;
 		ctx->root = ctx->current;
 	} else {
-		ctx->registry = reg_common_open_local(cmdline_credentials, ev_ctx, cmdline_lp_ctx);
+		ctx->registry = reg_common_open_local(
+					popt_get_cmdline_credentials(),
+					ev_ctx, cmdline_lp_ctx);
 	}
 
 	if (ctx->registry == NULL)

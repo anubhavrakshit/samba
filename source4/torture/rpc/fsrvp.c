@@ -44,6 +44,7 @@
 #include "librpc/gen_ndr/ndr_security.h"
 #include "librpc/gen_ndr/ndr_srvsvc_c.h"
 #include "librpc/gen_ndr/ndr_fsrvp_c.h"
+#include "lib/cmdline/popt_common.h"
 
 #define FSHARE	"fsrvp_share"
 #define FNAME	"testfss.dat"
@@ -344,10 +345,10 @@ static bool test_fsrvp_sc_create(struct torture_context *tctx,
 
 	torture_assert(tctx, !GUID_compare(&r_sharemap_get.in.ShadowCopySetId,
 					   &map->ShadowCopySetId),
-		       "sc_set GUID missmatch in GetShareMapping");
+		       "sc_set GUID mismatch in GetShareMapping");
 	torture_assert(tctx, !GUID_compare(&r_sharemap_get.in.ShadowCopyId,
 					   &map->ShadowCopyId),
-		       "sc GUID missmatch in GetShareMapping");
+		       "sc GUID mismatch in GetShareMapping");
 
 done:
 	talloc_free(tmp_ctx);
@@ -506,7 +507,6 @@ static bool test_fsrvp_sc_share_io(struct torture_context *tctx,
 	TALLOC_CTX *tmp_ctx = talloc_new(tctx);
 	char *share_unc = talloc_asprintf(tmp_ctx, "\\\\%s\\%s",
 					  dcerpc_server_name(p), FSHARE);
-	extern struct cli_credentials *cmdline_credentials;
 	struct smb2_tree *tree_base;
 	struct smb2_tree *tree_snap;
 	struct smbcli_options options;
@@ -520,7 +520,7 @@ static bool test_fsrvp_sc_share_io(struct torture_context *tctx,
 			      lpcfg_smb_ports(tctx->lp_ctx),
 			      FSHARE,
 			      lpcfg_resolve_context(tctx->lp_ctx),
-			      cmdline_credentials,
+			      popt_get_cmdline_credentials(),
 			      &tree_base,
 			      tctx->ev,
 			      &options,
@@ -551,7 +551,7 @@ static bool test_fsrvp_sc_share_io(struct torture_context *tctx,
 			      lpcfg_smb_ports(tctx->lp_ctx),
 			      sc_map->ShadowCopyShareName,
 			      lpcfg_resolve_context(tctx->lp_ctx),
-			      cmdline_credentials,
+			      popt_get_cmdline_credentials(),
 			      &tree_snap,
 			      tctx->ev,
 			      &options,
@@ -604,7 +604,7 @@ static bool test_fsrvp_enum_snaps(struct torture_context *tctx,
 	io.level = RAW_IOCTL_SMB2;
 	io.in.file.handle = fh;
 	io.in.function = FSCTL_SRV_ENUM_SNAPS;
-	io.in.max_response_size = 16;
+	io.in.max_output_response = 16;
 	io.in.flags = SMB2_IOCTL_FLAG_IS_FSCTL;
 
 	status = smb2_ioctl(tree, mem_ctx, &io);
@@ -612,7 +612,7 @@ static bool test_fsrvp_enum_snaps(struct torture_context *tctx,
 
 	*_count = IVAL(io.out.out.data, 0);
 
-	/* with max_response_size=16, no labels should be sent */
+	/* with max_output_response=16, no labels should be sent */
 	torture_assert_int_equal(tctx, IVAL(io.out.out.data, 4), 0,
 				 "enum snaps labels");
 
@@ -633,7 +633,6 @@ static bool test_fsrvp_enum_created(struct torture_context *tctx,
 	TALLOC_CTX *tmp_ctx = talloc_new(tctx);
 	char *share_unc = talloc_asprintf(tmp_ctx, "\\\\%s\\%s\\",
 					  dcerpc_server_name(p), FSHARE);
-	extern struct cli_credentials *cmdline_credentials;
 	struct smb2_tree *tree_base;
 	struct smbcli_options options;
 	struct smb2_handle base_fh;
@@ -645,7 +644,7 @@ static bool test_fsrvp_enum_created(struct torture_context *tctx,
 			      lpcfg_smb_ports(tctx->lp_ctx),
 			      FSHARE,
 			      lpcfg_resolve_context(tctx->lp_ctx),
-			      cmdline_credentials,
+			      popt_get_cmdline_credentials(),
 			      &tree_base,
 			      tctx->ev,
 			      &options,
@@ -915,10 +914,9 @@ static bool fsrvp_rpc_setup(struct torture_context *tctx, void **data)
 	struct torture_rpc_tcase *tcase = talloc_get_type(
 						tctx->active_tcase, struct torture_rpc_tcase);
 	struct torture_rpc_tcase_data *tcase_data;
-	extern struct cli_credentials *cmdline_credentials;
 
 	*data = tcase_data = talloc_zero(tctx, struct torture_rpc_tcase_data);
-	tcase_data->credentials = cmdline_credentials;
+	tcase_data->credentials = popt_get_cmdline_credentials();
 
 	status = torture_rpc_connection(tctx,
 				&(tcase_data->pipe),

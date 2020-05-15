@@ -23,6 +23,7 @@
 #include "includes.h"
 #include "auth/auth.h"
 #include "librpc/gen_ndr/ndr_security.h"
+#include "lib/util_unixsids.h"
 #include <ldb.h>
 #include "ldb_wrap.h"
 #include "param/param.h"
@@ -166,31 +167,29 @@ struct idmap_context *idmap_init(TALLOC_CTX *mem_ctx,
 
 	idmap_ctx->lp_ctx = lp_ctx;
 
-	idmap_ctx->ldb_ctx = ldb_wrap_connect(mem_ctx, ev_ctx, lp_ctx,
+	idmap_ctx->ldb_ctx = ldb_wrap_connect(idmap_ctx, ev_ctx, lp_ctx,
 					      "idmap.ldb",
 					      system_session(lp_ctx),
 					      NULL, 0);
 	if (idmap_ctx->ldb_ctx == NULL) {
-		return NULL;
+		goto fail;
 	}
 
-	idmap_ctx->unix_groups_sid = dom_sid_parse_talloc(mem_ctx, "S-1-22-2");
-	if (idmap_ctx->unix_groups_sid == NULL) {
-		return NULL;
-	}
-
-	idmap_ctx->unix_users_sid = dom_sid_parse_talloc(mem_ctx, "S-1-22-1");
-	if (idmap_ctx->unix_users_sid == NULL) {
-		return NULL;
-	}
-	
-	idmap_ctx->samdb = samdb_connect(idmap_ctx, ev_ctx, lp_ctx, system_session(lp_ctx), 0);
+	idmap_ctx->samdb = samdb_connect(idmap_ctx,
+					 ev_ctx,
+					 lp_ctx,
+					 system_session(lp_ctx),
+					 NULL,
+					 0);
 	if (idmap_ctx->samdb == NULL) {
 		DEBUG(0, ("Failed to load sam.ldb in idmap_init\n"));
-		return NULL;
+		goto fail;
 	}
 
 	return idmap_ctx;
+fail:
+	TALLOC_FREE(idmap_ctx);
+	return NULL;
 }
 
 /**
@@ -212,11 +211,12 @@ static NTSTATUS idmap_xid_to_sid(struct idmap_context *idmap_ctx,
 				 struct dom_sid **sid)
 {
 	int ret;
-	NTSTATUS status = NT_STATUS_NONE_MAPPED;
+	NTSTATUS status;
 	struct ldb_context *ldb = idmap_ctx->ldb_ctx;
 	struct ldb_result *res = NULL;
 	struct ldb_message *msg;
-	struct dom_sid *unix_sid, *new_sid;
+	const struct dom_sid *unix_sid;
+	struct dom_sid *new_sid;
 	TALLOC_CTX *tmp_ctx = talloc_new(mem_ctx);
 	const char *id_type;
 
@@ -354,13 +354,9 @@ static NTSTATUS idmap_xid_to_sid(struct idmap_context *idmap_ctx,
 
 	/* For local users/groups , we just create a rid = uid/gid */
 	if (unixid->type == ID_TYPE_UID) {
-		unix_sid = dom_sid_parse_talloc(tmp_ctx, "S-1-22-1");
+		unix_sid = &global_sid_Unix_Users;
 	} else {
-		unix_sid = dom_sid_parse_talloc(tmp_ctx, "S-1-22-2");
-	}
-	if (unix_sid == NULL) {
-		status = NT_STATUS_NO_MEMORY;
-		goto failed;
+		unix_sid = &global_sid_Unix_Groups;
 	}
 
 	new_sid = dom_sid_add_rid(mem_ctx, unix_sid, unixid->id);
@@ -398,19 +394,20 @@ static NTSTATUS idmap_sid_to_xid(struct idmap_context *idmap_ctx,
 				 struct unixid *unixid)
 {
 	int ret;
-	NTSTATUS status = NT_STATUS_NONE_MAPPED;
+	NTSTATUS status;
 	struct ldb_context *ldb = idmap_ctx->ldb_ctx;
 	struct ldb_dn *dn;
 	struct ldb_message *hwm_msg, *map_msg, *sam_msg;
 	struct ldb_result *res = NULL;
 	int trans = -1;
 	uint32_t low, high, hwm, new_xid;
-	char *sid_string, *unixid_string, *hwm_string;
+	struct dom_sid_buf sid_string;
+	char *unixid_string, *hwm_string;
 	bool hwm_entry_exists;
 	TALLOC_CTX *tmp_ctx = talloc_new(mem_ctx);
 	const char *sam_attrs[] = {"uidNumber", "gidNumber", "samAccountType", NULL};
 
-	if (dom_sid_in_domain(idmap_ctx->unix_users_sid, sid)) {
+	if (sid_check_is_in_unix_users(sid)) {
 		uint32_t rid;
 		DEBUG(6, ("This is a local unix uid, just calculate that.\n"));
 		status = dom_sid_split_rid(tmp_ctx, sid, NULL, &rid);
@@ -426,7 +423,7 @@ static NTSTATUS idmap_sid_to_xid(struct idmap_context *idmap_ctx,
 		return NT_STATUS_OK;
 	}
 
-	if (dom_sid_in_domain(idmap_ctx->unix_groups_sid, sid)) {
+	if (sid_check_is_in_unix_groups(sid)) {
 		uint32_t rid;
 		DEBUG(6, ("This is a local unix gid, just calculate that.\n"));
 		status = dom_sid_split_rid(tmp_ctx, sid, NULL, &rid);
@@ -449,6 +446,7 @@ static NTSTATUS idmap_sid_to_xid(struct idmap_context *idmap_ctx,
 	 */
 	
 	if (lpcfg_parm_bool(idmap_ctx->lp_ctx, NULL, "idmap_ldb", "use rfc2307", false)) {
+		struct dom_sid_buf buf;
 		ret = dsdb_search_one(idmap_ctx->samdb, tmp_ctx, &sam_msg,
 				      ldb_get_default_basedn(idmap_ctx->samdb),
 				      LDB_SCOPE_SUBTREE, sam_attrs, 0,
@@ -456,7 +454,7 @@ static NTSTATUS idmap_sid_to_xid(struct idmap_context *idmap_ctx,
 				      "(|(sAMaccountType=%u)(sAMaccountType=%u)(sAMaccountType=%u)"
 				      "(sAMaccountType=%u)(sAMaccountType=%u))"
 				      "(|(uidNumber=*)(gidNumber=*)))",
-				      dom_sid_string(tmp_ctx, sid),
+				      dom_sid_str_buf(sid, &buf),
 				      ATYPE_ACCOUNT, ATYPE_WORKSTATION_TRUST, ATYPE_INTERDOMAIN_TRUST,
 				      ATYPE_SECURITY_GLOBAL_GROUP, ATYPE_SECURITY_LOCAL_GROUP);
 	} else {
@@ -465,8 +463,9 @@ static NTSTATUS idmap_sid_to_xid(struct idmap_context *idmap_ctx,
 	}
 
 	if (ret == LDB_ERR_CONSTRAINT_VIOLATION) {
+		struct dom_sid_buf buf;
 		DEBUG(1, ("Search for objectSid=%s gave duplicate results, failing to map to a unix ID!\n",
-			  dom_sid_string(tmp_ctx, sid)));
+			  dom_sid_str_buf(sid, &buf)));
 		status = NT_STATUS_NONE_MAPPED;
 		goto failed;
 	} else if (ret == LDB_SUCCESS) {
@@ -495,8 +494,10 @@ static NTSTATUS idmap_sid_to_xid(struct idmap_context *idmap_ctx,
 			}
 		}
 	} else if (ret != LDB_ERR_NO_SUCH_OBJECT) {
+		struct dom_sid_buf buf;
 		DEBUG(1, ("Search for objectSid=%s gave '%s', failing to map to a SID!\n",
-			  dom_sid_string(tmp_ctx, sid), ldb_errstring(idmap_ctx->samdb)));
+			  dom_sid_str_buf(sid, &buf),
+			  ldb_errstring(idmap_ctx->samdb)));
 
 		status = NT_STATUS_NONE_MAPPED;
 		goto failed;
@@ -550,7 +551,7 @@ static NTSTATUS idmap_sid_to_xid(struct idmap_context *idmap_ctx,
 		goto failed;
 	}
 
-	/* Redo the search to make sure noone changed the mapping while we
+	/* Redo the search to make sure no one changed the mapping while we
 	 * weren't looking */
 	ret = ldb_search(ldb, tmp_ctx, &res, NULL, LDB_SCOPE_SUBTREE,
 				 NULL, "(&(objectClass=sidMap)(objectSid=%s))",
@@ -624,11 +625,7 @@ static NTSTATUS idmap_sid_to_xid(struct idmap_context *idmap_ctx,
 		goto failed;
 	}
 
-	sid_string = dom_sid_string(tmp_ctx, sid);
-	if (sid_string == NULL) {
-		status = NT_STATUS_NO_MEMORY;
-		goto failed;
-	}
+	dom_sid_str_buf(sid, &sid_string);
 
 	unixid_string = talloc_asprintf(tmp_ctx, "%u", new_xid);
 	if (unixid_string == NULL) {
@@ -704,7 +701,7 @@ static NTSTATUS idmap_sid_to_xid(struct idmap_context *idmap_ctx,
 		goto failed;
 	}
 
-	map_msg->dn = ldb_dn_new_fmt(tmp_ctx, ldb, "CN=%s", sid_string);
+	map_msg->dn = ldb_dn_new_fmt(tmp_ctx, ldb, "CN=%s", sid_string.buf);
 	if (map_msg->dn == NULL) {
 		status = NT_STATUS_NO_MEMORY;
 		goto failed;
@@ -735,7 +732,7 @@ static NTSTATUS idmap_sid_to_xid(struct idmap_context *idmap_ctx,
 		goto failed;
 	}
 
-	ret = ldb_msg_add_string(map_msg, "cn", sid_string);
+	ret = ldb_msg_add_string(map_msg, "cn", sid_string.buf);
 	if (ret != LDB_SUCCESS) {
 		status = NT_STATUS_NONE_MAPPED;
 		goto failed;
@@ -844,10 +841,11 @@ NTSTATUS idmap_sids_to_xids(struct idmap_context *idmap_ctx,
 						  &id[i]->xid);
 		}
 		if (!NT_STATUS_IS_OK(status)) {
-			char *str = dom_sid_string(mem_ctx, id[i]->sid);
+			struct dom_sid_buf buf;
 			DEBUG(1, ("idmapping sid_to_xid failed for id[%d]=%s: %s\n",
-				  i, str, nt_errstr(status)));
-			talloc_free(str);
+				  i,
+				  dom_sid_str_buf(id[i]->sid, &buf),
+				  nt_errstr(status)));
 			error_count++;
 			id[i]->status = ID_UNMAPPED;
 		} else {

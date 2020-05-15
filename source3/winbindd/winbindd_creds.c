@@ -23,6 +23,7 @@
 #include "winbindd.h"
 #include "../libcli/auth/libcli_auth.h"
 #include "../libcli/security/security.h"
+#include "libsmb/samlogon_cache.h"
 #undef DBGC_CLASS
 #define DBGC_CLASS DBGC_WINBIND
 
@@ -75,7 +76,8 @@ NTSTATUS winbindd_store_creds(struct winbindd_domain *domain,
 
 		enum lsa_SidType type;
 
-		if (!lookup_cached_name(domain->name,
+		if (!lookup_cached_name(domain->name, /* namespace */
+					domain->name,
 					user,
 					&cred_sid,
 					&type)) {

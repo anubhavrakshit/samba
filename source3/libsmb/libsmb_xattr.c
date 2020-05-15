@@ -154,10 +154,8 @@ sort_acl(struct security_acl *the_acl)
 	for (i=1;i<the_acl->num_aces;) {
 		if (security_ace_equal(&the_acl->aces[i-1],
 				       &the_acl->aces[i])) {
-			int j;
-			for (j=i; j<the_acl->num_aces-1; j++) {
-				the_acl->aces[j] = the_acl->aces[j+1];
-			}
+			ARRAY_DEL_ELEMENT(
+				the_acl->aces, i, the_acl->num_aces);
 			the_acl->num_aces--;
 		} else {
 			i++;
@@ -546,48 +544,36 @@ done:
 
 
 /* Obtain the current dos attributes */
-static DOS_ATTR_DESC *
+static struct DOS_ATTR_DESC *
 dos_attr_query(SMBCCTX *context,
                TALLOC_CTX *ctx,
                const char *filename,
                SMBCSRV *srv)
 {
-        struct timespec create_time_ts;
-        struct timespec write_time_ts;
-        struct timespec access_time_ts;
-        struct timespec change_time_ts;
-        off_t size = 0;
-        uint16_t mode = 0;
-	SMB_INO_T inode = 0;
-        DOS_ATTR_DESC *ret;
+	struct stat sb = {0};
+        struct DOS_ATTR_DESC *ret = NULL;
 
-        ret = talloc(ctx, DOS_ATTR_DESC);
+        ret = talloc(ctx, struct DOS_ATTR_DESC);
         if (!ret) {
                 errno = ENOMEM;
                 return NULL;
         }
 
         /* Obtain the DOS attributes */
-        if (!SMBC_getatr(context, srv, filename,
-                         &mode, &size,
-                         &create_time_ts,
-                         &access_time_ts,
-                         &write_time_ts,
-                         &change_time_ts,
-                         &inode)) {
+        if (!SMBC_getatr(context, srv, filename, &sb)) {
                 errno = SMBC_errno(context, srv->cli);
                 DEBUG(5, ("dos_attr_query Failed to query old attributes\n"));
 		TALLOC_FREE(ret);
                 return NULL;
         }
 
-        ret->mode = mode;
-        ret->size = size;
-        ret->create_time = convert_timespec_to_time_t(create_time_ts);
-        ret->access_time = convert_timespec_to_time_t(access_time_ts);
-        ret->write_time = convert_timespec_to_time_t(write_time_ts);
-        ret->change_time = convert_timespec_to_time_t(change_time_ts);
-        ret->inode = inode;
+        ret->mode = sb.st_mode;
+        ret->size = sb.st_size;
+        ret->create_time = sb.st_ctime;
+        ret->access_time = sb.st_atime;
+        ret->write_time = sb.st_mtime;
+        ret->change_time = sb.st_mtime;
+        ret->inode = sb.st_ino;
 
         return ret;
 }
@@ -596,7 +582,7 @@ dos_attr_query(SMBCCTX *context,
 /* parse a ascii version of a security descriptor */
 static void
 dos_attr_parse(SMBCCTX *context,
-               DOS_ATTR_DESC *dad,
+               struct DOS_ATTR_DESC *dad,
                SMBCSRV *srv,
                char *str)
 {
@@ -736,17 +722,6 @@ cacl_get(SMBCCTX *context,
         char *name;
         char *pExclude;
         char *p;
-        struct timespec create_time_ts;
-	struct timespec write_time_ts;
-        struct timespec access_time_ts;
-        struct timespec change_time_ts;
-	time_t create_time = (time_t)0;
-	time_t write_time = (time_t)0;
-        time_t access_time = (time_t)0;
-        time_t change_time = (time_t)0;
-	off_t size = 0;
-	uint16_t mode = 0;
-	SMB_INO_T ino = 0;
 	struct cli_state *cli = srv->cli;
         struct {
                 const char * create_time_attr;
@@ -1155,25 +1130,31 @@ cacl_get(SMBCCTX *context,
         }
 
         if (all || some_dos) {
+		struct stat sb = {0};
+		time_t create_time = (time_t)0;
+		time_t write_time = (time_t)0;
+		time_t access_time = (time_t)0;
+		time_t change_time = (time_t)0;
+		off_t size = 0;
+		uint16_t mode = 0;
+		SMB_INO_T ino = 0;
+
                 /* Point to the portion after "system.dos_attr." */
                 name += 16;     /* if (all) this will be invalid but unused */
 
                 /* Obtain the DOS attributes */
-                if (!SMBC_getatr(context, srv, filename, &mode, &size, 
-                                 &create_time_ts,
-                                 &access_time_ts,
-                                 &write_time_ts,
-                                 &change_time_ts,
-                                 &ino)) {
-
+                if (!SMBC_getatr(context, srv, filename, &sb)) {
                         errno = SMBC_errno(context, srv->cli);
                         return -1;
                 }
 
-                create_time = convert_timespec_to_time_t(create_time_ts);
-                access_time = convert_timespec_to_time_t(access_time_ts);
-                write_time = convert_timespec_to_time_t(write_time_ts);
-                change_time = convert_timespec_to_time_t(change_time_ts);
+		create_time = sb.st_ctime;
+		access_time = sb.st_atime;
+		write_time  = sb.st_mtime;
+		change_time = sb.st_mtime;
+		size        = sb.st_size;
+		mode        = sb.st_mode;
+		ino         = sb.st_ino;
 
                 if (! exclude_dos_mode) {
                         if (all || all_dos) {
@@ -1717,7 +1698,7 @@ SMBC_setxattr_ctx(SMBCCTX *context,
 	char *password = NULL;
 	char *workgroup = NULL;
 	char *path = NULL;
-        DOS_ATTR_DESC *dad = NULL;
+        struct DOS_ATTR_DESC *dad = NULL;
         struct {
                 const char * create_time_attr;
                 const char * access_time_attr;
@@ -1815,17 +1796,26 @@ SMBC_setxattr_ctx(SMBCCTX *context,
                 /* get a DOS Attribute Descriptor with current attributes */
                 dad = dos_attr_query(context, talloc_tos(), path, srv);
                 if (dad) {
+			bool ok;
+
                         /* Overwrite old with new, using what was provided */
                         dos_attr_parse(context, dad, srv, namevalue);
 
                         /* Set the new DOS attributes */
-                        if (! SMBC_setatr(context, srv, path,
-                                          dad->create_time,
-                                          dad->access_time,
-                                          dad->write_time,
-                                          dad->change_time,
-                                          dad->mode)) {
-
+			ok = SMBC_setatr(
+				context,
+				srv,
+				path,
+				(struct timespec) {
+					.tv_sec = dad->create_time },
+				(struct timespec) {
+					.tv_sec = dad->access_time },
+				(struct timespec) {
+					.tv_sec = dad->write_time },
+				(struct timespec) {
+					.tv_sec = dad->change_time },
+				dad->mode);
+			if (!ok) {
                                 /* cause failure if NT failed too */
                                 dad = NULL; 
                         }
@@ -1970,12 +1960,19 @@ SMBC_setxattr_ctx(SMBCCTX *context,
                                 dos_attr_parse(context, dad, srv, namevalue);
 
                                 /* Set the new DOS attributes */
-                                ret2 = SMBC_setatr(context, srv, path,
-                                                   dad->create_time,
-                                                   dad->access_time,
-                                                   dad->write_time,
-                                                   dad->change_time,
-                                                   dad->mode);
+				ret2 = SMBC_setatr(
+					context,
+					srv,
+					path,
+					(struct timespec) {
+						.tv_sec = dad->create_time },
+					(struct timespec) {
+						.tv_sec = dad->access_time },
+					(struct timespec) {
+						.tv_sec = dad->write_time },
+					(struct timespec) {
+						.tv_sec = dad->change_time },
+					dad->mode);
 
                                 /* ret2 has True (success) / False (failure) */
                                 if (ret2) {

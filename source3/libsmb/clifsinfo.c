@@ -21,16 +21,15 @@
 
 #include "includes.h"
 #include "libsmb/libsmb.h"
-#include "../libcli/auth/spnego.h"
-#include "../auth/ntlmssp/ntlmssp.h"
 #include "../lib/util/tevent_ntstatus.h"
 #include "async_smb.h"
-#include "../libcli/smb/smb_seal.h"
 #include "trans2.h"
 #include "auth_generic.h"
 #include "auth/gensec/gensec.h"
 #include "../libcli/smb/smbXcli_base.h"
 #include "auth/credentials/credentials.h"
+#include "../librpc/gen_ndr/ndr_security.h"
+#include "libcli/security/dom_sid.h"
 
 /****************************************************************************
  Get UNIX extensions version info.
@@ -62,7 +61,7 @@ struct tevent_req *cli_unix_extensions_version_send(TALLOC_CTX *mem_ctx,
 	SSVAL(state->setup, 0, TRANSACT2_QFSINFO);
 	SSVAL(state->param, 0, SMB_QUERY_CIFS_UNIX_INFO);
 
-	subreq = cli_trans_send(state, ev, cli, SMBtrans2,
+	subreq = cli_trans_send(state, ev, cli, 0, SMBtrans2,
 				NULL, 0, 0, 0,
 				state->setup, 1, 0,
 				state->param, 2, 0,
@@ -199,7 +198,7 @@ struct tevent_req *cli_set_unix_extensions_capabilities_send(
 	SIVAL(state->data, 4, caplow);
 	SIVAL(state->data, 8, caphigh);
 
-	subreq = cli_trans_send(state, ev, cli, SMBtrans2,
+	subreq = cli_trans_send(state, ev, cli, 0, SMBtrans2,
 				NULL, 0, 0, 0,
 				state->setup, 1, 0,
 				state->param, 4, 0,
@@ -285,7 +284,7 @@ struct tevent_req *cli_get_fs_attr_info_send(TALLOC_CTX *mem_ctx,
 	SSVAL(state->setup+0, 0, TRANSACT2_QFSINFO);
 	SSVAL(state->param+0, 0, SMB_QUERY_FS_ATTRIBUTE_INFO);
 
-	subreq = cli_trans_send(state, ev, cli, SMBtrans2,
+	subreq = cli_trans_send(state, ev, cli, 0, SMBtrans2,
 				NULL, 0, 0, 0,
 				state->setup, 1, 0,
 				state->param, 2, 0,
@@ -338,6 +337,10 @@ NTSTATUS cli_get_fs_attr_info(struct cli_state *cli, uint32_t *fs_attr)
 	struct tevent_req *req;
 	NTSTATUS status = NT_STATUS_NO_MEMORY;
 
+	if (smbXcli_conn_protocol(cli->conn) >= PROTOCOL_SMB2_02) {
+		return cli_smb2_get_fs_attr_info(cli, fs_attr);
+	}
+
 	if (smbXcli_conn_has_async_calls(cli->conn)) {
 		return NT_STATUS_INVALID_PARAMETER;
 	}
@@ -372,6 +375,14 @@ NTSTATUS cli_get_fs_volume_info(struct cli_state *cli,
 	uint32_t rdata_count;
 	unsigned int nlen;
 	char *volume_name = NULL;
+
+	if (smbXcli_conn_protocol(cli->conn) >= PROTOCOL_SMB2_02) {
+		return cli_smb2_get_fs_volume_info(cli,
+						mem_ctx,
+						_volume_name,
+						pserial_number,
+						pdate);
+	}
 
 	SSVAL(setup, 0, TRANSACT2_QFSINFO);
 	SSVAL(param,0,SMB_QUERY_FS_VOLUME_INFO);
@@ -436,6 +447,15 @@ NTSTATUS cli_get_fs_full_size_info(struct cli_state *cli,
 	uint8_t *rdata = NULL;
 	uint32_t rdata_count;
 	NTSTATUS status;
+
+	if (smbXcli_conn_protocol(cli->conn) >= PROTOCOL_SMB2_02) {
+		return cli_smb2_get_fs_full_size_info(cli,
+						total_allocation_units,
+						caller_allocation_units,
+						actual_allocation_units,
+						sectors_per_allocation_unit,
+						bytes_per_sector);
+	}
 
 	SSVAL(setup, 0, TRANSACT2_QFSINFO);
 	SSVAL(param, 0, SMB_FS_FULL_SIZE_INFORMATION);
@@ -532,246 +552,248 @@ NTSTATUS cli_get_posix_fs_info(struct cli_state *cli,
 	return NT_STATUS_OK;
 }
 
+/****************************************************************************
+ Do a UNIX extensions SMB_QUERY_POSIX_WHOAMI call.
+****************************************************************************/
 
-/******************************************************************************
- Send/receive the request encryption blob.
-******************************************************************************/
-
-static NTSTATUS enc_blob_send_receive(struct cli_state *cli, DATA_BLOB *in, DATA_BLOB *out, DATA_BLOB *param_out)
-{
+struct posix_whoami_state {
 	uint16_t setup[1];
-	uint8_t param[4];
-	uint8_t *rparam=NULL, *rdata=NULL;
-	uint32_t num_rparam, num_rdata;
+	uint8_t param[2];
+	uint32_t max_rdata;
+	bool guest;
+	uint64_t uid;
+	uint64_t gid;
+	uint32_t num_gids;
+	uint64_t *gids;
+	uint32_t num_sids;
+	struct dom_sid *sids;
+};
+
+static void cli_posix_whoami_done(struct tevent_req *subreq);
+
+struct tevent_req *cli_posix_whoami_send(TALLOC_CTX *mem_ctx,
+					struct tevent_context *ev,
+					struct cli_state *cli)
+{
+	struct tevent_req *req = NULL, *subreq = NULL;
+	struct posix_whoami_state *state = NULL;
+
+	req = tevent_req_create(mem_ctx, &state, struct posix_whoami_state);
+	if (req == NULL) {
+		return NULL;
+	}
+
+	/* Setup setup word. */
+	SSVAL(state->setup, 0, TRANSACT2_QFSINFO);
+	SSVAL(state->param, 0, SMB_QUERY_POSIX_WHOAMI);
+
+	state->max_rdata = 62*1024;
+
+	subreq = cli_trans_send(state,                  /* mem ctx. */
+				ev,                     /* event ctx. */
+				cli,                    /* cli_state. */
+				0,			/* additional_flags2 */
+				SMBtrans2,              /* cmd. */
+				NULL,                   /* pipe name. */
+				-1,                     /* fid. */
+				0,                      /* function. */
+				0,                      /* flags. */
+				state->setup,           /* setup. */
+				1,                      /* num setup uint16_t words. */
+				0,                      /* max returned setup. */
+				state->param,           /* param. */
+				2,                      /* num param. */
+				0,                      /* max returned param. */
+				NULL,	                /* data. */
+				0,                      /* num data. */
+				state->max_rdata);      /* max returned data. */
+
+	if (tevent_req_nomem(subreq, req)) {
+		return tevent_req_post(req, ev);
+	}
+	tevent_req_set_callback(subreq, cli_posix_whoami_done, req);
+	return req;
+}
+
+static void cli_posix_whoami_done(struct tevent_req *subreq)
+{
+	struct tevent_req *req = tevent_req_callback_data(
+			subreq, struct tevent_req);
+	struct posix_whoami_state *state = tevent_req_data(
+			req, struct posix_whoami_state);
+	uint8_t *rdata = NULL;
+	uint8_t *p = NULL;
+	uint32_t num_rdata = 0;
+	uint32_t i;
 	NTSTATUS status;
 
-	SSVAL(setup+0, 0, TRANSACT2_SETFSINFO);
-	SSVAL(param,0,0);
-	SSVAL(param,2,SMB_REQUEST_TRANSPORT_ENCRYPTION);
+	status = cli_trans_recv(subreq,
+				state,
+				NULL,
+				NULL,
+				0,
+				NULL,
+                                NULL,
+				0,
+				NULL,
+				&rdata,
+				40,
+				&num_rdata);
+	TALLOC_FREE(subreq);
+	if (tevent_req_nterror(req, status)) {
+		return;
+	}
 
-	status = cli_trans(talloc_tos(), cli, SMBtrans2, NULL, 0, 0, 0,
-			   setup, 1, 0,
-			   param, 4, 2,
-			   (uint8_t *)in->data, in->length, CLI_BUFFER_SIZE,
-			   NULL,	  /* recv_flags */
-			   NULL, 0, NULL, /* rsetup */
-			   &rparam, 0, &num_rparam,
-			   &rdata, 0, &num_rdata);
+	/*
+	 * Not strictly needed - cli_trans_recv()
+	 * will ensure at least 40 bytes here. Added
+	 * as more of a reminder to be careful when
+	 * parsing network packets in C.
+	 */
 
-	if (!NT_STATUS_IS_OK(status) &&
-	    !NT_STATUS_EQUAL(status, NT_STATUS_MORE_PROCESSING_REQUIRED)) {
+	if (num_rdata < 40 || rdata + num_rdata < rdata) {
+		tevent_req_nterror(req, NT_STATUS_INVALID_NETWORK_RESPONSE);
+		return;
+	}
+
+	state->guest = (IVAL(rdata, 0) & SMB_WHOAMI_GUEST);
+	state->uid = BVAL(rdata, 8);
+	state->gid = BVAL(rdata, 16);
+	state->num_gids = IVAL(rdata, 24);
+	state->num_sids = IVAL(rdata, 28);
+
+	state->gids = talloc_array(state, uint64_t, state->num_gids);
+	if (tevent_req_nomem(state->gids, req)) {
+		return;
+	}
+	state->sids = talloc_array(state, struct dom_sid, state->num_sids);
+	if (tevent_req_nomem(state->sids, req)) {
+		return;
+	}
+
+	p = rdata + 40;
+
+	for (i = 0; i < state->num_gids; i++) {
+		if (p + 8 > rdata + num_rdata) {
+			tevent_req_nterror(req,
+				NT_STATUS_INVALID_NETWORK_RESPONSE);
+			return;
+		}
+		state->gids[i] = BVAL(p, 0);
+		p += 8;
+	}
+
+	num_rdata -= (p - rdata);
+
+	for (i = 0; i < state->num_sids; i++) {
+		ssize_t sid_size = sid_parse(p, num_rdata, &state->sids[i]);
+
+		if ((sid_size == -1) || (sid_size > num_rdata)) {
+			tevent_req_nterror(req,
+				NT_STATUS_INVALID_NETWORK_RESPONSE);
+			return;
+		}
+
+		p += sid_size;
+		num_rdata -= sid_size;
+	}
+	tevent_req_done(req);
+}
+
+NTSTATUS cli_posix_whoami_recv(struct tevent_req *req,
+			TALLOC_CTX *mem_ctx,
+			uint64_t *puid,
+			uint64_t *pgid,
+			uint32_t *pnum_gids,
+			uint64_t **pgids,
+			uint32_t *pnum_sids,
+			struct dom_sid **psids,
+			bool *pguest)
+{
+	NTSTATUS status;
+	struct posix_whoami_state *state = tevent_req_data(
+			req, struct posix_whoami_state);
+
+	if (tevent_req_is_nterror(req, &status)) {
 		return status;
 	}
 
-	*out = data_blob(rdata, num_rdata);
-	*param_out = data_blob(rparam, num_rparam);
-
-	TALLOC_FREE(rparam);
-	TALLOC_FREE(rdata);
-	return status;
+	if (puid) {
+		*puid = state->uid;
+	}
+	if (pgid) {
+		*pgid = state->gid;
+	}
+	if (pnum_gids) {
+		*pnum_gids = state->num_gids;
+	}
+	if (pgids) {
+		*pgids = talloc_move(mem_ctx, &state->gids);
+	}
+	if (pnum_sids) {
+		*pnum_sids = state->num_sids;
+	}
+	if (psids) {
+		*psids = talloc_move(mem_ctx, &state->sids);
+	}
+	if (pguest) {
+		*pguest = state->guest;
+	}
+	return NT_STATUS_OK;
 }
 
-/******************************************************************************
- Start a raw ntlmssp encryption.
-******************************************************************************/
-
-NTSTATUS cli_raw_ntlm_smb_encryption_start(struct cli_state *cli, 
-				const char *user,
-				const char *pass,
-				const char *domain)
+NTSTATUS cli_posix_whoami(struct cli_state *cli,
+			TALLOC_CTX *mem_ctx,
+			uint64_t *puid,
+			uint64_t *pgid,
+			uint32_t *num_gids,
+			uint64_t **gids,
+			uint32_t *num_sids,
+			struct dom_sid **sids,
+			bool *pguest)
 {
-	DATA_BLOB blob_in = data_blob_null;
-	DATA_BLOB blob_out = data_blob_null;
-	DATA_BLOB param_out = data_blob_null;
-	NTSTATUS status = NT_STATUS_UNSUCCESSFUL;
-	struct auth_generic_state *auth_generic_state;
-	struct smb_trans_enc_state *es = talloc_zero(NULL, struct smb_trans_enc_state);
-	if (!es) {
-		return NT_STATUS_NO_MEMORY;
-	}
-	status = auth_generic_client_prepare(es,
-					     &auth_generic_state);
-	if (!NT_STATUS_IS_OK(status)) {
-		goto fail;
-	}
+        TALLOC_CTX *frame = talloc_stackframe();
+        struct tevent_context *ev = NULL;
+        struct tevent_req *req = NULL;
+        NTSTATUS status = NT_STATUS_OK;
 
-	gensec_want_feature(auth_generic_state->gensec_security, GENSEC_FEATURE_SESSION_KEY);
-	gensec_want_feature(auth_generic_state->gensec_security, GENSEC_FEATURE_SEAL);
+        if (smbXcli_conn_has_async_calls(cli->conn)) {
+                /*
+                 * Can't use sync call while an async call is in flight
+                 */
+                status = NT_STATUS_INVALID_PARAMETER;
+                goto fail;
+        }
 
-	if (!NT_STATUS_IS_OK(status = auth_generic_set_username(auth_generic_state, user))) {
-		goto fail;
-	}
-	if (!NT_STATUS_IS_OK(status = auth_generic_set_domain(auth_generic_state, domain))) {
-		goto fail;
-	}
-	if (!NT_STATUS_IS_OK(status = auth_generic_set_password(auth_generic_state, pass))) {
-		goto fail;
-	}
+        ev = samba_tevent_context_init(frame);
+        if (ev == NULL) {
+                status = NT_STATUS_NO_MEMORY;
+                goto fail;
+        }
 
-	if (!NT_STATUS_IS_OK(status = auth_generic_client_start(auth_generic_state, GENSEC_OID_NTLMSSP))) {
-		goto fail;
-	}
+        req = cli_posix_whoami_send(frame,
+                                ev,
+                                cli);
+        if (req == NULL) {
+                status = NT_STATUS_NO_MEMORY;
+                goto fail;
+        }
 
-	do {
-		status = gensec_update(auth_generic_state->gensec_security, auth_generic_state,
-				       blob_in, &blob_out);
-		data_blob_free(&blob_in);
-		data_blob_free(&param_out);
-		if (NT_STATUS_EQUAL(status, NT_STATUS_MORE_PROCESSING_REQUIRED) || NT_STATUS_IS_OK(status)) {
-			NTSTATUS trans_status = enc_blob_send_receive(cli,
-									&blob_out,
-									&blob_in,
-									&param_out);
-			if (!NT_STATUS_EQUAL(trans_status,
-					NT_STATUS_MORE_PROCESSING_REQUIRED) &&
-					!NT_STATUS_IS_OK(trans_status)) {
-				status = trans_status;
-			} else {
-				if (param_out.length == 2) {
-					es->enc_ctx_num = SVAL(param_out.data, 0);
-				}
-			}
-		}
-		data_blob_free(&blob_out);
-	} while (NT_STATUS_EQUAL(status, NT_STATUS_MORE_PROCESSING_REQUIRED));
+        if (!tevent_req_poll_ntstatus(req, ev, &status)) {
+                goto fail;
+        }
 
-	data_blob_free(&blob_in);
+        status = cli_posix_whoami_recv(req,
+			mem_ctx,
+			puid,
+			pgid,
+			num_gids,
+			gids,
+			num_sids,
+			sids,
+			pguest);
 
-	if (NT_STATUS_IS_OK(status)) {
-		es->enc_on = true;
-		/* Replace the old state, if any. */
-		/* We only need the gensec_security part from here.
-		 * es is a malloc()ed pointer, so we cannot make
-		 * gensec_security a talloc child */
-		es->gensec_security = talloc_move(NULL,
-						  &auth_generic_state->gensec_security);
-		smb1cli_conn_set_encryption(cli->conn, es);
-		es = NULL;
-	}
-
-  fail:
-	TALLOC_FREE(es);
+ fail:
+	TALLOC_FREE(frame);
 	return status;
-}
-
-/******************************************************************************
- Start a SPNEGO gssapi encryption context.
-******************************************************************************/
-
-NTSTATUS cli_gss_smb_encryption_start(struct cli_state *cli)
-{
-	DATA_BLOB blob_recv = data_blob_null;
-	DATA_BLOB blob_send = data_blob_null;
-	DATA_BLOB param_out = data_blob_null;
-	NTSTATUS status = NT_STATUS_UNSUCCESSFUL;
-	struct auth_generic_state *auth_generic_state;
-	struct smb_trans_enc_state *es = talloc_zero(NULL, struct smb_trans_enc_state);
-
-	if (!es) {
-		return NT_STATUS_NO_MEMORY;
-	}
-
-	status = auth_generic_client_prepare(es,
-					     &auth_generic_state);
-	if (!NT_STATUS_IS_OK(status)) {
-		goto fail;
-	}
-
-	gensec_want_feature(auth_generic_state->gensec_security, GENSEC_FEATURE_SESSION_KEY);
-	gensec_want_feature(auth_generic_state->gensec_security, GENSEC_FEATURE_SEAL);
-
-	cli_credentials_set_kerberos_state(auth_generic_state->credentials, 
-					   CRED_MUST_USE_KERBEROS);
-
-	status = gensec_set_target_service(auth_generic_state->gensec_security, "cifs");
-	if (!NT_STATUS_IS_OK(status)) {
-		goto fail;
-	}
-
-	status = gensec_set_target_hostname(auth_generic_state->gensec_security, 
-					    smbXcli_conn_remote_name(cli->conn));
-	if (!NT_STATUS_IS_OK(status)) {
-		goto fail;
-	}
-
-	if (!NT_STATUS_IS_OK(status = auth_generic_client_start(auth_generic_state, GENSEC_OID_SPNEGO))) {
-		goto fail;
-	}
-
-	status = gensec_update(auth_generic_state->gensec_security, talloc_tos(),
-			       blob_recv, &blob_send);
-
-	do {
-		data_blob_free(&blob_recv);
-		status = enc_blob_send_receive(cli, &blob_send, &blob_recv, &param_out);
-		if (param_out.length == 2) {
-			es->enc_ctx_num = SVAL(param_out.data, 0);
-		}
-		data_blob_free(&blob_send);
-		status = gensec_update(auth_generic_state->gensec_security, talloc_tos(),
-				       blob_recv, &blob_send);
-	} while (NT_STATUS_EQUAL(status, NT_STATUS_MORE_PROCESSING_REQUIRED));
-	data_blob_free(&blob_recv);
-
-	if (NT_STATUS_IS_OK(status)) {
-		if (!gensec_have_feature(auth_generic_state->gensec_security, 
-					 GENSEC_FEATURE_SIGN) ||
-		    !gensec_have_feature(auth_generic_state->gensec_security, 
-					 GENSEC_FEATURE_SEAL)) {
-			status = NT_STATUS_ACCESS_DENIED;
-		}
-	}
-
-	if (NT_STATUS_IS_OK(status)) {
-		es->enc_on = true;
-		/* Replace the old state, if any. */
-		/* We only need the gensec_security part from here.
-		 * es is a malloc()ed pointer, so we cannot make
-		 * gensec_security a talloc child */
-		es->gensec_security = talloc_move(es,
-						  &auth_generic_state->gensec_security);
-		smb1cli_conn_set_encryption(cli->conn, es);
-		es = NULL;
-	}
-fail:
-	TALLOC_FREE(es);
-	return status;
-}
-
-/********************************************************************
- Ensure a connection is encrypted.
-********************************************************************/
-
-NTSTATUS cli_force_encryption(struct cli_state *c,
-			const char *username,
-			const char *password,
-			const char *domain)
-{
-	uint16_t major, minor;
-	uint32_t caplow, caphigh;
-	NTSTATUS status;
-
-	if (!SERVER_HAS_UNIX_CIFS(c)) {
-		return NT_STATUS_NOT_SUPPORTED;
-	}
-
-	status = cli_unix_extensions_version(c, &major, &minor, &caplow,
-					     &caphigh);
-	if (!NT_STATUS_IS_OK(status)) {
-		DEBUG(10, ("cli_force_encryption: cli_unix_extensions_version "
-			   "returned %s\n", nt_errstr(status)));
-		return NT_STATUS_UNKNOWN_REVISION;
-	}
-
-	if (!(caplow & CIFS_UNIX_TRANSPORT_ENCRYPTION_CAP)) {
-		return NT_STATUS_UNSUPPORTED_COMPRESSION;
-	}
-
-	if (c->use_kerberos) {
-		return cli_gss_smb_encryption_start(c);
-	}
-	return cli_raw_ntlm_smb_encryption_start(c,
-					username,
-					password,
-					domain);
 }

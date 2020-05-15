@@ -1,19 +1,23 @@
 #!/usr/bin/env python
 
-srcdir=".."
+srcdir = ".."
 
 import sys, os
 from optparse import SUPPRESS_HELP
-sys.path.insert(0, srcdir+"/buildtools/wafsamba")
+sys.path.insert(0, srcdir + "/buildtools/wafsamba")
 sys.path.insert(0, "source3")
-import wafsamba, Options, Logs, Utils, Scripting
+
+from waflib import Options, Logs, Errors
+import wafsamba
 import build.charset
-import samba_utils, samba_version
+from wafsamba import samba_utils
+from samba_utils import TO_LIST
 import samba3
+from waflib.Tools import bison
 
-Options.default_prefix = '/usr/local/samba'
+default_prefix = Options.default_prefix = '/usr/local/samba'
 
-def set_options(opt):
+def options(opt):
 
     opt.add_option('--with-static-modules',
                    help=("Comma-separated list of names of modules to statically link in. "+
@@ -36,51 +40,49 @@ def set_options(opt):
                          "--with-shared-modules"),
                    action="store", dest='shared_modules', default=None)
 
-    opt.SAMBA3_ADD_OPTION('winbind')
-    opt.SAMBA3_ADD_OPTION('ads')
-    opt.SAMBA3_ADD_OPTION('ldap')
-    opt.SAMBA3_ADD_OPTION('cups', with_name="enable", without_name="disable")
-    opt.SAMBA3_ADD_OPTION('iprint', with_name="enable", without_name="disable")
-    opt.SAMBA3_ADD_OPTION('pam')
-    opt.SAMBA3_ADD_OPTION('pam_smbpass')
-    opt.SAMBA3_ADD_OPTION('quotas')
-    opt.SAMBA3_ADD_OPTION('sendfile-support')
-    opt.SAMBA3_ADD_OPTION('utmp')
-    opt.SAMBA3_ADD_OPTION('pthreadpool', with_name="enable", without_name="disable", default=True)
-    opt.SAMBA3_ADD_OPTION('avahi', with_name="enable", without_name="disable")
-    opt.SAMBA3_ADD_OPTION('iconv')
-    opt.SAMBA3_ADD_OPTION('acl-support')
-    opt.SAMBA3_ADD_OPTION('dnsupdate')
-    opt.SAMBA3_ADD_OPTION('syslog')
-    opt.SAMBA3_ADD_OPTION('automount')
-    opt.SAMBA3_ADD_OPTION('aio-support')
-    opt.SAMBA3_ADD_OPTION('dmapi', default=None) # None means autodetection
-    opt.SAMBA3_ADD_OPTION('fam', default=None) # None means autodetection
-    opt.SAMBA3_ADD_OPTION('profiling-data', default=False)
-    opt.SAMBA3_ADD_OPTION('libarchive', default=None)
+    opt.samba_add_onoff_option('winbind')
+    opt.samba_add_onoff_option('ads')
+    opt.samba_add_onoff_option('ldap')
+    opt.samba_add_onoff_option('cups', with_name="enable", without_name="disable")
+    opt.samba_add_onoff_option('iprint', with_name="enable", without_name="disable")
+    opt.samba_add_onoff_option('pam')
+    opt.samba_add_onoff_option('quotas', default=None)
+    opt.samba_add_onoff_option('sendfile-support', default=None)
+    opt.samba_add_onoff_option('utmp')
+    opt.samba_add_onoff_option('avahi', with_name="enable", without_name="disable")
+    opt.samba_add_onoff_option('iconv')
+    opt.samba_add_onoff_option('acl-support')
+    opt.samba_add_onoff_option('dnsupdate')
+    opt.samba_add_onoff_option('syslog')
+    opt.samba_add_onoff_option('automount')
+    opt.samba_add_onoff_option('dmapi', default=None) # None means autodetection
+    opt.samba_add_onoff_option('fam', default=None) # None means autodetection
+    opt.samba_add_onoff_option('profiling-data', default=False)
+    opt.samba_add_onoff_option('libarchive', default=True)
 
-    opt.SAMBA3_ADD_OPTION('cluster-support', default=None)
+    opt.samba_add_onoff_option('cluster-support', default=False)
 
-    opt.SAMBA3_ADD_OPTION('regedit', default=None)
+    opt.samba_add_onoff_option('regedit', default=None)
+    opt.samba_add_onoff_option('winexe', default=None)
 
-    opt.SAMBA3_ADD_OPTION('fake-kaserver',
+    opt.samba_add_onoff_option('fake-kaserver',
                           help=("Include AFS fake-kaserver support"), default=False)
 
     opt.add_option('--with-libcephfs',
                    help=("Directory under which libcephfs is installed"),
                    action="store", dest='libcephfs_dir', default=None)
 
-    opt.SAMBA3_ADD_OPTION('glusterfs', with_name="enable", without_name="disable", default=True)
+    opt.samba_add_onoff_option('glusterfs', with_name="enable", without_name="disable", default=True)
+    opt.samba_add_onoff_option('cephfs', with_name="enable", without_name="disable", default=True)
 
     opt.add_option('--enable-vxfs',
                   help=("enable support for VxFS (default=no)"),
                   action="store_true", dest='enable_vxfs', default=False)
 
-    opt.SAMBA3_ADD_OPTION('spotlight', with_name="enable", without_name="disable", default=False)
+    # default = None means autodetection
+    opt.samba_add_onoff_option('spotlight', with_name="enable", without_name="disable", default=None)
 
 def configure(conf):
-    from samba_utils import TO_LIST
-
     default_static_modules = []
     default_shared_modules = []
     required_static_modules = []
@@ -95,36 +97,33 @@ def configure(conf):
         conf.ADD_LDFLAGS("-Wl,--export-dynamic", testflags=True)
 
     # We crash without vfs_default
-    required_static_modules.extend(TO_LIST('vfs_default'))
+    # and vfs_not_implemented provides helper function
+    # for other modules
+    required_static_modules.extend(TO_LIST('vfs_default vfs_not_implemented'))
 
-    conf.CHECK_HEADERS('execinfo.h libexc.h libunwind.h netdb.h')
+    conf.CHECK_HEADERS('netdb.h')
     conf.CHECK_HEADERS('linux/falloc.h linux/ioctl.h')
 
-    conf.CHECK_FUNCS('getcwd fchown chmod fchmod mknod')
+    conf.CHECK_FUNCS('getcwd fchown chmod fchmod mknod mknodat')
     conf.CHECK_FUNCS('strtol strchr strupr chflags')
-    conf.CHECK_FUNCS('getrlimit fsync fdatasync setpgid')
+    conf.CHECK_FUNCS('getrlimit fsync setpgid')
     conf.CHECK_FUNCS('setsid glob strpbrk crypt16 getauthuid')
     conf.CHECK_FUNCS('innetgr')
     conf.CHECK_FUNCS('initgroups select poll rdchk getgrnam getgrent pathconf')
     conf.CHECK_FUNCS('setpriv setgidx setuidx setgroups syscall sysconf')
-    conf.CHECK_FUNCS('atexit grantpt posix_openpt fallocate posix_fallocate')
+    conf.CHECK_FUNCS('atexit grantpt posix_openpt fallocate')
     conf.CHECK_FUNCS('fseeko setluid')
     conf.CHECK_FUNCS('getpwnam', headers='sys/types.h pwd.h')
     conf.CHECK_FUNCS('fdopendir')
     conf.CHECK_FUNCS('fstatat')
-    conf.CHECK_FUNCS('getpwent_r setenv strcasecmp fcvt fcvtl')
+    conf.CHECK_FUNCS('getpwent_r setenv clearenv strcasecmp fcvt fcvtl')
     conf.CHECK_FUNCS('syslog vsyslog timegm setlocale')
-    conf.CHECK_FUNCS_IN('nanosleep', 'rt')
     conf.CHECK_FUNCS('lutimes futimes utimensat futimens')
     conf.CHECK_FUNCS('mlock munlock mlockall munlockall')
     conf.CHECK_FUNCS('memalign posix_memalign hstrerror')
-    conf.CHECK_FUNCS('shmget')
-    conf.CHECK_FUNCS_IN('shm_open', 'rt', checklibc=True)
-    #FIXME: for some reason this one still fails
     conf.CHECK_FUNCS_IN('yp_get_default_domain', 'nsl')
     conf.CHECK_FUNCS_IN('dn_expand _dn_expand __dn_expand', 'resolv')
     conf.CHECK_FUNCS_IN('dn_expand', 'inet')
-    conf.CHECK_DECLS('fdatasync', reverse=True)
     conf.CHECK_DECLS('readahead', reverse=True, headers='fcntl.h')
 
     if conf.CHECK_CODE('''
@@ -137,10 +136,13 @@ long ret = splice(0,0,1,0,400,SPLICE_F_MOVE);
         headers='fcntl.h'):
         conf.CHECK_DECLS('splice', reverse=True, headers='fcntl.h')
 
-    # Check for inotify support
-    conf.CHECK_HEADERS('sys/inotify.h')
-    if "HAVE_SYS_INOTIFY_H" in conf.env:
-        conf.DEFINE('HAVE_INOTIFY', 1)
+    # Check for inotify support (Skip if we are SunOS)
+    #NOTE: illumos provides sys/inotify.h but is not an exact match for linux
+    host_os = sys.platform
+    if host_os.rfind('sunos') == -1:
+        conf.CHECK_HEADERS('sys/inotify.h')
+        if conf.env.HAVE_SYS_INOTIFY_H:
+           conf.DEFINE('HAVE_INOTIFY', 1)
 
     # Check for kernel change notify support
     conf.CHECK_CODE('''
@@ -158,18 +160,13 @@ main() {
 #include <sys/types.h>
 #include <fcntl.h>
 #include <signal.h>
-#ifndef F_NOTIFY
-#define F_NOTIFY 1026
+#ifndef F_GETLEASE
+#define F_GETLEASE 1025
 #endif
 main() {
-        exit(fcntl(open("/tmp", O_RDONLY), F_NOTIFY, 0) == -1 ?  1 : 0);
+        exit(fcntl(open("/tmp", O_RDONLY), F_GETLEASE, 0) == -1 ?  1 : 0);
 }''', 'HAVE_KERNEL_OPLOCKS_LINUX', addmain=False, execute=True,
         msg="Checking for Linux kernel oplocks")
-
-    # Check for IRIX kernel oplock types
-    conf.CHECK_CODE('oplock_stat_t t; t.os_state = OP_REVOKE; t.os_dev = 1; t.os_ino = 1;',
-                    'HAVE_KERNEL_OPLOCKS_IRIX', headers='fcntl.h',
-                    msg="Checking for IRIX kernel oplock types")
 
     # Check for kernel share modes
     conf.CHECK_CODE('''
@@ -206,6 +203,7 @@ main() {
 
     if samba_fam_libs is not None:
         conf.DEFINE('SAMBA_FAM_LIBS', samba_fam_libs)
+        conf.DEFINE('HAVE_FAM', 1)
     else:
         if Options.options.with_fam == True:
             conf.fatal('FAM support requested, but no suitable FAM library found')
@@ -214,14 +212,22 @@ main() {
 
     # check for libarchive (tar command in smbclient)
     # None means autodetect, True/False means enable/disable
-    conf.env['archive_lib'] = ''
+    conf.SET_TARGET_TYPE('archive', 'EMPTY')
     if Options.options.with_libarchive is not False:
-        libarchive_mandatory = Options.options.with_libarchive == True
         Logs.info("Checking for libarchive existence")
-        if conf.CHECK_BUNDLED_SYSTEM('libarchive', minversion='3.1.2'):
-            conf.env['archive_lib'] = 'libarchive'
-        elif libarchive_mandatory:
-            conf.fatal('libarchive support requested, but no suitable pkgconfig found')
+        if conf.CHECK_HEADERS('archive.h') and conf.CHECK_LIB('archive', shlib=True):
+            conf.CHECK_FUNCS_IN('archive_read_support_filter_all archive_read_free', 'archive')
+        else:
+            conf.fatal("libarchive support not found. "
+                       "Try installing libarchive-dev or libarchive-devel. "
+                       "Otherwise, use --without-libarchive to "
+                       "build without libarchive support. "
+                       "libarchive support is required for the smbclient "
+                       "tar-file mode")
+    elif conf.CONFIG_GET('ENABLE_SELFTEST'):
+        raise Errors.WafError('libarchive library required for '
+                             '--enable-selftest')
+
 
     # check for DMAPI libs
     if Options.options.with_dmapi == False:
@@ -310,7 +316,7 @@ int main(int argc, char **argv)
     conf.CHECK_STRUCTURE_MEMBER('struct stat', 'st_flags', define='HAVE_STAT_ST_FLAGS',
                                 headers='sys/types.h sys/stat.h unistd.h')
 
-    if "HAVE_BLKCNT_T" in conf.env:
+    if conf.env.HAVE_BLKCNT_T:
         conf.CHECK_CODE('''
         static int test_array[1 - 2 * !(((long int)(sizeof(blkcnt_t))) <= 4)];''',
                 'SIZEOF_BLKCNT_T_4',
@@ -318,7 +324,7 @@ int main(int argc, char **argv)
                 msg="Checking whether blkcnt_t is 32 bit")
 
     # If sizeof is 4 it can't be 8
-    if "HAVE_BLKCNT_T" in conf.env:
+    if conf.env.HAVE_BLKCNT_T:
         if not conf.CONFIG_SET('SIZEOF_BLKCNT_T_4'):
             conf.CHECK_CODE('''
             static int test_array[1 - 2 * !(((long int)(sizeof(blkcnt_t))) <= 8)];''',
@@ -329,7 +335,7 @@ int main(int argc, char **argv)
     # Check for POSIX capability support
     conf.CHECK_FUNCS_IN('cap_get_proc', 'cap', headers='sys/capability.h')
 
-    if "HAVE_SYS_CAPABILITY_H" in conf.env:
+    if conf.env.HAVE_SYS_CAPABILITY_H:
         conf.CHECK_CODE('''
         cap_t cap;
         cap_value_t vals[1];
@@ -377,35 +383,77 @@ int main(int argc, char **argv) {
                     msg="Checking for LL suffix on long long integers")
 
     conf.CHECK_FUNCS('''
-_acl __acl atexit 
- _chdir __chdir chflags chmod _close __close _closedir
-__closedir crypt16 devnm dirfd
-DNSServiceRegister _dup __dup _dup2 __dup2 endmntent execl
-_facl __facl _fchdir
-__fchdir fchmod fchown _fcntl __fcntl fcvt fcvtl fdatasync
-_fork __fork fseeko
-fsetxattr _fstat __fstat fsync
-futimens futimes __fxstat getauthuid
-getcwd _getcwd __getcwd getdents __getdents getdirentries
-getgrent getgrnam getgrouplist getgrset getmntent getpagesize
-getpwanam getpwent_r getrlimit
-glob grantpt hstrerror initgroups innetgr
-llseek _llseek __llseek _lseek __lseek
-_lstat __lstat lutimes
-__lxstat memalign mknod mlock mlockall munlock munlockall
-_open __open _opendir __opendir
-pathconf poll posix_fallocate
-posix_memalign pread _pread __pread
-pwrite _pwrite __pwrite
-rdchk _read __read _readdir __readdir
-_seekdir __seekdir
-select setenv setgidx setgroups setlocale setluid
-setmntent setpgid setpriv setsid setuidx
-shmget shm_open
-_stat __stat statvfs
-strcasecmp strchr strpbrk strsignal strtol strupr sysconf sysctl sysctlbyname
-__sys_llseek syslog _telldir __telldir timegm
-utimensat vsyslog _write __write __xstat
+DNSServiceRegister
+atexit
+chflags
+chmod
+crypt16
+devnm
+dirfd
+endmntent
+execl
+fchmod
+fchown
+fcvt
+fcvtl
+fseeko
+fsync
+futimens
+futimes
+getauthuid
+getcwd
+getgrent
+getgrnam
+getgrouplist
+getgrset
+getmntent
+getpagesize
+getpwanam
+getpwent_r
+getrlimit
+glob
+grantpt
+hstrerror
+initgroups
+innetgr
+llseek
+lutimes
+memalign
+mknod
+mlock
+mlockall
+munlock
+munlockall
+pathconf poll
+posix_memalign
+pread
+pwrite
+rdchk
+select
+setenv
+setgidx
+setgroups
+setlocale
+setluid
+setmntent
+setpgid
+setpriv
+setsid
+setuidx
+statvfs
+strcasecmp
+strchr
+strpbrk
+strsignal
+strtol
+strupr
+sysconf
+sysctl
+sysctlbyname
+syslog
+timegm
+utimensat
+vsyslog
 ''')
 
     conf.CHECK_SAMBA3_CHARSET() # see build/charset.py
@@ -455,12 +503,12 @@ utimensat vsyslog _write __write __xstat
 
     if Options.options.with_acl_support:
         if (host_os.rfind('hpux') > -1):
-		Logs.info('Using HPUX ACLs')
+                Logs.info('Using HPUX ACLs')
                 conf.DEFINE('HAVE_HPUX_ACLS',1)
                 conf.DEFINE('POSIX_ACL_NEEDS_MASK',1)
                 default_static_modules.extend(TO_LIST('vfs_hpuxacl'))
-	elif (host_os.rfind('aix') > -1):
-		Logs.info('Using AIX ACLs')
+        elif (host_os.rfind('aix') > -1):
+                Logs.info('Using AIX ACLs')
                 conf.DEFINE('HAVE_AIX_ACLS',1)
                 default_static_modules.extend(TO_LIST('vfs_aixacl vfs_aixacl2'))
         elif (host_os.rfind('darwin') > -1):
@@ -544,53 +592,9 @@ return acl_get_perm_np(permset_d, perm);
     conf.CHECK_DECLS('readahead', headers='fcntl.h', always=True)
 
     conf.CHECK_CODE('int fd = openat(AT_FDCWD, ".", O_RDONLY);',
-		'HAVE_OPENAT',
-		msg='Checking for openat',
-		headers='fcntl.h')
-
-    if Options.options.with_aio_support:
-        conf.CHECK_FUNCS_IN('aio_read', 'aio')
-        conf.CHECK_FUNCS_IN('aio_read', 'rt')
-        conf.CHECK_CODE('struct aiocb a; return aio_read(&a);',
-                        'HAVE_AIO',
-                        msg='Checking for asynchronous io support',
-                        headers='sys/types.h aio.h',
-                        lib='aio rt')
-        if conf.CONFIG_SET('HAVE_AIO'):
-            conf.CHECK_CODE('struct aiocb a; return aio_read(&a);', 'HAVE_AIO_READ', msg='Checking for aio_read', headers='aio.h', lib='aio rt')
-            conf.CHECK_CODE('struct aiocb a; return aio_write(&a);', 'HAVE_AIO_WRITE', msg='Checking for aio_write', headers='aio.h', lib='aio rt')
-            conf.CHECK_CODE('struct aiocb a; return aio_fsync(1, &a);', 'HAVE_AIO_FSYNC', msg='Checking for aio_fsync', headers='aio.h', lib='aio rt')
-            conf.CHECK_CODE('struct aiocb a; return aio_return(&a);', 'HAVE_AIO_RETURN', msg='Checking for aio_return', headers='aio.h', lib='aio rt')
-            conf.CHECK_CODE('struct aiocb a; return aio_error(&a);', 'HAVE_AIO_ERROR', msg='Checking for aio_error', headers='aio.h', lib='aio rt')
-            conf.CHECK_CODE('struct aiocb a; return aio_cancel(1, &a);', 'HAVE_AIO_CANCEL', msg='Checking for aio_cancel', headers='aio.h', lib='aio rt')
-            conf.CHECK_CODE('const struct aiocb * const a[1]; struct timespec t; return aio_suspend(a, 1, &t);', 'HAVE_AIO_SUSPEND', msg='Checking for aio_suspend', headers='aio.h', lib='aio rt')
-        if not conf.CONFIG_SET('HAVE_AIO'):
-            conf.DEFINE('HAVE_NO_AIO', '1')
-    else:
-        conf.DEFINE('HAVE_NO_AIO', '1')
-
-    if host_os.rfind('linux') > -1:
-	conf.CHECK_FUNCS_IN('io_submit', 'aio')
-	conf.CHECK_CODE('''
-struct io_event ioev;
-struct iocb *ioc;
-io_context_t ctx;
-struct timespec ts;
-int fd;
-char *buf;
-fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-io_queue_init(128,&ctx);
-io_prep_pwrite(ioc, 1, buf, 1, 0);
-io_prep_pread(ioc, 1, buf, 1, 0);
-io_set_eventfd(ioc, fd);
-io_set_callback(ioc, (io_callback_t)(0));
-io_submit(ctx, 1, &ioc);
-io_getevents(ctx, 1, 1, &ioev, &ts);
-''',
-			'HAVE_LINUX_KERNEL_AIO',
-			msg='Checking for linux kernel asynchronous io support',
-			headers='unistd.h stdlib.h sys/types.h fcntl.h sys/eventfd.h libaio.h',
-			lib='aio')
+                'HAVE_OPENAT',
+                msg='Checking for openat',
+                headers='fcntl.h')
 
     conf.CHECK_CODE('''
 struct msghdr msg;
@@ -634,24 +638,8 @@ msg.msg_accrightslen = sizeof(fd);
                                 headers='unistd.h sys/types.h dirent.h',
                                 define='HAVE_DIRENT_D_OFF')
 
-    conf.CHECK_FUNCS('setnetgrent getnetgrent endnetgrent')
-    if conf.CHECK_CFLAGS('-Werror-implicit-function-declaration'):
-        netgrent_cflags = '-Werror-implicit-function-declaration'
-    else:
-        netgrent_cflags = ''
-    conf.CHECK_CODE('setnetgrent("foo")', 'HAVE_SETNETGRENT_PROTOTYPE',
-                    msg="Checking for setnetgrent prototype",
-                    headers='netdb.h netgroup.h',
-                    cflags=netgrent_cflags)
-    conf.CHECK_CODE('getnetgrent', 'HAVE_GETNETGRENT_PROTOTYPE',
-                    msg="Checking for getnetgrent prototype",
-                    headers='netdb.h netgroup.h',
-                    cflags=netgrent_cflags)
-    conf.CHECK_CODE('endnetgrent', 'HAVE_ENDNETGRENT_PROTOTYPE',
-                    msg="Checking for endnetgrent prototype",
-                    headers='netdb.h netgroup.h',
-                    cflags=netgrent_cflags)
-
+    if (conf.CONFIG_SET('HAVE_YP_GET_DEFAULT_DOMAIN')):
+           conf.DEFINE('HAVE_NETGROUP', '1')
 
     # Look for CUPS
     if Options.options.with_cups:
@@ -663,7 +651,7 @@ msg.msg_accrightslen = sizeof(fd);
             conf.CHECK_CFG(path=conf.env.CUPS_CONFIG, args="--cflags --ldflags",
                            package="", uselib_store="CUPS")
         conf.CHECK_HEADERS('cups/cups.h cups/language.h', lib='cups')
-        conf.CHECK_FUNCS_IN('httpConnect httpConnectEncrypt', 'cups')
+        conf.CHECK_FUNCS_IN('httpConnect httpConnect2 httpConnectEncrypt', 'cups')
         if conf.CONFIG_SET('HAVE_CUPS_CUPS_H') and conf.CONFIG_SET('HAVE_CUPS_LANGUAGE_H'):
             conf.DEFINE('HAVE_CUPS', '1')
         else:
@@ -822,6 +810,9 @@ msg.msg_accrightslen = sizeof(fd);
         forced_shared_modules.extend(TO_LIST('idmap_ad idmap_rfc2307'))
     elif Options.options.with_ads == False:
         Logs.info("Building without Active Directory support (--without-ads).")
+        if not Options.options.without_ad_dc:
+            conf.fatal("Building --without-ads requires also "
+                       "building --without-ad-dc.")
     else:
         if not use_ads_krb5:
             Logs.warn("Active Directory support not available: krb5 libs don't have all required features")
@@ -861,6 +852,8 @@ msg.msg_accrightslen = sizeof(fd);
                                     define='HAVE_UT_UT_EXIT')
         conf.CHECK_STRUCTURE_MEMBER('struct utmpx', 'ut_syslen', headers='utmpx.h',
                                     define='HAVE_UX_UT_SYSLEN')
+        conf.CHECK_STRUCTURE_MEMBER('struct utmpx', 'ut_host', headers='utmpx.h',
+                                    define='HAVE_UX_UT_HOST')
         conf.CHECK_CODE('struct utmp utarg; struct utmp *utreturn; utreturn = pututline(&utarg);',
                         'PUTUTLINE_RETURNS_UTMP', headers='utmp.h',
                         msg="Checking whether pututline returns pointer")
@@ -965,9 +958,10 @@ int i; i = PAM_RADIO_TYPE;
         if use_pam:
             conf.DEFINE('WITH_PAM', 1)
             conf.DEFINE('WITH_PAM_MODULES', 1)
-
-    if Options.options.with_pam_smbpass:
-        conf.env.with_pam_smbpass = True
+        else:
+            conf.fatal("PAM support is enabled but prerequisite libraries "
+                       "or headers not found. Use --without-pam to disable "
+                       "PAM support.");
 
     seteuid = False
 
@@ -1013,23 +1007,23 @@ syscall(SYS_setgroups32, 0, NULL);
         if (conf.CONFIG_SET('USE_LINUX_32BIT_SYSCALLS')):
             seteuid = conf.CHECK_CODE('''
                                 #define AUTOCONF_TEST 1
-                                #define USE_LINUX_THREAD_CREDENTIALS 1
+                                #define HAVE_LINUX_THREAD_CREDENTIALS 1
                                 #define USE_LINUX_32BIT_SYSCALLS 1
                                 #include "../lib/util/setid.c"
                                 #include "./lib/util_sec.c"
                                 ''',
-                                'USE_LINUX_THREAD_CREDENTIALS',
+                                'HAVE_LINUX_THREAD_CREDENTIALS',
                                 addmain=False,
                                 execute=True,
                                 msg="Checking whether we can use Linux thread-specific credentials with 32-bit system calls")
         else:
             seteuid = conf.CHECK_CODE('''
                                 #define AUTOCONF_TEST 1
-                                #define USE_LINUX_THREAD_CREDENTIALS 1
+                                #define HAVE_LINUX_THREAD_CREDENTIALS 1
                                 #include "../lib/util/setid.c"
                                 #include "./lib/util_sec.c"
                                 ''',
-                                'USE_LINUX_THREAD_CREDENTIALS',
+                                'HAVE_LINUX_THREAD_CREDENTIALS',
                                 addmain=False,
                                 execute=True,
                                 msg="Checking whether we can use Linux thread-specific credentials")
@@ -1083,7 +1077,7 @@ syscall(SYS_setgroups32, 0, NULL);
             Logs.warn("--with-dnsupdate=yes but gssapi support not sufficient")
         else:
             conf.DEFINE('WITH_DNS_UPDATES', 1)
-    conf.CHECK_HEADERS('valgrind.h valgrind/valgrind.h valgrind/memcheck.h')
+    # valgrind.h or valgrind/valgrind.h is checked in lib/replace/wscript
     if Options.options.developer:
         if conf.CONFIG_SET('HAVE_VALGRIND_H') or conf.CONFIG_SET('HAVE_VALGRIND_VALGRIND_H'):
             conf.DEFINE('VALGRIND', '1')
@@ -1111,18 +1105,174 @@ syscall(SYS_setgroups32, 0, NULL);
                 execute=True,
                 msg='Checking whether fcntl locking is available')
 
-# glibc up to 2.3.6 had dangerously broken posix_fallocate(). DON'T USE IT.
-    if not conf.CHECK_CODE('''
-#define _XOPEN_SOURCE 600
-#include <stdlib.h>
-#if defined(__GLIBC__) && ((__GLIBC__ < 2) || (__GLIBC__ == 2 && __GLIBC_MINOR__ < 4))
-#error probably broken posix_fallocate
-#endif
-''',
-                           '_HAVE_UNBROKEN_POSIX_FALLOCATE',
-                           msg='Checking for broken posix_fallocate'):
-        conf.DEFINE('HAVE_BROKEN_POSIX_FALLOCATE', '1')
+    conf.CHECK_CODE('''
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <errno.h>
 
+#define DATA "ofdtest.fcntl"
+
+int main() {
+        struct flock lck = {
+           .l_whence = SEEK_SET,
+           .l_type = F_WRLCK,
+           .l_start = 0,
+           .l_len = 1,
+           .l_pid = 0,
+        };
+        int ret;
+        int fd1;
+        int fd2;
+        char *testdir = getenv("TESTDIR");
+
+        if (testdir) {
+           if (chdir(testdir) != 0) {
+              goto err;
+           }
+        }
+
+        unlink(DATA);
+        fd1 = open(DATA, O_RDWR|O_CREAT|O_EXCL, 0600);
+        fd2 = open(DATA, O_RDWR);
+        if (fd1 == -1 || fd2 == -1) {
+           goto err;
+        }
+        ret = fcntl(fd1,F_OFD_SETLKW,&lck);
+        if (ret == -1) {
+          goto err;
+        }
+        ret = fcntl(fd2,F_OFD_SETLK,&lck);
+        if (ret != -1) {
+          goto err;
+        }
+        if (errno != EAGAIN) {
+          goto err;
+        }
+        ret = fcntl(fd2,F_OFD_GETLK,&lck);
+        if (ret == -1) {
+          goto err;
+        }
+        unlink(DATA);
+        exit(0);
+err:
+        unlink(DATA);
+        exit(1);
+}''',
+            'HAVE_OFD_LOCKS',
+            addmain=False,
+            execute=True,
+            msg="Checking whether fcntl lock supports open file description locks")
+
+    conf.CHECK_CODE('''
+#include <fcntl.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <sys/socket.h>
+
+int main(void)
+{
+        int sockfd, ret;
+        struct f_owner_ex owner, get_owner;
+
+        sockfd = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (sockfd == -1) {
+            goto err;
+        }
+
+        owner.type = F_OWNER_PID;
+        owner.pid = getpid();
+
+        ret = fcntl(sockfd, F_SETOWN_EX, &owner);
+        if (ret == -1) {
+            goto err;
+        }
+
+        ret = fcntl(sockfd, F_GETOWN_EX, &get_owner);
+        if (ret == -1) {
+            goto err;
+        }
+
+        if (get_owner.type != F_OWNER_PID) {
+            goto err;
+        }
+
+        if (get_owner.pid != getpid()) {
+            goto err;
+        }
+
+        close(sockfd);
+        exit(0);
+err:
+        close(sockfd);
+        exit(1);
+}''',
+            'HAVE_F_OWNER_EX',
+            addmain=False,
+            execute=True,
+            msg="Checking whether fcntl supports flags to send direct I/O availability signals")
+
+    conf.CHECK_CODE('''
+#include <fcntl.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <stdint.h>
+
+#define DATA "hinttest.fcntl"
+
+int main(void)
+{
+        uint64_t *hint, get_hint;
+        int fd;
+
+        fd = open(DATA, O_RDONLY | O_CREAT | O_EXCL);
+        if (fd == -1) {
+            goto err;
+        }
+
+        *hint = RWH_WRITE_LIFE_SHORT;
+        int ret = fcntl(fd, F_SET_RW_HINT, hint);
+        if (ret == -1) {
+            goto err;
+        }
+
+        ret = fcntl(fd, F_GET_RW_HINT, &get_hint);
+        if (ret == -1) {
+            goto err;
+        }
+
+        if (get_hint != RWH_WRITE_LIFE_SHORT) {
+            goto err;
+        }
+
+        *hint = RWH_WRITE_LIFE_EXTREME;
+        ret = fcntl(fd, F_SET_FILE_RW_HINT, hint);
+        if (ret == -1) {
+            goto err;
+        }
+
+        ret = fcntl(fd, F_GET_FILE_RW_HINT, &get_hint);
+        if (ret == -1) {
+            goto err;
+        }
+
+        if (get_hint != RWH_WRITE_LIFE_EXTREME) {
+            goto err;
+        }
+
+        close(fd);
+        unlink(DATA);
+        exit(0);
+err:
+        close(fd);
+        unlink(DATA);
+        exit(1);
+}''',
+            'HAVE_RW_HINTS',
+            addmain=False,
+            execute=True,
+            msg="Checking whether fcntl supports setting/geting hints")
 
     conf.CHECK_STRUCTURE_MEMBER('struct stat', 'st_mtim.tv_nsec',
                                 define='HAVE_STRUCT_STAT_ST_MTIM_TV_NSEC') # Linux, Solaris
@@ -1221,6 +1371,9 @@ main() {
 #include <unistd.h>
 #endif
 #include <sys/types.h>
+#if defined(HAVE_SYS_SYSMACROS_H)
+#include <sys/sysmacros.h>
+#endif
 main() { dev_t dev = makedev(1,2); return 0; }
 ''',
         'HAVE_MAKEDEV',
@@ -1254,7 +1407,9 @@ main() {
                     addmain=False,
                     execute=True)
 
-    if Options.options.with_sendfile_support:
+    conf.SET_TARGET_TYPE('sendfile', 'EMPTY')
+    conf.CHECK_LIB('sendfile')
+    if not Options.options.with_sendfile_support == False:
         if (host_os.rfind('linux') > -1) or (host_os.rfind('gnu') > -1) or (host_os.rfind('k*bsd*-gnu') > -1) or (host_os.rfind('kopensolaris*-gnu') > -1):
             conf.CHECK_CODE('''
                             int tofd, fromfd;
@@ -1269,7 +1424,6 @@ main() {
             if conf.CONFIG_SET('_HAVE_SENDFILE'):
                 conf.DEFINE('HAVE_SENDFILE', '1')
                 conf.DEFINE('LINUX_SENDFILE_API', '1')
-                conf.DEFINE('WITH_SENDFILE', '1')
         elif (host_os.rfind('freebsd') > -1) or (host_os.rfind('dragonfly') > -1):
             conf.CHECK_CODE('''
                             #include <sys/types.h>
@@ -1293,7 +1447,6 @@ main() {
             if conf.CONFIG_SET('_HAVE_SENDFILE'):
                 conf.DEFINE('HAVE_SENDFILE', '1')
                 conf.DEFINE('FREEBSD_SENDFILE_API', '1')
-                conf.DEFINE('WITH_SENDFILE', '1')
         elif (host_os.rfind('darwin') > -1):
             conf.CHECK_CODE('''
                             #include <sys/types.h>
@@ -1309,14 +1462,13 @@ main() {
                             hdr.trl_cnt = 0;
                             hdtrl.iov_base = (void *)0;
                             hdtrl.iov_len = 0;
-			    ret = sendfile(fromfd, tofd, offset, &nwritten, &hdr, 0);
+                            ret = sendfile(fromfd, tofd, offset, &nwritten, &hdr, 0);
                             ''',
                             '_HAVE_SENDFILE',
                             msg='Checking for darwin sendfile support')
             if conf.CONFIG_SET('_HAVE_SENDFILE'):
                 conf.DEFINE('HAVE_SENDFILE', '1')
                 conf.DEFINE('DARWIN_SENDFILE_API', '1')
-                conf.DEFINE('WITH_SENDFILE', '1')
         elif (host_os.rfind('hpux') > -1) or (host_os.rfind('osf') > -1):
             conf.CHECK_CODE('''
                             #include <sys/socket.h>
@@ -1335,9 +1487,8 @@ main() {
             if conf.CONFIG_SET('_HAVE_SENDFILE'):
                 conf.DEFINE('HAVE_SENDFILE', '1')
                 conf.DEFINE('HPUX_SENDFILE_API', '1')
-                conf.DEFINE('WITH_SENDFILE', '1')
-        elif (host_os.rfind('solaris') > -1):
-            conf.CHECK_FUNCS_IN('sendfile', 'sendfilev')
+        elif (host_os.rfind('sunos') > -1):
+            conf.CHECK_FUNCS_IN('sendfilev', 'sendfile')
             conf.CHECK_CODE('''
                             #include <sys/sendfile.h>,
                             int sfvcnt;
@@ -1357,11 +1508,11 @@ main() {
                             nwritten = sendfilev(tofd, vec, sfvcnt, &xferred);
                             ''',
                             '_HAVE_SENDFILEV',
-                            msg='Checking for solaris sendfilev support')
+                            msg='Checking for solaris sendfilev support',
+                            lib='sendfile')
             if conf.CONFIG_SET('_HAVE_SENDFILEV'):
                 conf.DEFINE('HAVE_SENDFILEV', '1')
                 conf.DEFINE('SOLARIS_SENDFILE_API', '1')
-                conf.DEFINE('WITH_SENDFILE', '1')
         elif (host_os.rfind('aix') > -1):
             conf.CHECK_CODE('''
                             #include <sys/socket.h>
@@ -1383,8 +1534,9 @@ main() {
             if conf.CONFIG_SET('_HAVE_SENDFILE'):
                 conf.DEFINE('HAVE_SENDFILE', '1')
                 conf.DEFINE('AIX_SENDFILE_API', '1')
-                conf.DEFINE('WITH_SENDFILE', '1')
 
+    if Options.options.with_sendfile_support == True and not conf.CONFIG_SET('HAVE_SENDFILE'):
+        conf.fatal('sendfile support not found but it was requested !')
     # Check for getcwd allowing a NULL arg.
     conf.CHECK_CODE('''
 #include <unistd.h>
@@ -1400,13 +1552,16 @@ main() {
     conf.CHECK_FUNCS_IN('getspnam', 'security')
     conf.CHECK_FUNCS_IN('getspnam', 'sec')
 
-    if Options.options.with_quotas:
+    legacy_quota_libs = ''
+    if not Options.options.with_quotas == False:
         # For quotas on Veritas VxFS filesystems
         conf.CHECK_HEADERS('sys/fs/vx_quota.h')
         # For sys/quota.h and linux/quota.h
         conf.CHECK_HEADERS('sys/quota.h')
         # For quotas on BSD systems
         conf.CHECK_HEADERS('ufs/ufs/quota.h')
+        # For quotas on AIX systems
+        conf.CHECK_HEADERS('jfs/quota.h')
         # For quotas on Linux XFS filesystems
         if conf.CHECK_HEADERS('xfs/xqm.h'):
             conf.DEFINE('HAVE_XFS_QUOTAS', '1')
@@ -1426,18 +1581,31 @@ main() {
                 msg='for XFS QUOTA in <sys/quota.h>',
                 execute=False,
                 local_include=False)
-        
+
         # For IRIX like dqb_isoftlimit instead of dqb_fsoftlimit in struc dqblk
         conf.CHECK_STRUCTURE_MEMBER('struct dqblk', 'dqb_fsoftlimit', define='HAVE_DQB_FSOFTLIMIT',
                                 headers='sys/quota.h')
         #darwin style quota bytecount
         conf.CHECK_STRUCTURE_MEMBER('struct dqblk', 'dqb_curbytes', define='HAVE_STRUCT_DQBLK_DQB_CURBYTES',
                                 headers='sys/quota.h')
-        if conf.CHECK_HEADERS('rpcsvc/rquota.h'):
-            conf.DEFINE('HAVE_NFS_QUOTAS', '1')
+        conf.CHECK_HEADERS('rpc/types.h rpc/xdr.h', together=True)
+        if conf.CHECK_HEADERS('rpcsvc/rquota.h', lib='tirpc'):
+            # Optional structure member
             conf.CHECK_STRUCTURE_MEMBER('struct getquota_rslt', 'getquota_rslt_u',
                                         define='HAVE_GETQUOTA_RSLT_GETQUOTA_RSLT_U',
-                                        headers='rpcsvc/rquota.h')
+                                        headers='rpcsvc/rquota.h',
+                                        lib='tirpc')
+
+            # Required function for NFS quota support
+            conf.CHECK_CODE('''
+                            clnt_create("", RQUOTAPROG, RQUOTAVERS, "udp");
+                            ''',
+                            headers="rpc/rpc.h rpc/types.h rpcsvc/rquota.h rpc/nettype.h rpc/xdr.h",
+                            define='HAVE_NFS_QUOTAS',
+                            msg='checking for clnt_create()',
+                            execute=True,
+                            local_include=False,
+                            lib='tirpc')
 
         if (host_os.rfind('linux') > -1):
             conf.DEFINE('HAVE_QUOTACTL_LINUX', '1')
@@ -1464,21 +1632,55 @@ main() {
                                 execute=True,
                                 addmain=False)
 
-        conf.CHECK_CODE('''
-                     clnt_create("", RQUOTAPROG, RQUOTAVERS, "udp");
-''', 
-                        headers="rpc/rpc.h rpc/types.h rpcsvc/rquota.h rpc/nettype.h rpc/xdr.h", 
-                        define='HAVE_NFS_QUOTAS',
-                        msg='for NFS QUOTAS',
-                        execute=True,
-                        local_include=False)
-
         if conf.CONFIG_SET('HAVE_QUOTACTL_LINUX') or \
            conf.CONFIG_SET('HAVE_QUOTACTL_4A') or \
            conf.CONFIG_SET('HAVE_QUOTACTL_4B') or \
            conf.CONFIG_SET('HAVE_XFS_QUOTAS'):
             conf.DEFINE('HAVE_SYS_QUOTAS', '1')
             conf.DEFINE('WITH_QUOTAS', '1')
+
+        #
+        # check if Legacy quota code can be brought in
+        # if standard interfaces are not supported
+        #
+        if not conf.CONFIG_SET('WITH_QUOTAS'):
+            if host_os.rfind('sunos5') > -1:
+                conf.DEFINE('SUNOS5', '1')
+                legacy_quota_libs = 'nsl'
+            conf.CHECK_CODE('''
+            #define WITH_QUOTAS 1
+            #define AUTOCONF_TEST 1
+            #include "../tests/oldquotas.c"
+            ''',
+                            cflags=conf.env['WERROR_CFLAGS'],
+                            define='WITH_QUOTAS',
+                            lib=legacy_quota_libs,
+                            msg='Checking whether legacy quota code can be used',
+                            execute=False,
+                            addmain=False)
+            if not conf.CONFIG_SET('WITH_QUOTAS'):
+                legacy_quota_libs = ''
+    conf.env['legacy_quota_libs'] = legacy_quota_libs
+
+    if Options.options.with_quotas == True and not conf.CONFIG_SET('WITH_QUOTAS'):
+        conf.fatal('quota support not found but it was equested !')
+
+    conf.CHECK_CODE('(void)unshare(CLONE_FS);',
+                    headers='sched.h',
+                    define='HAVE_UNSHARE_CLONE_FS',
+                    msg='for Linux unshare(CLONE_FS)')
+
+    # Check for mallinfo
+    conf.CHECK_CODE('''
+    struct mallinfo mi;
+    int tmp;
+
+    mi = mallinfo();
+    tmp = mi.arena + mi.ordblks + mi.smblks + mi.hblks +
+          mi.hblkhd + mi.usmblks + mi.fsmblks +  mi.uordblks +
+          mi.fordblks + mi.keepcost;
+    return tmp;
+    ''', 'HAVE_MALLINFO', msg="Checking for mallinfo()", headers='malloc.h')
 
     #
     # cluster support (CTDB)
@@ -1488,15 +1690,8 @@ main() {
         conf.env.with_ctdb = False
     else:
         Logs.info("building with cluster support")
-        conf.env['CTDB_CFLAGS'] = '-DCLUSTER_SUPPORT=1'
-        conf.env['CTDB_INCLUDE'] = conf.srcdir + '/ctdb/include'
         conf.env.with_ctdb = True
-
-    conf.CHECK_CODE('__attribute__((destructor)) static void cleanup(void) { }',
-                    'HAVE_FUNCTION_ATTRIBUTE_DESTRUCTOR',
-                    addmain=False,
-                    link=False,
-                    msg='Checking whether we can compile with __attribute__((destructor))')
+        conf.DEFINE('CLUSTER_SUPPORT', 1)
 
     conf.CHECK_CODE('void seekdir(DIR *d, long loc) { return; }',
                     'SEEKDIR_RETURNS_VOID',
@@ -1507,48 +1702,69 @@ main() {
         conf.DEFINE('WITH_PROFILE', 1);
         conf.CHECK_FUNCS('getrusage', headers="sys/time.h sys/resource.h")
 
-    if Options.options.with_pthreadpool:
-        if conf.CONFIG_SET('HAVE_PTHREAD'):
-            conf.DEFINE('WITH_PTHREADPOOL', '1')
-        else:
-            Logs.warn("pthreadpool support cannot be enabled when pthread support was not found")
-            conf.undefine('WITH_PTHREADPOOL')
-
     if (conf.CHECK_HEADERS('linux/ioctl.h sys/ioctl.h linux/fs.h') and
-	conf.CHECK_DECLS('FS_IOC_GETFLAGS FS_COMPR_FL', headers='linux/fs.h')):
-	    conf.DEFINE('HAVE_LINUX_IOCTL', '1')
+        conf.CHECK_DECLS('FS_IOC_GETFLAGS FS_COMPR_FL', headers='linux/fs.h')):
+            conf.DEFINE('HAVE_LINUX_IOCTL', '1')
 
-    conf.env['CCFLAGS_CEPHFS'] = "-D_FILE_OFFSET_BITS=64"
+    conf.env['CFLAGS_CEPHFS'] = "-D_FILE_OFFSET_BITS=64"
     if Options.options.libcephfs_dir:
-        conf.env['CPPPATH_CEPHFS'] = Options.options.libcephfs_dir + '/include'
-        conf.env['LIBPATH_CEPHFS'] = Options.options.libcephfs_dir + '/lib'
+        Logs.error('''--with-libcephfs no longer supported, please use compiler
+                   flags instead, e.g. GCC LIBRARY_PATH and C_INCLUDE_PATH''')
+        sys.exit(1)
 
-    if conf.CHECK_HEADERS('cephfs/libcephfs.h', False, False, 'cephfs') and conf.CHECK_LIB('cephfs'):
-        conf.DEFINE('HAVE_CEPH', '1')
+    if (Options.options.with_cephfs and
+        conf.CHECK_HEADERS('cephfs/libcephfs.h', False, False, 'cephfs') and
+        conf.CHECK_LIB('cephfs', shlib=True)):
+        if (Options.options.with_acl_support and
+            conf.CHECK_FUNCS_IN('ceph_statx', 'cephfs',
+                                headers='cephfs/libcephfs.h')):
+            conf.DEFINE('HAVE_CEPH', '1')
+        else:
+            Logs.warn('''Ceph support disabled due to --without-acl-support
+                      or lack of ceph_statx support''')
+            conf.undefine('HAVE_CEPH')
 
     if Options.options.with_glusterfs:
         conf.CHECK_CFG(package='glusterfs-api', args='"glusterfs-api >= 4" --cflags --libs',
                        msg='Checking for glusterfs-api >= 4', uselib_store="GFAPI")
-        conf.CHECK_HEADERS('api/glfs.h', lib='gfapi')
+        conf.CHECK_HEADERS('glusterfs/api/glfs.h', lib='gfapi')
         conf.CHECK_LIB('gfapi', shlib=True)
 
-        if conf.CONFIG_SET('HAVE_API_GLFS_H'):
-            conf.DEFINE('HAVE_GLUSTERFS', '1')
+        if conf.CONFIG_SET('HAVE_GLUSTERFS_API_GLFS_H'):
+            if Options.options.with_acl_support:
+                 conf.DEFINE('HAVE_GLUSTERFS', '1')
+            else:
+                Logs.warn("GlusterFS support disabled due to --without-acl-support")
+                conf.undefine('HAVE_GLUSTERFS')
         else:
-            conf.SET_TARGET_TYPE('gfapi', 'EMPTY')
             conf.undefine('HAVE_GLUSTERFS')
+
+        conf.CHECK_CFG(package='glusterfs-api', args='"glusterfs-api >= 6" --cflags --libs',
+                       msg='Checking for glusterfs-api >= 6',
+                       uselib_store="GFAPI_VER_6")
+        conf.CHECK_CFG(package='glusterfs-api', args='"glusterfs-api >= 7.6" --cflags --libs',
+                       msg='Checking for glusterfs-api >= 7.6',
+                       uselib_store="GFAPI_VER_7_6")
     else:
         conf.SET_TARGET_TYPE('gfapi', 'EMPTY')
         conf.undefine('HAVE_GLUSTERFS')
 
     if Options.options.enable_vxfs:
-	conf.DEFINE('HAVE_VXFS', '1')
+        conf.DEFINE('HAVE_VXFS', '1')
 
     if conf.CHECK_CFG(package='dbus-1', args='--cflags --libs',
                       msg='Checking for dbus', uselib_store="DBUS-1"):
         if (conf.CHECK_HEADERS('dbus/dbus.h', lib='dbus-1')
                                       and conf.CHECK_LIB('dbus-1', shlib=True)):
             conf.DEFINE('HAVE_DBUS', '1')
+
+    if conf.CHECK_CFG(package='liburing', args='--cflags --libs',
+                      msg='Checking for liburing package', uselib_store="URING"):
+        if (conf.CHECK_HEADERS('liburing.h', lib='uring')
+                                      and conf.CHECK_LIB('uring', shlib=True)):
+            conf.CHECK_FUNCS_IN('io_uring_ring_dontfork', 'uring',
+                                headers='liburing.h')
+            conf.DEFINE('HAVE_LIBURING', '1')
 
     conf.env.build_regedit = False
     if not Options.options.with_regedit == False:
@@ -1567,6 +1783,25 @@ main() {
         else:
             Logs.info("ncurses not available, not building regedit")
 
+    if conf.CHECK_HEADERS('ftw.h') and conf.CHECK_FUNCS('nftw'):
+        conf.env.build_mvxattr = True
+
+    conf.env.build_winexe = False
+    if not Options.options.with_winexe == False:
+        if conf.CONFIG_SET('HAVE_WINEXE_CC_WIN32') or conf.CONFIG_SET('HAVE_WINEXE_CC_WIN64'):
+            conf.env.build_winexe = True
+
+    if conf.env.build_winexe:
+        Logs.info("building winexe")
+    else:
+        if Options.options.with_winexe == False:
+            Logs.info("not building winexe (--without-winexe)")
+        elif Options.options.with_winexe == True:
+            Logs.error("mingw not available, cannot build winexe")
+            conf.fatal("mingw not available, but --with-winexe was specified")
+        else:
+            Logs.info("mingw not available, not building winexe")
+
     conf.CHECK_FUNCS_IN('DES_pcbc_encrypt', 'crypto')
     if Options.options.with_fake_kaserver == True:
         conf.CHECK_HEADERS('afs/param.h afs/stds.h', together=True)
@@ -1576,43 +1811,123 @@ main() {
         else:
             conf.fatal('AFS headers not available, but --with-fake-kaserver was specified')
 
+    if conf.CHECK_CFG(package='glib-2.0',
+                      args='--cflags --libs',
+                      msg='Checking for glib-2.0',
+                      uselib_store="GLIB-2.0"):
+        if (conf.CHECK_HEADERS('glib.h', lib='glib-2.0') and conf.CHECK_LIB('glib-2.0', shlib=True)):
+            conf.DEFINE('HAVE_GLIB', 1)
+
+    if conf.CONFIG_SET('HAVE_GLIB'):
+        conf.DEFINE('WITH_TEVENT_GLIB_GLUE', '1')
+
     conf.env['libtracker']=''
+    tracker_versions = ['2.0', '1.0', '0.16', '0.14']
+
+    for version in tracker_versions:
+        testlib = 'tracker-sparql-' + version
+        if conf.CHECK_CFG(package=testlib,
+                          args='--cflags --libs',
+                          mandatory=False):
+            conf.SET_TARGET_TYPE(testlib, 'SYSLIB')
+            conf.env['libtracker'] = testlib
+            conf.DEFINE('HAVE_TRACKER', '1')
+            break
+
+    Logs.info("Checking for bison")
+    bison.configure(conf)
+    if conf.env['BISON']:
+        conf.CHECK_COMMAND('%s --version  | head -n1' % conf.env.BISON[0],
+                           msg='Using bison version',
+                           define=None,
+                           on_target=False)
+
+    Logs.info("Checking for flex")
+    conf.find_program('flex', var='FLEX')
+    if conf.env['FLEX']:
+        conf.env.FLEXFLAGS = ['-t']
+        conf.CHECK_COMMAND('%s --version' % conf.env.FLEX[0],
+                           msg='Using flex version',
+                           define=None,
+                           on_target=False)
+
+    with_spotlight_tracker_backend = (
+        conf.CONFIG_SET('HAVE_TRACKER')
+        and conf.CONFIG_SET('HAVE_GLIB')
+        and conf.env['BISON']
+        and conf.env['FLEX']
+        and conf.CONFIG_GET('HAVE_UTF8_NORMALISATION')
+    )
+
+    with_spotlight_es_backend = (
+        conf.CONFIG_SET('HAVE_JSON_OBJECT')
+        and conf.env['BISON']
+        and conf.env['FLEX']
+        and conf.CONFIG_GET('HAVE_UTF8_NORMALISATION')
+    )
+
     conf.env.with_spotlight = False
-    if Options.options.with_spotlight:
-        versions = ['1.0', '0.16', '0.14']
-        for version in versions:
-            testlib = 'tracker-sparql-' + version
-            if conf.check_cfg(package=testlib,
-                              args='--cflags --libs',
-                              mandatory=False):
-                conf.SET_TARGET_TYPE(testlib, 'SYSLIB')
-                conf.env['libtracker'] = testlib
-                conf.env.with_spotlight = True
-                conf.DEFINE('WITH_SPOTLIGHT', '1')
-                break
+    if Options.options.with_spotlight is not False:
+        backends = ['noindex']
 
-        if not conf.env.with_spotlight:
-            conf.fatal("Spotlight support requested but tracker-sparql library missing")
-        Logs.info("building with Spotlight support")
+        if not conf.env['BISON']:
+            Logs.warn("Spotlight support requested but bison missing")
+        if not conf.env['FLEX']:
+            Logs.warn("Spotlight support requested but flex missing")
+        if not conf.CONFIG_GET('HAVE_UTF8_NORMALISATION'):
+            Logs.warn("Missing support for Unicode normalisation. "
+                      "Try installing icu-dev or libicu-devel.")
+        if not conf.CONFIG_SET('HAVE_TRACKER'):
+            Logs.warn('Missing libtracker-sparql development files for Spotlight backend "tracker"')
+        if not conf.CONFIG_SET('HAVE_GLIB'):
+            Logs.warn('Missing glib-2.0 development files for Spotlight backend "tracker"')
+        if not conf.CONFIG_GET('HAVE_JSON_OBJECT'):
+            Logs.warn('Missing libjansson development files for Spotlight backend "elasticsearch"')
 
-    forced_static_modules.extend(TO_LIST('auth_domain auth_builtin auth_sam auth_winbind'))
-    default_static_modules.extend(TO_LIST('''pdb_smbpasswd pdb_tdbsam pdb_wbc_sam
-                                      auth_unix auth_wbc
+        if with_spotlight_tracker_backend:
+            conf.env.spotlight_backend_tracker = True
+            backends.append('tracker')
+            conf.DEFINE('HAVE_SPOTLIGHT_BACKEND_TRACKER', '1')
+
+        if with_spotlight_es_backend:
+            conf.env.spotlight_backend_es = True
+            backends.append('elasticsearch')
+            conf.DEFINE('HAVE_SPOTLIGHT_BACKEND_ES', '1')
+
+        if (Options.options.with_spotlight is True
+            and not conf.env.spotlight_backend_tracker
+            and not conf.env.spotlight_backend_es):
+            conf.fatal("Unmet dependencies for Spotlight backends")
+
+        Logs.info("Building with Spotlight support, available backends: %s" % ', '.join(backends))
+        default_static_modules.extend(TO_LIST('rpc_mdssvc_module'))
+        conf.DEFINE('WITH_SPOTLIGHT', '1')
+        conf.env.with_spotlight = True
+
+    if not conf.CONFIG_SET('HAVE_RPC_XDR_H'):
+        conf.CHECK_HEADERS('rpc/xdr.h', lib='tirpc')
+
+    if conf.CHECK_FUNCS_IN('nscd_flush_cache', 'nscd', headers='libnscd.h'):
+        conf.DEFINE('HAVE_NSCD_FLUSH_CACHE', '1')
+
+    forced_static_modules.extend(TO_LIST('auth_builtin auth_sam auth_winbind'))
+    default_static_modules.extend(TO_LIST('''pdb_smbpasswd pdb_tdbsam
+                                      auth_unix
                                       nss_info_template idmap_tdb idmap_passdb
                                       idmap_nss'''))
 
     default_shared_modules.extend(TO_LIST('''
-                                      vfs_recycle vfs_audit vfs_extd_audit vfs_full_audit vfs_netatalk
+                                      vfs_recycle vfs_audit vfs_extd_audit vfs_full_audit
                                       vfs_fake_perms vfs_default_quota vfs_readonly vfs_cap
                                       vfs_expand_msdfs vfs_shadow_copy vfs_shadow_copy2
-                                      vfs_readahead vfs_xattr_tdb vfs_posix_eadb
+                                      vfs_readahead vfs_xattr_tdb
                                       vfs_streams_xattr vfs_streams_depot vfs_acl_xattr vfs_acl_tdb
-                                      vfs_smb_traffic_analyzer vfs_preopen vfs_catia
+                                      vfs_preopen vfs_catia
                                       vfs_media_harmony vfs_unityed_media vfs_fruit vfs_shell_snap
                                       vfs_commit vfs_worm vfs_crossrename vfs_linux_xfs_sgid
-                                      vfs_time_audit
+                                      vfs_time_audit vfs_offline vfs_virusfilter vfs_widelinks
                                   '''))
-    default_shared_modules.extend(TO_LIST('auth_script idmap_tdb2 idmap_script'))
+    default_shared_modules.extend(TO_LIST('idmap_tdb2 idmap_script'))
     # these have broken dependencies
     forced_shared_modules.extend(TO_LIST('idmap_autorid idmap_rid idmap_hash'))
 
@@ -1621,13 +1936,17 @@ main() {
         default_shared_modules.extend(TO_LIST('perfcount_test'))
         default_shared_modules.extend(TO_LIST('vfs_skel_opaque vfs_skel_transparent vfs_shadow_copy_test'))
         default_shared_modules.extend(TO_LIST('auth_skel pdb_test'))
+        default_shared_modules.extend(TO_LIST('vfs_fake_dfq'))
+        default_shared_modules.extend(TO_LIST('gpext_security gpext_registry gpext_scripts'))
 
     if Options.options.enable_selftest or Options.options.developer:
-	default_shared_modules.extend(TO_LIST('vfs_fake_acls vfs_nfs4acl_xattr'))
-        
+        default_shared_modules.extend(TO_LIST('vfs_fake_acls vfs_nfs4acl_xattr'))
+        default_shared_modules.extend(TO_LIST('vfs_error_inject'))
+        default_shared_modules.extend(TO_LIST('vfs_delay_inject'))
 
     if conf.CONFIG_SET('AD_DC_BUILD_IS_ENABLED'):
         default_static_modules.extend(TO_LIST('pdb_samba_dsdb auth_samba4 vfs_dfs_samba4'))
+        default_shared_modules.extend(TO_LIST('vfs_posix_eadb'))
 
     if conf.CONFIG_SET('HAVE_FREEBSD_SUNACL_H'):
         default_shared_modules.extend(TO_LIST('vfs_zfsacl'))
@@ -1641,14 +1960,11 @@ main() {
     if (conf.CONFIG_SET('HAVE_STRUCT_MSGHDR_MSG_CONTROL') or conf.CONFIG_SET('HAVE_STRUCT_MSGHDR_MSG_ACCRIGHTS')):
         default_shared_modules.extend(TO_LIST('vfs_aio_fork'))
 
+    if conf.CONFIG_SET('HAVE_LIBURING'):
+        default_shared_modules.extend(TO_LIST('vfs_io_uring'))
+
     if Options.options.with_pthreadpool:
         default_shared_modules.extend(TO_LIST('vfs_aio_pthread'))
-
-    if conf.CONFIG_SET('HAVE_AIO'):
-        default_shared_modules.extend(TO_LIST('vfs_aio_posix'))
-
-    if conf.CONFIG_SET('HAVE_LINUX_KERNEL_AIO'):
-        default_shared_modules.extend(TO_LIST('vfs_aio_linux'))
 
     if conf.CONFIG_SET('HAVE_LDAP'):
         default_static_modules.extend(TO_LIST('pdb_ldapsam idmap_ldap'))
@@ -1661,19 +1977,27 @@ main() {
 
     if (conf.CONFIG_SET('HAVE_LINUX_IOCTL')
       and conf.CONFIG_SET('HAVE_BASENAME') and conf.CONFIG_SET('HAVE_DIRNAME')):
-	default_shared_modules.extend(TO_LIST('vfs_btrfs'))
+        default_shared_modules.extend(TO_LIST('vfs_btrfs'))
 
     if conf.CONFIG_SET("HAVE_CEPH"):
         default_shared_modules.extend(TO_LIST('vfs_ceph'))
+        # Unlike vfs_ceph, vfs_ceph_snapshots doesn't depend on libcephfs, so
+        # can be enabled atop a kernel CephFS share (with vfs_default) in
+        # addition to vfs_ceph. Still, only enable vfs_ceph_snapshots builds
+        # if we're building with libcephfs for now.
+        default_shared_modules.extend(TO_LIST('vfs_ceph_snapshots'))
 
     if conf.CONFIG_SET('HAVE_GLUSTERFS'):
         default_shared_modules.extend(TO_LIST('vfs_glusterfs'))
+
+    if conf.CONFIG_SET('HAVE_SETMNTENT'):
+        default_shared_modules.extend(TO_LIST('vfs_glusterfs_fuse'))
 
     if conf.CONFIG_SET('HAVE_VXFS'):
         default_shared_modules.extend(TO_LIST('vfs_vxfs'))
 
     if conf.CONFIG_SET('HAVE_DBUS'):
-	default_shared_modules.extend(TO_LIST('vfs_snapper'))
+        default_shared_modules.extend(TO_LIST('vfs_snapper'))
 
     explicit_shared_modules = TO_LIST(Options.options.shared_modules, delimiter=',')
     explicit_static_modules = TO_LIST(Options.options.static_modules, delimiter=',')
@@ -1721,13 +2045,13 @@ main() {
         if m.startswith('!'):
             m = m[1:]
             if m in required_static_modules:
-                raise Utils.WafError('These modules are REQUIRED as static modules: %s' %
+                raise Errors.WafError('These modules are REQUIRED as static modules: %s' %
                                      ' '.join(required_static_modules))
             if m in final_static_modules:
                 final_static_modules.remove(m)
             continue
         if m in forced_shared_modules:
-            raise Utils.WafError('These modules MUST be configured as shared modules: %s' %
+            raise Errors.WafError('These modules MUST be configured as shared modules: %s' %
                                  ' '.join(forced_shared_modules))
         if m in final_shared_modules:
             final_shared_modules.remove(m)
@@ -1742,10 +2066,10 @@ main() {
                 final_shared_modules.remove(m)
             continue
         if m in required_static_modules:
-            raise Utils.WafError('These modules are REQUIRED as static modules: %s' %
+            raise Errors.WafError('These modules are REQUIRED as static modules: %s' %
                                  ' '.join(required_static_modules))
         if m in forced_static_modules:
-            raise Utils.WafError('These module MUST be configured as static modules: %s' %
+            raise Errors.WafError('These module MUST be configured as static modules: %s' %
                                  ' '.join(forced_static_modules))
         if m in final_static_modules:
             final_static_modules.remove(m)
@@ -1760,7 +2084,7 @@ main() {
     static_list = {}
     shared_list = {}
 
-    prefixes = ['vfs', 'pdb', 'auth', 'nss_info', 'charset', 'idmap', 'gpext', 'perfcount']
+    prefixes = ['vfs', 'pdb', 'auth', 'nss_info', 'charset', 'idmap', 'gpext', 'perfcount', 'rpc']
     conf.env['MODULE_PREFIXES'] = prefixes
     for p in prefixes:
         for m in final_static_modules:
@@ -1780,16 +2104,14 @@ main() {
         conf.env[static_env] = []
         conf.env[shared_env] = []
         if p in static_list:
-            decl_list=""
+            decl_list = " ".join("extern NTSTATUS %s_init(TALLOC_CTX *mem_ctx); " % entry for entry in static_list[p])
             for entry in static_list[p]:
-                decl_list += "extern NTSTATUS %s_init(void); " % entry
                 conf.env[static_env].append('%s' % entry)
-            decl_list = decl_list.rstrip()
             conf.DEFINE('static_decl_%s' % p, decl_list)
-            conf.DEFINE('static_init_%s' % p, '{ %s_init(); }' % '_init();  '.join(static_list[p]))
+            conf.DEFINE('static_init_%s(mem_ctx)' % p, '{ %s_init((mem_ctx)); }' % '_init((mem_ctx));  '.join(static_list[p]))
         else:
             conf.DEFINE('static_decl_%s' % p, '')
-            conf.DEFINE('static_init_%s' % p, '{}')
+            conf.DEFINE('static_init_%s(mem_ctx)' % p, '{}')
         if p in shared_list:
             for entry in shared_list[p]:
                 conf.DEFINE('%s_init' % entry, 'samba_init_module')
@@ -1798,12 +2120,3 @@ main() {
         Logs.info("%s: %s" % (shared_env, ','.join(conf.env[shared_env])))
 
     conf.SAMBA_CONFIG_H('include/config.h')
-
-def ctags(ctx):
-    "build 'tags' file using ctags"
-    import Utils
-    source_root = os.path.dirname(Utils.g_module.root_path)
-    cmd = 'ctags $(find %s/.. -name "*.[ch]" | grep -v "*_proto\.h")' % source_root
-    print("Running: %s" % cmd)
-    os.system(cmd)
-

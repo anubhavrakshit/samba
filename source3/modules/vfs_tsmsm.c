@@ -89,6 +89,8 @@ static void tsmsm_free_data(void **pptr) {
 static int tsmsm_connect(struct vfs_handle_struct *handle,
 			 const char *service,
 			 const char *user) {
+	const struct loadparm_substitution *lp_sub =
+		loadparm_s3_global_substitution();
 	struct tsmsm_struct *tsmd;
 	const char *fres;
 	const char *tsmname;
@@ -115,18 +117,18 @@ static int tsmsm_connect(struct vfs_handle_struct *handle,
 	tsmname = (handle->param ? handle->param : "tsmsm");
 	
 	/* Get 'hsm script' and 'dmapi attribute' parameters to tsmd context */
-	tsmd->hsmscript = lp_parm_talloc_string(
-		tsmd, SNUM(handle->conn), tsmname,
+	tsmd->hsmscript = lp_parm_substituted_string(
+		tsmd, lp_sub, SNUM(handle->conn), tsmname,
 		"hsm script", NULL);
 	talloc_steal(tsmd, tsmd->hsmscript);
 	
-	tsmd->attrib_name = lp_parm_talloc_string(
-		tsmd, SNUM(handle->conn), tsmname,
+	tsmd->attrib_name = lp_parm_substituted_string(
+		tsmd, lp_sub, SNUM(handle->conn), tsmname,
 		"dmapi attribute", DM_ATTRIB_OBJECT);
 	talloc_steal(tsmd, tsmd->attrib_name);
 	
-	tsmd->attrib_value = lp_parm_talloc_string(
-		tsmd, SNUM(handle->conn), tsmname,
+	tsmd->attrib_value = lp_parm_substituted_string(
+		tsmd, lp_sub, SNUM(handle->conn), tsmname,
 		"dmapi value", NULL);
 	talloc_steal(tsmd, tsmd->attrib_value);
 	
@@ -266,6 +268,33 @@ done:
 	return offline;
 }
 
+static NTSTATUS tsmsm_get_dos_attributes(struct vfs_handle_struct *handle,
+					 struct smb_filename *fname,
+					 uint32_t *dosmode)
+{
+	bool offline;
+
+	offline = tsmsm_is_offline(handle, fname, &fname->st);
+	if (offline) {
+		*dosmode |= FILE_ATTRIBUTE_OFFLINE;
+	}
+
+	return SMB_VFS_NEXT_GET_DOS_ATTRIBUTES(handle, fname, dosmode);
+}
+
+static NTSTATUS tsmsm_fget_dos_attributes(struct vfs_handle_struct *handle,
+					  files_struct *fsp,
+					  uint32_t *dosmode)
+{
+	bool offline;
+
+	offline = tsmsm_is_offline(handle, fsp->fsp_name, &fsp->fsp_name->st);
+	if (offline) {
+		*dosmode |= FILE_ATTRIBUTE_OFFLINE;
+	}
+
+	return SMB_VFS_NEXT_FGET_DOS_ATTRIBUTES(handle, fsp, dosmode);
+}
 
 static bool tsmsm_aio_force(struct vfs_handle_struct *handle, struct files_struct *fsp)
 {
@@ -289,8 +318,8 @@ static bool tsmsm_aio_force(struct vfs_handle_struct *handle, struct files_struc
 struct tsmsm_pread_state {
 	struct files_struct *fsp;
 	ssize_t ret;
-	int err;
 	bool was_offline;
+	struct vfs_aio_state vfs_aio_state;
 };
 
 static void tsmsm_pread_done(struct tevent_req *subreq);
@@ -326,17 +355,18 @@ static void tsmsm_pread_done(struct tevent_req *subreq)
 	struct tsmsm_pread_state *state = tevent_req_data(
 		req, struct tsmsm_pread_state);
 
-	state->ret = SMB_VFS_PREAD_RECV(subreq, &state->err);
+	state->ret = SMB_VFS_PREAD_RECV(subreq, &state->vfs_aio_state);
 	TALLOC_FREE(subreq);
 	tevent_req_done(req);
 }
 
-static ssize_t tsmsm_pread_recv(struct tevent_req *req, int *err)
+static ssize_t tsmsm_pread_recv(struct tevent_req *req,
+				struct vfs_aio_state *vfs_aio_state)
 {
 	struct tsmsm_pread_state *state = tevent_req_data(
 		req, struct tsmsm_pread_state);
 
-	if (tevent_req_is_unix_error(req, err)) {
+	if (tevent_req_is_unix_error(req, &vfs_aio_state->error)) {
 		return -1;
 	}
 	if (state->ret >= 0 && state->was_offline) {
@@ -345,15 +375,15 @@ static ssize_t tsmsm_pread_recv(struct tevent_req *req, int *err)
 			     FILE_NOTIFY_CHANGE_ATTRIBUTES,
 			     fsp->fsp_name->base_name);
 	}
-	*err = state->err;
+	*vfs_aio_state = state->vfs_aio_state;
 	return state->ret;
 }
 
 struct tsmsm_pwrite_state {
 	struct files_struct *fsp;
 	ssize_t ret;
-	int err;
 	bool was_offline;
+	struct vfs_aio_state vfs_aio_state;
 };
 
 static void tsmsm_pwrite_done(struct tevent_req *subreq);
@@ -390,17 +420,18 @@ static void tsmsm_pwrite_done(struct tevent_req *subreq)
 	struct tsmsm_pwrite_state *state = tevent_req_data(
 		req, struct tsmsm_pwrite_state);
 
-	state->ret = SMB_VFS_PWRITE_RECV(subreq, &state->err);
+	state->ret = SMB_VFS_PWRITE_RECV(subreq, &state->vfs_aio_state);
 	TALLOC_FREE(subreq);
 	tevent_req_done(req);
 }
 
-static ssize_t tsmsm_pwrite_recv(struct tevent_req *req, int *err)
+static ssize_t tsmsm_pwrite_recv(struct tevent_req *req,
+				 struct vfs_aio_state *vfs_aio_state)
 {
 	struct tsmsm_pwrite_state *state = tevent_req_data(
 		req, struct tsmsm_pwrite_state);
 
-	if (tevent_req_is_unix_error(req, err)) {
+	if (tevent_req_is_unix_error(req, &vfs_aio_state->error)) {
 		return -1;
 	}
 	if (state->ret >= 0 && state->was_offline) {
@@ -409,7 +440,7 @@ static ssize_t tsmsm_pwrite_recv(struct tevent_req *req, int *err)
 			     FILE_NOTIFY_CHANGE_ATTRIBUTES,
 			     fsp->fsp_name->base_name);
 	}
-	*err = state->err;
+	*vfs_aio_state = state->vfs_aio_state;
 	return state->ret;
 }
 
@@ -465,8 +496,8 @@ static ssize_t tsmsm_pwrite(struct vfs_handle_struct *handle, struct files_struc
 	return result;
 }
 
-static int tsmsm_set_offline(struct vfs_handle_struct *handle, 
-                             const struct smb_filename *fname)
+static NTSTATUS tsmsm_set_offline(struct vfs_handle_struct *handle,
+				  const struct smb_filename *fname)
 {
 	struct tsmsm_struct *tsmd = (struct tsmsm_struct *) handle->data;
 	int result = 0;
@@ -477,27 +508,83 @@ static int tsmsm_set_offline(struct vfs_handle_struct *handle,
 	if (tsmd->hsmscript == NULL) {
 		/* no script enabled */
 		DEBUG(1, ("tsmsm_set_offline: No 'tsmsm:hsm script' configured\n"));
-		return 0;
+		return NT_STATUS_OK;
 	}
 
         status = get_full_smb_filename(talloc_tos(), fname, &path);
         if (!NT_STATUS_IS_OK(status)) {
-                errno = map_errno_from_nt_status(status);
-                return false;
+		return status;
         }
 
 	/* Now, call the script */
 	command = talloc_asprintf(tsmd, "%s offline \"%s\"", tsmd->hsmscript, path);
 	if(!command) {
 		DEBUG(1, ("tsmsm_set_offline: can't allocate memory to run hsm script"));
-		return -1;
+		return NT_STATUS_NO_MEMORY;
 	}
 	DEBUG(10, ("tsmsm_set_offline: Running [%s]\n", command));
-	if((result = smbrun(command, NULL)) != 0) {
+	result = smbrun(command, NULL, NULL);
+	if(result != 0) {
 		DEBUG(1,("tsmsm_set_offline: Running [%s] returned %d\n", command, result));
+		TALLOC_FREE(command);
+		return NT_STATUS_INTERNAL_ERROR;
 	}
 	TALLOC_FREE(command);
-	return result;
+	return NT_STATUS_OK;
+}
+
+static NTSTATUS tsmsm_set_dos_attributes(struct vfs_handle_struct *handle,
+					 const struct smb_filename *smb_fname,
+					 uint32_t dosmode)
+{
+	NTSTATUS status;
+	uint32_t old_dosmode;
+	struct smb_filename *fname = NULL;
+
+	/* dos_mode() doesn't like const smb_fname */
+	fname = cp_smb_filename(talloc_tos(), smb_fname);
+	if (fname == NULL) {
+		return NT_STATUS_NO_MEMORY;
+	}
+
+	old_dosmode = dos_mode(handle->conn, fname);
+	TALLOC_FREE(fname);
+
+	status = SMB_VFS_NEXT_SET_DOS_ATTRIBUTES(handle, smb_fname, dosmode);
+	if (!NT_STATUS_IS_OK(status)) {
+		return status;
+	}
+
+	if (!(old_dosmode & FILE_ATTRIBUTE_OFFLINE) &&
+	    (dosmode & FILE_ATTRIBUTE_OFFLINE))
+	{
+		return NT_STATUS_OK;
+	}
+
+	return tsmsm_set_offline(handle, smb_fname);
+}
+
+static NTSTATUS tsmsm_fset_dos_attributes(struct vfs_handle_struct *handle,
+					  struct files_struct *fsp,
+					  uint32_t dosmode)
+{
+	NTSTATUS status;
+	uint32_t old_dosmode;
+
+	old_dosmode = dos_mode(handle->conn, fsp->fsp_name);
+
+	status = SMB_VFS_NEXT_FSET_DOS_ATTRIBUTES(handle, fsp, dosmode);
+	if (!NT_STATUS_IS_OK(status)) {
+		return status;
+	}
+
+	if (!(old_dosmode & FILE_ATTRIBUTE_OFFLINE) &&
+	    (dosmode & FILE_ATTRIBUTE_OFFLINE))
+	{
+		return NT_STATUS_OK;
+	}
+
+	return tsmsm_set_offline(handle, fsp->fsp_name);
 }
 
 static uint32_t tsmsm_fs_capabilities(struct vfs_handle_struct *handle,
@@ -517,12 +604,16 @@ static struct vfs_fn_pointers tsmsm_fns = {
 	.pwrite_send_fn = tsmsm_pwrite_send,
 	.pwrite_recv_fn = tsmsm_pwrite_recv,
 	.sendfile_fn = tsmsm_sendfile,
-	.is_offline_fn = tsmsm_is_offline,
-	.set_offline_fn = tsmsm_set_offline,
+	.set_dos_attributes_fn = tsmsm_set_dos_attributes,
+	.fset_dos_attributes_fn = tsmsm_fset_dos_attributes,
+	.get_dos_attributes_fn = tsmsm_get_dos_attributes,
+	.get_dos_attributes_send_fn = vfs_not_implemented_get_dos_attributes_send,
+	.get_dos_attributes_recv_fn = vfs_not_implemented_get_dos_attributes_recv,
+	.fget_dos_attributes_fn = tsmsm_fget_dos_attributes,
 };
 
-NTSTATUS vfs_tsmsm_init(void);
-NTSTATUS vfs_tsmsm_init(void)
+static_decl_vfs;
+NTSTATUS vfs_tsmsm_init(TALLOC_CTX *ctx)
 {
 	return smb_register_vfs(SMB_VFS_INTERFACE_VERSION,
 				"tsmsm", &tsmsm_fns);

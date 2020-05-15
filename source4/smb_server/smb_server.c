@@ -44,7 +44,6 @@ static NTSTATUS smbsrv_recv_generic_request(void *private_data, DATA_BLOB blob)
 	if (CVAL(blob.data,0) != 0) {
 		status = smbsrv_init_smb_connection(smb_conn, smb_conn->lp_ctx);
 		NT_STATUS_NOT_OK_RETURN(status);
-		packet_set_callback(smb_conn->packet, smbsrv_recv_smb_request);
 		return smbsrv_recv_smb_request(smb_conn, blob);
 	}
 
@@ -179,7 +178,8 @@ _PUBLIC_ NTSTATUS smbsrv_add_socket(TALLOC_CTX *mem_ctx,
 				    struct tevent_context *event_context,
 				    struct loadparm_context *lp_ctx,
 				    const struct model_ops *model_ops,
-				    const char *address)
+				    const char *address,
+				    void *process_context)
 {
 	const char **ports = lpcfg_smb_ports(lp_ctx);
 	int i;
@@ -192,7 +192,7 @@ _PUBLIC_ NTSTATUS smbsrv_add_socket(TALLOC_CTX *mem_ctx,
 					     model_ops, &smb_stream_ops, 
 					     "ip", address, &port,
 					     lpcfg_socket_options(lp_ctx),
-					     NULL);
+					     NULL, process_context);
 		NT_STATUS_NOT_OK_RETURN(status);
 	}
 

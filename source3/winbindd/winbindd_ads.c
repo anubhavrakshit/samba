@@ -23,6 +23,8 @@
 
 #include "includes.h"
 #include "winbindd.h"
+#include "winbindd_ads.h"
+#include "libsmb/namequery.h"
 #include "rpc_client/rpc_client.h"
 #include "../librpc/gen_ndr/ndr_netlogon_c.h"
 #include "../libds/common/flags.h"
@@ -30,6 +32,7 @@
 #include "../libcli/ldap/ldap_ndr.h"
 #include "../libcli/security/security.h"
 #include "../libds/common/flag_mapping.h"
+#include "libsmb/samlogon_cache.h"
 #include "passdb.h"
 
 #ifdef HAVE_ADS
@@ -38,6 +41,7 @@
 #define DBGC_CLASS DBGC_WINBIND
 
 extern struct winbindd_methods reconnect_methods;
+extern struct winbindd_methods msrpc_methods;
 
 #define WINBIND_CCACHE_NAME "MEMORY:winbind_ccache"
 
@@ -106,7 +110,10 @@ static ADS_STATUS ads_cached_connection_connect(ADS_STRUCT **adsp,
 	/* we don't want this to affect the users ccache */
 	setenv("KRB5CCNAME", WINBIND_CCACHE_NAME, 1);
 
-	ads = ads_init(target_realm, target_dom_name, ldap_server);
+	ads = ads_init(target_realm,
+		       target_dom_name,
+		       ldap_server,
+		       ADS_SASL_SEAL);
 	if (!ads) {
 		DEBUG(1,("ads_init for domain %s failed\n", target_dom_name));
 		return ADS_ERROR(LDAP_NO_MEMORY);
@@ -117,6 +124,8 @@ static ADS_STATUS ads_cached_connection_connect(ADS_STRUCT **adsp,
 
 	ads->auth.renewable = renewable;
 	ads->auth.password = password;
+
+	ads->auth.flags |= ADS_AUTH_ALLOW_NTLMSSP;
 
 	ads->auth.realm = SMB_STRDUP(auth_realm);
 	if (!strupper_m(ads->auth.realm)) {
@@ -153,6 +162,14 @@ ADS_STATUS ads_idmap_cached_connection(ADS_STRUCT **adsp, const char *dom_name)
 	char *ldap_server, *realm, *password;
 	struct winbindd_domain *wb_dom;
 	ADS_STATUS status;
+
+	if (IS_AD_DC) {
+		/*
+		 * Make sure we never try to use LDAP against
+		 * a trusted domain as AD DC.
+		 */
+		return ADS_ERROR_NT(NT_STATUS_REQUEST_NOT_ACCEPTED);
+	}
 
 	ads_cached_connection_reuse(adsp);
 	if (*adsp != NULL) {
@@ -226,6 +243,14 @@ static ADS_STRUCT *ads_cached_connection(struct winbindd_domain *domain)
 	ADS_STATUS status;
 	char *password, *realm;
 
+	if (IS_AD_DC) {
+		/*
+		 * Make sure we never try to use LDAP against
+		 * a trusted domain as AD DC.
+		 */
+		return NULL;
+	}
+
 	DEBUG(10,("ads_cached_connection\n"));
 	ads_cached_connection_reuse((ADS_STRUCT **)&domain->private_data);
 
@@ -286,18 +311,16 @@ static ADS_STRUCT *ads_cached_connection(struct winbindd_domain *domain)
 /* Query display info for a realm. This is the basic user list fn */
 static NTSTATUS query_user_list(struct winbindd_domain *domain,
 			       TALLOC_CTX *mem_ctx,
-			       uint32_t *num_entries,
-			       struct wbint_userinfo **pinfo)
+			       uint32_t **prids)
 {
 	ADS_STRUCT *ads = NULL;
-	const char *attrs[] = { "*", NULL };
-	int i, count;
+	const char *attrs[] = { "sAMAccountType", "objectSid", NULL };
+	int count;
+	uint32_t *rids = NULL;
 	ADS_STATUS rc;
 	LDAPMessage *res = NULL;
 	LDAPMessage *msg = NULL;
 	NTSTATUS status = NT_STATUS_UNSUCCESSFUL;
-
-	*num_entries = 0;
 
 	DEBUG(3,("ads: query_user_list\n"));
 
@@ -330,8 +353,8 @@ static NTSTATUS query_user_list(struct winbindd_domain *domain,
 		goto done;
 	}
 
-	(*pinfo) = talloc_zero_array(mem_ctx, struct wbint_userinfo, count);
-	if (!*pinfo) {
+	rids = talloc_zero_array(mem_ctx, uint32_t, count);
+	if (rids == NULL) {
 		status = NT_STATUS_NO_MEMORY;
 		goto done;
 	}
@@ -339,69 +362,47 @@ static NTSTATUS query_user_list(struct winbindd_domain *domain,
 	count = 0;
 
 	for (msg = ads_first_entry(ads, res); msg; msg = ads_next_entry(ads, msg)) {
-		struct wbint_userinfo *info = &((*pinfo)[count]);
-		uint32_t group;
+		struct dom_sid user_sid;
 		uint32_t atype;
+		bool ok;
 
-		if (!ads_pull_uint32(ads, msg, "sAMAccountType", &atype) ||
-		    ds_atype_map(atype) != SID_NAME_USER) {
-			DEBUG(1,("Not a user account? atype=0x%x\n", atype));
+		ok = ads_pull_uint32(ads, msg, "sAMAccountType", &atype);
+		if (!ok) {
+			DBG_INFO("Object lacks sAMAccountType attribute\n");
+			continue;
+		}
+		if (ds_atype_map(atype) != SID_NAME_USER) {
+			DBG_INFO("Not a user account? atype=0x%x\n", atype);
 			continue;
 		}
 
-		info->acct_name = ads_pull_username(ads, mem_ctx, msg);
-		info->full_name = ads_pull_string(ads, mem_ctx, msg, "displayName");
-		if (info->full_name == NULL) {
-			info->full_name = ads_pull_string(ads, mem_ctx, msg, "name");
-		}
-		info->homedir = NULL;
-		info->shell = NULL;
-		info->primary_gid = (gid_t)-1;
-
-		if (!ads_pull_sid(ads, msg, "objectSid",
-				  &info->user_sid)) {
-			DEBUG(1, ("No sid for %s !?\n", info->acct_name));
+		if (!ads_pull_sid(ads, msg, "objectSid", &user_sid)) {
+			char *dn = ads_get_dn(ads, talloc_tos(), msg);
+			DBG_INFO("No sid for %s !?\n", dn);
+			TALLOC_FREE(dn);
 			continue;
 		}
 
-		if (!ads_pull_uint32(ads, msg, "primaryGroupID", &group)) {
-			DEBUG(1, ("No primary group for %s !?\n",
-				  info->acct_name));
+		if (!dom_sid_in_domain(&domain->sid, &user_sid)) {
+			struct dom_sid_buf sidstr, domstr;
+			DBG_WARNING("Got sid %s in domain %s\n",
+				    dom_sid_str_buf(&user_sid, &sidstr),
+				    dom_sid_str_buf(&domain->sid, &domstr));
 			continue;
 		}
-		sid_compose(&info->group_sid, &domain->sid, group);
 
+		sid_split_rid(&user_sid, &rids[count]);
 		count += 1;
 	}
 
-	(*num_entries) = count;
-	ads_msgfree(ads, res);
-
-	for (i=0; i<count; i++) {
-		struct wbint_userinfo *info = &((*pinfo)[i]);
-		const char *gecos = NULL;
-		gid_t primary_gid = (gid_t)-1;
-
-		status = nss_get_info_cached(domain, &info->user_sid, mem_ctx,
-					     &info->homedir, &info->shell,
-					     &gecos, &primary_gid);
-		if (!NT_STATUS_IS_OK(status)) {
-			/*
-			 * Deliberately ignore this error, there might be more
-			 * users to fill
-			 */
-			continue;
-		}
-
-		if (gecos != NULL) {
-			info->full_name = gecos;
-		}
-		info->primary_gid = primary_gid;
+	rids = talloc_realloc(mem_ctx, rids, uint32_t, count);
+	if (prids != NULL) {
+		*prids = rids;
 	}
 
 	status = NT_STATUS_OK;
 
-	DEBUG(3,("ads query_user_list gave %d entries\n", (*num_entries)));
+	DBG_NOTICE("ads query_user_list gave %d entries\n", count);
 
 done:
 	return status;
@@ -502,8 +503,8 @@ static NTSTATUS enum_dom_groups(struct winbindd_domain *domain,
 		struct dom_sid sid;
 		uint32_t rid;
 
-		name = ads_pull_username(ads, mem_ctx, msg);
-		gecos = ads_pull_string(ads, mem_ctx, msg, "name");
+		name = ads_pull_username(ads, (*info), msg);
+		gecos = ads_pull_string(ads, (*info), msg, "name");
 		if (!ads_pull_sid(ads, msg, "objectSid", &sid)) {
 			DEBUG(1,("No sid for %s !?\n", name));
 			continue;
@@ -514,8 +515,8 @@ static NTSTATUS enum_dom_groups(struct winbindd_domain *domain,
 			continue;
 		}
 
-		fstrcpy((*info)[i].acct_name, name);
-		fstrcpy((*info)[i].acct_desc, gecos);
+		(*info)[i].acct_name = name;
+		(*info)[i].acct_desc = gecos;
 		(*info)[i].rid = rid;
 		i++;
 	}
@@ -560,12 +561,12 @@ static NTSTATUS name_to_sid(struct winbindd_domain *domain,
 			    const char *domain_name,
 			    const char *name,
 			    uint32_t flags,
+			    const char **pdom_name,
 			    struct dom_sid *sid,
 			    enum lsa_SidType *type)
 {
-	return reconnect_methods.name_to_sid(domain, mem_ctx,
-					     domain_name, name, flags,
-					     sid, type);
+	return msrpc_methods.name_to_sid(domain, mem_ctx, domain_name, name,
+					 flags, pdom_name, sid, type);
 }
 
 /* convert a domain SID to a user or group name - use rpc methods */
@@ -576,8 +577,8 @@ static NTSTATUS sid_to_name(struct winbindd_domain *domain,
 			    char **name,
 			    enum lsa_SidType *type)
 {
-	return reconnect_methods.sid_to_name(domain, mem_ctx, sid,
-					     domain_name, name, type);
+	return msrpc_methods.sid_to_name(domain, mem_ctx, sid,
+					 domain_name, name, type);
 }
 
 /* convert a list of rids to names - use rpc methods */
@@ -590,174 +591,9 @@ static NTSTATUS rids_to_names(struct winbindd_domain *domain,
 			      char ***names,
 			      enum lsa_SidType **types)
 {
-	return reconnect_methods.rids_to_names(domain, mem_ctx, sid,
-					       rids, num_rids,
-					       domain_name, names, types);
-}
-
-/* If you are looking for "dn_lookup": Yes, it used to be here!
- * It has gone now since it was a major speed bottleneck in
- * lookup_groupmem (its only use). It has been replaced by
- * an rpc lookup sids call... R.I.P. */
-
-/* Lookup user information from a rid */
-static NTSTATUS query_user(struct winbindd_domain *domain, 
-			   TALLOC_CTX *mem_ctx, 
-			   const struct dom_sid *sid,
-			   struct wbint_userinfo *info)
-{
-	ADS_STRUCT *ads = NULL;
-	const char *attrs[] = { "*", NULL };
-	ADS_STATUS rc;
-	int count;
-	LDAPMessage *msg = NULL;
-	char *ldap_exp;
-	char *sidstr;
-	uint32_t group_rid;
-	NTSTATUS status = NT_STATUS_UNSUCCESSFUL;
-	struct netr_SamInfo3 *user = NULL;
-	gid_t gid = -1;
-	int ret;
-	char *full_name;
-
-	DEBUG(3,("ads: query_user\n"));
-
-	info->homedir = NULL;
-	info->shell = NULL;
-
-	/* try netsamlogon cache first */
-
-	if ( (user = netsamlogon_cache_get( mem_ctx, sid )) != NULL )
-	{
-		DEBUG(5,("query_user: Cache lookup succeeded for %s\n", 
-			 sid_string_dbg(sid)));
-
-		sid_compose(&info->user_sid, &domain->sid, user->base.rid);
-		sid_compose(&info->group_sid, &domain->sid, user->base.primary_gid);
-
-		info->acct_name = talloc_strdup(mem_ctx, user->base.account_name.string);
-		info->full_name = talloc_strdup(mem_ctx, user->base.full_name.string);
-
-		nss_get_info_cached( domain, sid, mem_ctx,
-			      &info->homedir, &info->shell, &info->full_name, 
-			      &gid );
-		info->primary_gid = gid;
-
-		TALLOC_FREE(user);
-
-		if (info->full_name == NULL) {
-			/* this might fail so we dont check the return code */
-			wcache_query_user_fullname(domain,
-						   mem_ctx,
-						   sid,
-						   &info->full_name);
-		}
-
-		return NT_STATUS_OK;
-	}
-
-	if ( !winbindd_can_contact_domain(domain)) {
-		DEBUG(8,("query_user: No incoming trust from domain %s\n",
-			 domain->name));
-
-		/* We still need to generate some basic information
-		   about the user even if we cannot contact the 
-		   domain.  Most of this stuff we can deduce. */
-
-		sid_copy( &info->user_sid, sid );
-
-		/* Assume "Domain Users" for the primary group */
-
-		sid_compose(&info->group_sid, &domain->sid, DOMAIN_RID_USERS );
-
-		/* Try to fill in what the nss_info backend can do */
-
-		nss_get_info_cached( domain, sid, mem_ctx,
-			      &info->homedir, &info->shell, &info->full_name, 
-			      &gid);
-		info->primary_gid = gid;
-
-		return NT_STATUS_OK;
-	}
-
-	/* no cache...do the query */
-
-	if ( (ads = ads_cached_connection(domain)) == NULL ) {
-		domain->last_status = NT_STATUS_SERVER_DISABLED;
-		return NT_STATUS_SERVER_DISABLED;
-	}
-
-	sidstr = ldap_encode_ndr_dom_sid(talloc_tos(), sid);
-
-	ret = asprintf(&ldap_exp, "(objectSid=%s)", sidstr);
-	TALLOC_FREE(sidstr);
-	if (ret == -1) {
-		return NT_STATUS_NO_MEMORY;
-	}
-	rc = ads_search_retry(ads, &msg, ldap_exp, attrs);
-	SAFE_FREE(ldap_exp);
-	if (!ADS_ERR_OK(rc)) {
-		DEBUG(1,("query_user(sid=%s) ads_search: %s\n",
-			 sid_string_dbg(sid), ads_errstr(rc)));
-		return ads_ntstatus(rc);
-	} else if (!msg) {
-		DEBUG(1,("query_user(sid=%s) ads_search returned NULL res\n",
-			 sid_string_dbg(sid)));
-		return NT_STATUS_INTERNAL_ERROR;
-	}
-
-	count = ads_count_replies(ads, msg);
-	if (count != 1) {
-		DEBUG(1,("query_user(sid=%s): Not found\n",
-			 sid_string_dbg(sid)));
-		ads_msgfree(ads, msg);
-		return NT_STATUS_NO_SUCH_USER;
-	}
-
-	info->acct_name = ads_pull_username(ads, mem_ctx, msg);
-
-	if (!ads_pull_uint32(ads, msg, "primaryGroupID", &group_rid)) {
-		DEBUG(1,("No primary group for %s !?\n",
-			 sid_string_dbg(sid)));
-		ads_msgfree(ads, msg);
-		return NT_STATUS_NO_SUCH_USER;
-	}
-	sid_copy(&info->user_sid, sid);
-	sid_compose(&info->group_sid, &domain->sid, group_rid);
-
-	/*
-	 * We have to fetch the "name" attribute before doing the
-	 * nss_get_info_cached call. nss_get_info_cached might destroy
-	 * the ads struct, potentially invalidating the ldap message.
-	 */
-	full_name = ads_pull_string(ads, mem_ctx, msg, "displayName");
-	if (full_name == NULL) {
-		full_name = ads_pull_string(ads, mem_ctx, msg, "name");
-	}
-
-	ads_msgfree(ads, msg);
-	msg = NULL;
-
-	status = nss_get_info_cached( domain, sid, mem_ctx,
-		      &info->homedir, &info->shell, &info->full_name, 
-		      &gid);
-	info->primary_gid = gid;
-	if (!NT_STATUS_IS_OK(status)) {
-		DEBUG(1, ("nss_get_info_cached failed: %s\n",
-			  nt_errstr(status)));
-		return status;
-	}
-
-	if (info->full_name == NULL) {
-		info->full_name = full_name;
-	} else {
-		TALLOC_FREE(full_name);
-	}
-
-	status = NT_STATUS_OK;
-
-	DEBUG(3,("ads query_user gave %s\n", info->acct_name));
-	return NT_STATUS_OK;
+	return msrpc_methods.rids_to_names(domain, mem_ctx, sid,
+					   rids, num_rids,
+					   domain_name, names, types);
 }
 
 /* Lookup groups a user is a member of - alternate method, for when
@@ -886,7 +722,7 @@ static NTSTATUS lookup_usergroups_memberof(struct winbindd_domain *domain,
 	const char *attrs[] = {"memberOf", NULL};
 	uint32_t num_groups = 0;
 	struct dom_sid *group_sids = NULL;
-	int i;
+	size_t i;
 	char **strings = NULL;
 	size_t num_strings = 0, num_sids = 0;
 
@@ -1003,11 +839,12 @@ static NTSTATUS lookup_usergroups(struct winbindd_domain *domain,
 	uint32_t primary_group_rid;
 	NTSTATUS status = NT_STATUS_UNSUCCESSFUL;
 	uint32_t num_groups = 0;
+	struct dom_sid_buf buf;
 
 	DEBUG(3,("ads: lookup_usergroups\n"));
 	*p_num_groups = 0;
 
-	status = lookup_usergroups_cached(domain, mem_ctx, sid, 
+	status = lookup_usergroups_cached(mem_ctx, sid,
 					  p_num_groups, user_sids);
 	if (NT_STATUS_IS_OK(status)) {
 		return NT_STATUS_OK;
@@ -1035,7 +872,9 @@ static NTSTATUS lookup_usergroups(struct winbindd_domain *domain,
 	if (!ADS_ERR_OK(rc)) {
 		status = ads_ntstatus(rc);
 		DEBUG(1, ("lookup_usergroups(sid=%s) ads_search tokenGroups: "
-			  "%s\n", sid_string_dbg(sid), ads_errstr(rc)));
+			  "%s\n",
+			  dom_sid_str_buf(sid, &buf),
+			  ads_errstr(rc)));
 		goto done;
 	}
 
@@ -1044,13 +883,14 @@ static NTSTATUS lookup_usergroups(struct winbindd_domain *domain,
 		status = NT_STATUS_UNSUCCESSFUL;
 		DEBUG(1,("lookup_usergroups(sid=%s) ads_search tokenGroups: "
 			 "invalid number of results (count=%d)\n", 
-			 sid_string_dbg(sid), count));
+			 dom_sid_str_buf(sid, &buf),
+			 count));
 		goto done;
 	}
 
 	if (!msg) {
 		DEBUG(1,("lookup_usergroups(sid=%s) ads_search tokenGroups: NULL msg\n", 
-			 sid_string_dbg(sid)));
+			 dom_sid_str_buf(sid, &buf)));
 		status = NT_STATUS_UNSUCCESSFUL;
 		goto done;
 	}
@@ -1063,7 +903,8 @@ static NTSTATUS lookup_usergroups(struct winbindd_domain *domain,
 
 	if (!ads_pull_uint32(ads, msg, "primaryGroupID", &primary_group_rid)) {
 		DEBUG(1,("%s: No primary group for sid=%s !?\n", 
-			 domain->name, sid_string_dbg(sid)));
+			 domain->name,
+			 dom_sid_str_buf(sid, &buf)));
 		goto done;
 	}
 
@@ -1129,7 +970,7 @@ static NTSTATUS lookup_usergroups(struct winbindd_domain *domain,
 	status = (*user_sids != NULL) ? NT_STATUS_OK : NT_STATUS_NO_MEMORY;
 
 	DEBUG(3,("ads lookup_usergroups (tokenGroups) succeeded for sid=%s\n",
-		 sid_string_dbg(sid)));
+		 dom_sid_str_buf(sid, &buf)));
 done:
 	TALLOC_FREE(user_dn);
 	ads_msgfree(ads, msg);
@@ -1142,10 +983,8 @@ static NTSTATUS lookup_useraliases(struct winbindd_domain *domain,
 				   uint32_t num_sids, const struct dom_sid *sids,
 				   uint32_t *num_aliases, uint32_t **alias_rids)
 {
-	return reconnect_methods.lookup_useraliases(domain, mem_ctx,
-						    num_sids, sids,
-						    num_aliases,
-						    alias_rids);
+	return msrpc_methods.lookup_useraliases(domain, mem_ctx, num_sids, sids,
+						num_aliases, alias_rids);
 }
 
 static NTSTATUS add_primary_group_members(
@@ -1245,7 +1084,7 @@ static NTSTATUS lookup_groupmem(struct winbindd_domain *domain,
 	NTSTATUS status = NT_STATUS_UNSUCCESSFUL;
 	char *sidbinstr;
 	char **members = NULL;
-	int i;
+	size_t i;
 	size_t num_members = 0;
 	ads_control args;
 	struct dom_sid *sid_mem_nocache = NULL;
@@ -1255,9 +1094,10 @@ static NTSTATUS lookup_groupmem(struct winbindd_domain *domain,
 	uint32_t num_nocache = 0;
 	TALLOC_CTX *tmp_ctx = NULL;
 	uint32_t rid;
+	struct dom_sid_buf buf;
 
 	DEBUG(10,("ads: lookup_groupmem %s sid=%s\n", domain->name,
-		  sid_string_dbg(group_sid)));
+		  dom_sid_str_buf(group_sid, &buf)));
 
 	*num_names = 0;
 
@@ -1383,7 +1223,8 @@ static NTSTATUS lookup_groupmem(struct winbindd_domain *domain,
 		if (lookup_cached_sid(mem_ctx, &sid, &domain_name, &name,
 		    &name_type)) {
 			DEBUG(10,("ads: lookup_groupmem: got sid %s from "
-				  "cache\n", sid_string_dbg(&sid)));
+				  "cache\n",
+				  dom_sid_str_buf(&sid, &buf)));
 			sid_copy(&(*sid_mem)[*num_names], &sid);
 			(*names)[*num_names] = fill_domain_username_talloc(
 							*names,
@@ -1396,7 +1237,8 @@ static NTSTATUS lookup_groupmem(struct winbindd_domain *domain,
 		}
 		else {
 			DEBUG(10, ("ads: lookup_groupmem: sid %s not found in "
-				   "cache\n", sid_string_dbg(&sid)));
+				   "cache\n",
+				   dom_sid_str_buf(&sid, &buf)));
 			sid_copy(&(sid_mem_nocache)[num_nocache], &sid);
 			num_nocache++;
 		}
@@ -1472,7 +1314,7 @@ static NTSTATUS lookup_groupmem(struct winbindd_domain *domain,
 
 	status = NT_STATUS_OK;
 	DEBUG(3,("ads lookup_groupmem for sid=%s succeeded\n",
-		 sid_string_dbg(group_sid)));
+		 dom_sid_str_buf(group_sid, &buf)));
 
 done:
 
@@ -1493,6 +1335,13 @@ static NTSTATUS sequence_number(struct winbindd_domain *domain, uint32_t *seq)
 		DEBUG(10,("sequence: No incoming trust for domain %s\n",
 			  domain->name));
 		*seq = time(NULL);		
+		return NT_STATUS_OK;
+	}
+
+	if (IS_AD_DC) {
+		DEBUG(10,("sequence: Avoid LDAP connection for domain %s\n",
+			  domain->name));
+		*seq = time(NULL);
 		return NT_STATUS_OK;
 	}
 
@@ -1527,7 +1376,7 @@ static NTSTATUS lockout_policy(struct winbindd_domain *domain,
 			       TALLOC_CTX *mem_ctx,
 			       struct samr_DomInfo12 *policy)
 {
-	return reconnect_methods.lockout_policy(domain, mem_ctx, policy);
+	return msrpc_methods.lockout_policy(domain, mem_ctx, policy);
 }
 
 /* find the password policy of a domain - use rpc methods */
@@ -1535,7 +1384,7 @@ static NTSTATUS password_policy(struct winbindd_domain *domain,
 				TALLOC_CTX *mem_ctx,
 				struct samr_DomInfo1 *policy)
 {
-	return reconnect_methods.password_policy(domain, mem_ctx, policy);
+	return msrpc_methods.password_policy(domain, mem_ctx, policy);
 }
 
 /* get a list of trusted domains */
@@ -1545,7 +1394,7 @@ static NTSTATUS trusted_domains(struct winbindd_domain *domain,
 {
 	NTSTATUS 		result = NT_STATUS_UNSUCCESSFUL;
 	WERROR werr;
-	int			i;
+	uint32_t		i;
 	uint32_t		flags;
 	struct rpc_pipe_client *cli;
 	int ret_count;
@@ -1611,7 +1460,7 @@ static NTSTATUS trusted_domains(struct winbindd_domain *domain,
 		 */
 
 		if ((trust->trust_attributes
-		     == LSA_TRUST_ATTRIBUTE_QUARANTINED_DOMAIN) &&
+		     & LSA_TRUST_ATTRIBUTE_QUARANTINED_DOMAIN) &&
 		    !domain->primary )
 		{
 			DEBUG(10,("trusted_domains: Skipping external trusted "
@@ -1697,6 +1546,14 @@ static NTSTATUS trusted_domains(struct winbindd_domain *domain,
 			}
 			TALLOC_FREE(parent);
 
+			/*
+			 * We need to pass the modified properties
+			 * to the caller.
+			 */
+			trust->trust_flags = d.domain_flags;
+			trust->trust_type = d.domain_type;
+			trust->trust_attributes = d.domain_trust_attribs;
+
 			wcache_tdc_add_domain( &d );
 			ret_count++;
 		}
@@ -1713,7 +1570,6 @@ struct winbindd_methods ads_methods = {
 	name_to_sid,
 	sid_to_name,
 	rids_to_names,
-	query_user,
 	lookup_usergroups,
 	lookup_useraliases,
 	lookup_groupmem,

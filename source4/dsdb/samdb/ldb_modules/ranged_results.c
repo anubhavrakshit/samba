@@ -35,14 +35,14 @@
 struct rr_context {
 	struct ldb_module *module;
 	struct ldb_request *req;
+	bool dirsync_in_use;
 };
 
 static struct rr_context *rr_init_context(struct ldb_module *module,
 					  struct ldb_request *req)
 {
-	struct rr_context *ac;
-
-	ac = talloc_zero(req, struct rr_context);
+	struct ldb_control *dirsync_control = NULL;
+	struct rr_context *ac = talloc_zero(req, struct rr_context);
 	if (ac == NULL) {
 		ldb_set_errstring(ldb_module_get_ctx(module), "Out of Memory");
 		return NULL;
@@ -50,6 +50,16 @@ static struct rr_context *rr_init_context(struct ldb_module *module,
 
 	ac->module = module;
 	ac->req = req;
+
+	/*
+	 * check if there's a dirsync control (as there is an
+	 * interaction between these modules)
+	 */
+	dirsync_control = ldb_request_get_control(req,
+						  LDB_CONTROL_DIRSYNC_OID);
+	if (dirsync_control != NULL) {
+		ac->dirsync_in_use = true;
+	}
 
 	return ac;
 }
@@ -82,6 +92,15 @@ static int rr_search_callback(struct ldb_request *req, struct ldb_reply *ares)
 					ares->response, ares->error);
 	}
 
+	if (ac->dirsync_in_use) {
+		/*
+		 * We return full attribute values when mixed with
+		 * dirsync
+		 */
+		return ldb_module_send_entry(ac->req,
+					     ares->message,
+					     ares->controls);
+	}
 	/* LDB_REPLY_ENTRY */
 
 	temp_ctx = talloc_new(ac->req);
@@ -201,6 +220,8 @@ static int rr_search(struct ldb_module *module, struct ldb_request *req)
 	/* Strip the range request from the attribute */
 	for (i = 0; req->op.search.attrs && req->op.search.attrs[i]; i++) {
 		char *p;
+		size_t range_len = strlen(";range=");
+
 		new_attrs = talloc_realloc(req, new_attrs, const char *, i+2);
 		new_attrs[i] = req->op.search.attrs[i];
 		new_attrs[i+1] = NULL;
@@ -208,12 +229,12 @@ static int rr_search(struct ldb_module *module, struct ldb_request *req)
 		if (!p) {
 			continue;
 		}
-		if (strncasecmp(p, ";range=", strlen(";range=")) != 0) {
+		if (strncasecmp(p, ";range=", range_len) != 0) {
 			continue;
 		}
 		end = (unsigned int)-1;
-		if (sscanf(p, ";range=%u-*", &start) != 1) {
-			if (sscanf(p, ";range=%u-%u", &start, &end) != 2) {
+		if (sscanf(p + range_len, "%u-*", &start) != 1) {
+			if (sscanf(p + range_len, "%u-%u", &start, &end) != 2) {
 				ldb_asprintf_errstring(ldb,
 					"range request error: "
 					"range request malformed");

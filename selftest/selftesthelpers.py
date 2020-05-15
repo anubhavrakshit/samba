@@ -17,25 +17,32 @@
 # by the name of the test, the environment it needs and the command to run, all
 # three separated by newlines. All other lines in the output are considered
 # comments.
+from __future__ import print_function
 
 import os
 import subprocess
 import sys
 
+
 def srcdir():
     return os.path.normpath(os.getenv("SRCDIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")))
+
 
 def source4dir():
     return os.path.normpath(os.path.join(srcdir(), "source4"))
 
+
 def source3dir():
     return os.path.normpath(os.path.join(srcdir(), "source3"))
+
 
 def bindir():
     return os.path.normpath(os.getenv("BINDIR", "./bin"))
 
+
 def binpath(name):
     return os.path.join(bindir(), name)
+
 
 # Split perl variable to allow $PERL to be set to e.g. "perl -W"
 perl = os.getenv("PERL", "perl").split()
@@ -65,14 +72,18 @@ def plantestsuite(name, env, cmdline):
     :param env: Environment to run the testsuite in
     :param cmdline: Command line to run
     """
-    print "-- TEST --"
-    print name
-    print env
+    print("-- TEST --")
+    if env == "none":
+        fullname = name
+    else:
+        fullname = "%s(%s)" % (name, env)
+    print(fullname)
+    print(env)
     if isinstance(cmdline, list):
         cmdline = " ".join(cmdline)
     if "$LISTOPT" in cmdline:
         raise AssertionError("test %s supports --list, but not --load-list" % name)
-    print cmdline + " 2>&1 " + " | " + add_prefix(name, env)
+    print(cmdline + " 2>&1 " + " | " + add_prefix(name, env))
 
 
 def add_prefix(prefix, env, support_list=False):
@@ -80,26 +91,26 @@ def add_prefix(prefix, env, support_list=False):
         listopt = "$LISTOPT "
     else:
         listopt = ""
-    return "%s/selftest/filter-subunit %s--fail-on-empty --prefix=\"%s.\" --suffix=\"(%s)\"" % (srcdir(), listopt, prefix, env)
+    return "%s %s/selftest/filter-subunit %s--fail-on-empty --prefix=\"%s.\" --suffix=\"(%s)\"" % (python, srcdir(), listopt, prefix, env)
 
 
 def plantestsuite_loadlist(name, env, cmdline):
-    print "-- TEST-LOADLIST --"
+    print("-- TEST-LOADLIST --")
     if env == "none":
         fullname = name
     else:
         fullname = "%s(%s)" % (name, env)
-    print fullname
-    print env
+    print(fullname)
+    print(env)
     if isinstance(cmdline, list):
         cmdline = " ".join(cmdline)
     support_list = ("$LISTOPT" in cmdline)
-    if not "$LISTOPT" in cmdline:
+    if "$LISTOPT" not in cmdline:
         raise AssertionError("loadlist test %s does not support not --list" % name)
-    if not "$LOADLIST" in cmdline:
+    if "$LOADLIST" not in cmdline:
         raise AssertionError("loadlist test %s does not support --load-list" % name)
-    print ("%s | %s" % (cmdline.replace("$LOADLIST", ""), add_prefix(name, env, support_list))).replace("$LISTOPT", "--list")
-    print cmdline.replace("$LISTOPT", "") + " 2>&1 " + " | " + add_prefix(name, env, False)
+    print(("%s | %s" % (cmdline.replace("$LOADLIST", ""), add_prefix(name, env, support_list))).replace("$LISTOPT", "--list"))
+    print(cmdline.replace("$LISTOPT", "") + " 2>&1 " + " | " + add_prefix(name, env, False))
 
 
 def skiptestsuite(name, reason):
@@ -109,7 +120,7 @@ def skiptestsuite(name, reason):
     :param reason: Reason the test suite was skipped
     """
     # FIXME: Report this using subunit, but re-adjust the testsuite count somehow
-    print >>sys.stderr, "skipping %s (%s)" % (name, reason)
+    print("skipping %s (%s)" % (name, reason), file=sys.stderr)
 
 
 def planperltestsuite(name, path):
@@ -124,14 +135,16 @@ def planperltestsuite(name, path):
         skiptestsuite(name, "Test::More not available")
 
 
-def planpythontestsuite(env, module, name=None, extra_path=[]):
+def planpythontestsuite(env, module, name=None, extra_path=None):
     if name is None:
         name = module
-    pypath = list(extra_path)
     args = [python, "-m", "samba.subunit.run", "$LISTOPT", "$LOADLIST", module]
-    if pypath:
-        args.insert(0, "PYTHONPATH=%s" % ":".join(["$PYTHONPATH"] + pypath))
-    plantestsuite_loadlist(name, env, args)
+    if extra_path:
+        pypath = ["PYTHONPATH=$PYTHONPATH:%s" % ":".join(extra_path)]
+    else:
+        pypath = []
+
+    plantestsuite_loadlist(name, env, pypath + args)
 
 
 def get_env_torture_options():
@@ -149,7 +162,7 @@ bbdir = os.path.join(srcdir(), "testprogs/blackbox")
 configuration = "--configfile=$SMB_CONF_PATH"
 
 smbtorture4 = binpath("smbtorture")
-smbtorture4_testsuite_list = subprocess.Popen([smbtorture4, "--list-suites"], stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate("")[0].splitlines()
+smbtorture4_testsuite_list = subprocess.Popen([smbtorture4, "--list-suites"], stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate("")[0].decode('utf8').splitlines()
 
 smbtorture4_options = [
     configuration,
@@ -157,7 +170,7 @@ smbtorture4_options = [
     "--maximum-runtime=$SELFTEST_MAXTIME",
     "--basedir=$SELFTEST_TMPDIR",
     "--format=subunit"
-    ] + get_env_torture_options()
+] + get_env_torture_options()
 
 
 def plansmbtorture4testsuite(name, env, options, target, modname=None):
@@ -171,7 +184,7 @@ def plansmbtorture4testsuite(name, env, options, target, modname=None):
 
 
 def smbtorture4_testsuites(prefix):
-    return filter(lambda x: x.startswith(prefix), smbtorture4_testsuite_list)
+    return list(filter(lambda x: x.startswith(prefix), smbtorture4_testsuite_list))
 
 
 smbclient3 = binpath('smbclient')
@@ -183,3 +196,9 @@ scriptdir = os.path.join(srcdir(), "script/tests")
 wbinfo = binpath('wbinfo')
 dbwrap_tool = binpath('dbwrap_tool')
 vfstest = binpath('vfstest')
+smbcquotas = binpath('smbcquotas')
+smbget = binpath('smbget')
+rpcclient = binpath('rpcclient')
+smbcacls = binpath('smbcacls')
+smbcontrol = binpath('smbcontrol')
+smbstatus = binpath('smbstatus')

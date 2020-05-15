@@ -19,6 +19,7 @@
 
 #include "replace.h"
 #include "includes.h"
+#include "lib/util/server_id.h"
 #include "messages.h"
 #include "lib/util/tevent_unix.h"
 #include <stdio.h>
@@ -110,7 +111,7 @@ int main(int argc, const char *argv[])
 	struct messaging_context *msg_ctx;
 	struct tevent_req *req;
 	int ret;
-	struct server_id id;
+	struct server_id my_id, id;
 
 	if (argc != 2) {
 		fprintf(stderr, "Usage: %s <dst>\n", argv[0]);
@@ -130,8 +131,9 @@ int main(int argc, const char *argv[])
 		perror("messaging_init failed");
 		return -1;
 	}
+	my_id = messaging_server_id(msg_ctx);
 
-	id = server_id_from_string(get_my_vnn(), argv[1]);
+	id = server_id_from_string(my_id.vnn, argv[1]);
 	if (!procid_valid(&id)) {
 		fprintf(stderr, "pid %s invalid\n", argv[1]);
 		return -1;

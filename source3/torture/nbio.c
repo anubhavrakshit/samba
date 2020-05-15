@@ -261,7 +261,7 @@ void nb_rename(const char *oldname, const char *newname)
 {
 	NTSTATUS status;
 
-	status = cli_rename(c, oldname, newname);
+	status = cli_rename(c, oldname, newname, false);
 	if (!NT_STATUS_IS_OK(status)) {
 		printf("ERROR: rename %s %s failed (%s)\n", 
 		       oldname, newname, nt_errstr(status));
@@ -287,7 +287,7 @@ void nb_qfsinfo(int level)
 {
 	uint64_t bsize, total, avail;
 	/* this is not the right call - we need cli_qfsinfo() */
-	cli_disk_size(c, &bsize, &total, &avail);
+	cli_disk_size(c, "", &bsize, &total, &avail);
 }
 
 static NTSTATUS find_fn(const char *mnt, struct file_info *finfo, const char *name,

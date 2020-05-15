@@ -27,15 +27,40 @@
 #include <ldb.h>
 #include <ldb_private.h>
 
+#ifdef HAVE_LMDB
+#include <lmdb.h>
+#endif /* ifdef HAVE_LMDB */
+
+
 static struct ldb_context *ldb;
 bool show_index = false;
 bool validate_contents = false;
+
+static void print_data(TDB_DATA d)
+{
+	unsigned char *p = (unsigned char *)d.dptr;
+	int len = d.dsize;
+	while (len--) {
+		if (isprint(*p) && !strchr("\"\\", *p)) {
+			fputc(*p, stdout);
+		} else {
+			printf("\\%02X", *p);
+		}
+		p++;
+	}
+}
+
+static unsigned int pull_uint32(uint8_t *p)
+{
+       return p[0] | (p[1]<<8) | (p[2]<<16) | (p[3]<<24);
+}
+
 
 static int traverse_fn(TDB_CONTEXT *tdb, TDB_DATA key, TDB_DATA _dbuf, void *state)
 {
 	int ret, i, j;
 	struct ldb_dn *dn = state;
-	struct ldb_message *msg = talloc_zero(NULL, struct ldb_message);
+	struct ldb_message *msg = ldb_msg_new(NULL);
 	struct ldb_val dbuf = {
 		.data = _dbuf.dptr,
 		.length = _dbuf.dsize,
@@ -74,6 +99,10 @@ static int traverse_fn(TDB_CONTEXT *tdb, TDB_DATA key, TDB_DATA _dbuf, void *sta
 		}
 	}
 
+	printf("# key: ");
+	print_data(key);
+	printf("\n# pack format: %#010x\n", pull_uint32(_dbuf.dptr));
+
 	if (!validate_contents || ldb_dn_is_special(msg->dn)) {
 		ldb_ldif_write_file(ldb, stdout, &ldif);
 		TALLOC_FREE(msg);
@@ -108,6 +137,9 @@ static int traverse_fn(TDB_CONTEXT *tdb, TDB_DATA key, TDB_DATA _dbuf, void *sta
 
 	return 0;
 }
+
+static void log_stderr(struct tdb_context *tdb, enum tdb_debug_level level,
+		       const char *fmt, ...) PRINTF_ATTRIBUTE(3,4);
 
 static void log_stderr(struct tdb_context *tdb, enum tdb_debug_level level,
 		       const char *fmt, ...)
@@ -149,7 +181,9 @@ static void emergency_walk(TDB_DATA key, TDB_DATA dbuf, void *keyname)
 static int dump_tdb(const char *fname, struct ldb_dn *dn, bool emergency)
 {
 	TDB_CONTEXT *tdb;
-	struct tdb_logging_context logfn = { log_stderr };
+	struct tdb_logging_context logfn = {
+		.log_fn = log_stderr,
+	};
 
 	tdb = tdb_open_ex(fname, 0, 0, O_RDONLY, 0, &logfn, NULL);
 	if (!tdb) {
@@ -162,6 +196,116 @@ static int dump_tdb(const char *fname, struct ldb_dn *dn, bool emergency)
 	}
 	return tdb_traverse(tdb, traverse_fn, dn) == -1 ? 1 : 0;
 }
+
+#ifdef HAVE_LMDB
+static int dump_lmdb(const char *fname, struct ldb_dn *dn, bool emergency)
+{
+	int ret;
+	struct MDB_env *env = NULL;
+	struct MDB_txn *txn = NULL;
+	MDB_dbi dbi;
+	struct MDB_cursor *cursor = NULL;
+	struct MDB_val key;
+	struct MDB_val data;
+
+	ret = mdb_env_create(&env);
+	if (ret != 0) {
+		fprintf(stderr,
+			"Could not create MDB environment: (%d)  %s\n",
+			ret,
+			mdb_strerror(ret));
+		goto close_env;
+	}
+
+	ret = mdb_env_open(env,
+			   fname,
+			   MDB_NOSUBDIR|MDB_NOTLS|MDB_RDONLY,
+			   0600);
+	if (ret != 0) {
+		fprintf(stderr,
+			"Could not open environment for %s: (%d)  %s\n",
+			fname,
+			ret,
+			mdb_strerror(ret));
+		goto close_env;
+	}
+
+	ret = mdb_txn_begin(env, NULL, MDB_RDONLY, &txn);
+	if (ret != 0) {
+		fprintf(stderr,
+			"Could not start transaction: (%d)  %s\n",
+			ret,
+			mdb_strerror(ret));
+		goto close_env;
+	}
+
+	ret = mdb_dbi_open(txn, NULL, 0, &dbi);
+	if (ret != 0) {
+		fprintf(stderr,
+			"Could not open database: (%d)  %s\n",
+			ret,
+			mdb_strerror(ret));
+		goto close_txn;
+	}
+
+	ret = mdb_cursor_open(txn, dbi, &cursor);
+	if (ret != 0) {
+		fprintf(stderr,
+			"Could not open cursor: (%d)  %s\n",
+			ret,
+			mdb_strerror(ret));
+		goto close_txn;
+	}
+
+	ret = mdb_cursor_get(cursor, &key, &data, MDB_FIRST);
+	if (ret != 0 && ret != MDB_NOTFOUND) {
+		fprintf(stderr,
+			"Could not find first record: (%d)  %s\n",
+			ret,
+			mdb_strerror(ret));
+		goto close_cursor;
+	}
+	while (ret != MDB_NOTFOUND) {
+		struct TDB_DATA tkey = {
+			.dptr = key.mv_data,
+			.dsize = key.mv_size
+		};
+		struct TDB_DATA tdata = {
+			.dptr = data.mv_data,
+			.dsize = data.mv_size
+		};
+		traverse_fn(NULL, tkey, tdata, dn);
+		ret = mdb_cursor_get(cursor, &key, &data, MDB_NEXT);
+		if (ret != 0 && ret != MDB_NOTFOUND) {
+			fprintf(stderr,
+				"Could not read next record: (%d)  %s\n",
+				ret,
+				mdb_strerror(ret));
+			goto close_cursor;
+		}
+	}
+	ret = 0;
+
+close_cursor:
+	mdb_cursor_close(cursor);
+close_txn:
+	mdb_txn_commit(txn);
+close_env:
+	mdb_env_close(env);
+
+	if (ret != 0) {
+		return 1;
+	}
+	return 0;
+
+}
+#else
+static int dump_lmdb(const char *fname, struct ldb_dn *dn, bool emergency)
+{
+	/* not built with lmdb support */
+	return 1;
+}
+#endif /* #ifdef HAVE_LMDB */
 
 static void usage( void)
 {
@@ -197,7 +341,7 @@ static void usage( void)
 		exit(1);
 	}
 
-	while ((c = getopt( argc, argv, "hd:ec")) != -1) {
+	while ((c = getopt( argc, argv, "hd:eic")) != -1) {
 		switch (c) {
 		case 'h':
 			usage();
@@ -226,5 +370,14 @@ static void usage( void)
 
 	fname = argv[optind];
 
-	return dump_tdb(fname, dn, emergency);
+	rc = dump_lmdb(fname, dn, emergency);
+	if (rc != 0) {
+		rc = dump_tdb(fname, dn, emergency);
+		if (rc != 0) {
+			fprintf(stderr, "Failed to open %s\n", fname);
+			return 1;
+		}
+	}
+	return 0;
+
 }

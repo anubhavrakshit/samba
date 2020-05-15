@@ -29,7 +29,11 @@
 #include "libcli/security/security.h"
 #include "libcli/security/session.h"
 #include "rpc_server/drsuapi/dcesrv_drsuapi.h"
+#include "librpc/gen_ndr/ndr_drsuapi.h"
 #include "auth/session.h"
+
+#undef DBGC_CLASS
+#define DBGC_CLASS            DBGC_DRS_REPL
 
 /*
   check that the SPN update should be allowed as an override
@@ -49,6 +53,8 @@ static bool writespn_check_spn(struct drsuapi_bind_state *b_state,
 	 * 1) they are on the clients own account object
 	 * 2) they are of the form SERVICE/dnshostname
 	 */
+	struct auth_session_info *session_info =
+		dcesrv_call_session_info(dce_call);
 	struct dom_sid *user_sid, *sid;
 	TALLOC_CTX *tmp_ctx = talloc_new(dce_call);
 	struct ldb_result *res;
@@ -78,7 +84,7 @@ static bool writespn_check_spn(struct drsuapi_bind_state *b_state,
 		return false;
 	}
 
-	user_sid = &dce_call->conn->auth_state.session_info->security_token->sids[PRIMARY_USER_SID_INDEX];
+	user_sid = &session_info->security_token->sids[PRIMARY_USER_SID_INDEX];
 	sid = samdb_result_dom_sid(tmp_ctx, res->msgs[0], "objectSid");
 	if (sid == NULL) {
 		talloc_free(tmp_ctx);
@@ -105,8 +111,8 @@ static bool writespn_check_spn(struct drsuapi_bind_state *b_state,
 		return false;
 	}
 
-	ret = krb5_parse_name_flags(krb_ctx, spn, KRB5_PRINCIPAL_PARSE_NO_REALM,
-				    &principal);
+	kerr = krb5_parse_name_flags(krb_ctx, spn, KRB5_PRINCIPAL_PARSE_NO_REALM,
+				     &principal);
 	if (kerr != 0) {
 		krb5_free_context(krb_ctx);
 		talloc_free(tmp_ctx);
@@ -172,7 +178,7 @@ WERROR dcesrv_drsuapi_DsWriteAccountSpn(struct dcesrv_call_state *dce_call, TALL
 
 			msg = ldb_msg_new(mem_ctx);
 			if (msg == NULL) {
-				return WERR_NOMEM;
+				return WERR_NOT_ENOUGH_MEMORY;
 			}
 
 			msg->dn = ldb_dn_new(msg, b_state->sam_ctx,
@@ -194,7 +200,7 @@ WERROR dcesrv_drsuapi_DsWriteAccountSpn(struct dcesrv_call_state *dce_call, TALL
 							 "servicePrincipalName",
 							 req->spn_names[i].str);
 				if (ret != LDB_SUCCESS) {
-					return WERR_NOMEM;
+					return WERR_NOT_ENOUGH_MEMORY;
 				}
 				spn_count++;
 			}
@@ -232,6 +238,8 @@ WERROR dcesrv_drsuapi_DsWriteAccountSpn(struct dcesrv_call_state *dce_call, TALL
 				DEBUG(0,("Failed to modify SPNs on %s: %s\n",
 					 ldb_dn_get_linearized(msg->dn),
 					 ldb_errstring(b_state->sam_ctx)));
+				NDR_PRINT_IN_DEBUG(
+					drsuapi_DsWriteAccountSpn, r);
 				r->out.res->res1.status = WERR_ACCESS_DENIED;
 			} else {
 				DEBUG(2,("Modified %u SPNs on %s\n", spn_count,
@@ -243,5 +251,5 @@ WERROR dcesrv_drsuapi_DsWriteAccountSpn(struct dcesrv_call_state *dce_call, TALL
 		}
 	}
 
-	return WERR_UNKNOWN_LEVEL;
+	return WERR_INVALID_LEVEL;
 }

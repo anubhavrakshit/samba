@@ -59,6 +59,9 @@
 #define HDR_WCT 32
 #define HDR_VWV 33
 
+/* Macros for accessing SMB protocol elements */
+#define VWV(vwv) ((vwv)*2)
+
 #define smb_len_nbt(buf) (RIVAL(buf, 0) & 0x1FFFF)
 #define _smb_setlen_nbt(buf,len) RSIVAL(buf, 0, (len) & 0x1FFFF)
 #define smb_setlen_nbt(buf, len) do { \
@@ -95,6 +98,7 @@ enum protocol_types {
 #define PROTOCOL_LATEST PROTOCOL_SMB3_11
 
 enum smb_signing_setting {
+	SMB_SIGNING_IPC_DEFAULT = -2, /* Only used in C code */
 	SMB_SIGNING_DEFAULT = -1,
 	SMB_SIGNING_OFF = 0,
 	SMB_SIGNING_IF_REQUIRED = 1,
@@ -277,6 +281,12 @@ enum smb_signing_setting {
 	CAP_LARGE_WRITEX | \
 	0)
 
+/*
+ * The action flags in the SMB session setup response
+ */
+#define SMB_SETUP_GUEST          0x0001
+#define SMB_SETUP_USE_LANMAN_KEY 0x0002
+
 /* Client-side offline caching policy types */
 enum csc_policy {
 	CSC_POLICY_MANUAL=0,
@@ -302,14 +312,15 @@ enum csc_policy {
 #define FLAGS2_LONG_PATH_COMPONENTS    0x0001
 #define FLAGS2_EXTENDED_ATTRIBUTES     0x0002
 #define FLAGS2_SMB_SECURITY_SIGNATURES 0x0004
+#define FLAGS2_COMPRESSED              0x0008 /* MS-SMB */
 #define FLAGS2_SMB_SECURITY_SIGNATURES_REQUIRED 0x0010
 #define FLAGS2_IS_LONG_NAME            0x0040
+#define FLAGS2_REPARSE_PATH            0x0400 /* MS-SMB @GMT- path. */
 #define FLAGS2_EXTENDED_SECURITY       0x0800
 #define FLAGS2_DFS_PATHNAMES           0x1000
 #define FLAGS2_READ_PERMIT_EXECUTE     0x2000
 #define FLAGS2_32_BIT_ERROR_CODES      0x4000
 #define FLAGS2_UNICODE_STRINGS         0x8000
-#define FLAGS2_WIN2K_SIGNATURE         0xC852 /* Hack alert ! For now... JRA. */
 
 /* FileAttributes (search attributes) field */
 #define FILE_ATTRIBUTE_READONLY		0x0001L
@@ -333,7 +344,8 @@ enum csc_policy {
 					FILE_ATTRIBUTE_HIDDEN|\
 					FILE_ATTRIBUTE_SYSTEM|\
 					FILE_ATTRIBUTE_DIRECTORY|\
-					FILE_ATTRIBUTE_ARCHIVE)
+					FILE_ATTRIBUTE_ARCHIVE|\
+					FILE_ATTRIBUTE_OFFLINE)
 
 /* File type flags */
 #define FILE_TYPE_DISK  0
@@ -394,6 +406,7 @@ enum csc_policy {
 #define FILE_SUPPORTS_ENCRYPTION        0x00020000
 #define FILE_NAMED_STREAMS              0x00040000
 #define FILE_READ_ONLY_VOLUME           0x00080000
+#define FILE_SUPPORTS_BLOCK_REFCOUNTING	0x08000000
 
 /* ShareAccess field. */
 #define FILE_SHARE_NONE 0 /* Cannot be used in bitmask. */

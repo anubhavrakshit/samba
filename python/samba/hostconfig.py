@@ -16,8 +16,9 @@
 #
 
 """Local host configuration."""
+from __future__ import absolute_import
+from .samdb import SamDB
 
-from samdb import SamDB
 
 class Hostconfig(object):
     """Aggregate object that contains all information about the configuration
@@ -58,7 +59,7 @@ class SharesContainer(object):
 
     def __len__(self):
         if "global" in self._lp.services():
-            return len(self._lp)-1
+            return len(self._lp) - 1
         return len(self._lp)
 
     def keys(self):

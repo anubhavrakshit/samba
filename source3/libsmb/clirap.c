@@ -22,13 +22,16 @@
 #include "includes.h"
 #include "../libcli/auth/libcli_auth.h"
 #include "../librpc/gen_ndr/rap.h"
-#include "../lib/crypto/arcfour.h"
 #include "../lib/util/tevent_ntstatus.h"
 #include "async_smb.h"
 #include "libsmb/libsmb.h"
 #include "libsmb/clirap.h"
 #include "trans2.h"
 #include "../libcli/smb/smbXcli_base.h"
+#include "cli_smb2_fnum.h"
+
+#include <gnutls/gnutls.h>
+#include <gnutls/crypto.h>
 
 #define PIPE_LANMAN   "\\PIPE\\LANMAN"
 
@@ -93,75 +96,6 @@ fail:
 }
 
 /****************************************************************************
- Perform a NetWkstaUserLogon.
-****************************************************************************/
-
-bool cli_NetWkstaUserLogon(struct cli_state *cli,char *user, char *workstation)
-{
-	char *rparam = NULL;
-	char *rdata = NULL;
-	char *p;
-	unsigned int rdrcnt,rprcnt;
-	char param[1024];
-
-	memset(param, 0, sizeof(param));
-
-	/* send a SMBtrans command with api NetWkstaUserLogon */
-	p = param;
-	SSVAL(p,0,132); /* api number */
-	p += 2;
-	strlcpy(p,"OOWb54WrLh",sizeof(param)-PTR_DIFF(p,param));
-	p = skip_string(param,sizeof(param),p);
-	strlcpy(p,"WB21BWDWWDDDDDDDzzzD",sizeof(param)-PTR_DIFF(p,param));
-	p = skip_string(param,sizeof(param),p);
-	SSVAL(p,0,1);
-	p += 2;
-	strlcpy(p,user,sizeof(param)-PTR_DIFF(p,param));
-	if (!strupper_m(p)) {
-		return false;
-	}
-	p += 21;
-	p++;
-	p += 15;
-	p++;
-	strlcpy(p, workstation,sizeof(param)-PTR_DIFF(p,param));
-	if (!strupper_m(p)) {
-		return false;
-	}
-	p += 16;
-	SSVAL(p, 0, CLI_BUFFER_SIZE);
-	p += 2;
-	SSVAL(p, 0, CLI_BUFFER_SIZE);
-	p += 2;
-
-	if (cli_api(cli,
-                    param, PTR_DIFF(p,param),1024,  /* param, length, max */
-                    NULL, 0, CLI_BUFFER_SIZE,           /* data, length, max */
-                    &rparam, &rprcnt,               /* return params, return size */
-                    &rdata, &rdrcnt                 /* return data, return size */
-                   )) {
-		cli->rap_error = rparam? SVAL(rparam,0) : -1;
-		p = rdata;
-
-		if (cli->rap_error == 0) {
-			DEBUG(4,("NetWkstaUserLogon success\n"));
-			/*
-			 * The cli->privileges = SVAL(p, 24); field was set here
-			 * but it was not use anywhere else.
-			 */
-			/* The cli->eff_name field used to be set here
-	                   but it wasn't used anywhere else. */
-		} else {
-			DEBUG(1,("NetwkstaUserLogon gave error %d\n", cli->rap_error));
-		}
-	}
-
-	SAFE_FREE(rparam);
-	SAFE_FREE(rdata);
-	return (cli->rap_error == 0);
-}
-
-/****************************************************************************
  Call a NetShareEnum - try and browse available connections on a host.
 ****************************************************************************/
 
@@ -173,6 +107,8 @@ int cli_RNetShareEnum(struct cli_state *cli, void (*fn)(const char *, uint32_t, 
 	unsigned int rdrcnt,rprcnt;
 	char param[1024];
 	int count = -1;
+	bool ok;
+	int res;
 
 	/* now send a SMBtrans command with api RNetShareEnum */
 	p = param;
@@ -190,74 +126,82 @@ int cli_RNetShareEnum(struct cli_state *cli, void (*fn)(const char *, uint32_t, 
 	SSVAL(p,2,0xFFE0);
 	p += 4;
 
-	if (cli_api(cli,
-		    param, PTR_DIFF(p,param), 1024,  /* Param, length, maxlen */
-		    NULL, 0, 0xFFE0,            /* data, length, maxlen - Win2k needs a small buffer here too ! */
-		    &rparam, &rprcnt,                /* return params, length */
-		    &rdata, &rdrcnt))                /* return data, length */
-		{
-			int res = rparam? SVAL(rparam,0) : -1;
+	ok = cli_api(
+		cli,
+		param, PTR_DIFF(p,param), 1024,  /* Param, length, maxlen */
+		NULL, 0, 0xFFE0,            /* data, length, maxlen - Win2k needs a small buffer here too ! */
+		&rparam, &rprcnt,                /* return params, length */
+		&rdata, &rdrcnt);                /* return data, length */
+	if (!ok) {
+		DEBUG(4,("NetShareEnum failed\n"));
+		goto done;
+	}
 
-			if (res == 0 || res == ERRmoredata) {
-				int converter=SVAL(rparam,2);
-				int i;
-				char *rdata_end = rdata + rdrcnt;
+	if (rprcnt < 6) {
+		DBG_ERR("Got invalid result: rprcnt=%u\n", rprcnt);
+		goto done;
+	}
 
-				count=SVAL(rparam,4);
-				p = rdata;
+	res = rparam? SVAL(rparam,0) : -1;
 
-				for (i=0;i<count;i++,p+=20) {
-					char *sname;
-					int type;
-					int comment_offset;
-					const char *cmnt;
-					const char *p1;
-					char *s1, *s2;
-					size_t len;
-					TALLOC_CTX *frame = talloc_stackframe();
+	if (res == 0 || res == ERRmoredata) {
+		int converter=SVAL(rparam,2);
+		int i;
+		char *rdata_end = rdata + rdrcnt;
 
-					if (p + 20 > rdata_end) {
-						TALLOC_FREE(frame);
-						break;
-					}
+		count=SVAL(rparam,4);
+		p = rdata;
 
-					sname = p;
-					type = SVAL(p,14);
-					comment_offset = (IVAL(p,16) & 0xFFFF) - converter;
-					if (comment_offset < 0 ||
-							comment_offset > (int)rdrcnt) {
-						TALLOC_FREE(frame);
-						break;
-					}
-					cmnt = comment_offset?(rdata+comment_offset):"";
+		for (i=0;i<count;i++,p+=20) {
+			char *sname;
+			int type;
+			int comment_offset;
+			const char *cmnt;
+			const char *p1;
+			char *s1, *s2;
+			size_t len;
+			TALLOC_CTX *frame = talloc_stackframe();
 
-					/* Work out the comment length. */
-					for (p1 = cmnt, len = 0; *p1 &&
-							p1 < rdata_end; len++)
-						p1++;
-					if (!*p1) {
-						len++;
-					}
-					pull_string_talloc(frame,rdata,0,
-						&s1,sname,14,STR_ASCII);
-					pull_string_talloc(frame,rdata,0,
-						&s2,cmnt,len,STR_ASCII);
-					if (!s1 || !s2) {
-						TALLOC_FREE(frame);
-						continue;
-					}
-
-					fn(s1, type, s2, state);
-
-					TALLOC_FREE(frame);
-				}
-			} else {
-				DEBUG(4,("NetShareEnum res=%d\n", res));
+			if (p + 20 > rdata_end) {
+				TALLOC_FREE(frame);
+				break;
 			}
-		} else {
-			DEBUG(4,("NetShareEnum failed\n"));
-		}
 
+			sname = p;
+			type = SVAL(p,14);
+			comment_offset = (IVAL(p,16) & 0xFFFF) - converter;
+			if (comment_offset < 0 ||
+			    comment_offset > (int)rdrcnt) {
+				TALLOC_FREE(frame);
+				break;
+			}
+			cmnt = comment_offset?(rdata+comment_offset):"";
+
+			/* Work out the comment length. */
+			for (p1 = cmnt, len = 0; *p1 &&
+				     p1 < rdata_end; len++)
+				p1++;
+			if (!*p1) {
+				len++;
+			}
+			pull_string_talloc(frame,rdata,0,
+					   &s1,sname,14,STR_ASCII);
+			pull_string_talloc(frame,rdata,0,
+					   &s2,cmnt,len,STR_ASCII);
+			if (!s1 || !s2) {
+				TALLOC_FREE(frame);
+				continue;
+			}
+
+			fn(s1, type, s2, state);
+
+			TALLOC_FREE(frame);
+		}
+	} else {
+			DEBUG(4,("NetShareEnum res=%d\n", res));
+	}
+
+done:
 	SAFE_FREE(rparam);
 	SAFE_FREE(rdata);
 
@@ -361,6 +305,13 @@ bool cli_NetServerEnum(struct cli_state *cli, char *workgroup, uint32_t stype,
 		}
 
 		rdata_end = rdata + rdrcnt;
+
+		if (rprcnt < 6) {
+			DBG_ERR("Got invalid result: rprcnt=%u\n", rprcnt);
+			res = -1;
+			break;
+		}
+
 		res = rparam ? SVAL(rparam,0) : -1;
 
 		if (res == 0 || res == ERRmoredata ||
@@ -507,6 +458,12 @@ bool cli_oem_change_password(struct cli_state *cli, const char *user, const char
 	char *rparam = NULL;
 	char *rdata = NULL;
 	unsigned int rprcnt, rdrcnt;
+	gnutls_cipher_hd_t cipher_hnd = NULL;
+	gnutls_datum_t old_pw_key = {
+		.data = old_pw_hash,
+		.size = sizeof(old_pw_hash),
+	};
+	int rc;
 
 	if (strlen(user) >= sizeof(fstring)-1) {
 		DEBUG(0,("cli_oem_change_password: user name %s is too long.\n", user));
@@ -538,14 +495,33 @@ bool cli_oem_change_password(struct cli_state *cli, const char *user, const char
 	DEBUG(100,("make_oem_passwd_hash\n"));
 	dump_data(100, data, 516);
 #endif
-	arcfour_crypt( (unsigned char *)data, (unsigned char *)old_pw_hash, 516);
+	rc = gnutls_cipher_init(&cipher_hnd,
+				GNUTLS_CIPHER_ARCFOUR_128,
+				&old_pw_key,
+				NULL);
+	if (rc < 0) {
+		DBG_ERR("gnutls_cipher_init failed: %s\n",
+			gnutls_strerror(rc));
+		return false;
+	}
+	rc = gnutls_cipher_encrypt(cipher_hnd,
+			      data,
+			      516);
+	gnutls_cipher_deinit(cipher_hnd);
+	if (rc < 0) {
+		return false;
+	}
 
 	/*
 	 * Now place the old password hash in the data.
 	 */
 	E_deshash(new_password, new_pw_hash);
 
-	E_old_pw_hash( new_pw_hash, old_pw_hash, (uchar *)&data[516]);
+	rc = E_old_pw_hash( new_pw_hash, old_pw_hash, (uchar *)&data[516]);
+	if (rc != 0) {
+		DBG_ERR("E_old_pw_hash failed: %s\n", gnutls_strerror(rc));
+		return false;
+	}
 
 	data_len = 532;
 
@@ -559,10 +535,16 @@ bool cli_oem_change_password(struct cli_state *cli, const char *user, const char
 		return False;
 	}
 
+	if (rdrcnt < 2) {
+		cli->rap_error = ERRbadformat;
+		goto done;
+	}
+
 	if (rparam) {
 		cli->rap_error = SVAL(rparam,0);
 	}
 
+done:
 	SAFE_FREE(rparam);
 	SAFE_FREE(rdata);
 
@@ -700,50 +682,224 @@ NTSTATUS cli_qpathinfo1(struct cli_state *cli,
 	return status;
 }
 
-/****************************************************************************
- Send a setpathinfo call.
-****************************************************************************/
-
-NTSTATUS cli_setpathinfo_basic(struct cli_state *cli, const char *fname,
-			       time_t create_time,
-			       time_t access_time,
-			       time_t write_time,
-			       time_t change_time,
-			       uint16_t mode)
+static void prep_basic_information_buf(
+	uint8_t buf[40],
+	struct timespec create_time,
+	struct timespec access_time,
+	struct timespec write_time,
+	struct timespec change_time,
+	uint16_t mode)
 {
-	unsigned int data_len = 0;
-	char data[40];
-	char *p;
+	char *p = (char *)buf;
+	/*
+	 * Add the create, last access, modification, and status change times
+	 */
+	put_long_date_full_timespec(
+		TIMESTAMP_SET_NT_OR_BETTER, p, &create_time);
+	p += 8;
 
-        p = data;
+	put_long_date_full_timespec(
+		TIMESTAMP_SET_NT_OR_BETTER, p, &access_time);
+	p += 8;
 
-        /*
-         * Add the create, last access, modification, and status change times
-         */
-        put_long_date(p, create_time);
-        p += 8;
+	put_long_date_full_timespec(
+		TIMESTAMP_SET_NT_OR_BETTER, p, &write_time);
+	p += 8;
 
-        put_long_date(p, access_time);
-        p += 8;
+	put_long_date_full_timespec(
+		TIMESTAMP_SET_NT_OR_BETTER, p, &change_time);
+	p += 8;
 
-        put_long_date(p, write_time);
-        p += 8;
+	if (mode == (uint16_t)-1 || mode == FILE_ATTRIBUTE_NORMAL) {
+		/* No change. */
+		mode = 0;
+	} else if (mode == 0) {
+		/* Clear all existing attributes. */
+		mode = FILE_ATTRIBUTE_NORMAL;
+	}
 
-        put_long_date(p, change_time);
-        p += 8;
+	/* Add attributes */
+	SIVAL(p, 0, mode);
 
-        /* Add attributes */
-        SIVAL(p, 0, mode);
-        p += 4;
+	p += 4;
 
-        /* Add padding */
-        SIVAL(p, 0, 0);
-        p += 4;
+	/* Add padding */
+	SIVAL(p, 0, 0);
+	p += 4;
 
-        data_len = PTR_DIFF(p, data);
+	SMB_ASSERT(PTR_DIFF(p, buf) == 40);
+}
 
-	return cli_setpathinfo(cli, SMB_FILE_BASIC_INFORMATION, fname,
-			       (uint8_t *)data, data_len);
+NTSTATUS cli_setpathinfo_ext(struct cli_state *cli, const char *fname,
+			     struct timespec create_time,
+			     struct timespec access_time,
+			     struct timespec write_time,
+			     struct timespec change_time,
+			     uint16_t mode)
+{
+	uint8_t buf[40];
+
+	prep_basic_information_buf(
+		buf,
+		create_time,
+		access_time,
+		write_time,
+		change_time,
+		mode);
+
+	if (smbXcli_conn_protocol(cli->conn) >= PROTOCOL_SMB2_02) {
+		DATA_BLOB in_data = data_blob_const(buf, sizeof(buf));
+		/*
+		 * Split out SMB2 here as we need to select
+		 * the correct info type and level.
+		 */
+		return cli_smb2_setpathinfo(cli,
+				fname,
+				1, /* SMB2_SETINFO_FILE */
+				SMB_FILE_BASIC_INFORMATION - 1000,
+				&in_data);
+	}
+
+	return cli_setpathinfo(
+		cli, SMB_FILE_BASIC_INFORMATION, fname, buf, sizeof(buf));
+}
+
+struct cli_setfileinfo_ext_state {
+	uint8_t data[40];
+	DATA_BLOB in_data;
+};
+
+static void cli_setfileinfo_ext_done(struct tevent_req *subreq);
+static void cli_setfileinfo_ext_done2(struct tevent_req *subreq);
+
+struct tevent_req *cli_setfileinfo_ext_send(
+	TALLOC_CTX *mem_ctx,
+	struct tevent_context *ev,
+	struct cli_state *cli,
+	uint16_t fnum,
+	struct timespec create_time,
+	struct timespec access_time,
+	struct timespec write_time,
+	struct timespec change_time,
+	uint16_t mode)
+{
+	struct tevent_req *req = NULL, *subreq = NULL;
+	struct cli_setfileinfo_ext_state *state = NULL;
+
+	req = tevent_req_create(
+		mem_ctx, &state, struct cli_setfileinfo_ext_state);
+	if (req == NULL) {
+		return NULL;
+	}
+	prep_basic_information_buf(
+		state->data,
+		create_time,
+		access_time,
+		write_time,
+		change_time,
+		mode);
+
+	if (smbXcli_conn_protocol(cli->conn) >= PROTOCOL_SMB2_02) {
+		state->in_data = (DATA_BLOB) {
+			.data = state->data, .length = sizeof(state->data),
+		};
+
+		subreq = cli_smb2_set_info_fnum_send(
+			state,
+			ev,
+			cli,
+			fnum,
+			SMB2_0_INFO_FILE,
+			SMB_FILE_BASIC_INFORMATION - 1000,
+			&state->in_data,
+			0);	/* in_additional_info */
+		if (tevent_req_nomem(subreq, req)) {
+			return tevent_req_post(req, ev);
+		}
+		tevent_req_set_callback(
+			subreq, cli_setfileinfo_ext_done2, req);
+		return req;
+	}
+
+	subreq = cli_setfileinfo_send(
+		state,
+		ev,
+		cli,
+		fnum,
+		SMB_FILE_BASIC_INFORMATION,
+		state->data,
+		sizeof(state->data));
+	if (tevent_req_nomem(subreq, req)) {
+		return tevent_req_post(req, ev);
+	}
+	tevent_req_set_callback(subreq, cli_setfileinfo_ext_done, req);
+	return req;
+}
+
+static void cli_setfileinfo_ext_done(struct tevent_req *subreq)
+{
+	NTSTATUS status = cli_setfileinfo_recv(subreq);
+	tevent_req_simple_finish_ntstatus(subreq, status);
+}
+
+static void cli_setfileinfo_ext_done2(struct tevent_req *subreq)
+{
+	NTSTATUS status = cli_smb2_set_info_fnum_recv(subreq);
+	tevent_req_simple_finish_ntstatus(subreq, status);
+}
+
+NTSTATUS cli_setfileinfo_ext_recv(struct tevent_req *req)
+{
+	return tevent_req_simple_recv_ntstatus(req);
+}
+
+NTSTATUS cli_setfileinfo_ext(
+	struct cli_state *cli,
+	uint16_t fnum,
+	struct timespec create_time,
+	struct timespec access_time,
+	struct timespec write_time,
+	struct timespec change_time,
+	uint16_t mode)
+{
+	TALLOC_CTX *frame = NULL;
+	struct tevent_context *ev = NULL;
+	struct tevent_req *req = NULL;
+	NTSTATUS status = NT_STATUS_NO_MEMORY;
+
+	if (smbXcli_conn_has_async_calls(cli->conn)) {
+		/*
+		 * Can't use sync call while an async call is in flight
+		 */
+		return NT_STATUS_INVALID_PARAMETER;
+	}
+
+	frame = talloc_stackframe();
+
+	ev = samba_tevent_context_init(frame);
+	if (ev == NULL) {
+		goto fail;
+	}
+	req = cli_setfileinfo_ext_send(
+		ev,
+		ev,
+		cli,
+		fnum,
+		create_time,
+		access_time,
+		write_time,
+		change_time,
+		mode);
+	if (req == NULL) {
+		goto fail;
+	}
+	if (!tevent_req_poll_ntstatus(req, ev, &status)) {
+		goto fail;
+	}
+	status = cli_setfileinfo_ext_recv(req);
+ fail:
+	TALLOC_FREE(frame);
+	return status;
 }
 
 /****************************************************************************
@@ -832,7 +988,15 @@ NTSTATUS cli_qpathinfo2_recv(struct tevent_req *req,
                 *size = IVAL2_TO_SMB_BIG_UINT(state->data,48);
 	}
 	if (ino) {
-		*ino = IVAL(state->data, 64);
+		/*
+		 * SMB1 qpathinfo2 uses SMB_QUERY_FILE_ALL_INFO
+		 * which doesn't return an inode number (fileid).
+		 * We can't change this to one of the FILE_ID
+		 * info levels as only Win2003 and above support
+		 * these [MS-SMB: 2.2.2.3.1] and the SMB1 code
+		 * needs to support older servers.
+		 */
+		*ino = 0;
 	}
 	return NT_STATUS_OK;
 }
@@ -1425,7 +1589,7 @@ NTSTATUS cli_qpathinfo3(struct cli_state *cli, const char *fname,
 {
 	NTSTATUS status = NT_STATUS_OK;
 	SMB_STRUCT_STAT st = { 0 };
-	uint32_t attr;
+	uint32_t attr = 0;
 	uint64_t pos;
 
 	if (smbXcli_conn_protocol(cli->conn) >= PROTOCOL_SMB2_02) {

@@ -1174,6 +1174,8 @@ tgs_parse_request(krb5_context context,
     Key *tkey;
     krb5_keyblock *subkey = NULL;
     unsigned usage;
+    krb5uint32 kvno = 0;
+    krb5uint32 *kvno_ptr = NULL;
 
     *auth_data = NULL;
     *csec  = NULL;
@@ -1201,7 +1203,12 @@ tgs_parse_request(krb5_context context,
 				       ap_req.ticket.sname,
 				       ap_req.ticket.realm);
 
-    ret = _kdc_db_fetch(context, config, princ, HDB_F_GET_KRBTGT, ap_req.ticket.enc_part.kvno, NULL, krbtgt);
+    if (ap_req.ticket.enc_part.kvno) {
+	    kvno = *ap_req.ticket.enc_part.kvno;
+	    kvno_ptr = &kvno;
+    }
+    ret = _kdc_db_fetch(context, config, princ, HDB_F_GET_KRBTGT, kvno_ptr,
+			NULL, krbtgt);
 
     if(ret == HDB_ERR_NOT_FOUND_HERE) {
 	char *p;
@@ -1541,6 +1548,8 @@ tgs_build_reply(krb5_context context,
 	hdb_entry_ex *uu;
 	krb5_principal p;
 	Key *uukey;
+	krb5uint32 second_kvno = 0;
+	krb5uint32 *kvno_ptr = NULL;
 
 	if(b->additional_tickets == NULL ||
 	   b->additional_tickets->len == 0){
@@ -1557,8 +1566,12 @@ tgs_build_reply(krb5_context context,
 	    goto out;
 	}
 	_krb5_principalname2krb5_principal(context, &p, t->sname, t->realm);
+	if(t->enc_part.kvno){
+	    second_kvno = *t->enc_part.kvno;
+	    kvno_ptr = &second_kvno;
+	}
 	ret = _kdc_db_fetch(context, config, p,
-			    HDB_F_GET_KRBTGT, t->enc_part.kvno,
+			    HDB_F_GET_KRBTGT, kvno_ptr,
 			    NULL, &uu);
 	krb5_free_principal(context, p);
 	if(ret){
@@ -1647,7 +1660,9 @@ server_lookup:
 	Realm req_rlm;
 	krb5_realm *realms;
 
-	if ((req_rlm = get_krbtgt_realm(&sp->name)) != NULL) {
+	if (!config->autodetect_referrals) {
+		/* noop */
+	} else if ((req_rlm = get_krbtgt_realm(&sp->name)) != NULL) {
 	    if(nloop++ < 2) {
 		new_rlm = find_rpath(context, tgt->crealm, req_rlm);
 		if(new_rlm) {
@@ -1910,6 +1925,13 @@ server_lookup:
 		goto out;
 	    }
 
+	    if (!krb5_checksum_is_keyed(context, self.cksum.cksumtype)) {
+		free_PA_S4U2Self(&self);
+		kdc_log(context, config, 0, "Reject PA-S4U2Self with unkeyed checksum");
+		ret = KRB5KRB_AP_ERR_INAPP_CKSUM;
+		goto out;
+	    }
+
 	    ret = _krb5_s4u2self_to_checksumdata(context, &self, &datack);
 	    if (ret)
 		goto out;
@@ -1953,31 +1975,43 @@ server_lookup:
 	    if (ret)
 		goto out;
 
+	    ret = _kdc_db_fetch(context, config, tp, HDB_F_GET_CLIENT | flags,
+				NULL, &s4u2self_impersonated_clientdb,
+				&s4u2self_impersonated_client);
+	    if (ret) {
+		const char *msg;
+
+		/*
+		 * If the client belongs to the same realm as our krbtgt, it
+		 * should exist in the local database.
+		 *
+		 */
+
+		if (ret == HDB_ERR_NOENTRY)
+		    ret = KRB5KDC_ERR_C_PRINCIPAL_UNKNOWN;
+		msg = krb5_get_error_message(context, ret);
+		kdc_log(context, config, 1,
+			"S2U4Self principal to impersonate %s not found in database: %s",
+			tpn, msg);
+		krb5_free_error_message(context, msg);
+		goto out;
+	    }
+
+	    /* Ignore pw_end attributes (as Windows does),
+	     * since S4U2Self is not password authentication. */
+	    free(s4u2self_impersonated_client->entry.pw_end);
+	    s4u2self_impersonated_client->entry.pw_end = NULL;
+
+	    ret = kdc_check_flags(context, config, s4u2self_impersonated_client, tpn,
+				  NULL, NULL, FALSE);
+	    if (ret)
+		goto out;
+
 	    /* If we were about to put a PAC into the ticket, we better fix it to be the right PAC */
 	    if(rspac.data) {
 		krb5_pac p = NULL;
 		krb5_data_free(&rspac);
-		ret = _kdc_db_fetch(context, config, tp, HDB_F_GET_CLIENT | flags,
-				    NULL, &s4u2self_impersonated_clientdb, &s4u2self_impersonated_client);
-		if (ret) {
-		    const char *msg;
-
-		    /*
-		     * If the client belongs to the same realm as our krbtgt, it
-		     * should exist in the local database.
-		     *
-		     */
-
-		    if (ret == HDB_ERR_NOENTRY)
-			ret = KRB5KDC_ERR_C_PRINCIPAL_UNKNOWN;
-		    msg = krb5_get_error_message(context, ret);
-		    kdc_log(context, config, 1,
-			    "S2U4Self principal to impersonate %s not found in database: %s",
-			    tpn, msg);
-		    krb5_free_error_message(context, msg);
-		    goto out;
-		}
-		ret = _kdc_pac_generate(context, s4u2self_impersonated_client, &p);
+		ret = _kdc_pac_generate(context, s4u2self_impersonated_client, NULL, &p);
 		if (ret) {
 		    kdc_log(context, config, 0, "PAC generation failed for -- %s",
 			    tpn);
@@ -2012,10 +2046,12 @@ server_lookup:
 
 	    /*
 	     * If the service isn't trusted for authentication to
-	     * delegation, remove the forward flag.
+	     * delegation or if the impersonate client is disallowed
+	     * forwardable, remove the forwardable flag.
 	     */
 
-	    if (client->entry.flags.trusted_for_delegation) {
+	    if (client->entry.flags.trusted_for_delegation &&
+		s4u2self_impersonated_client->entry.flags.forwardable) {
 		str = "[forwardable]";
 	    } else {
 		b->kdc_options.forwardable = 0;

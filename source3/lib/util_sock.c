@@ -28,8 +28,8 @@
 #include "../lib/util/tevent_unix.h"
 #include "../lib/util/tevent_ntstatus.h"
 #include "../lib/tsocket/tsocket.h"
-#include "lib/sys_rw.h"
-#include "lib/sys_rw_data.h"
+#include "lib/util/sys_rw.h"
+#include "lib/util/sys_rw_data.h"
 
 const char *client_addr(int fd, char *addr, size_t addrlen)
 {
@@ -417,7 +417,6 @@ struct open_socket_out_state {
 	struct sockaddr_storage ss;
 	socklen_t salen;
 	uint16_t port;
-	int wait_usec;
 	struct tevent_req *connect_subreq;
 };
 
@@ -459,32 +458,34 @@ struct tevent_req *open_socket_out_send(TALLOC_CTX *mem_ctx,
 					int timeout)
 {
 	char addr[INET6_ADDRSTRLEN];
-	struct tevent_req *result;
+	struct tevent_req *req;
 	struct open_socket_out_state *state;
 	NTSTATUS status;
 
-	result = tevent_req_create(mem_ctx, &state,
-				   struct open_socket_out_state);
-	if (result == NULL) {
+	req = tevent_req_create(mem_ctx, &state,
+				struct open_socket_out_state);
+	if (req == NULL) {
 		return NULL;
 	}
 	state->ev = ev;
 	state->ss = *pss;
 	state->port = port;
-	state->wait_usec = 10000;
 	state->salen = -1;
 
 	state->fd = socket(state->ss.ss_family, SOCK_STREAM, 0);
 	if (state->fd == -1) {
 		status = map_nt_error_from_unix(errno);
-		goto post_status;
+		tevent_req_nterror(req, status);
+		return tevent_req_post(req, ev);
 	}
 
-	tevent_req_set_cleanup_fn(result, open_socket_out_cleanup);
+	tevent_req_set_cleanup_fn(req, open_socket_out_cleanup);
 
-	if (!tevent_req_set_endtime(
-		    result, ev, timeval_current_ofs_msec(timeout))) {
-		goto fail;
+	if ((timeout != 0) &&
+	    !tevent_req_set_endtime(
+		    req, ev, timeval_current_ofs_msec(timeout))) {
+		tevent_req_oom(req);
+		return tevent_req_post(req, ev);
 	}
 
 #if defined(HAVE_IPV6)
@@ -517,22 +518,12 @@ struct tevent_req *open_socket_out_send(TALLOC_CTX *mem_ctx,
 	state->connect_subreq = async_connect_send(
 		state, state->ev, state->fd, (struct sockaddr *)&state->ss,
 		state->salen, NULL, NULL, NULL);
-	if ((state->connect_subreq == NULL)
-	    || !tevent_req_set_endtime(
-		    state->connect_subreq, state->ev,
-		    timeval_current_ofs(0, state->wait_usec))) {
-		goto fail;
+	if (tevent_req_nomem(state->connect_subreq, NULL)) {
+		return tevent_req_post(req, ev);
 	}
 	tevent_req_set_callback(state->connect_subreq,
-				open_socket_out_connected, result);
-	return result;
-
- post_status:
-	tevent_req_nterror(result, status);
-	return tevent_req_post(result, ev);
- fail:
-	TALLOC_FREE(result);
-	return NULL;
+				open_socket_out_connected, req);
+	return req;
 }
 
 static void open_socket_out_connected(struct tevent_req *subreq)
@@ -552,47 +543,6 @@ static void open_socket_out_connected(struct tevent_req *subreq)
 		return;
 	}
 
-	if (
-#ifdef ETIMEDOUT
-		(sys_errno == ETIMEDOUT) ||
-#endif
-		(sys_errno == EINPROGRESS) ||
-		(sys_errno == EALREADY) ||
-		(sys_errno == EAGAIN)) {
-
-		/*
-		 * retry
-		 */
-
-		if (state->wait_usec < 250000) {
-			state->wait_usec *= 1.5;
-		}
-
-		subreq = async_connect_send(state, state->ev, state->fd,
-					    (struct sockaddr *)&state->ss,
-					    state->salen, NULL, NULL, NULL);
-		if (tevent_req_nomem(subreq, req)) {
-			return;
-		}
-		if (!tevent_req_set_endtime(
-			    subreq, state->ev,
-			    timeval_current_ofs_usec(state->wait_usec))) {
-			tevent_req_nterror(req, NT_STATUS_NO_MEMORY);
-			return;
-		}
-		state->connect_subreq = subreq;
-		tevent_req_set_callback(subreq, open_socket_out_connected, req);
-		return;
-	}
-
-#ifdef EISCONN
-	if (sys_errno == EISCONN) {
-		tevent_req_done(req);
-		return;
-	}
-#endif
-
-	/* real error */
 	tevent_req_nterror(req, map_nt_error_from_unix(sys_errno));
 }
 
@@ -1070,7 +1020,7 @@ int get_remote_hostname(const struct tsocket_address *remote_address,
 	lookup_nc(&nc);
 
 	if (nc.name == NULL) {
-		*name = talloc_strdup(mem_ctx, "UNKOWN");
+		*name = talloc_strdup(mem_ctx, "UNKNOWN");
 	} else {
 		*name = talloc_strdup(mem_ctx, nc.name);
 	}
@@ -1096,6 +1046,7 @@ int create_pipe_sock(const char *socket_dir,
 	int sock = -1;
 	mode_t old_umask;
 	char *path = NULL;
+	size_t path_len;
 
 	old_umask = umask(0);
 
@@ -1122,7 +1073,17 @@ int create_pipe_sock(const char *socket_dir,
 	unlink(path);
 	memset(&sunaddr, 0, sizeof(sunaddr));
 	sunaddr.sun_family = AF_UNIX;
-	strlcpy(sunaddr.sun_path, path, sizeof(sunaddr.sun_path));
+
+	path_len = strlcpy(sunaddr.sun_path, path, sizeof(sunaddr.sun_path));
+	if (path_len > sizeof(sunaddr.sun_path)) {
+		DBG_ERR("Refusing to attempt to create pipe socket "
+			"%s.  Path is longer than permitted for a "
+			"unix domain socket.  It would truncate to "
+			"%s\n",
+			path,
+			sunaddr.sun_path);
+		goto out_close;
+	}
 
 	if (bind(sock, (struct sockaddr *)&sunaddr, sizeof(sunaddr)) == -1) {
 		DEBUG(0, ("bind failed on pipe socket %s: %s\n", path,
@@ -1344,88 +1305,6 @@ bool is_myname_or_ipaddr(const char *s)
 
 	/* No match */
 	return false;
-}
-
-struct getaddrinfo_state {
-	const char *node;
-	const char *service;
-	const struct addrinfo *hints;
-	struct addrinfo *res;
-	int ret;
-};
-
-static void getaddrinfo_do(void *private_data);
-static void getaddrinfo_done(struct tevent_req *subreq);
-
-struct tevent_req *getaddrinfo_send(TALLOC_CTX *mem_ctx,
-				    struct tevent_context *ev,
-				    struct fncall_context *ctx,
-				    const char *node,
-				    const char *service,
-				    const struct addrinfo *hints)
-{
-	struct tevent_req *req, *subreq;
-	struct getaddrinfo_state *state;
-
-	req = tevent_req_create(mem_ctx, &state, struct getaddrinfo_state);
-	if (req == NULL) {
-		return NULL;
-	}
-
-	state->node = node;
-	state->service = service;
-	state->hints = hints;
-
-	subreq = fncall_send(state, ev, ctx, getaddrinfo_do, state);
-	if (tevent_req_nomem(subreq, req)) {
-		return tevent_req_post(req, ev);
-	}
-	tevent_req_set_callback(subreq, getaddrinfo_done, req);
-	return req;
-}
-
-static void getaddrinfo_do(void *private_data)
-{
-	struct getaddrinfo_state *state =
-		talloc_get_type_abort(private_data, struct getaddrinfo_state);
-
-	state->ret = getaddrinfo(state->node, state->service, state->hints,
-				 &state->res);
-}
-
-static void getaddrinfo_done(struct tevent_req *subreq)
-{
-	struct tevent_req *req = tevent_req_callback_data(
-		subreq, struct tevent_req);
-	int ret, err;
-
-	ret = fncall_recv(subreq, &err);
-	TALLOC_FREE(subreq);
-	if (ret == -1) {
-		tevent_req_error(req, err);
-		return;
-	}
-	tevent_req_done(req);
-}
-
-int getaddrinfo_recv(struct tevent_req *req, struct addrinfo **res)
-{
-	struct getaddrinfo_state *state = tevent_req_data(
-		req, struct getaddrinfo_state);
-	int err;
-
-	if (tevent_req_is_unix_error(req, &err)) {
-		switch(err) {
-		case ENOMEM:
-			return EAI_MEMORY;
-		default:
-			return EAI_FAIL;
-		}
-	}
-	if (state->ret == 0) {
-		*res = state->res;
-	}
-	return state->ret;
 }
 
 int poll_one_fd(int fd, int events, int timeout, int *revents)

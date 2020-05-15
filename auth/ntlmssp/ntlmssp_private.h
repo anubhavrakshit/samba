@@ -20,14 +20,15 @@
 
 /* For structures internal to the NTLMSSP implementation that should not be exposed */
 
-#include "../lib/crypto/arcfour.h"
+#include <gnutls/gnutls.h>
+#include <gnutls/crypto.h>
 
 struct auth_session_info;
 
 struct ntlmssp_crypt_direction {
 	uint32_t seq_num;
 	uint8_t sign_key[16];
-	struct arcfour_state seal_state;
+	gnutls_cipher_hd_t seal_state;
 };
 
 union ntlmssp_crypt_state {
@@ -49,18 +50,12 @@ struct gensec_ntlmssp_context {
 	struct ntlmssp_state *ntlmssp_state;
 };
 
-/* The following definitions come from auth/ntlmssp.c  */
-
-NTSTATUS gensec_ntlmssp_update(struct gensec_security *gensec_security,
-			       TALLOC_CTX *out_mem_ctx,
-			       struct tevent_context *ev,
-			       const DATA_BLOB input, DATA_BLOB *out);
-
 /* The following definitions come from auth/ntlmssp_util.c  */
 
 void debug_ntlmssp_flags(uint32_t neg_flags);
-void ntlmssp_handle_neg_flags(struct ntlmssp_state *ntlmssp_state,
-			      uint32_t neg_flags, bool allow_lm);
+NTSTATUS ntlmssp_handle_neg_flags(struct ntlmssp_state *ntlmssp_state,
+				  uint32_t neg_flags, const char *name);
+const DATA_BLOB ntlmssp_version_blob(void);
 
 /* The following definitions come from auth/ntlmssp_server.c  */
 
@@ -88,6 +83,10 @@ NTSTATUS ntlmssp_client_initial(struct gensec_security *gensec_security,
 				TALLOC_CTX *out_mem_ctx,
 				DATA_BLOB in, DATA_BLOB *out) ;
 
+NTSTATUS gensec_ntlmssp_resume_ccache(struct gensec_security *gensec_security,
+				TALLOC_CTX *out_mem_ctx,
+				DATA_BLOB in, DATA_BLOB *out);
+
 /**
  * Next state function for the Challenge Packet.  Generate an auth packet.
  *
@@ -101,6 +100,7 @@ NTSTATUS ntlmssp_client_challenge(struct gensec_security *gensec_security,
 				  TALLOC_CTX *out_mem_ctx,
 				  const DATA_BLOB in, DATA_BLOB *out) ;
 NTSTATUS gensec_ntlmssp_client_start(struct gensec_security *gensec_security);
+NTSTATUS gensec_ntlmssp_resume_ccache_start(struct gensec_security *gensec_security);
 
 /* The following definitions come from auth/ntlmssp/gensec_ntlmssp_server.c  */
 
@@ -118,18 +118,14 @@ NTSTATUS gensec_ntlmssp_server_negotiate(struct gensec_security *gensec_security
 					 TALLOC_CTX *out_mem_ctx,
 					 const DATA_BLOB request, DATA_BLOB *reply);
 
-/**
- * Next state function for the Authenticate packet (GENSEC wrapper)
- *
- * @param gensec_security GENSEC state
- * @param out_mem_ctx Memory context for *out
- * @param in The request, as a DATA_BLOB.  reply.data must be NULL
- * @param out The reply, as an allocated DATA_BLOB, caller to free.
- * @return Errors or NT_STATUS_OK if authentication sucessful
- */
-NTSTATUS gensec_ntlmssp_server_auth(struct gensec_security *gensec_security,
-				    TALLOC_CTX *out_mem_ctx,
-				    const DATA_BLOB in, DATA_BLOB *out);
+struct tevent_req *ntlmssp_server_auth_send(TALLOC_CTX *mem_ctx,
+					    struct tevent_context *ev,
+					    struct gensec_security *gensec_security,
+					    const DATA_BLOB in);
+NTSTATUS ntlmssp_server_auth_recv(struct tevent_req *req,
+				  TALLOC_CTX *out_mem_ctx,
+				  DATA_BLOB *out);
+
 
 /**
  * Start NTLMSSP on the server side

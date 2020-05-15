@@ -23,7 +23,6 @@
 #include "smbd/globals.h"
 #include "../lib/util/tevent_ntstatus.h"
 #include "../lib/util/tevent_unix.h"
-#include "lib/tevent_wait.h"
 
 /****************************************************************************
  The buffer we keep around whilst an aio request is in process.
@@ -46,12 +45,6 @@ struct aio_extra {
 bool aio_write_through_requested(struct aio_extra *aio_ex)
 {
 	return aio_ex->write_through;
-}
-
-static int aio_extra_destructor(struct aio_extra *aio_ex)
-{
-	outstanding_aio_calls--;
-	return 0;
 }
 
 /****************************************************************************
@@ -80,9 +73,7 @@ static struct aio_extra *create_aio_extra(TALLOC_CTX *mem_ctx,
 			return NULL;
 		}
 	}
-	talloc_set_destructor(aio_ex, aio_extra_destructor);
 	aio_ex->fsp = fsp;
-	outstanding_aio_calls++;
 	return aio_ex;
 }
 
@@ -110,7 +101,7 @@ static int aio_del_req_from_fsp(struct aio_req_fsp_link *lnk)
 	fsp->aio_requests[i] = fsp->aio_requests[fsp->num_aio_requests];
 
 	if (fsp->num_aio_requests == 0) {
-		tevent_wait_done(fsp->deferred_close);
+		TALLOC_FREE(fsp->aio_requests);
 	}
 	return 0;
 }
@@ -129,9 +120,19 @@ bool aio_add_req_to_fsp(files_struct *fsp, struct tevent_req *req)
 	if (array_len <= fsp->num_aio_requests) {
 		struct tevent_req **tmp;
 
+		if (fsp->num_aio_requests + 10 < 10) {
+			/* Integer wrap. */
+			TALLOC_FREE(lnk);
+			return false;
+		}
+
+		/*
+		 * Allocate in blocks of 10 so we don't allocate
+		 * on every aio request.
+		 */
 		tmp = talloc_realloc(
 			fsp, fsp->aio_requests, struct tevent_req *,
-			fsp->num_aio_requests+1);
+			fsp->num_aio_requests+10);
 		if (tmp == NULL) {
 			TALLOC_FREE(lnk);
 			return false;
@@ -163,6 +164,12 @@ NTSTATUS schedule_aio_read_and_X(connection_struct *conn,
 	size_t bufsize;
 	size_t min_aio_read_size = lp_aio_read_size(SNUM(conn));
 	struct tevent_req *req;
+	bool ok;
+
+	ok = vfs_valid_pread_range(startpos, smb_maxcnt);
+	if (!ok) {
+		return NT_STATUS_INVALID_PARAMETER;
+	}
 
 	if (fsp->base_fsp != NULL) {
 		/* No AIO on streams yet */
@@ -180,16 +187,8 @@ NTSTATUS schedule_aio_read_and_X(connection_struct *conn,
 		return NT_STATUS_RETRY;
 	}
 
-	/* Only do this on non-chained and non-chaining reads not using the
-	 * write cache. */
-        if (req_is_in_chain(smbreq) || (lp_write_cache_size(SNUM(conn)) != 0)) {
-		return NT_STATUS_RETRY;
-	}
-
-	if (outstanding_aio_calls >= aio_pending_size) {
-		DEBUG(10,("schedule_aio_read_and_X: Already have %d aio "
-			  "activities outstanding.\n",
-			  outstanding_aio_calls ));
+	/* Only do this on non-chained and non-chaining reads */
+        if (req_is_in_chain(smbreq)) {
 		return NT_STATUS_RETRY;
 	}
 
@@ -213,7 +212,7 @@ NTSTATUS schedule_aio_read_and_X(connection_struct *conn,
 		&aio_ex->lock);
 
 	/* Take the lock until the AIO completes. */
-	if (!SMB_VFS_STRICT_LOCK(conn, fsp, &aio_ex->lock)) {
+	if (!SMB_VFS_STRICT_LOCK_CHECK(conn, fsp, &aio_ex->lock)) {
 		TALLOC_FREE(aio_ex);
 		return NT_STATUS_FILE_LOCK_CONFLICT;
 	}
@@ -228,7 +227,6 @@ NTSTATUS schedule_aio_read_and_X(connection_struct *conn,
 	if (req == NULL) {
 		DEBUG(0,("schedule_aio_read_and_X: aio_read failed. "
 			 "Error %s\n", strerror(errno) ));
-		SMB_VFS_STRICT_UNLOCK(conn, fsp, &aio_ex->lock);
 		TALLOC_FREE(aio_ex);
 		return NT_STATUS_RETRY;
 	}
@@ -236,7 +234,6 @@ NTSTATUS schedule_aio_read_and_X(connection_struct *conn,
 
 	if (!aio_add_req_to_fsp(fsp, req)) {
 		DEBUG(1, ("Could not add req to fsp\n"));
-		SMB_VFS_STRICT_UNLOCK(conn, fsp, &aio_ex->lock);
 		TALLOC_FREE(aio_ex);
 		return NT_STATUS_RETRY;
 	}
@@ -256,17 +253,16 @@ static void aio_pread_smb1_done(struct tevent_req *req)
 	struct aio_extra *aio_ex = tevent_req_callback_data(
 		req, struct aio_extra);
 	files_struct *fsp = aio_ex->fsp;
-	int outsize;
+	size_t outsize;
 	char *outbuf = (char *)aio_ex->outbuf.data;
-	char *data = smb_buf(outbuf) + 1 /* padding byte */;
 	ssize_t nread;
-	int err;
+	struct vfs_aio_state vfs_aio_state;
 
-	nread = SMB_VFS_PREAD_RECV(req, &err);
+	nread = SMB_VFS_PREAD_RECV(req, &vfs_aio_state);
 	TALLOC_FREE(req);
 
 	DEBUG(10, ("pread_recv returned %d, err = %s\n", (int)nread,
-		   (nread == -1) ? strerror(err) : "no error"));
+		   (nread == -1) ? strerror(vfs_aio_state.error) : "no error"));
 
 	if (fsp == NULL) {
 		DEBUG( 3, ("aio_pread_smb1_done: file closed whilst "
@@ -276,24 +272,15 @@ static void aio_pread_smb1_done(struct tevent_req *req)
 		return;
 	}
 
-	/* Unlock now we're done. */
-	SMB_VFS_STRICT_UNLOCK(fsp->conn, fsp, &aio_ex->lock);
-
 	if (nread < 0) {
 		DEBUG( 3, ("handle_aio_read_complete: file %s nread == %d. "
 			   "Error = %s\n", fsp_str_dbg(fsp), (int)nread,
-			   strerror(err)));
+			   strerror(vfs_aio_state.error)));
 
-		ERROR_NT(map_nt_error_from_unix(err));
+		ERROR_NT(map_nt_error_from_unix(vfs_aio_state.error));
 		outsize = srv_set_message(outbuf,0,0,true);
 	} else {
-		outsize = srv_set_message(outbuf, 12,
-					  nread + 1 /* padding byte */, false);
-		SSVAL(outbuf,smb_vwv2, 0xFFFF); /* Remaining - must be * -1. */
-		SSVAL(outbuf,smb_vwv5, nread);
-		SSVAL(outbuf,smb_vwv6, smb_offset(data,outbuf));
-		SSVAL(outbuf,smb_vwv7, ((nread >> 16) & 1));
-		SSVAL(smb_buf(outbuf), -2, nread);
+		outsize = setup_readX_header(outbuf, nread);
 
 		aio_ex->fsp->fh->pos = aio_ex->offset + nread;
 		aio_ex->fsp->fh->position_information = aio_ex->fsp->fh->pos;
@@ -303,7 +290,15 @@ static void aio_pread_smb1_done(struct tevent_req *req)
 			   (int)aio_ex->nbyte, (int)nread ) );
 
 	}
-	smb_setlen(outbuf, outsize - 4);
+
+	if (outsize <= 4) {
+		DBG_INFO("Invalid outsize (%zu)\n", outsize);
+		TALLOC_FREE(aio_ex);
+		return;
+	}
+	outsize -= 4;
+	_smb_setlen_large(outbuf, outsize);
+
 	show_msg(outbuf);
 	if (!srv_send_smb(aio_ex->smbreq->xconn, outbuf,
 			  true, aio_ex->smbreq->seqnum+1,
@@ -339,6 +334,7 @@ static struct tevent_req *pwrite_fsync_send(TALLOC_CTX *mem_ctx,
 {
 	struct tevent_req *req, *subreq;
 	struct pwrite_fsync_state *state;
+	bool ok;
 
 	req = tevent_req_create(mem_ctx, &state, struct pwrite_fsync_state);
 	if (req == NULL) {
@@ -347,6 +343,17 @@ static struct tevent_req *pwrite_fsync_send(TALLOC_CTX *mem_ctx,
 	state->ev = ev;
 	state->fsp = fsp;
 	state->write_through = write_through;
+
+	ok = vfs_valid_pwrite_range(offset, n);
+	if (!ok) {
+		tevent_req_error(req, EINVAL);
+		return tevent_req_post(req, ev);
+	}
+
+	if (n == 0) {
+		tevent_req_done(req);
+		return tevent_req_post(req, ev);
+	}
 
 	subreq = SMB_VFS_PWRITE_SEND(state, ev, fsp, data, n, offset);
 	if (tevent_req_nomem(subreq, req)) {
@@ -363,13 +370,13 @@ static void pwrite_fsync_write_done(struct tevent_req *subreq)
 	struct pwrite_fsync_state *state = tevent_req_data(
 		req, struct pwrite_fsync_state);
 	connection_struct *conn = state->fsp->conn;
-	int err;
 	bool do_sync;
+	struct vfs_aio_state vfs_aio_state;
 
-	state->nwritten = SMB_VFS_PWRITE_RECV(subreq, &err);
+	state->nwritten = SMB_VFS_PWRITE_RECV(subreq, &vfs_aio_state);
 	TALLOC_FREE(subreq);
 	if (state->nwritten == -1) {
-		tevent_req_error(req, err);
+		tevent_req_error(req, vfs_aio_state.error);
 		return;
 	}
 
@@ -391,12 +398,13 @@ static void pwrite_fsync_sync_done(struct tevent_req *subreq)
 {
 	struct tevent_req *req = tevent_req_callback_data(
 		subreq, struct tevent_req);
-	int ret, err;
+	int ret;
+	struct vfs_aio_state vfs_aio_state;
 
-	ret = SMB_VFS_FSYNC_RECV(subreq, &err);
+	ret = SMB_VFS_FSYNC_RECV(subreq, &vfs_aio_state);
 	TALLOC_FREE(subreq);
 	if (ret == -1) {
-		tevent_req_error(req, err);
+		tevent_req_error(req, vfs_aio_state.error);
 		return;
 	}
 	tevent_req_done(req);
@@ -446,22 +454,8 @@ NTSTATUS schedule_aio_write_and_X(connection_struct *conn,
 		return NT_STATUS_RETRY;
 	}
 
-	/* Only do this on non-chained and non-chaining writes not using the
-	 * write cache. */
-        if (req_is_in_chain(smbreq) || (lp_write_cache_size(SNUM(conn)) != 0)) {
-		return NT_STATUS_RETRY;
-	}
-
-	if (outstanding_aio_calls >= aio_pending_size) {
-		DEBUG(3,("schedule_aio_write_and_X: Already have %d aio "
-			 "activities outstanding.\n",
-			  outstanding_aio_calls ));
-		DEBUG(10,("schedule_aio_write_and_X: failed to schedule "
-			  "aio_write for file %s, offset %.0f, len = %u "
-			  "(mid = %u)\n",
-			  fsp_str_dbg(fsp), (double)startpos,
-			  (unsigned int)numtowrite,
-			  (unsigned int)smbreq->mid ));
+	/* Only do this on non-chained and non-chaining writes */
+        if (req_is_in_chain(smbreq)) {
 		return NT_STATUS_RETRY;
 	}
 
@@ -482,7 +476,7 @@ NTSTATUS schedule_aio_write_and_X(connection_struct *conn,
 		&aio_ex->lock);
 
 	/* Take the lock until the AIO completes. */
-	if (!SMB_VFS_STRICT_LOCK(conn, fsp, &aio_ex->lock)) {
+	if (!SMB_VFS_STRICT_LOCK_CHECK(conn, fsp, &aio_ex->lock)) {
 		TALLOC_FREE(aio_ex);
 		return NT_STATUS_FILE_LOCK_CONFLICT;
 	}
@@ -496,7 +490,6 @@ NTSTATUS schedule_aio_write_and_X(connection_struct *conn,
 	if (req == NULL) {
 		DEBUG(3,("schedule_aio_wrote_and_X: aio_write failed. "
 			 "Error %s\n", strerror(errno) ));
-		SMB_VFS_STRICT_UNLOCK(conn, fsp, &aio_ex->lock);
 		TALLOC_FREE(aio_ex);
 		return NT_STATUS_RETRY;
 	}
@@ -504,7 +497,6 @@ NTSTATUS schedule_aio_write_and_X(connection_struct *conn,
 
 	if (!aio_add_req_to_fsp(fsp, req)) {
 		DEBUG(1, ("Could not add req to fsp\n"));
-		SMB_VFS_STRICT_UNLOCK(conn, fsp, &aio_ex->lock);
 		TALLOC_FREE(aio_ex);
 		return NT_STATUS_RETRY;
 	}
@@ -516,7 +508,8 @@ NTSTATUS schedule_aio_write_and_X(connection_struct *conn,
 	contend_level2_oplocks_end(fsp, LEVEL2_CONTEND_WRITE);
 
 	if (!aio_ex->write_through && !lp_sync_always(SNUM(fsp->conn))
-	    && fsp->aio_write_behind) {
+	    && fsp->fsp_flags.aio_write_behind)
+	{
 		/* Lie to the client and immediately claim we finished the
 		 * write. */
 	        SSVAL(aio_ex->outbuf.data,smb_vwv2,numtowrite);
@@ -535,10 +528,9 @@ NTSTATUS schedule_aio_write_and_X(connection_struct *conn,
 	}
 
 	DEBUG(10,("schedule_aio_write_and_X: scheduled aio_write for file "
-		  "%s, offset %.0f, len = %u (mid = %u) "
-		  "outstanding_aio_calls = %d\n",
+		  "%s, offset %.0f, len = %u (mid = %u)\n",
 		  fsp_str_dbg(fsp), (double)startpos, (unsigned int)numtowrite,
-		  (unsigned int)aio_ex->smbreq->mid, outstanding_aio_calls ));
+		  (unsigned int)aio_ex->smbreq->mid));
 
 	return NT_STATUS_OK;
 }
@@ -567,12 +559,9 @@ static void aio_pwrite_smb1_done(struct tevent_req *req)
 		return;
 	}
 
-	/* Unlock now we're done. */
-	SMB_VFS_STRICT_UNLOCK(fsp->conn, fsp, &aio_ex->lock);
-
 	mark_file_modified(fsp);
 
-	if (fsp->aio_write_behind) {
+	if (fsp->fsp_flags.aio_write_behind) {
 
 		if (nwritten != numtowrite) {
 			if (nwritten == -1) {
@@ -659,12 +648,16 @@ bool cancel_smb2_aio(struct smb_request *smbreq)
 	}
 
 	/*
-	 * We let the aio request run. Setting fsp to NULL has the
-	 * effect that the _done routines don't send anything out.
+	 * We let the aio request run and don't try to cancel it which means
+	 * processing of the SMB2 request must continue as normal, cf MS-SMB2
+	 * 3.3.5.16:
+	 *
+	 *   If the target request is not successfully canceled, processing of
+	 *   the target request MUST continue and no response is sent to the
+	 *   cancel request.
 	 */
 
-	aio_ex->fsp = NULL;
-	return true;
+	return false;
 }
 
 static void aio_pread_smb2_done(struct tevent_req *req);
@@ -684,6 +677,12 @@ NTSTATUS schedule_smb2_aio_read(connection_struct *conn,
 	struct aio_extra *aio_ex;
 	size_t min_aio_read_size = lp_aio_read_size(SNUM(conn));
 	struct tevent_req *req;
+	bool ok;
+
+	ok = vfs_valid_pread_range(startpos, smb_maxcnt);
+	if (!ok) {
+		return NT_STATUS_INVALID_PARAMETER;
+	}
 
 	if (fsp->base_fsp != NULL) {
 		/* No AIO on streams yet */
@@ -706,15 +705,7 @@ NTSTATUS schedule_smb2_aio_read(connection_struct *conn,
 		return NT_STATUS_RETRY;
 	}
 
-	/* Only do this on reads not using the write cache. */
-	if (lp_write_cache_size(SNUM(conn)) != 0) {
-		return NT_STATUS_RETRY;
-	}
-
-	if (outstanding_aio_calls >= aio_pending_size) {
-		DEBUG(10,("smb2: Already have %d aio "
-			"activities outstanding.\n",
-			outstanding_aio_calls ));
+	if (smbd_smb2_is_compound(smbreq->smb2req)) {
 		return NT_STATUS_RETRY;
 	}
 
@@ -733,7 +724,7 @@ NTSTATUS schedule_smb2_aio_read(connection_struct *conn,
 		&aio_ex->lock);
 
 	/* Take the lock until the AIO completes. */
-	if (!SMB_VFS_STRICT_LOCK(conn, fsp, &aio_ex->lock)) {
+	if (!SMB_VFS_STRICT_LOCK_CHECK(conn, fsp, &aio_ex->lock)) {
 		TALLOC_FREE(aio_ex);
 		return NT_STATUS_FILE_LOCK_CONFLICT;
 	}
@@ -746,7 +737,6 @@ NTSTATUS schedule_smb2_aio_read(connection_struct *conn,
 	if (req == NULL) {
 		DEBUG(0, ("smb2: SMB_VFS_PREAD_SEND failed. "
 			  "Error %s\n", strerror(errno)));
-		SMB_VFS_STRICT_UNLOCK(conn, fsp, &aio_ex->lock);
 		TALLOC_FREE(aio_ex);
 		return NT_STATUS_RETRY;
 	}
@@ -754,7 +744,6 @@ NTSTATUS schedule_smb2_aio_read(connection_struct *conn,
 
 	if (!aio_add_req_to_fsp(fsp, req)) {
 		DEBUG(1, ("Could not add req to fsp\n"));
-		SMB_VFS_STRICT_UNLOCK(conn, fsp, &aio_ex->lock);
 		TALLOC_FREE(aio_ex);
 		return NT_STATUS_RETRY;
 	}
@@ -780,29 +769,18 @@ static void aio_pread_smb2_done(struct tevent_req *req)
 	files_struct *fsp = aio_ex->fsp;
 	NTSTATUS status;
 	ssize_t nread;
-	int err = 0;
+	struct vfs_aio_state vfs_aio_state = { 0 };
 
-	nread = SMB_VFS_PREAD_RECV(req, &err);
+	nread = SMB_VFS_PREAD_RECV(req, &vfs_aio_state);
 	TALLOC_FREE(req);
 
 	DEBUG(10, ("pread_recv returned %d, err = %s\n", (int)nread,
-		   (nread == -1) ? strerror(err) : "no error"));
-
-	if (fsp == NULL) {
-		DEBUG(3, ("%s: request cancelled (mid[%ju])\n",
-			  __func__, (uintmax_t)aio_ex->smbreq->mid));
-		TALLOC_FREE(aio_ex);
-		tevent_req_nterror(subreq, NT_STATUS_INTERNAL_ERROR);
-		return;
-	}
-
-	/* Unlock now we're done. */
-	SMB_VFS_STRICT_UNLOCK(fsp->conn, fsp, &aio_ex->lock);
+		   (nread == -1) ? strerror(vfs_aio_state.error) : "no error"));
 
 	/* Common error or success code processing for async or sync
 	   read returns. */
 
-	status = smb2_read_complete(subreq, nread, err);
+	status = smb2_read_complete(subreq, nread, vfs_aio_state.error);
 
 	if (nread > 0) {
 		fsp->fh->pos = aio_ex->offset + nread;
@@ -815,7 +793,7 @@ static void aio_pread_smb2_done(struct tevent_req *req)
 		   fsp_str_dbg(aio_ex->fsp),
 		   (double)aio_ex->offset,
 		   (unsigned int)nread,
-		   err, nt_errstr(status)));
+		   vfs_aio_state.error, nt_errstr(status)));
 
 	if (!NT_STATUS_IS_OK(status)) {
 		tevent_req_nterror(subreq, status);
@@ -862,15 +840,7 @@ NTSTATUS schedule_aio_smb2_write(connection_struct *conn,
 		return NT_STATUS_RETRY;
 	}
 
-	/* Only do this on writes not using the write cache. */
-	if (lp_write_cache_size(SNUM(conn)) != 0) {
-		return NT_STATUS_RETRY;
-	}
-
-	if (outstanding_aio_calls >= aio_pending_size) {
-		DEBUG(3,("smb2: Already have %d aio "
-			"activities outstanding.\n",
-			outstanding_aio_calls ));
+	if (smbd_smb2_is_compound(smbreq->smb2req)) {
 		return NT_STATUS_RETRY;
 	}
 
@@ -890,7 +860,7 @@ NTSTATUS schedule_aio_smb2_write(connection_struct *conn,
 		&aio_ex->lock);
 
 	/* Take the lock until the AIO completes. */
-	if (!SMB_VFS_STRICT_LOCK(conn, fsp, &aio_ex->lock)) {
+	if (!SMB_VFS_STRICT_LOCK_CHECK(conn, fsp, &aio_ex->lock)) {
 		TALLOC_FREE(aio_ex);
 		return NT_STATUS_FILE_LOCK_CONFLICT;
 	}
@@ -904,7 +874,6 @@ NTSTATUS schedule_aio_smb2_write(connection_struct *conn,
 	if (req == NULL) {
 		DEBUG(3, ("smb2: SMB_VFS_PWRITE_SEND failed. "
 			  "Error %s\n", strerror(errno)));
-		SMB_VFS_STRICT_UNLOCK(conn, fsp, &aio_ex->lock);
 		TALLOC_FREE(aio_ex);
 		return NT_STATUS_RETRY;
 	}
@@ -912,7 +881,6 @@ NTSTATUS schedule_aio_smb2_write(connection_struct *conn,
 
 	if (!aio_add_req_to_fsp(fsp, req)) {
 		DEBUG(1, ("Could not add req to fsp\n"));
-		SMB_VFS_STRICT_UNLOCK(conn, fsp, &aio_ex->lock);
 		TALLOC_FREE(aio_ex);
 		return NT_STATUS_RETRY;
 	}
@@ -933,13 +901,11 @@ NTSTATUS schedule_aio_smb2_write(connection_struct *conn,
 	 */
 
 	DEBUG(10,("smb2: scheduled aio_write for file "
-		"%s, offset %.0f, len = %u (mid = %u) "
-		"outstanding_aio_calls = %d\n",
+		"%s, offset %.0f, len = %u (mid = %u)\n",
 		fsp_str_dbg(fsp),
 		(double)in_offset,
 		(unsigned int)in_data.length,
-		(unsigned int)aio_ex->smbreq->mid,
-		outstanding_aio_calls ));
+		(unsigned int)aio_ex->smbreq->mid));
 
 	return NT_STATUS_OK;
 }
@@ -960,17 +926,6 @@ static void aio_pwrite_smb2_done(struct tevent_req *req)
 
 	DEBUG(10, ("pwrite_recv returned %d, err = %s\n", (int)nwritten,
 		   (nwritten == -1) ? strerror(err) : "no error"));
-
-	if (fsp == NULL) {
-		DEBUG(3, ("%s: request cancelled (mid[%ju])\n",
-			  __func__, (uintmax_t)aio_ex->smbreq->mid));
-		TALLOC_FREE(aio_ex);
-		tevent_req_nterror(subreq, NT_STATUS_INTERNAL_ERROR);
-		return;
-	}
-
-	/* Unlock now we're done. */
-	SMB_VFS_STRICT_UNLOCK(fsp->conn, fsp, &aio_ex->lock);
 
 	mark_file_modified(fsp);
 

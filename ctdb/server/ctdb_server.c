@@ -17,12 +17,22 @@
    along with this program; if not, see <http://www.gnu.org/licenses/>.
 */
 
-#include "includes.h"
-#include "tdb.h"
-#include "lib/util/dlinklist.h"
+#include "replace.h"
 #include "system/network.h"
 #include "system/filesys.h"
-#include "../include/ctdb_private.h"
+
+#include <talloc.h>
+#include <tevent.h>
+
+#include "lib/util/dlinklist.h"
+#include "lib/util/debug.h"
+#include "lib/util/samba_util.h"
+
+#include "ctdb_private.h"
+#include "ctdb_client.h"
+
+#include "common/common.h"
+#include "common/logging.h"
 
 /*
   choose the transport we will use
@@ -35,55 +45,46 @@ int ctdb_set_transport(struct ctdb_context *ctdb, const char *transport)
 	return 0;
 }
 
-/*
-  Check whether an ip is a valid node ip
-  Returns the node id for this ip address or -1
-*/
-int ctdb_ip_to_nodeid(struct ctdb_context *ctdb, const ctdb_sock_addr *nodeip)
+/* Return the node structure for nodeip, NULL if nodeip is invalid */
+struct ctdb_node *ctdb_ip_to_node(struct ctdb_context *ctdb,
+				  const ctdb_sock_addr *nodeip)
 {
-	int nodeid;
+	unsigned int nodeid;
 
 	for (nodeid=0;nodeid<ctdb->num_nodes;nodeid++) {
 		if (ctdb->nodes[nodeid]->flags & NODE_FLAGS_DELETED) {
 			continue;
 		}
 		if (ctdb_same_ip(&ctdb->nodes[nodeid]->address, nodeip)) {
-			return nodeid;
+			return ctdb->nodes[nodeid];
 		}
 	}
 
-	return -1;
+	return NULL;
 }
 
-/*
-  choose the recovery lock file
-*/
-int ctdb_set_recovery_lock_file(struct ctdb_context *ctdb, const char *file)
+/* Return the PNN for nodeip, CTDB_UNKNOWN_PNN if nodeip is invalid */
+uint32_t ctdb_ip_to_pnn(struct ctdb_context *ctdb,
+			const ctdb_sock_addr *nodeip)
 {
-	if (ctdb->recovery_lock_file != NULL) {
-		talloc_free(ctdb->recovery_lock_file);
-		ctdb->recovery_lock_file = NULL;
+	struct ctdb_node *node;
+
+	node = ctdb_ip_to_node(ctdb, nodeip);
+	if (node == NULL) {
+		return CTDB_UNKNOWN_PNN;
 	}
 
-	if (file == NULL) {
-		DEBUG(DEBUG_ALERT,("Recovery lock file set to \"\". Disabling recovery lock checking\n"));
-		return 0;
-	}
-
-	ctdb->recovery_lock_file = talloc_strdup(ctdb, file);
-	CTDB_NO_MEMORY(ctdb, ctdb->recovery_lock_file);
-
-	return 0;
+	return node->pnn;
 }
 
 /* Load a nodes list file into a nodes array */
 static int convert_node_map_to_list(struct ctdb_context *ctdb,
 				    TALLOC_CTX *mem_ctx,
-				    struct ctdb_node_map *node_map,
+				    struct ctdb_node_map_old *node_map,
 				    struct ctdb_node ***nodes,
 				    uint32_t *num_nodes)
 {
-	int i;
+	unsigned int i;
 
 	*nodes = talloc_zero_array(mem_ctx,
 					struct ctdb_node *, node_map->num);
@@ -119,7 +120,7 @@ static int convert_node_map_to_list(struct ctdb_context *ctdb,
 /* Load the nodes list from a file */
 void ctdb_load_nodes_file(struct ctdb_context *ctdb)
 {
-	struct ctdb_node_map *node_map;
+	struct ctdb_node_map_old *node_map;
 	int ret;
 
 	node_map = ctdb_read_nodes_file(ctdb, ctdb->nodes_file);
@@ -168,7 +169,7 @@ int ctdb_set_address(struct ctdb_context *ctdb, const char *address)
 */
 uint32_t ctdb_get_num_active_nodes(struct ctdb_context *ctdb)
 {
-	int i;
+	unsigned int i;
 	uint32_t count=0;
 	for (i=0; i < ctdb->num_nodes; i++) {
 		if (!(ctdb->nodes[i]->flags & NODE_FLAGS_INACTIVE)) {
@@ -203,7 +204,7 @@ void ctdb_input_pkt(struct ctdb_context *ctdb, struct ctdb_req_header *hdr)
 	case CTDB_REPLY_CALL:
 	case CTDB_REQ_DMASTER:
 	case CTDB_REPLY_DMASTER:
-		/* we dont allow these calls when banned */
+		/* we don't allow these calls when banned */
 		if (ctdb->nodes[ctdb->pnn]->flags & NODE_FLAGS_BANNED) {
 			DEBUG(DEBUG_DEBUG,(__location__ " ctdb operation %u"
 				" request %u"
@@ -276,6 +277,12 @@ void ctdb_input_pkt(struct ctdb_context *ctdb, struct ctdb_req_header *hdr)
 
 	case CTDB_REQ_KEEPALIVE:
 		CTDB_INCREMENT_STAT(ctdb, keepalive_packets_recv);
+		ctdb_request_keepalive(ctdb, hdr);
+		break;
+
+	case CTDB_REQ_TUNNEL:
+		CTDB_INCREMENT_STAT(ctdb, node.req_tunnel);
+		ctdb_request_tunnel(ctdb, hdr);
 		break;
 
 	default:
@@ -294,6 +301,12 @@ done:
 */
 void ctdb_node_dead(struct ctdb_node *node)
 {
+	if (node->ctdb->methods == NULL) {
+		DBG_ERR("Can not restart transport while shutting down\n");
+		return;
+	}
+	node->ctdb->methods->restart(node);
+
 	if (node->flags & NODE_FLAGS_DISCONNECTED) {
 		DEBUG(DEBUG_INFO,("%s: node %s is already marked disconnected: %u connected\n", 
 			 node->ctdb->name, node->name, 
@@ -305,16 +318,9 @@ void ctdb_node_dead(struct ctdb_node *node)
 	node->rx_cnt = 0;
 	node->dead_count = 0;
 
-	DEBUG(DEBUG_NOTICE,("%s: node %s is dead: %u connected\n", 
+	DEBUG(DEBUG_ERR,("%s: node %s is dead: %u connected\n",
 		 node->ctdb->name, node->name, node->ctdb->num_connected));
 	ctdb_daemon_cancel_controls(node->ctdb, node);
-
-	if (node->ctdb->methods == NULL) {
-		DEBUG(DEBUG_ERR,(__location__ " Can not restart transport while shutting down daemon.\n"));
-		return;
-	}
-
-	node->ctdb->methods->restart(node);
 }
 
 /*
@@ -332,7 +338,7 @@ void ctdb_node_connected(struct ctdb_node *node)
 	node->dead_count = 0;
 	node->flags &= ~NODE_FLAGS_DISCONNECTED;
 	node->flags |= NODE_FLAGS_UNHEALTHY;
-	DEBUG(DEBUG_NOTICE,
+	DEBUG(DEBUG_ERR,
 	      ("%s: connected to %s - %u connected\n", 
 	       node->ctdb->name, node->name, node->ctdb->num_connected));
 }
@@ -346,7 +352,8 @@ struct queue_next {
 /*
   triggered when a deferred packet is due
  */
-static void queue_next_trigger(struct event_context *ev, struct timed_event *te, 
+static void queue_next_trigger(struct tevent_context *ev,
+			       struct tevent_timer *te,
 			       struct timeval t, void *private_data)
 {
 	struct queue_next *q = talloc_get_type(private_data, struct queue_next);
@@ -367,8 +374,9 @@ static void ctdb_defer_packet(struct ctdb_context *ctdb, struct ctdb_req_header 
 		return;
 	}
 	q->ctdb = ctdb;
-	q->hdr = talloc_memdup(ctdb, hdr, hdr->length);
+	q->hdr = talloc_memdup(q, hdr, hdr->length);
 	if (q->hdr == NULL) {
+		talloc_free(q);
 		DEBUG(DEBUG_ERR,("Error copying deferred packet to self\n"));
 		return;
 	}
@@ -376,7 +384,7 @@ static void ctdb_defer_packet(struct ctdb_context *ctdb, struct ctdb_req_header 
 	/* use this to put packets directly into our recv function */
 	ctdb_input_pkt(q->ctdb, q->hdr);
 #else
-	event_add_timed(ctdb->ev, q, timeval_zero(), queue_next_trigger, q);
+	tevent_add_timer(ctdb->ev, q, timeval_zero(), queue_next_trigger, q);
 #endif
 }
 
@@ -387,7 +395,7 @@ static void ctdb_defer_packet(struct ctdb_context *ctdb, struct ctdb_req_header 
 static void ctdb_broadcast_packet_all(struct ctdb_context *ctdb, 
 				      struct ctdb_req_header *hdr)
 {
-	int i;
+	unsigned int i;
 	for (i=0; i < ctdb->num_nodes; i++) {
 		if (ctdb->nodes[i]->flags & NODE_FLAGS_DELETED) {
 			continue;
@@ -398,14 +406,18 @@ static void ctdb_broadcast_packet_all(struct ctdb_context *ctdb,
 }
 
 /*
-  broadcast a packet to all nodes in the current vnnmap
+  broadcast a packet to all active nodes
 */
-static void ctdb_broadcast_packet_vnnmap(struct ctdb_context *ctdb, 
+static void ctdb_broadcast_packet_active(struct ctdb_context *ctdb,
 					 struct ctdb_req_header *hdr)
 {
-	int i;
-	for (i=0;i<ctdb->vnn_map->size;i++) {
-		hdr->destnode = ctdb->vnn_map->map[i];
+	unsigned int i;
+	for (i = 0; i < ctdb->num_nodes; i++) {
+		if (ctdb->nodes[i]->flags & NODE_FLAGS_INACTIVE) {
+			continue;
+		}
+
+		hdr->destnode = ctdb->nodes[i]->pnn;
 		ctdb_queue_packet(ctdb, hdr);
 	}
 }
@@ -416,7 +428,7 @@ static void ctdb_broadcast_packet_vnnmap(struct ctdb_context *ctdb,
 static void ctdb_broadcast_packet_connected(struct ctdb_context *ctdb, 
 					    struct ctdb_req_header *hdr)
 {
-	int i;
+	unsigned int i;
 	for (i=0; i < ctdb->num_nodes; i++) {
 		if (ctdb->nodes[i]->flags & NODE_FLAGS_DELETED) {
 			continue;
@@ -439,8 +451,8 @@ void ctdb_queue_packet(struct ctdb_context *ctdb, struct ctdb_req_header *hdr)
 	case CTDB_BROADCAST_ALL:
 		ctdb_broadcast_packet_all(ctdb, hdr);
 		return;
-	case CTDB_BROADCAST_VNNMAP:
-		ctdb_broadcast_packet_vnnmap(ctdb, hdr);
+	case CTDB_BROADCAST_ACTIVE:
+		ctdb_broadcast_packet_active(ctdb, hdr);
 		return;
 	case CTDB_BROADCAST_CONNECTED:
 		ctdb_broadcast_packet_connected(ctdb, hdr);

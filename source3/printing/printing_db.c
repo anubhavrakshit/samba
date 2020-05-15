@@ -35,7 +35,7 @@ static struct tdb_print_db *print_db_head;
 struct tdb_print_db *get_print_db_byname(const char *printername)
 {
 	struct tdb_print_db *p = NULL, *last_entry = NULL;
-	int num_open = 0;
+	size_t num_open = 0;
 	char *printdb_path = NULL;
 	bool done_become_root = False;
 	char *print_cache_path;
@@ -95,7 +95,7 @@ struct tdb_print_db *get_print_db_byname(const char *printername)
 		DLIST_ADD(print_db_head, p);
 	}
 
-	print_cache_path = cache_path("printing/");
+	print_cache_path = cache_path(talloc_tos(), "printing/");
 	if (print_cache_path == NULL) {
 		DLIST_REMOVE(print_db_head, p);
 		SAFE_FREE(p);
