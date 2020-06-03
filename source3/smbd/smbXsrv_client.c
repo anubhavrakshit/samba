@@ -294,6 +294,13 @@ NTSTATUS smb2srv_client_lookup_global(struct smbXsrv_client *client,
 		return NT_STATUS_OBJECTID_NOT_FOUND;
 	}
 
+	if (global == NULL) {
+		/*
+		 * most likely ndr_pull_struct_blob() failed
+		 */
+		return NT_STATUS_INTERNAL_DB_CORRUPTION;
+	}
+
 	*_global = global;
 	return NT_STATUS_OK;
 }
@@ -374,6 +381,10 @@ static NTSTATUS smbXsrv_client_global_store(struct smbXsrv_client_global0 *globa
 	 * we would add glue code here, that would be able to
 	 * store the information in the old format.
 	 */
+
+	SMB_ASSERT(global->local_address != NULL);
+	SMB_ASSERT(global->remote_address != NULL);
+	SMB_ASSERT(global->remote_name != NULL);
 
 	if (global->db_rec == NULL) {
 		return NT_STATUS_INTERNAL_ERROR;
@@ -512,7 +523,9 @@ NTSTATUS smbXsrv_client_create(TALLOC_CTX *mem_ctx,
 	client->msg_ctx = msg_ctx;
 
 	client->server_multi_channel_enabled = lp_server_multi_channel_support();
-
+	if (client->server_multi_channel_enabled) {
+		client->next_channel_id = 1;
+	}
 	client->table = talloc_move(client, &table);
 	table = client->table;
 
@@ -539,7 +552,7 @@ NTSTATUS smbXsrv_client_create(TALLOC_CTX *mem_ctx,
 		};
 		struct GUID_txt_buf buf;
 
-		DBG_DEBUG("client_guid[%s] stored\n",
+		DBG_DEBUG("client_guid[%s] created\n",
 			  GUID_buf_string(&global->client_guid, &buf));
 		NDR_PRINT_DEBUG(smbXsrv_clientB, &client_blob);
 	}
@@ -662,7 +675,10 @@ static void smbXsrv_client_connection_pass_loop(struct tevent_req *subreq)
 
 	DBG_ERR("got connection sockfd[%d]\n", sock_fd);
 	NDR_PRINT_DEBUG(smbXsrv_connection_passB, &pass_blob);
-	status = smbd_add_connection(client, sock_fd, &xconn);
+	status = smbd_add_connection(client,
+				     sock_fd,
+				     pass_info0->initial_connect_time,
+				     &xconn);
 	if (!NT_STATUS_IS_OK(status)) {
 		close(sock_fd);
 		sock_fd = -1;

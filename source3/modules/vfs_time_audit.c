@@ -352,7 +352,7 @@ static NTSTATUS smb_time_audit_create_dfs_pathat(struct vfs_handle_struct *handl
 static NTSTATUS smb_time_audit_read_dfs_pathat(struct vfs_handle_struct *handle,
 			TALLOC_CTX *mem_ctx,
 			struct files_struct *dirfsp,
-			const struct smb_filename *smb_fname,
+			struct smb_filename *smb_fname,
 			struct referral **ppreflist,
 			size_t *preferral_count)
 {
@@ -584,22 +584,29 @@ static int smb_time_audit_closedir(vfs_handle_struct *handle,
 	return result;
 }
 
-static int smb_time_audit_open(vfs_handle_struct *handle,
-			       struct smb_filename *fname,
-			       files_struct *fsp,
-			       int flags, mode_t mode)
+static int smb_time_audit_openat(vfs_handle_struct *handle,
+				 const struct files_struct *dirfsp,
+				 const struct smb_filename *smb_fname,
+				 struct files_struct *fsp,
+				 int flags,
+				 mode_t mode)
 {
 	int result;
 	struct timespec ts1,ts2;
 	double timediff;
 
 	clock_gettime_mono(&ts1);
-	result = SMB_VFS_NEXT_OPEN(handle, fname, fsp, flags, mode);
+	result = SMB_VFS_NEXT_OPENAT(handle,
+				     dirfsp,
+				     smb_fname,
+				     fsp,
+				     flags,
+				     mode);
 	clock_gettime_mono(&ts2);
 	timediff = nsec_time_diff(&ts2,&ts1)*1.0e-9;
 
 	if (timediff > audit_timeout) {
-		smb_time_audit_log_fsp("open", timediff, fsp);
+		smb_time_audit_log_fsp("openat", timediff, fsp);
 	}
 
 	return result;
@@ -607,6 +614,7 @@ static int smb_time_audit_open(vfs_handle_struct *handle,
 
 static NTSTATUS smb_time_audit_create_file(vfs_handle_struct *handle,
 					   struct smb_request *req,
+					   struct files_struct **dirfsp,
 					   struct smb_filename *fname,
 					   uint32_t access_mask,
 					   uint32_t share_access,
@@ -632,6 +640,7 @@ static NTSTATUS smb_time_audit_create_file(vfs_handle_struct *handle,
 	result = SMB_VFS_NEXT_CREATE_FILE(
 		handle,					/* handle */
 		req,					/* req */
+		dirfsp,					/* dirfsp */
 		fname,					/* fname */
 		access_mask,				/* access_mask */
 		share_access,				/* share_access */
@@ -2854,7 +2863,7 @@ static struct vfs_fn_pointers vfs_time_audit_fns = {
 	.rewind_dir_fn = smb_time_audit_rewinddir,
 	.mkdirat_fn = smb_time_audit_mkdirat,
 	.closedir_fn = smb_time_audit_closedir,
-	.open_fn = smb_time_audit_open,
+	.openat_fn = smb_time_audit_openat,
 	.create_file_fn = smb_time_audit_create_file,
 	.close_fn = smb_time_audit_close,
 	.pread_fn = smb_time_audit_pread,

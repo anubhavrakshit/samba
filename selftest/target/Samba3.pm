@@ -237,6 +237,7 @@ sub check_env($$)
 	ad_member_rfc2307   => ["ad_dc_ntvfs"],
 	ad_member_idmap_rid => ["ad_dc"],
 	ad_member_idmap_ad  => ["fl2008r2dc"],
+	ad_member_fips      => ["ad_dc_fips"],
 
 	clusteredmember_smb1 => ["nt4_dc"],
 );
@@ -643,19 +644,17 @@ sub setup_clusteredmember_smb1
 	return $ret;
 }
 
-sub setup_ad_member
+sub provision_ad_member
 {
-	my ($self, $prefix, $dcvars, $trustvars_f, $trustvars_e) = @_;
+	my ($self,
+	    $prefix,
+	    $dcvars,
+	    $trustvars_f,
+	    $trustvars_e,
+	    $force_fips_mode) = @_;
 
 	my $prefix_abs = abs_path($prefix);
 	my @dirs = ();
-
-	# If we didn't build with ADS, pretend this env was never available
-	if (not $self->have_ads()) {
-	        return "UNKNOWN";
-	}
-
-	print "PROVISIONING S3 AD MEMBER...";
 
 	mkdir($prefix_abs, 0777);
 
@@ -747,6 +746,11 @@ sub setup_ad_member
 
 	$ret->{KRB5_CONFIG} = $ctx->{krb5_conf};
 
+	if (defined($force_fips_mode)) {
+		$ret->{GNUTLS_FORCE_FIPS_MODE} = "1";
+		$ret->{OPENSSL_FORCE_FIPS_MODE} = "1";
+	}
+
 	my $net = Samba::bindir_path($self, "net");
 	# Add hosts file for name lookups
 	my $cmd = "NSS_WRAPPER_HOSTS='$ret->{NSS_WRAPPER_HOSTS}' ";
@@ -756,11 +760,15 @@ sub setup_ad_member
 	} else {
 		$cmd .= "RESOLV_WRAPPER_HOSTS=\"$ret->{RESOLV_WRAPPER_HOSTS}\" ";
 	}
+	if (defined($force_fips_mode)) {
+		$cmd .= "GNUTLS_FORCE_FIPS_MODE=1 ";
+		$cmd .= "OPENSSL_FORCE_FIPS_MODE=1 ";
+	}
 	$cmd .= "RESOLV_CONF=\"$ret->{RESOLV_CONF}\" ";
 	$cmd .= "KRB5_CONFIG=\"$ret->{KRB5_CONFIG}\" ";
 	$cmd .= "SELFTEST_WINBINDD_SOCKET_DIR=\"$ret->{SELFTEST_WINBINDD_SOCKET_DIR}\" ";
 	$cmd .= "$net join $ret->{CONFIGURATION}";
-	$cmd .= " -U$dcvars->{USERNAME}\%$dcvars->{PASSWORD}";
+	$cmd .= " -U$dcvars->{USERNAME}\%$dcvars->{PASSWORD} -k";
 
 	if (system($cmd) != 0) {
 	    warn("Join failed\n$cmd");
@@ -809,6 +817,24 @@ sub setup_ad_member
 	$ret->{TRUST_E_BOTH_REALM} = $trustvars_e->{REALM};
 
 	return $ret;
+}
+
+sub setup_ad_member
+{
+	my ($self,
+	    $prefix,
+	    $dcvars,
+	    $trustvars_f,
+	    $trustvars_e) = @_;
+
+	# If we didn't build with ADS, pretend this env was never available
+	if (not $self->have_ads()) {
+	        return "UNKNOWN";
+	}
+
+	print "PROVISIONING AD MEMBER...";
+
+	return $self->provision_ad_member($prefix, $dcvars, $trustvars_f, $trustvars_e);
 }
 
 sub setup_ad_member_rfc2307
@@ -1110,6 +1136,28 @@ sub setup_ad_member_idmap_ad
 	$ret->{TRUST_DOMSID} = $dcvars->{TRUST_DOMSID};
 
 	return $ret;
+}
+
+sub setup_ad_member_fips
+{
+	my ($self,
+	    $prefix,
+	    $dcvars,
+	    $trustvars_f,
+	    $trustvars_e) = @_;
+
+	# If we didn't build with ADS, pretend this env was never available
+	if (not $self->have_ads()) {
+	        return "UNKNOWN";
+	}
+
+	print "PROVISIONING AD FIPS MEMBER...";
+
+	return $self->provision_ad_member($prefix,
+					  $dcvars,
+					  $trustvars_f,
+					  $trustvars_e,
+					  1);
 }
 
 sub setup_simpleserver
@@ -3004,12 +3052,22 @@ sub wait_for_start($$$$$)
 
 	    my $count = 0;
 	    do {
-		$cmd = Samba::bindir_path($self, "smbclient");
-		$cmd .= " $envvars->{CONFIGURATION}";
-		$cmd .= " -L $envvars->{SERVER}";
-		$cmd .= " -U%";
-		$cmd .= " -I $envvars->{SERVER_IP}";
-		$cmd .= " -p 139";
+		if (defined($envvars->{GNUTLS_FORCE_FIPS_MODE})) {
+			# We don't have NTLM in FIPS mode, so lets use
+			# smbcontrol instead of smbclient.
+			$cmd = Samba::bindir_path($self, "smbcontrol");
+			$cmd .= " $envvars->{CONFIGURATION}";
+			$cmd .= " smbd ping";
+		} else {
+			# This uses NTLM which is not available in FIPS
+			$cmd = Samba::bindir_path($self, "smbclient");
+			$cmd .= " $envvars->{CONFIGURATION}";
+			$cmd .= " -L $envvars->{SERVER}";
+			$cmd .= " -U%";
+			$cmd .= " -I $envvars->{SERVER_IP}";
+			$cmd .= " -p 139";
+		}
+
 		$ret = system($cmd);
 		if ($ret != 0) {
 		    sleep(1);

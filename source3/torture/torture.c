@@ -148,10 +148,6 @@ static struct cli_state *open_nbt_connection(void)
 		flags |= CLI_FULL_CONNECTION_LEVEL_II_OPLOCKS;
 	}
 
-	if (use_kerberos) {
-		flags |= CLI_FULL_CONNECTION_USE_KERBEROS;
-	}
-
 	if (force_dos_errors) {
 		flags |= CLI_FULL_CONNECTION_FORCE_DOS_ERRORS;
 	}
@@ -1013,21 +1009,6 @@ static bool run_readwritelarge_internal(void)
 		       (unsigned long)fsize);
 		correct = False;
 	}
-
-#if 0
-	/* ToDo - set allocation. JRA */
-	if(!cli_set_allocation_size(cli1, fnum1, 0)) {
-		printf("set allocation size to zero failed (%s)\n", cli_errstr(&cli1));
-		return False;
-	}
-	if (!cli_qfileinfo_basic(cli1, fnum1, NULL, &fsize, NULL, NULL, NULL,
-				 NULL, NULL)) {
-		printf("qfileinfo failed (%s)\n", cli_errstr(cli1));
-		correct = False;
-	}
-	if (fsize != 0)
-		printf("readwritelarge test 3 (truncate test) succeeded (size = %x)\n", fsize);
-#endif
 
 	status = cli_close(cli1, fnum1);
 	if (!NT_STATUS_IS_OK(status)) {
@@ -6341,27 +6322,6 @@ static bool run_rename(int dummy)
 	}
 
 
-#if 0
-  {
-	uint16_t fnum2;
-
-	if (!NT_STATUS_IS_OK(cli_ntcreate(cli1, fname, 0, DELETE_ACCESS, FILE_ATTRIBUTE_NORMAL,
-				   FILE_SHARE_NONE, FILE_OVERWRITE_IF, 0, 0, &fnum2, NULL))) {
-		printf("Fourth open failed - %s\n", cli_errstr(cli1));
-		return False;
-	}
-	if (!NT_STATUS_IS_OK(cli_nt_delete_on_close(cli1, fnum2, true))) {
-		printf("[8] setting delete_on_close on file failed !\n");
-		return False;
-	}
-
-	if (!NT_STATUS_IS_OK(cli_close(cli1, fnum2))) {
-		printf("close - 4 failed (%s)\n", cli_errstr(cli1));
-		return False;
-	}
-  }
-#endif
-
 	status = cli_rename(cli1, fname, fname1, false);
 	if (!NT_STATUS_IS_OK(status)) {
 		printf("Third rename failed (SHARE_NONE) - this should have succeeded - %s\n", nt_errstr(status));
@@ -6425,21 +6385,6 @@ static bool run_rename(int dummy)
 	} else {
 		printf("Fifth rename succeeded (SHARE_READ | SHARE_WRITE | SHARE_DELETE) (this is correct) - %s\n", nt_errstr(status));
 	}
-
-        /*
-         * Now check if the first name still exists ...
-         */
-
-        /* if (!NT_STATUS_OP(cli_ntcreate(cli1, fname, 0, GENERIC_READ_ACCESS, FILE_ATTRIBUTE_NORMAL,
-				   FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-				   FILE_OVERWRITE_IF, 0, 0, &fnum2, NULL))) {
-          printf("Opening original file after rename of open file fails: %s\n",
-              cli_errstr(cli1));
-        }
-        else {
-          printf("Opening original file after rename of open file works ...\n");
-          (void)cli_close(cli1, fnum2);
-          } */
 
         /*--*/
 	status = cli_close(cli1, fnum1);
@@ -11503,6 +11448,81 @@ static bool run_large_readx(int dummy)
 	return correct;
 }
 
+static NTSTATUS msdfs_attribute_list_fn(const char *mnt,
+				  struct file_info *finfo,
+				  const char *mask,
+				  void *private_data)
+{
+	uint16_t *p_mode = (uint16_t *)private_data;
+
+	if (strequal(finfo->name, test_filename)) {
+		*p_mode = finfo->mode;
+	}
+
+	return NT_STATUS_OK;
+}
+
+static bool run_msdfs_attribute(int dummy)
+{
+	static struct cli_state *cli;
+	bool correct = false;
+	uint16_t mode = 0;
+	NTSTATUS status;
+
+	printf("Starting MSDFS-ATTRIBUTE test\n");
+
+	if (test_filename == NULL || test_filename[0] == '\0') {
+		printf("MSDFS-ATTRIBUTE test "
+			"needs -f filename-of-msdfs-link\n");
+		return false;
+	}
+
+	/*
+	 * NB. We use torture_open_connection_flags() not
+	 * torture_open_connection() as the latter forces
+	 * SMB1.
+	 */
+	if (!torture_open_connection_flags(&cli, 0, 0)) {
+		return false;
+	}
+
+	smbXcli_conn_set_sockopt(cli->conn, sockops);
+
+	status = cli_list(cli,
+			"*",
+			FILE_ATTRIBUTE_DIRECTORY,
+			msdfs_attribute_list_fn,
+			&mode);
+
+	if (!NT_STATUS_IS_OK(status)) {
+		printf("cli_list failed with %s\n",
+			nt_errstr(status));
+		goto out;
+	}
+	if ((mode & FILE_ATTRIBUTE_REPARSE_POINT) == 0) {
+		printf("file %s should have "
+			"FILE_ATTRIBUTE_REPARSE_POINT set. attr = 0x%x\n",
+			test_filename,
+			(unsigned int)mode);
+		goto out;
+	}
+
+	if ((mode & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+		printf("file %s should have "
+			"FILE_ATTRIBUTE_DIRECTORY set. attr = 0x%x\n",
+			test_filename,
+			(unsigned int)mode);
+		goto out;
+	}
+
+	correct = true;
+
+  out:
+
+	torture_close_connection(cli);
+	return correct;
+}
+
 static bool run_cli_echo(int dummy)
 {
 	struct cli_state *cli;
@@ -14676,6 +14696,10 @@ static struct {
 		.fn    = run_large_readx,
 	},
 	{
+		.name  = "MSDFS-ATTRIBUTE",
+		.fn    = run_msdfs_attribute,
+	},
+	{
 		.name  = "NTTRANS-CREATE",
 		.fn    = run_nttrans_create,
 	},
@@ -14774,6 +14798,10 @@ static struct {
 	{
 		.name  = "SMB2-SACL",
 		.fn    = run_smb2_sacl,
+	},
+	{
+		.name  = "SMB2-QUOTA1",
+		.fn    = run_smb2_quota1,
 	},
 	{
 		.name  = "CLEANUP1",

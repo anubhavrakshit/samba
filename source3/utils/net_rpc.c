@@ -206,16 +206,23 @@ int run_rpc_command(struct net_context *c,
 			}
 		} else {
 			if (conn_flags & NET_FLAGS_SEAL) {
-				nt_status = cli_rpc_pipe_open_generic_auth(
+				struct cli_credentials *creds = NULL;
+
+				creds = net_context_creds(c, mem_ctx);
+				if (creds == NULL) {
+					DBG_ERR("net_rpc_ntlm_creds() failed\n");
+					nt_status = NT_STATUS_INTERNAL_ERROR;
+					goto fail;
+				}
+
+				nt_status = cli_rpc_pipe_open_with_creds(
 					cli, table,
 					(conn_flags & NET_FLAGS_TCP) ?
 					NCACN_IP_TCP : NCACN_NP,
-					CRED_DONT_USE_KERBEROS,
 					DCERPC_AUTH_TYPE_NTLMSSP,
 					DCERPC_AUTH_LEVEL_PRIVACY,
 					smbXcli_conn_remote_name(cli->conn),
-					lp_workgroup(), c->opt_user_name,
-					c->opt_password, &pipe_hnd);
+					creds, &pipe_hnd);
 			} else {
 				nt_status = cli_rpc_pipe_open_noauth(
 					cli, table,
@@ -6588,6 +6595,7 @@ static int rpc_trustdom_establish(struct net_context *c, int argc,
 	};
 
 	c->opt_user_name = acct_name;
+	c->opt_user_specified = true;
 
 	/* find the domain controller */
 	if (!net_find_pdc(&server_ss, pdc_name, domain_name)) {

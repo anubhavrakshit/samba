@@ -320,6 +320,13 @@
  *              to struct smb_filename
  * Version 43 - Move SMB_VFS_GET_NT_ACL() -> SMB_VFS_GET_NT_ACL_AT().
  * Version 43 - Remove root_dir_fid from SMB_VFS_CREATE_FILE().
+ * Version 43 - Add dirfsp to struct files_struct
+ * Version 43 - Add dirfsp args to SMB_VFS_CREATE_FILE()
+ * Version 43 - Add SMB_VFS_OPENAT()
+ * Version 43 - Remove SMB_VFS_OPEN()
+ * Version 43 - SMB_VFS_READ_DFS_PATHAT() should take a non-const name.
+		There's no easy way to return stat info for a DFS link
+		otherwise.
  */
 
 #define SMB_VFS_INTERFACE_VERSION 43
@@ -377,6 +384,7 @@ typedef struct files_struct {
 	struct smbXsrv_open *op;
 	struct connection_struct *conn;
 	struct fd_handle *fh;
+	struct files_struct *dirfsp;
 	unsigned int num_smb_operations;
 	struct file_id file_id;
 	uint64_t initial_allocation_size; /* Faked up initial allocation on disk. */
@@ -394,6 +402,7 @@ typedef struct files_struct {
 		bool can_write : 1;
 		bool modified : 1;
 		bool is_directory : 1;
+		bool is_dirfsp : 1;
 		bool aio_write_behind : 1;
 		bool initial_delete_on_close : 1;
 		bool delete_on_close : 1;
@@ -522,7 +531,6 @@ typedef struct connection_struct {
 	   and directories when setting time ? */
 	enum timestamp_set_resolution ts_res;
 	char *connectpath;
-	char *origpath;
 	struct files_struct *cwd_fsp; /* Working directory. */
 	bool tcon_done;
 
@@ -736,7 +744,7 @@ struct vfs_fn_pointers {
 	NTSTATUS (*read_dfs_pathat_fn)(struct vfs_handle_struct *handle,
 				TALLOC_CTX *mem_ctx,
 				struct files_struct *dirfsp,
-				const struct smb_filename *smb_fname,
+				struct smb_filename *smb_fname,
 				struct referral **ppreflist,
 				size_t *preferral_count);
 
@@ -757,11 +765,15 @@ struct vfs_fn_pointers {
 
 	/* File operations */
 
-	int (*open_fn)(struct vfs_handle_struct *handle,
-		       struct smb_filename *smb_fname, files_struct *fsp,
-		       int flags, mode_t mode);
+	int (*openat_fn)(struct vfs_handle_struct *handle,
+			 const struct files_struct *dirfsp,
+			 const struct smb_filename *smb_fname,
+			 struct files_struct *fsp,
+			 int flags,
+			 mode_t mode);
 	NTSTATUS (*create_file_fn)(struct vfs_handle_struct *handle,
 				   struct smb_request *req,
+				   struct files_struct **dirfsp,
 				   struct smb_filename *smb_fname,
 				   uint32_t access_mask,
 				   uint32_t share_access,
@@ -1246,7 +1258,7 @@ NTSTATUS smb_vfs_call_create_dfs_pathat(struct vfs_handle_struct *handle,
 NTSTATUS smb_vfs_call_read_dfs_pathat(struct vfs_handle_struct *handle,
 				TALLOC_CTX *mem_ctx,
 				struct files_struct *dirfsp,
-				const struct smb_filename *smb_fname,
+				struct smb_filename *smb_fname,
 				struct referral **ppreflist,
 				size_t *preferral_count);
 DIR *smb_vfs_call_fdopendir(struct vfs_handle_struct *handle,
@@ -1268,11 +1280,15 @@ int smb_vfs_call_mkdirat(struct vfs_handle_struct *handle,
 			mode_t mode);
 int smb_vfs_call_closedir(struct vfs_handle_struct *handle,
 			  DIR *dir);
-int smb_vfs_call_open(struct vfs_handle_struct *handle,
-		      struct smb_filename *smb_fname, struct files_struct *fsp,
-		      int flags, mode_t mode);
+int smb_vfs_call_openat(struct vfs_handle_struct *handle,
+			const struct files_struct *dirfsp,
+			const struct smb_filename *smb_fname,
+			struct files_struct *fsp,
+			int flags,
+			mode_t mode);
 NTSTATUS smb_vfs_call_create_file(struct vfs_handle_struct *handle,
 				  struct smb_request *req,
+				  struct files_struct **dirfsp,
 				  struct smb_filename *smb_fname,
 				  uint32_t access_mask,
 				  uint32_t share_access,
@@ -1692,7 +1708,7 @@ NTSTATUS vfs_not_implemented_create_dfs_pathat(struct vfs_handle_struct *handle,
 NTSTATUS vfs_not_implemented_read_dfs_pathat(struct vfs_handle_struct *handle,
 				TALLOC_CTX *mem_ctx,
 				struct files_struct *dirfsp,
-				const struct smb_filename *smb_fname,
+				struct smb_filename *smb_fname,
 				struct referral **ppreflist,
 				size_t *preferral_count);
 NTSTATUS vfs_not_implemented_snap_check_path(struct vfs_handle_struct *handle,
@@ -1725,8 +1741,15 @@ int vfs_not_implemented_closedir(vfs_handle_struct *handle, DIR *dir);
 int vfs_not_implemented_open(vfs_handle_struct *handle,
 			     struct smb_filename *smb_fname,
 			     files_struct *fsp, int flags, mode_t mode);
+int vfs_not_implemented_openat(vfs_handle_struct *handle,
+			       const struct files_struct *dirfsp,
+			       const struct smb_filename *smb_fname,
+			       struct files_struct *fsp,
+			       int flags,
+			       mode_t mode);
 NTSTATUS vfs_not_implemented_create_file(struct vfs_handle_struct *handle,
 				struct smb_request *req,
+				struct files_struct **dirfsp,
 				struct smb_filename *smb_fname,
 				uint32_t access_mask,
 				uint32_t share_access,

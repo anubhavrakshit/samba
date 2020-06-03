@@ -1896,7 +1896,7 @@ char *get_original_lcomp(TALLOC_CTX *ctx,
  * @param twrp		Optional VSS time
  * @param p_cont_wcard	If not NULL, will be set to true if the dfs path
  *			resolution detects a wildcard.
- * @param pp_smb_fname	The final converted name will be allocated if the
+ * @param _smb_fname	The final converted name will be allocated if the
  *			return is NT_STATUS_OK.
  *
  * @return NT_STATUS_OK if all operations completed successfully, appropriate
@@ -1912,7 +1912,6 @@ static NTSTATUS filename_convert_internal(TALLOC_CTX *ctx,
 				struct smb_filename **_smb_fname)
 {
 	struct smb_filename *smb_fname = NULL;
-	char *twrp_name = NULL;
 	NTSTATUS status;
 
 	*_smb_fname = NULL;
@@ -1967,10 +1966,8 @@ static NTSTATUS filename_convert_internal(TALLOC_CTX *ctx,
 			"for name %s with %s\n",
 			name_in,
 			nt_errstr(status) ));
-		TALLOC_FREE(twrp_name);
 		return status;
 	}
-	TALLOC_FREE(twrp_name);
 
 	if ((ucf_flags & UCF_UNIX_NAME_LOOKUP) &&
 			VALID_STAT(smb_fname->st) &&

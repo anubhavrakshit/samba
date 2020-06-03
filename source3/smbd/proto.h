@@ -447,15 +447,14 @@ NTSTATUS fsp_set_smb_fname(struct files_struct *fsp,
 			   const struct smb_filename *smb_fname_in);
 size_t fsp_fullbasepath(struct files_struct *fsp, char *buf, size_t buflen);
 
-NTSTATUS create_internal_dirfsp_at(connection_struct *conn,
-				   struct files_struct *dirfsp,
-				   const struct smb_filename *smb_dname,
-				   struct files_struct **_fsp);
+NTSTATUS create_internal_dirfsp(connection_struct *conn,
+				const struct smb_filename *smb_dname,
+				struct files_struct **_fsp);
 
-NTSTATUS open_internal_dirfsp_at(connection_struct *conn,
-				 struct files_struct *dirfsp,
-				 const struct smb_filename *smb_dname,
-				 struct files_struct **_fsp);
+NTSTATUS open_internal_dirfsp(connection_struct *conn,
+			      const struct smb_filename *smb_dname,
+			      int open_flags,
+			      struct files_struct **_fsp);
 
 /* The following definitions come from smbd/ipc.c  */
 
@@ -723,8 +722,11 @@ NTSTATUS check_parent_access(struct connection_struct *conn,
 				struct files_struct *dirfsp,
 				struct smb_filename *smb_fname,
 				uint32_t access_mask);
-NTSTATUS fd_open(struct connection_struct *conn, files_struct *fsp,
+NTSTATUS fd_open(files_struct *fsp,
 		 int flags, mode_t mode);
+NTSTATUS fd_openat(files_struct *fsp,
+		   int flags,
+		   mode_t mode);
 NTSTATUS fd_close(files_struct *fsp);
 void change_file_owner_to_parent(connection_struct *conn,
 				 struct smb_filename *inherit_from_dir,
@@ -752,6 +754,7 @@ struct fsp_lease *find_fsp_lease(struct files_struct *new_fsp,
 				 uint16_t lease_epoch);
 NTSTATUS create_file_default(connection_struct *conn,
 			     struct smb_request *req,
+			     struct files_struct **dirfsp,
 			     struct smb_filename * smb_fname,
 			     uint32_t access_mask,
 			     uint32_t share_access,

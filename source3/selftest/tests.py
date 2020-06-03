@@ -96,6 +96,7 @@ fileserver_tests = [
          "SMB2-SESSION-REAUTH", "SMB2-SESSION-RECONNECT", "SMB2-FTRUNCATE",
          "SMB2-ANONYMOUS", "SMB2-DIR-FSYNC",
 	 "SMB2-PATH-SLASH",
+	 "SMB2-QUOTA1",
          "CLEANUP1",
          "CLEANUP2",
          "CLEANUP4",
@@ -170,6 +171,33 @@ plantestsuite("samba3.smbtorture_s3.hidenewfiles(fileserver_smb1)",
                smbtorture3,
                "",
                "-l $LOCAL_PATH"])
+
+#
+# MSDFS attribute tests.
+#
+plantestsuite("samba3.smbtorture_s3.smb2.MSDFS-ATTRIBUTE",
+                "fileserver",
+                [os.path.join(samba3srcdir,
+                              "script/tests/test_smbtorture_s3.sh"),
+                'MSDFS-ATTRIBUTE',
+                '//$SERVER_IP/msdfs-share',
+                '$USERNAME',
+                '$PASSWORD',
+                smbtorture3,
+                "-mSMB2",
+                "-f msdfs-src1"])
+
+plantestsuite("samba3.smbtorture_s3.smb1.MSDFS-ATTRIBUTE",
+                "fileserver_smb1",
+                [os.path.join(samba3srcdir,
+                              "script/tests/test_smbtorture_s3.sh"),
+                'MSDFS-ATTRIBUTE',
+                '//$SERVER_IP/msdfs-share',
+                '$USERNAME',
+                '$PASSWORD',
+                smbtorture3,
+                "-mNT1",
+                "-f msdfs-src1"])
 
 shares = [
     "vfs_aio_pthread_async_dosmode_default1",
@@ -575,7 +603,7 @@ rpc = ["rpc.authcontext", "rpc.samba3.bind", "rpc.samba3.srvsvc", "rpc.samba3.sh
        "rpc.mdssvc",
        "rpc.samr", "rpc.samr.users", "rpc.samr.users.privileges", "rpc.samr.passwords",
        "rpc.samr.passwords.pwdlastset", "rpc.samr.passwords.lockout", "rpc.samr.passwords.badpwdcount", "rpc.samr.large-dc", "rpc.samr.machine.auth",
-       "rpc.samr.priv", "rpc.samr.passwords.validate",
+       "rpc.samr.priv", "rpc.samr.passwords.validate", "rpc.samr.handletype",
        "rpc.netlogon.admin",
        "rpc.schannel", "rpc.schannel2", "rpc.bench-schannel1", "rpc.schannel_anon_setpw", "rpc.join", "rpc.bind",
        "rpc.initshutdown", "rpc.wkssvc", "rpc.srvsvc"]

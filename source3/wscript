@@ -74,6 +74,7 @@ def options(opt):
 
     opt.samba_add_onoff_option('glusterfs', with_name="enable", without_name="disable", default=True)
     opt.samba_add_onoff_option('cephfs', with_name="enable", without_name="disable", default=True)
+    opt.samba_add_onoff_option('snapper', with_name="enable", without_name="disable", default=True)
 
     opt.add_option('--enable-vxfs',
                   help=("enable support for VxFS (default=no)"),
@@ -1663,7 +1664,7 @@ main() {
     conf.env['legacy_quota_libs'] = legacy_quota_libs
 
     if Options.options.with_quotas == True and not conf.CONFIG_SET('WITH_QUOTAS'):
-        conf.fatal('quota support not found but it was equested !')
+        conf.fatal('quota support not found but it was requested !')
 
     conf.CHECK_CODE('(void)unshare(CLONE_FS);',
                     headers='sched.h',
@@ -1752,11 +1753,16 @@ main() {
     if Options.options.enable_vxfs:
         conf.DEFINE('HAVE_VXFS', '1')
 
-    if conf.CHECK_CFG(package='dbus-1', args='--cflags --libs',
+    if Options.options.with_snapper:
+        if conf.CHECK_CFG(package='dbus-1', args='--cflags --libs',
                       msg='Checking for dbus', uselib_store="DBUS-1"):
-        if (conf.CHECK_HEADERS('dbus/dbus.h', lib='dbus-1')
+            if (conf.CHECK_HEADERS('dbus/dbus.h', lib='dbus-1')
                                       and conf.CHECK_LIB('dbus-1', shlib=True)):
-            conf.DEFINE('HAVE_DBUS', '1')
+                conf.DEFINE('HAVE_DBUS', '1')
+        else:
+            conf.fatal("vfs_snapper is enabled but prerequisite DBUS libraries "
+                       "or headers not found. Use --disable-snapper to disable "
+                       "vfs_snapper support.");
 
     if conf.CHECK_CFG(package='liburing', args='--cflags --libs',
                       msg='Checking for liburing package', uselib_store="URING"):

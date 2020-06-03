@@ -245,6 +245,7 @@ tasks = {
             "schema_dc",
             "clusteredmember_smb1",
             ])),
+        ("test-slow-none", make_test(cmd='make test', TESTS="--include=selftest/slow-none", include_envs=["none"])),
         ("lcov", LCOV_CMD),
         ("install", "make install"),
         ("check-clean-tree", "script/clean-source-tree.sh"),
@@ -457,11 +458,11 @@ tasks = {
         ],
 
     # Test fips compliance
-    "samba-ad-dc-fips": [
-        ("random-sleep", random_sleep(1, 1)),
+    "samba-fips": [
+        ("random-sleep", random_sleep(100, 500)),
         ("configure", "./configure.developer --with-selftest-prefix=./bin/ab --with-system-mitkrb5 --with-experimental-mit-ad-dc" + samba_configure_params),
         ("make", "make -j"),
-        ("test", make_test(include_envs=["ad_dc_fips"])),
+        ("test", make_test(include_envs=["ad_dc_fips", "ad_member_fips"])),
         ("lcov", LCOV_CMD),
         ("check-clean-tree", "script/clean-source-tree.sh"),
         ],
@@ -485,7 +486,7 @@ tasks = {
         ],
 
     "samba-admem-mit": [
-        ("random-sleep", random_sleep(300, 900)),
+        ("random-sleep", random_sleep(1, 1)),
         ("configure", "./configure.developer --with-selftest-prefix=./bin/ab --with-system-mitkrb5 --with-experimental-mit-ad-dc" + samba_configure_params),
         ("make", "make -j"),
         ("test", make_test(include_envs=[
@@ -563,7 +564,7 @@ tasks = {
         ("random-sleep", random_sleep(300, 900)),
         ("configure", "ADDITIONAL_CFLAGS='-O3 -Wp,-D_FORTIFY_SOURCE=2' ./configure.developer --with-selftest-prefix=./bin/ab --abi-check-disable" + samba_configure_params),
         ("make", "make -j"),
-        ("test", make_test(cmd='make test', include_envs=["none"])),
+        ("test", make_test(cmd='make test', TESTS="--exclude=selftest/slow-none", include_envs=["none"])),
         ("quicktest", make_test(cmd='make quicktest', include_envs=["ad_dc", "ad_dc_smb1", "ad_dc_smb1_done"])),
         ("lcov", LCOV_CMD),
         ("install", "make install"),
@@ -826,7 +827,7 @@ defaulttasks.remove("pass")
 defaulttasks.remove("fail")
 defaulttasks.remove("samba-test-only")
 defaulttasks.remove("samba-fuzz")
-defaulttasks.remove("samba-ad-dc-fips")
+defaulttasks.remove("samba-fips")
 if os.environ.get("AUTOBUILD_SKIP_SAMBA_O3", "0") == "1":
     defaulttasks.remove("samba-o3")
 

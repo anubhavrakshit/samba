@@ -115,7 +115,7 @@ static NTSTATUS skel_create_dfs_pathat(struct vfs_handle_struct *handle,
 static NTSTATUS skel_read_dfs_pathat(struct vfs_handle_struct *handle,
 				TALLOC_CTX *mem_ctx,
 				struct files_struct *dirfsp,
-				const struct smb_filename *smb_fname,
+				struct smb_filename *smb_fname,
 				struct referral **ppreflist,
 				size_t *preferral_count)
 {
@@ -191,8 +191,12 @@ static int skel_closedir(vfs_handle_struct *handle, DIR *dir)
 	return -1;
 }
 
-static int skel_open(vfs_handle_struct *handle, struct smb_filename *smb_fname,
-		     files_struct *fsp, int flags, mode_t mode)
+static int skel_openat(struct vfs_handle_struct *handle,
+		       const struct files_struct *dirfsp,
+		       const struct smb_filename *smb_fname,
+		       struct files_struct *fsp,
+		       int flags,
+		       mode_t mode)
 {
 	errno = ENOSYS;
 	return -1;
@@ -200,6 +204,7 @@ static int skel_open(vfs_handle_struct *handle, struct smb_filename *smb_fname,
 
 static NTSTATUS skel_create_file(struct vfs_handle_struct *handle,
 				 struct smb_request *req,
+				 struct files_struct **dirfsp,
 				 struct smb_filename *smb_fname,
 				 uint32_t access_mask,
 				 uint32_t share_access,
@@ -1061,7 +1066,7 @@ static struct vfs_fn_pointers skel_opaque_fns = {
 
 	/* File operations */
 
-	.open_fn = skel_open,
+	.openat_fn = skel_openat,
 	.create_file_fn = skel_create_file,
 	.close_fn = skel_close_fn,
 	.pread_fn = skel_pread,

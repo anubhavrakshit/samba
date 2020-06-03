@@ -147,29 +147,48 @@ static int cap_mkdirat(vfs_handle_struct *handle,
 			mode);
 }
 
-static int cap_open(vfs_handle_struct *handle, struct smb_filename *smb_fname,
-		    files_struct *fsp, int flags, mode_t mode)
+static int cap_openat(vfs_handle_struct *handle,
+		      const struct files_struct *dirfsp,
+		      const struct smb_filename *smb_fname_in,
+		      files_struct *fsp,
+		      int flags,
+		      mode_t mode)
 {
-	char *cappath;
-	char *tmp_base_name = NULL;
+	char *cappath = NULL;
+	struct smb_filename *smb_fname = NULL;
 	int ret;
+	int saved_errno = 0;
 
-	cappath = capencode(talloc_tos(), smb_fname->base_name);
-
-	if (!cappath) {
+	cappath = capencode(talloc_tos(), smb_fname_in->base_name);
+	if (cappath == NULL) {
 		errno = ENOMEM;
 		return -1;
 	}
 
-	tmp_base_name = smb_fname->base_name;
+	smb_fname = cp_smb_filename(talloc_tos(), smb_fname_in);
+	if (smb_fname == NULL) {
+		TALLOC_FREE(cappath);
+		errno = ENOMEM;
+		return -1;
+	}
 	smb_fname->base_name = cappath;
 
-	DEBUG(3,("cap: cap_open for %s\n", smb_fname_str_dbg(smb_fname)));
-	ret = SMB_VFS_NEXT_OPEN(handle, smb_fname, fsp, flags, mode);
+	DBG_DEBUG("cap_open for %s\n", smb_fname_str_dbg(smb_fname));
+	ret = SMB_VFS_NEXT_OPENAT(handle,
+				  dirfsp,
+				  smb_fname,
+				  fsp,
+				  flags,
+				  mode);
 
-	smb_fname->base_name = tmp_base_name;
+	if (ret == -1) {
+		saved_errno = errno;
+	}
 	TALLOC_FREE(cappath);
-
+	TALLOC_FREE(smb_fname);
+	if (saved_errno != 0) {
+		errno = saved_errno;
+	}
 	return ret;
 }
 
@@ -1023,7 +1042,7 @@ static NTSTATUS cap_create_dfs_pathat(vfs_handle_struct *handle,
 static NTSTATUS cap_read_dfs_pathat(struct vfs_handle_struct *handle,
 			TALLOC_CTX *mem_ctx,
 			struct files_struct *dirfsp,
-			const struct smb_filename *smb_fname,
+			struct smb_filename *smb_fname,
 			struct referral **ppreflist,
 			size_t *preferral_count)
 {
@@ -1051,6 +1070,12 @@ static NTSTATUS cap_read_dfs_pathat(struct vfs_handle_struct *handle,
 			cap_smb_fname,
 			ppreflist,
 			preferral_count);
+
+	if (NT_STATUS_IS_OK(status)) {
+		/* Return any stat(2) info. */
+		smb_fname->st = cap_smb_fname->st;
+	}
+
 	TALLOC_FREE(cappath);
 	TALLOC_FREE(cap_smb_fname);
 	return status;
@@ -1061,7 +1086,7 @@ static struct vfs_fn_pointers vfs_cap_fns = {
 	.get_quota_fn = cap_get_quota,
 	.readdir_fn = cap_readdir,
 	.mkdirat_fn = cap_mkdirat,
-	.open_fn = cap_open,
+	.openat_fn = cap_openat,
 	.renameat_fn = cap_renameat,
 	.stat_fn = cap_stat,
 	.lstat_fn = cap_lstat,

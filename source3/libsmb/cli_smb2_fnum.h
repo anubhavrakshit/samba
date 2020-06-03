@@ -73,7 +73,12 @@ struct tevent_req *cli_smb2_delete_on_close_send(TALLOC_CTX *mem_ctx,
 					bool flag);
 NTSTATUS cli_smb2_delete_on_close_recv(struct tevent_req *req);
 NTSTATUS cli_smb2_delete_on_close(struct cli_state *cli, uint16_t fnum, bool flag);
-NTSTATUS cli_smb2_mkdir(struct cli_state *cli, const char *dirname);
+struct tevent_req *cli_smb2_mkdir_send(
+	TALLOC_CTX *mem_ctx,
+	struct tevent_context *ev,
+	struct cli_state *cli,
+	const char *name);
+NTSTATUS cli_smb2_mkdir_recv(struct tevent_req *req);
 struct tevent_req *cli_smb2_rmdir_send(
 	TALLOC_CTX *mem_ctx,
 	struct tevent_context *ev,
@@ -81,10 +86,6 @@ struct tevent_req *cli_smb2_rmdir_send(
 	const char *dname,
 	const struct smb2_create_blobs *in_cblobs);
 NTSTATUS cli_smb2_rmdir_recv(struct tevent_req *req);
-NTSTATUS cli_smb2_rmdir(
-	struct cli_state *cli,
-	const char *dname,
-	const struct smb2_create_blobs *in_cblobs);
 struct tevent_req *cli_smb2_unlink_send(
 	TALLOC_CTX *mem_ctx,
 	struct tevent_context *ev,
@@ -92,10 +93,6 @@ struct tevent_req *cli_smb2_unlink_send(
 	const char *fname,
 	const struct smb2_create_blobs *in_cblobs);
 NTSTATUS cli_smb2_unlink_recv(struct tevent_req *req);
-NTSTATUS cli_smb2_unlink(
-	struct cli_state *cli,
-	const char *fname,
-	const struct smb2_create_blobs *in_cblobs);
 NTSTATUS cli_smb2_list(struct cli_state *cli,
 			const char *pathname,
 			uint16_t attribute,
@@ -111,8 +108,12 @@ NTSTATUS cli_smb2_qpathinfo_basic(struct cli_state *cli,
 NTSTATUS cli_smb2_qpathinfo_alt_name(struct cli_state *cli,
 			const char *name,
 			fstring alt_name);
-NTSTATUS cli_smb2_chkpath(struct cli_state *cli,
-			const char *name);
+struct tevent_req *cli_smb2_chkpath_send(
+	TALLOC_CTX *mem_ctx,
+	struct tevent_context *ev,
+	struct cli_state *cli,
+	const char *name);
+NTSTATUS cli_smb2_chkpath_recv(struct tevent_req *req);
 struct tevent_req *cli_smb2_query_info_fnum_send(
 	TALLOC_CTX *mem_ctx,
 	struct tevent_context *ev,

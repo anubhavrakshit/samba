@@ -467,7 +467,6 @@ SMBCFILE *
 SMBC_opendir_ctx(SMBCCTX *context,
                  const char *fname)
 {
-        int saved_errno;
 	char *server = NULL;
         char *share = NULL;
         char *user = NULL;
@@ -961,6 +960,7 @@ SMBC_opendir_ctx(SMBCCTX *context,
 					  FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_HIDDEN,
 					  dir_list_fn, (void *)dir);
 			if (!NT_STATUS_IS_OK(status)) {
+				int saved_errno;
 				if (dir) {
 					SAFE_FREE(dir->fname);
 					SAFE_FREE(dir);
@@ -1041,7 +1041,7 @@ SMBC_closedir_ctx(SMBCCTX *context,
 		return -1;
 	}
 
-	if (!dir || !SMBC_dlist_contains(context->internal->files, dir)) {
+	if (!SMBC_dlist_contains(context->internal->files, dir)) {
 		errno = EBADF;
 		TALLOC_FREE(frame);
 		return -1;
@@ -1154,7 +1154,7 @@ SMBC_readdir_ctx(SMBCCTX *context,
 
 	}
 
-	if (!dir || !SMBC_dlist_contains(context->internal->files, dir)) {
+	if (!SMBC_dlist_contains(context->internal->files, dir)) {
 
 		errno = EBADF;
                 DEBUG(0, ("Invalid dir in SMBC_readdir_ctx()\n"));
@@ -1233,9 +1233,7 @@ SMBC_readdirplus_ctx(SMBCCTX *context,
 		return NULL;
 	}
 
-	if (dir == NULL ||
-	    SMBC_dlist_contains(context->internal->files,
-				dir) == 0) {
+	if (!SMBC_dlist_contains(context->internal->files, dir)) {
 		DBG_ERR("Invalid dir in SMBC_readdirplus_ctx()\n");
 		TALLOC_FREE(frame);
 		errno = EBADF;
@@ -1314,10 +1312,7 @@ const struct libsmb_file_info *SMBC_readdirplus2_ctx(SMBCCTX *context,
 		return NULL;
 	}
 
-	if (dir == NULL ||
-	    SMBC_dlist_contains(context->internal->files,
-					dir) == 0)
-	{
+	if (!SMBC_dlist_contains(context->internal->files, dir)) {
 		DBG_ERR("Invalid dir in SMBC_readdirplus2_ctx()\n");
 		TALLOC_FREE(frame);
 		errno = EBADF;
@@ -1422,7 +1417,7 @@ SMBC_getdents_ctx(SMBCCTX *context,
 
 	}
 
-	if (!dir || !SMBC_dlist_contains(context->internal->files, dir)) {
+	if (!SMBC_dlist_contains(context->internal->files, dir)) {
 
 		errno = EBADF;
 		TALLOC_FREE(frame);
@@ -1789,7 +1784,7 @@ SMBC_telldir_ctx(SMBCCTX *context,
 
 	}
 
-	if (!dir || !SMBC_dlist_contains(context->internal->files, dir)) {
+	if (!SMBC_dlist_contains(context->internal->files, dir)) {
 
 		errno = EBADF;
 		TALLOC_FREE(frame);
@@ -2633,8 +2628,7 @@ SMBC_notify_ctx(SMBCCTX *context, SMBCFILE *dir, smbc_bool recursive,
 		errno = EINVAL;
 		return -1;
 	}
-	if ((dir == NULL) ||
-	    !SMBC_dlist_contains(context->internal->files, dir)) {
+	if (!SMBC_dlist_contains(context->internal->files, dir)) {
 		TALLOC_FREE(frame);
 		errno = EBADF;
 		return -1;

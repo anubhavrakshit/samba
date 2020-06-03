@@ -176,15 +176,12 @@ NTSTATUS file_new(struct smb_request *req, connection_struct *conn,
  * This should only be used by callers in the VFS that need to control the
  * opening of the directory. Otherwise use open_internal_dirfsp_at().
  */
-NTSTATUS create_internal_dirfsp_at(connection_struct *conn,
-				   struct files_struct *dirfsp,
-				   const struct smb_filename *smb_dname,
-				   struct files_struct **_fsp)
+NTSTATUS create_internal_dirfsp(connection_struct *conn,
+				const struct smb_filename *smb_dname,
+				struct files_struct **_fsp)
 {
 	struct files_struct *fsp = NULL;
 	NTSTATUS status;
-
-	SMB_ASSERT(dirfsp == dirfsp->conn->cwd_fsp);
 
 	status = file_new(NULL, conn, &fsp);
 	if (!NT_STATUS_IS_OK(status)) {
@@ -197,11 +194,46 @@ NTSTATUS create_internal_dirfsp_at(connection_struct *conn,
 		return status;
 	}
 
-	if (!VALID_STAT(fsp->fsp_name->st)) {
-		status = vfs_stat_fsp(fsp);
-		if (!NT_STATUS_IS_OK(status)) {
-			return status;
-		}
+	fsp->access_mask = FILE_LIST_DIRECTORY;
+	fsp->fsp_flags.is_directory = true;
+	fsp->fsp_flags.is_dirfsp = true;
+
+	*_fsp = fsp;
+	return NT_STATUS_OK;
+}
+
+/*
+ * Open an internal fsp for an *existing* directory.
+ */
+NTSTATUS open_internal_dirfsp(connection_struct *conn,
+			      const struct smb_filename *smb_dname,
+			      int open_flags,
+			      struct files_struct **_fsp)
+{
+	struct files_struct *fsp = NULL;
+	NTSTATUS status;
+	int ret;
+
+	status = create_internal_dirfsp(conn, smb_dname, &fsp);
+	if (!NT_STATUS_IS_OK(status)) {
+		return status;
+	}
+
+#ifdef O_DIRECTORY
+	open_flags |= O_DIRECTORY;
+#endif
+	status = fd_open(fsp, open_flags, 0);
+	if (!NT_STATUS_IS_OK(status)) {
+		DBG_INFO("Could not open fd for %s (%s)\n",
+			 smb_fname_str_dbg(smb_dname),
+			 nt_errstr(status));
+		file_free(NULL, fsp);
+		return status;
+	}
+
+	ret = SMB_VFS_FSTAT(fsp, &fsp->fsp_name->st);
+	if (ret != 0) {
+		return map_nt_error_from_unix(errno);
 	}
 
 	if (!S_ISDIR(fsp->fsp_name->st.st_ex_mode)) {
@@ -212,44 +244,6 @@ NTSTATUS create_internal_dirfsp_at(connection_struct *conn,
 	}
 
 	fsp->file_id = vfs_file_id_from_sbuf(conn, &fsp->fsp_name->st);
-	fsp->access_mask = FILE_LIST_DIRECTORY;
-	fsp->fsp_flags.is_directory = true;
-
-	*_fsp = fsp;
-	return NT_STATUS_OK;
-}
-
-/*
- * Open an internal fsp for an *existing* directory.
- */
-NTSTATUS open_internal_dirfsp_at(connection_struct *conn,
-				 struct files_struct *dirfsp,
-				 const struct smb_filename *smb_dname,
-				 struct files_struct **_fsp)
-{
-	struct files_struct *fsp = NULL;
-	int open_flags = O_RDONLY;
-	NTSTATUS status;
-
-	SMB_ASSERT(dirfsp == dirfsp->conn->cwd_fsp);
-
-	status = create_internal_dirfsp_at(conn, dirfsp, smb_dname, &fsp);
-	if (!NT_STATUS_IS_OK(status)) {
-		return status;
-	}
-
-#ifdef O_DIRECTORY
-	open_flags |= O_DIRECTORY;
-#endif
-	status = fd_open(conn, fsp, open_flags, 0);
-	if (!NT_STATUS_IS_OK(status)) {
-		DBG_INFO("Could not open fd for %s (%s)\n",
-			 smb_fname_str_dbg(smb_dname),
-			 nt_errstr(status));
-		file_free(NULL, fsp);
-		return status;
-	}
-
 
 	*_fsp = fsp;
 	return NT_STATUS_OK;

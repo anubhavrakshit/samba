@@ -3720,7 +3720,7 @@ const char *smbXsrv_connection_dbg(const struct smbXsrv_connection *xconn)
 }
 
 NTSTATUS smbd_add_connection(struct smbXsrv_client *client, int sock_fd,
-			     struct smbXsrv_connection **_xconn)
+			     NTTIME now, struct smbXsrv_connection **_xconn)
 {
 	TALLOC_CTX *frame = talloc_stackframe();
 	struct smbXsrv_connection *xconn;
@@ -3750,6 +3750,10 @@ NTSTATUS smbd_add_connection(struct smbXsrv_client *client, int sock_fd,
 		return NT_STATUS_NO_MEMORY;
 	}
 	talloc_steal(frame, xconn);
+	xconn->connect_time = now;
+	if (client->next_channel_id != 0) {
+		xconn->channel_id = client->next_channel_id++;
+	}
 
 	xconn->transport.sock = sock_fd;
 	smbd_echo_init(xconn);
@@ -3994,7 +3998,7 @@ void smbd_process(struct tevent_context *ev_ctx,
 		smbd_setup_sig_hup_handler(sconn);
 	}
 
-	status = smbd_add_connection(client, sock_fd, &xconn);
+	status = smbd_add_connection(client, sock_fd, now, &xconn);
 	if (NT_STATUS_EQUAL(status, NT_STATUS_NETWORK_ACCESS_DENIED)) {
 		/*
 		 * send a negative session response "not listening on calling
@@ -4021,6 +4025,24 @@ void smbd_process(struct tevent_context *ev_ctx,
 	sconn->remote_hostname =
 		talloc_strdup(sconn, xconn->remote_hostname);
 	if (sconn->remote_hostname == NULL) {
+		exit_server_cleanly("tsocket_strdup() failed");
+	}
+
+	client->global->local_address =
+		tsocket_address_string(sconn->local_address,
+				       client->global);
+	if (client->global->local_address == NULL) {
+		exit_server_cleanly("tsocket_address_string() failed");
+	}
+	client->global->remote_address =
+		tsocket_address_string(sconn->remote_address,
+				       client->global);
+	if (client->global->remote_address == NULL) {
+		exit_server_cleanly("tsocket_address_string() failed");
+	}
+	client->global->remote_name =
+		talloc_strdup(client->global, sconn->remote_hostname);
+	if (client->global->remote_name == NULL) {
 		exit_server_cleanly("tsocket_strdup() failed");
 	}
 

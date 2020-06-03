@@ -1258,20 +1258,15 @@ static NTSTATUS unlink_file(struct py_cli_state *self, const char *filename)
 {
 	NTSTATUS status;
 	uint16_t attrs = (FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_HIDDEN);
+	struct tevent_req *req = NULL;
 
-	if (self->is_smb1) {
-		struct tevent_req *req = NULL;
-
-		req = cli_unlink_send(NULL, self->ev, self->cli, filename,
-				      attrs);
-		if (!py_tevent_req_wait_exc(self, req)) {
-			return NT_STATUS_INTERNAL_ERROR;
-		}
-		status = cli_unlink_recv(req);
-		TALLOC_FREE(req);
-	} else {
-		status = cli_unlink(self->cli, filename, attrs);
+	req = cli_unlink_send(
+		NULL, self->ev, self->cli, filename, attrs);
+	if (!py_tevent_req_wait_exc(self, req)) {
+		return NT_STATUS_INTERNAL_ERROR;
 	}
+	status = cli_unlink_recv(req);
+	TALLOC_FREE(req);
 
 	return status;
 }
@@ -1297,19 +1292,15 @@ static PyObject *py_smb_unlink(struct py_cli_state *self, PyObject *args)
 static NTSTATUS remove_dir(struct py_cli_state *self, const char *dirname)
 {
 	NTSTATUS status;
+	struct tevent_req *req = NULL;
 
-	if (self->is_smb1) {
-		struct tevent_req *req = NULL;
-
-		req = cli_rmdir_send(NULL, self->ev, self->cli, dirname);
-		if (!py_tevent_req_wait_exc(self, req)) {
-			return NT_STATUS_INTERNAL_ERROR;
-		}
-		status = cli_rmdir_recv(req);
-		TALLOC_FREE(req);
-	} else {
-		status = cli_rmdir(self->cli, dirname);
+	req = cli_rmdir_send(NULL, self->ev, self->cli, dirname);
+	if (!py_tevent_req_wait_exc(self, req)) {
+		return NT_STATUS_INTERNAL_ERROR;
 	}
+	status = cli_rmdir_recv(req);
+	TALLOC_FREE(req);
+
 	return status;
 }
 
@@ -1335,23 +1326,18 @@ static PyObject *py_smb_mkdir(struct py_cli_state *self, PyObject *args)
 {
 	NTSTATUS status;
 	const char *dirname = NULL;
+	struct tevent_req *req = NULL;
 
 	if (!PyArg_ParseTuple(args, "s:mkdir", &dirname)) {
 		return NULL;
 	}
 
-	if (self->is_smb1) {
-		struct tevent_req *req = NULL;
-
-		req = cli_mkdir_send(NULL, self->ev, self->cli, dirname);
-		if (!py_tevent_req_wait_exc(self, req)) {
-			return NULL;
-		}
-		status = cli_mkdir_recv(req);
-		TALLOC_FREE(req);
-	} else {
-		status = cli_mkdir(self->cli, dirname);
+	req = cli_mkdir_send(NULL, self->ev, self->cli, dirname);
+	if (!py_tevent_req_wait_exc(self, req)) {
+		return NULL;
 	}
+	status = cli_mkdir_recv(req);
+	TALLOC_FREE(req);
 	PyErr_NTSTATUS_IS_ERR_RAISE(status);
 
 	Py_RETURN_NONE;
@@ -1363,19 +1349,14 @@ static PyObject *py_smb_mkdir(struct py_cli_state *self, PyObject *args)
 static bool check_dir_path(struct py_cli_state *self, const char *path)
 {
 	NTSTATUS status;
+	struct tevent_req *req = NULL;
 
-	if (self->is_smb1) {
-		struct tevent_req *req = NULL;
-
-		req = cli_chkpath_send(NULL, self->ev, self->cli, path);
-		if (!py_tevent_req_wait_exc(self, req)) {
-			return false;
-		}
-		status = cli_chkpath_recv(req);
-		TALLOC_FREE(req);
-	} else {
-		status = cli_chkpath(self->cli, path);
+	req = cli_chkpath_send(NULL, self->ev, self->cli, path);
+	if (!py_tevent_req_wait_exc(self, req)) {
+		return false;
 	}
+	status = cli_chkpath_recv(req);
+	TALLOC_FREE(req);
 
 	return NT_STATUS_IS_OK(status);
 }

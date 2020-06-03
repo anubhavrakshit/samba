@@ -614,17 +614,31 @@ static int streams_depot_lstat(vfs_handle_struct *handle,
 	return ret;
 }
 
-static int streams_depot_open(vfs_handle_struct *handle,
-			      struct smb_filename *smb_fname,
-			      files_struct *fsp, int flags, mode_t mode)
+static int streams_depot_openat(struct vfs_handle_struct *handle,
+				const struct files_struct *dirfsp,
+				const struct smb_filename *smb_fname,
+				struct files_struct *fsp,
+				int flags,
+				mode_t mode)
 {
 	struct smb_filename *smb_fname_stream = NULL;
 	struct smb_filename *smb_fname_base = NULL;
+	struct files_struct *fspcwd = NULL;
 	NTSTATUS status;
 	int ret = -1;
 
+	/*
+	 * For now assert this so the below SMB_VFS_STAT() is ok.
+	 */
+	SMB_ASSERT(dirfsp->fh->fd == AT_FDCWD);
+
 	if (!is_named_stream(smb_fname)) {
-		return SMB_VFS_NEXT_OPEN(handle, smb_fname, fsp, flags, mode);
+		return SMB_VFS_NEXT_OPENAT(handle,
+					   dirfsp,
+					   smb_fname,
+					   fsp,
+					   flags,
+					   mode);
 	}
 
 	/* Ensure the base file still exists. */
@@ -653,11 +667,24 @@ static int streams_depot_open(vfs_handle_struct *handle,
 		goto done;
 	}
 
-	ret = SMB_VFS_NEXT_OPEN(handle, smb_fname_stream, fsp, flags, mode);
+	status = vfs_at_fspcwd(talloc_tos(), handle->conn, &fspcwd);
+	if (!NT_STATUS_IS_OK(status)) {
+		ret = -1;
+		errno = map_errno_from_nt_status(status);
+		goto done;
+	}
+
+	ret = SMB_VFS_NEXT_OPENAT(handle,
+				  fspcwd,
+				  smb_fname_stream,
+				  fsp,
+				  flags,
+				  mode);
 
  done:
 	TALLOC_FREE(smb_fname_stream);
 	TALLOC_FREE(smb_fname_base);
+	TALLOC_FREE(fspcwd);
 	return ret;
 }
 
@@ -1093,7 +1120,7 @@ static uint32_t streams_depot_fs_capabilities(struct vfs_handle_struct *handle,
 
 static struct vfs_fn_pointers vfs_streams_depot_fns = {
 	.fs_capabilities_fn = streams_depot_fs_capabilities,
-	.open_fn = streams_depot_open,
+	.openat_fn = streams_depot_openat,
 	.stat_fn = streams_depot_stat,
 	.lstat_fn = streams_depot_lstat,
 	.unlinkat_fn = streams_depot_unlinkat,

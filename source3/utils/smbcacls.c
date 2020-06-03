@@ -34,9 +34,6 @@
 #include "util_sd.h"
 
 static int test_args;
-
-#define CREATE_ACCESS_READ READ_CONTROL_ACCESS
-
 static int sddl;
 static int query_sec_info = -1;
 static int set_sec_info = -1;
@@ -237,9 +234,19 @@ static uint16_t get_fileinfo(struct cli_state *cli, const char *filename)
 	/* The desired access below is the only one I could find that works
 	   with NT4, W2KP and Samba */
 
-	status = cli_ntcreate(cli, filename, 0, CREATE_ACCESS_READ,
-			      0, FILE_SHARE_READ|FILE_SHARE_WRITE,
-			      FILE_OPEN, 0x0, 0x0, &fnum, &cr);
+	status = cli_ntcreate(
+		cli,			/* cli */
+		filename,		/* fname */
+		0,			/* CreatFlags */
+		READ_CONTROL_ACCESS,	/* CreatFlags */
+		0,			/* FileAttributes */
+		FILE_SHARE_READ|
+		FILE_SHARE_WRITE,	/* ShareAccess */
+		FILE_OPEN,		/* CreateDisposition */
+		0x0,			/* CreateOptions */
+		0x0,			/* SecurityFlags */
+		&fnum,			/* pfid */
+		&cr);			/* cr */
 	if (!NT_STATUS_IS_OK(status)) {
 		printf("Failed to open %s: %s\n", filename, nt_errstr(status));
 		return 0;
@@ -657,7 +664,7 @@ static int inherit(struct cli_state *cli, const char *filename,
 	if (strcmp(type,"allow")==0) {
 		if ((old->type & SEC_DESC_DACL_PROTECTED) ==
                     SEC_DESC_DACL_PROTECTED) {
-			int i;
+			uint32_t i;
 			char *parentname,*temp;
 			struct security_descriptor *parent;
 			temp = talloc_strdup(talloc_tos(), filename);
@@ -725,9 +732,12 @@ static int inherit(struct cli_state *cli, const char *filename,
                     SEC_DESC_DACL_PROTECTED) {
 			old->type=old->type | SEC_DESC_DACL_PROTECTED;
 
-			/* convert all inherited ACL's to non inherated ACL's. */
+			/*
+			 * convert all inherited ACL's to non
+			 * inherited ACL's.
+			 */
 			if (old->dacl) {
-				int i;
+				uint32_t i;
 				for (i=0;i<old->dacl->num_aces;i++) {
 					struct security_ace *ace=&old->dacl->aces[i];
 					/* Remove INHERITED FLAG from all aces */
@@ -764,17 +774,10 @@ static struct cli_state *connect_one(const struct user_auth_info *auth_info,
 	NTSTATUS nt_status;
 	uint32_t flags = 0;
 
-	if (get_cmdline_auth_info_use_kerberos(auth_info)) {
-		flags |= CLI_FULL_CONNECTION_USE_KERBEROS |
-			 CLI_FULL_CONNECTION_FALLBACK_AFTER_KERBEROS;
-	}
-
-	nt_status = cli_full_connection(&c, lp_netbios_name(), server,
+	nt_status = cli_full_connection_creds(&c, lp_netbios_name(), server,
 				NULL, 0,
 				share, "?????",
-				get_cmdline_auth_info_username(auth_info),
-				lp_workgroup(),
-				get_cmdline_auth_info_password(auth_info),
+				get_cmdline_auth_info_creds(auth_info),
 				flags,
 				get_cmdline_auth_info_signing_state(auth_info));
 	if (!NT_STATUS_IS_OK(nt_status)) {
@@ -783,10 +786,8 @@ static struct cli_state *connect_one(const struct user_auth_info *auth_info,
 	}
 
 	if (get_cmdline_auth_info_smb_encrypt(auth_info)) {
-		nt_status = cli_cm_force_encryption(c,
-					get_cmdline_auth_info_username(auth_info),
-					get_cmdline_auth_info_password(auth_info),
-					lp_workgroup(),
+		nt_status = cli_cm_force_encryption_creds(c,
+					get_cmdline_auth_info_creds(auth_info),
 					share);
                 if (!NT_STATUS_IS_OK(nt_status)) {
 			cli_shutdown(c);

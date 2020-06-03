@@ -111,14 +111,6 @@ NTSTATUS cli_full_connection_creds(struct cli_state **output_cli,
 				   struct cli_credentials *creds,
 				   int flags,
 				   int signing_state);
-NTSTATUS cli_full_connection(struct cli_state **output_cli,
-			     const char *my_name,
-			     const char *dest_host,
-			     const struct sockaddr_storage *dest_ss, int port,
-			     const char *service, const char *service_type,
-			     const char *user, const char *domain,
-			     const char *password, int flags,
-			     int signing_state);
 NTSTATUS cli_raw_tcon(struct cli_state *cli,
 		      const char *service, const char *pass, const char *dev,
 		      uint16_t *max_xmit, uint16_t *tid);
@@ -135,11 +127,6 @@ struct cli_state *get_ipc_connect_master_ip(TALLOC_CTX *ctx,
 NTSTATUS cli_cm_force_encryption_creds(struct cli_state *c,
 				       struct cli_credentials *creds,
 				       const char *sharename);
-NTSTATUS cli_cm_force_encryption(struct cli_state *c,
-			const char *username,
-			const char *password,
-			const char *domain,
-			const char *sharename);
 NTSTATUS cli_cm_open(TALLOC_CTX *ctx,
 				struct cli_state *referring_cli,
 				const char *server,
@@ -224,7 +211,6 @@ NTSTATUS cli_smb(TALLOC_CTX *mem_ctx, struct cli_state *cli,
 
 /* The following definitions come from libsmb/clierror.c  */
 
-const char *cli_errstr(struct cli_state *cli);
 NTSTATUS cli_nt_error(struct cli_state *cli);
 void cli_dos_error(struct cli_state *cli, uint8_t *eclass, uint32_t *ecode);
 int cli_errno(struct cli_state *cli);
@@ -979,13 +965,6 @@ NTSTATUS cli_query_mxac(struct cli_state *cli,
 
 /* The following definitions come from libsmb/clistr.c  */
 
-size_t clistr_pull_talloc(TALLOC_CTX *ctx,
-			  const char *base,
-			  uint16_t flags2,
-			  char **pp_dest,
-			  const void *src,
-			  int src_len,
-			  int flags);
 bool clistr_is_previous_version_path(const char *path,
 			const char **startp,
 			const char **endp,

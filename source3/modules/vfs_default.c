@@ -420,7 +420,7 @@ static NTSTATUS vfswrap_create_dfs_pathat(struct vfs_handle_struct *handle,
 static NTSTATUS vfswrap_read_dfs_pathat(struct vfs_handle_struct *handle,
 				TALLOC_CTX *mem_ctx,
 				struct files_struct *dirfsp,
-				const struct smb_filename *smb_fname,
+				struct smb_filename *smb_fname,
 				struct referral **ppreflist,
 				size_t *preferral_count)
 {
@@ -434,8 +434,14 @@ static NTSTATUS vfswrap_read_dfs_pathat(struct vfs_handle_struct *handle,
 #else
 	char link_target_buf[7];
 #endif
+	int ret;
 
 	SMB_ASSERT(dirfsp == dirfsp->conn->cwd_fsp);
+
+	if (is_named_stream(smb_fname)) {
+		status = NT_STATUS_OBJECT_NAME_NOT_FOUND;
+		goto err;
+	}
 
 	if (ppreflist == NULL && preferral_count == NULL) {
 		/*
@@ -482,6 +488,14 @@ static NTSTATUS vfswrap_read_dfs_pathat(struct vfs_handle_struct *handle,
 
 	if (!strnequal(link_target, "msdfs:", 6)) {
 		status = NT_STATUS_OBJECT_TYPE_MISMATCH;
+		goto err;
+	}
+
+	ret = sys_lstat(smb_fname->base_name,
+			&smb_fname->st,
+			lp_fake_directory_create_times(SNUM(handle->conn)));
+	if (ret < 0) {
+		status = map_nt_error_from_unix(errno);
 		goto err;
 	}
 
@@ -669,27 +683,32 @@ static int vfswrap_closedir(vfs_handle_struct *handle, DIR *dirp)
 
 /* File operations */
 
-static int vfswrap_open(vfs_handle_struct *handle,
-			struct smb_filename *smb_fname,
-			files_struct *fsp, int flags, mode_t mode)
+static int vfswrap_openat(vfs_handle_struct *handle,
+			  const struct files_struct *dirfsp,
+			  const struct smb_filename *smb_fname,
+			  files_struct *fsp,
+			  int flags,
+			  mode_t mode)
 {
-	int result = -1;
+	int result;
 
-	START_PROFILE(syscall_open);
+	START_PROFILE(syscall_openat);
 
 	if (is_named_stream(smb_fname)) {
 		errno = ENOENT;
+		result = -1;
 		goto out;
 	}
 
-	result = open(smb_fname->base_name, flags, mode);
- out:
-	END_PROFILE(syscall_open);
+	result = openat(dirfsp->fh->fd, smb_fname->base_name, flags, mode);
+
+out:
+	END_PROFILE(syscall_openat);
 	return result;
 }
-
 static NTSTATUS vfswrap_create_file(vfs_handle_struct *handle,
 				    struct smb_request *req,
+				    struct files_struct **dirfsp,
 				    struct smb_filename *smb_fname,
 				    uint32_t access_mask,
 				    uint32_t share_access,
@@ -707,7 +726,7 @@ static NTSTATUS vfswrap_create_file(vfs_handle_struct *handle,
 				    const struct smb2_create_blobs *in_context_blobs,
 				    struct smb2_create_blobs *out_context_blobs)
 {
-	return create_file_default(handle->conn, req, smb_fname,
+	return create_file_default(handle->conn, req, dirfsp, smb_fname,
 				   access_mask, share_access,
 				   create_disposition, create_options,
 				   file_attributes, oplock_request, lease,
@@ -3677,7 +3696,7 @@ static struct vfs_fn_pointers vfs_default_fns = {
 
 	/* File operations */
 
-	.open_fn = vfswrap_open,
+	.openat_fn = vfswrap_openat,
 	.create_file_fn = vfswrap_create_file,
 	.close_fn = vfswrap_close,
 	.pread_fn = vfswrap_pread,

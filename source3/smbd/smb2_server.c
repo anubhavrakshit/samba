@@ -1106,20 +1106,190 @@ static NTSTATUS smbd_smb2_request_setup_out(struct smbd_smb2_request *req)
 	return NT_STATUS_OK;
 }
 
+void smbXsrv_connection_disconnect_transport(struct smbXsrv_connection *xconn,
+					     NTSTATUS status)
+{
+	if (!NT_STATUS_IS_OK(xconn->transport.status)) {
+		return;
+	}
+
+	xconn->transport.status = status;
+	TALLOC_FREE(xconn->transport.fde);
+	if (xconn->transport.sock != -1) {
+		xconn->transport.sock = -1;
+	}
+	DO_PROFILE_INC(disconnect);
+}
+
+static size_t smbXsrv_client_valid_connections(struct smbXsrv_client *client)
+{
+	struct smbXsrv_connection *xconn = NULL;
+	size_t num_ok = 0;
+
+	for (xconn = client->connections; xconn != NULL; xconn = xconn->next) {
+		if (NT_STATUS_IS_OK(xconn->transport.status)) {
+			num_ok++;
+		}
+	}
+
+	return num_ok;
+}
+
+struct smbXsrv_connection_shutdown_state {
+	struct tevent_queue *wait_queue;
+};
+
+static void smbXsrv_connection_shutdown_wait_done(struct tevent_req *subreq);
+
+static struct tevent_req *smbXsrv_connection_shutdown_send(TALLOC_CTX *mem_ctx,
+					struct tevent_context *ev,
+					struct smbXsrv_connection *xconn)
+{
+	struct tevent_req *req = NULL;
+	struct smbXsrv_connection_shutdown_state *state = NULL;
+	struct tevent_req *subreq = NULL;
+	size_t len = 0;
+	struct smbd_smb2_request *preq = NULL;
+	NTSTATUS status;
+
+	/*
+	 * The caller should have called
+	 * smbXsrv_connection_disconnect_transport() before.
+	 */
+	SMB_ASSERT(!NT_STATUS_IS_OK(xconn->transport.status));
+
+	req = tevent_req_create(mem_ctx, &state,
+				struct smbXsrv_connection_shutdown_state);
+	if (req == NULL) {
+		return NULL;
+	}
+
+	status = smbXsrv_session_disconnect_xconn(xconn);
+	if (tevent_req_nterror(req, status)) {
+		return tevent_req_post(req, ev);
+	}
+
+	state->wait_queue = tevent_queue_create(state, "smbXsrv_connection_shutdown_queue");
+	if (tevent_req_nomem(state->wait_queue, req)) {
+		return tevent_req_post(req, ev);
+	}
+
+	for (preq = xconn->smb2.requests; preq != NULL; preq = preq->next) {
+		/*
+		 * The connection is gone so we
+		 * don't need to take care of
+		 * any crypto
+		 */
+		preq->session = NULL;
+		preq->do_signing = false;
+		preq->do_encryption = false;
+		preq->preauth = NULL;
+
+		if (preq->subreq != NULL) {
+			tevent_req_cancel(preq->subreq);
+		}
+
+		/*
+		 * Now wait until the request is finished.
+		 *
+		 * We don't set a callback, as we just want to block the
+		 * wait queue and the talloc_free() of the request will
+		 * remove the item from the wait queue.
+		 */
+		subreq = tevent_queue_wait_send(preq, ev, state->wait_queue);
+		if (tevent_req_nomem(subreq, req)) {
+			return tevent_req_post(req, ev);
+		}
+	}
+
+	len = tevent_queue_length(state->wait_queue);
+	if (len == 0) {
+		tevent_req_done(req);
+		return tevent_req_post(req, ev);
+	}
+
+	/*
+	 * Now we add our own waiter to the end of the queue,
+	 * this way we get notified when all pending requests are finished
+	 * and send to the socket.
+	 */
+	subreq = tevent_queue_wait_send(state, ev, state->wait_queue);
+	if (tevent_req_nomem(subreq, req)) {
+		return tevent_req_post(req, ev);
+	}
+	tevent_req_set_callback(subreq, smbXsrv_connection_shutdown_wait_done, req);
+
+	return req;
+}
+
+static void smbXsrv_connection_shutdown_wait_done(struct tevent_req *subreq)
+{
+	struct tevent_req *req =
+		tevent_req_callback_data(subreq,
+		struct tevent_req);
+
+	tevent_queue_wait_recv(subreq);
+	TALLOC_FREE(subreq);
+
+	tevent_req_done(req);
+}
+
+static NTSTATUS smbXsrv_connection_shutdown_recv(struct tevent_req *req)
+{
+	return tevent_req_simple_recv_ntstatus(req);
+}
+
+static void smbd_server_connection_terminate_done(struct tevent_req *subreq)
+{
+	struct smbXsrv_connection *xconn =
+		tevent_req_callback_data(subreq,
+		struct smbXsrv_connection);
+	struct smbXsrv_client *client = xconn->client;
+	NTSTATUS status;
+
+	status = smbXsrv_connection_shutdown_recv(subreq);
+	if (!NT_STATUS_IS_OK(status)) {
+		exit_server("smbXsrv_connection_shutdown_recv failed");
+	}
+
+	DLIST_REMOVE(client->connections, xconn);
+	TALLOC_FREE(xconn);
+}
+
 void smbd_server_connection_terminate_ex(struct smbXsrv_connection *xconn,
 					 const char *reason,
 					 const char *location)
 {
 	struct smbXsrv_client *client = xconn->client;
+	size_t num_ok = 0;
 
-	DEBUG(10,("smbd_server_connection_terminate_ex: conn[%s] reason[%s] at %s\n",
-		  smbXsrv_connection_dbg(xconn), reason, location));
+	/*
+	 * Make sure that no new request will be able to use this session.
+	 *
+	 * smbXsrv_connection_disconnect_transport() might be called already,
+	 * but calling it again is a no-op.
+	 */
+	smbXsrv_connection_disconnect_transport(xconn,
+					NT_STATUS_CONNECTION_DISCONNECTED);
 
-	if (client->connections->next != NULL) {
-		/* TODO: cancel pending requests */
-		DLIST_REMOVE(client->connections, xconn);
-		TALLOC_FREE(xconn);
-		DO_PROFILE_INC(disconnect);
+	num_ok = smbXsrv_client_valid_connections(client);
+
+	DBG_DEBUG("conn[%s] num_ok[%zu] reason[%s] at %s\n",
+		  smbXsrv_connection_dbg(xconn), num_ok,
+		  reason, location);
+
+	if (num_ok != 0) {
+		struct tevent_req *subreq = NULL;
+
+		subreq = smbXsrv_connection_shutdown_send(client,
+							  client->raw_ev_ctx,
+							  xconn);
+		if (subreq == NULL) {
+			exit_server("smbXsrv_connection_shutdown_send failed");
+		}
+		tevent_req_set_callback(subreq,
+					smbd_server_connection_terminate_done,
+					xconn);
 		return;
 	}
 
@@ -3794,6 +3964,8 @@ static NTSTATUS smbd_smb2_flush_send_queue(struct smbXsrv_connection *xconn)
 			talloc_free(e->mem_ctx);
 
 			if (!NT_STATUS_IS_OK(status)) {
+				smbXsrv_connection_disconnect_transport(xconn,
+									status);
 				return status;
 			}
 			continue;
@@ -3816,7 +3988,10 @@ static NTSTATUS smbd_smb2_flush_send_queue(struct smbXsrv_connection *xconn)
 			return NT_STATUS_OK;
 		}
 		if (err != 0) {
-			return map_nt_error_from_unix_common(err);
+			status = map_nt_error_from_unix_common(err);
+			smbXsrv_connection_disconnect_transport(xconn,
+								status);
+			return status;
 		}
 
 		ok = iov_advance(&e->vector, &e->count, ret);
@@ -3903,7 +4078,10 @@ again:
 	ret = recvmsg(xconn->transport.sock, &msg, 0);
 	if (ret == 0) {
 		/* propagate end of file */
-		return NT_STATUS_END_OF_FILE;
+		status = NT_STATUS_END_OF_FILE;
+		smbXsrv_connection_disconnect_transport(xconn,
+							status);
+		return status;
 	}
 	err = socket_error_from_errno(ret, errno, &retry);
 	if (retry) {
@@ -3912,7 +4090,10 @@ again:
 		return NT_STATUS_OK;
 	}
 	if (err != 0) {
-		return map_nt_error_from_unix_common(err);
+		status = map_nt_error_from_unix_common(err);
+		smbXsrv_connection_disconnect_transport(xconn,
+							status);
+		return status;
 	}
 
 	if (ret < state->vector.iov_len) {

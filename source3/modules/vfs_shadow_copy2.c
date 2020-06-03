@@ -1318,21 +1318,28 @@ static int shadow_copy2_fstat(vfs_handle_struct *handle, files_struct *fsp,
 	return ret;
 }
 
-static int shadow_copy2_open(vfs_handle_struct *handle,
-			     struct smb_filename *smb_fname, files_struct *fsp,
-			     int flags, mode_t mode)
+static int shadow_copy2_openat(vfs_handle_struct *handle,
+			       const struct files_struct *dirfsp,
+			       const struct smb_filename *smb_fname_in,
+			       struct files_struct *fsp,
+			       int flags,
+			       mode_t mode)
 {
+	struct smb_filename *smb_fname = NULL;
 	time_t timestamp = 0;
 	char *stripped = NULL;
-	char *tmp;
 	bool is_converted = false;
 	int saved_errno = 0;
 	int ret;
+	bool ok;
 
-	if (!shadow_copy2_strip_snapshot_converted(talloc_tos(), handle,
-					 smb_fname,
-					 &timestamp, &stripped,
-					 &is_converted)) {
+	ok = shadow_copy2_strip_snapshot_converted(talloc_tos(),
+						   handle,
+						   smb_fname_in,
+						   &timestamp,
+						   &stripped,
+						   &is_converted);
+	if (!ok) {
 		return -1;
 	}
 	if (timestamp == 0) {
@@ -1346,16 +1353,29 @@ static int shadow_copy2_open(vfs_handle_struct *handle,
 			 */
 			flags = O_RDONLY;
 		}
-		return SMB_VFS_NEXT_OPEN(handle, smb_fname, fsp, flags, mode);
+		return SMB_VFS_NEXT_OPENAT(handle,
+					   dirfsp,
+					   smb_fname_in,
+					   fsp,
+					   flags,
+					   mode);
 	}
 
-	tmp = smb_fname->base_name;
-	smb_fname->base_name = shadow_copy2_convert(
-		talloc_tos(), handle, stripped, timestamp);
-	TALLOC_FREE(stripped);
+	smb_fname = cp_smb_filename(talloc_tos(), smb_fname_in);
+	if (smb_fname == NULL) {
+		TALLOC_FREE(stripped);
+		errno = ENOMEM;
+		return -1;
+	}
 
+	smb_fname->base_name = shadow_copy2_convert(smb_fname,
+					       handle,
+					       stripped,
+					       timestamp);
+	TALLOC_FREE(stripped);
 	if (smb_fname->base_name == NULL) {
-		smb_fname->base_name = tmp;
+		TALLOC_FREE(smb_fname);
+		errno = ENOMEM;
 		return -1;
 	}
 
@@ -1367,13 +1387,17 @@ static int shadow_copy2_open(vfs_handle_struct *handle,
 	 */
 	flags = O_RDONLY;
 
-	ret = SMB_VFS_NEXT_OPEN(handle, smb_fname, fsp, flags, mode);
+	ret = SMB_VFS_NEXT_OPENAT(handle,
+				  dirfsp,
+				  smb_fname,
+				  fsp,
+				  flags,
+				  mode);
 	if (ret == -1) {
 		saved_errno = errno;
 	}
 
-	TALLOC_FREE(smb_fname->base_name);
-	smb_fname->base_name = tmp;
+	TALLOC_FREE(smb_fname);
 
 	if (saved_errno != 0) {
 		errno = saved_errno;
@@ -1920,6 +1944,7 @@ static int shadow_copy2_get_shadow_copy_data(
 	const char *snapdir;
 	struct smb_filename *snapdir_smb_fname = NULL;
 	struct files_struct *dirfsp = NULL;
+	struct files_struct *fspcwd = NULL;
 	struct dirent *d;
 	TALLOC_CTX *tmp_ctx = talloc_stackframe();
 	struct shadow_copy2_private *priv = NULL;
@@ -1956,10 +1981,9 @@ static int shadow_copy2_get_shadow_copy_data(
 		goto done;
 	}
 
-	status = create_internal_dirfsp_at(handle->conn,
-					   handle->conn->cwd_fsp,
-					   snapdir_smb_fname,
-					   &dirfsp);
+	status = create_internal_dirfsp(handle->conn,
+					snapdir_smb_fname,
+					&dirfsp);
 	if (!NT_STATUS_IS_OK(status)) {
 		DBG_WARNING("create_internal_dir_fsp() failed for '%s'"
 			    " - %s\n", snapdir, nt_errstr(status));
@@ -1967,15 +1991,22 @@ static int shadow_copy2_get_shadow_copy_data(
 		goto done;
 	}
 
+	status = vfs_at_fspcwd(talloc_tos(), handle->conn, &fspcwd);
+	if (!NT_STATUS_IS_OK(status)) {
+		errno = ENOMEM;
+		goto done;
+	}
+
 #ifdef O_DIRECTORY
 	open_flags |= O_DIRECTORY;
 #endif
 
-	dirfsp->fh->fd = SMB_VFS_NEXT_OPEN(handle,
-					   snapdir_smb_fname,
-					   dirfsp,
-					   open_flags,
-					   0);
+	dirfsp->fh->fd = SMB_VFS_NEXT_OPENAT(handle,
+					     fspcwd,
+					     snapdir_smb_fname,
+					     dirfsp,
+					     open_flags,
+					     0);
 	if (dirfsp->fh->fd == -1) {
 		DBG_WARNING("SMB_VFS_NEXT_OPEN failed for '%s'"
 			    " - %s\n", snapdir, strerror(errno));
@@ -2081,6 +2112,7 @@ static int shadow_copy2_get_shadow_copy_data(
 	ret = 0;
 
 done:
+	TALLOC_FREE(fspcwd );
 	if (p != NULL) {
 		SMB_VFS_NEXT_CLOSEDIR(handle, p);
 		p = NULL;
@@ -2362,7 +2394,7 @@ static NTSTATUS shadow_copy2_create_dfs_pathat(struct vfs_handle_struct *handle,
 static NTSTATUS shadow_copy2_read_dfs_pathat(struct vfs_handle_struct *handle,
 				TALLOC_CTX *mem_ctx,
 				struct files_struct *dirfsp,
-				const struct smb_filename *smb_fname,
+				struct smb_filename *smb_fname,
 				struct referral **ppreflist,
 				size_t *preferral_count)
 {
@@ -2408,6 +2440,11 @@ static NTSTATUS shadow_copy2_read_dfs_pathat(struct vfs_handle_struct *handle,
 				conv,
 				ppreflist,
 				preferral_count);
+
+	if (NT_STATUS_IS_OK(status)) {
+		/* Return any stat(2) info. */
+		smb_fname->st = conv->st;
+	}
 
 	TALLOC_FREE(conv);
 	return status;
@@ -3160,7 +3197,7 @@ static struct vfs_fn_pointers vfs_shadow_copy2_fns = {
 	.stat_fn = shadow_copy2_stat,
 	.lstat_fn = shadow_copy2_lstat,
 	.fstat_fn = shadow_copy2_fstat,
-	.open_fn = shadow_copy2_open,
+	.openat_fn = shadow_copy2_openat,
 	.unlinkat_fn = shadow_copy2_unlinkat,
 	.chmod_fn = shadow_copy2_chmod,
 	.chdir_fn = shadow_copy2_chdir,

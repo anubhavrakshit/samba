@@ -459,9 +459,7 @@ static int link_errno_convert(int err)
 	return err;
 }
 
-static int non_widelink_open(struct connection_struct *conn,
-			const struct smb_filename *conn_rootdir_fname,
-			files_struct *fsp,
+static int non_widelink_open(files_struct *fsp,
 			struct smb_filename *smb_fname,
 			int flags,
 			mode_t mode,
@@ -472,16 +470,16 @@ static int non_widelink_open(struct connection_struct *conn,
 ****************************************************************************/
 
 static int process_symlink_open(struct connection_struct *conn,
-			const struct smb_filename *conn_rootdir_fname,
 			files_struct *fsp,
 			struct smb_filename *smb_fname,
 			int flags,
 			mode_t mode,
 			unsigned int link_depth)
 {
+	const char *conn_rootdir = NULL;
+	struct smb_filename conn_rootdir_fname;
 	int fd = -1;
 	char *link_target = NULL;
-	struct smb_filename target_fname = {0};
 	int link_len = -1;
 	struct smb_filename *oldwd_fname = NULL;
 	size_t rootdir_len = 0;
@@ -489,6 +487,15 @@ static int process_symlink_open(struct connection_struct *conn,
 	char *resolved_name = NULL;
 	bool matched = false;
 	int saved_errno = 0;
+
+	conn_rootdir = SMB_VFS_CONNECTPATH(conn, smb_fname);
+	if (conn_rootdir == NULL) {
+		errno = ENOMEM;
+		return -1;
+	}
+	conn_rootdir_fname = (struct smb_filename) {
+		.base_name = discard_const_p(char, conn_rootdir),
+	};
 
 	/*
 	 * Ensure we don't get stuck in a symlink loop.
@@ -506,7 +513,19 @@ static int process_symlink_open(struct connection_struct *conn,
 		goto out;
 	}
 
-	/* Read the link target. */
+	/*
+	 * Read the link target. We do this just to verify that smb_fname indeed
+	 * points at a symbolic link and return the SMB_VFS_READLINKAT() errno
+	 * and failure in case smb_fname is NOT a symlink.
+	 *
+	 * The caller needs this piece of information to distinguish two cases
+	 * where open() fails with errno=ENOTDIR, cf the comment in
+	 * non_widelink_open().
+	 *
+	 * We rely on SMB_VFS_REALPATH() to resolve the path including the
+	 * symlink. Once we have SMB_VFS_STATX() or something similar in our VFS
+	 * we may want to use that instead of SMB_VFS_READLINKAT().
+	 */
 	link_len = SMB_VFS_READLINKAT(conn,
 				conn->cwd_fsp,
 				smb_fname,
@@ -516,15 +535,8 @@ static int process_symlink_open(struct connection_struct *conn,
 		goto out;
 	}
 
-	/* Ensure it's at least null terminated. */
-	link_target[link_len] = '\0';
-	target_fname = (struct smb_filename) {
-		.base_name = link_target,
-		.twrp = smb_fname->twrp,
-	};
-
 	/* Convert to an absolute path. */
-	resolved_fname = SMB_VFS_REALPATH(conn, talloc_tos(), &target_fname);
+	resolved_fname = SMB_VFS_REALPATH(conn, talloc_tos(), smb_fname);
 	if (resolved_fname == NULL) {
 		goto out;
 	}
@@ -535,9 +547,9 @@ static int process_symlink_open(struct connection_struct *conn,
 	 * does not end in '/'. FIXME ! Should we
 	 * smb_assert this ?
 	 */
-	rootdir_len = strlen(conn_rootdir_fname->base_name);
+	rootdir_len = strlen(conn_rootdir_fname.base_name);
 
-	matched = (strncmp(conn_rootdir_fname->base_name,
+	matched = (strncmp(conn_rootdir_fname.base_name,
 				resolved_name,
 				rootdir_len) == 0);
 	if (!matched) {
@@ -572,14 +584,12 @@ static int process_symlink_open(struct connection_struct *conn,
 	}
 
 	/* Ensure we operate from the root of the share. */
-	if (vfs_ChDir(conn, conn_rootdir_fname) == -1) {
+	if (vfs_ChDir(conn, &conn_rootdir_fname) == -1) {
 		goto out;
 	}
 
 	/* And do it all again.. */
-	fd = non_widelink_open(conn,
-				conn_rootdir_fname,
-				fsp,
+	fd = non_widelink_open(fsp,
 				smb_fname,
 				flags,
 				mode,
@@ -609,20 +619,20 @@ static int process_symlink_open(struct connection_struct *conn,
  Non-widelink open.
 ****************************************************************************/
 
-static int non_widelink_open(struct connection_struct *conn,
-			const struct smb_filename *conn_rootdir_fname,
-			files_struct *fsp,
-			struct smb_filename *smb_fname,
-			int flags,
-			mode_t mode,
-			unsigned int link_depth)
+static int non_widelink_open(files_struct *fsp,
+			     struct smb_filename *smb_fname,
+			     int flags,
+			     mode_t mode,
+			     unsigned int link_depth)
 {
+	struct connection_struct *conn = fsp->conn;
 	NTSTATUS status;
 	int fd = -1;
 	struct smb_filename *smb_fname_rel = NULL;
 	int saved_errno = 0;
 	struct smb_filename *oldwd_fname = NULL;
 	struct smb_filename *parent_dir_fname = NULL;
+	struct files_struct *cwdfsp = NULL;
 	bool ok;
 
 	if (fsp->fsp_flags.is_directory) {
@@ -670,12 +680,28 @@ static int non_widelink_open(struct connection_struct *conn,
 		goto out;
 	}
 
+	status = vfs_at_fspcwd(talloc_tos(),
+			       conn,
+			       &cwdfsp);
+	if (!NT_STATUS_IS_OK(status)) {
+		saved_errno = map_errno_from_nt_status(status);
+		goto out;
+	}
+
 	flags |= O_NOFOLLOW;
 
 	{
 		struct smb_filename *tmp_name = fsp->fsp_name;
+
 		fsp->fsp_name = smb_fname_rel;
-		fd = SMB_VFS_OPEN(conn, smb_fname_rel, fsp, flags, mode);
+
+		fd = SMB_VFS_OPENAT(conn,
+				    cwdfsp,
+				    smb_fname_rel,
+				    fsp,
+				    flags,
+				    mode);
+
 		fsp->fsp_name = tmp_name;
 	}
 
@@ -706,7 +732,6 @@ static int non_widelink_open(struct connection_struct *conn,
 			 * to ensure it's under the share definition.
 			 */
 			fd = process_symlink_open(conn,
-					conn_rootdir_fname,
 					fsp,
 					smb_fname_rel,
 					flags,
@@ -731,6 +756,7 @@ static int non_widelink_open(struct connection_struct *conn,
   out:
 
 	TALLOC_FREE(parent_dir_fname);
+	TALLOC_FREE(cwdfsp);
 
 	if (oldwd_fname != NULL) {
 		int ret = vfs_ChDir(conn, oldwd_fname);
@@ -749,15 +775,13 @@ static int non_widelink_open(struct connection_struct *conn,
  fd support routines - attempt to do a dos_open.
 ****************************************************************************/
 
-NTSTATUS fd_open(struct connection_struct *conn,
-		 files_struct *fsp,
+NTSTATUS fd_open(files_struct *fsp,
 		 int flags,
 		 mode_t mode)
 {
+	struct connection_struct *conn = fsp->conn;
 	struct smb_filename *smb_fname = fsp->fsp_name;
 	NTSTATUS status = NT_STATUS_OK;
-	struct smb_filename *conn_rootdir_fname = NULL;
-	const char *conn_rootdir;
 	int saved_errno = 0;
 
 	/*
@@ -769,38 +793,18 @@ NTSTATUS fd_open(struct connection_struct *conn,
 		flags |= O_NOFOLLOW;
 	}
 
-	/* Ensure path is below share definition. */
-	conn_rootdir = SMB_VFS_CONNECTPATH(conn,
-					smb_fname);
-
-	if (conn_rootdir == NULL) {
-		return NT_STATUS_NO_MEMORY;
-	}
-	conn_rootdir_fname = synthetic_smb_fname(talloc_tos(),
-					conn_rootdir,
-					NULL,
-					NULL,
-					0,
-					0);
-	if (conn_rootdir_fname == NULL) {
-		return NT_STATUS_NO_MEMORY;
-	}
-
 	/*
 	 * Only follow symlinks within a share
 	 * definition.
 	 */
-	fsp->fh->fd = non_widelink_open(conn,
-				conn_rootdir_fname,
-				fsp,
-				smb_fname,
-				flags,
-				mode,
-				0);
+	fsp->fh->fd = non_widelink_open(fsp,
+					smb_fname,
+					flags,
+					mode,
+					0);
 	if (fsp->fh->fd == -1) {
 		saved_errno = errno;
 	}
-	TALLOC_FREE(conn_rootdir_fname);
 	if (saved_errno != 0) {
 		errno = saved_errno;
 	}
@@ -820,11 +824,78 @@ NTSTATUS fd_open(struct connection_struct *conn,
 			}
 		}
 
+		DBG_DEBUG("name %s, flags = 0%o mode = 0%o, fd = %d. %s\n",
+			  smb_fname_str_dbg(smb_fname), flags, (int)mode,
+			  fsp->fh->fd, strerror(errno));
+		return status;
 	}
 
-	DEBUG(10,("fd_open: name %s, flags = 0%o mode = 0%o, fd = %d. %s\n",
-		  smb_fname_str_dbg(smb_fname), flags, (int)mode, fsp->fh->fd,
-		(fsp->fh->fd == -1) ? strerror(errno) : "" ));
+	DBG_DEBUG("name %s, flags = 0%o mode = 0%o, fd = %d\n",
+		  smb_fname_str_dbg(smb_fname), flags, (int)mode, fsp->fh->fd);
+
+	return status;
+}
+
+NTSTATUS fd_openat(files_struct *fsp,
+		   int flags,
+		   mode_t mode)
+{
+	NTSTATUS status = NT_STATUS_OK;
+	int saved_errno = 0;
+
+	if (fsp->dirfsp == fsp->conn->cwd_fsp) {
+		return fd_open(fsp, flags, mode);
+	}
+
+	/*
+	 * Never follow symlinks at this point, filename_convert() should have
+	 * resolved any symlink.
+	 */
+
+	flags |= O_NOFOLLOW;
+
+	/*
+	 * Only follow symlinks within a share
+	 * definition.
+	 */
+	fsp->fh->fd = SMB_VFS_OPENAT(fsp->conn,
+				     fsp->dirfsp,
+				     fsp->fsp_name,
+				     fsp,
+				     flags,
+				     mode);
+	if (fsp->fh->fd == -1) {
+		saved_errno = errno;
+	}
+	if (saved_errno != 0) {
+		errno = saved_errno;
+	}
+
+	if (fsp->fh->fd == -1) {
+		int posix_errno = link_errno_convert(errno);
+
+		status = map_nt_error_from_unix(posix_errno);
+
+		if (errno == EMFILE) {
+			static time_t last_warned = 0L;
+
+			if (time((time_t *) NULL) > last_warned) {
+				DEBUG(0,("Too many open files, unable "
+					"to open more!  smbd's max "
+					"open files = %d\n",
+					lp_max_open_files()));
+				last_warned = time((time_t *) NULL);
+			}
+		}
+
+		DBG_DEBUG("name %s, flags = 0%o mode = 0%o, fd = %d. %s\n",
+			  fsp_str_dbg(fsp), flags, (int)mode,
+			  fsp->fh->fd, strerror(errno));
+		return status;
+	}
+
+	DBG_DEBUG("name %s, flags = 0%o mode = 0%o, fd = %d\n",
+		  fsp_str_dbg(fsp), flags, (int)mode, fsp->fh->fd);
 
 	return status;
 }
@@ -1031,11 +1102,10 @@ static NTSTATUS change_dir_owner_to_parent(connection_struct *conn,
  file was created or not.
 ****************************************************************************/
 
-static NTSTATUS fd_open_atomic(struct connection_struct *conn,
-			files_struct *fsp,
-			int flags,
-			mode_t mode,
-			bool *file_created)
+static NTSTATUS fd_open_atomic(files_struct *fsp,
+			       int flags,
+			       mode_t mode,
+			       bool *file_created)
 {
 	NTSTATUS status = NT_STATUS_UNSUCCESSFUL;
 	NTSTATUS retry_status;
@@ -1046,7 +1116,7 @@ static NTSTATUS fd_open_atomic(struct connection_struct *conn,
 		/*
 		 * We're not creating the file, just pass through.
 		 */
-		status = fd_open(conn, fsp, flags, mode);
+		status = fd_openat(fsp, flags, mode);
 		*file_created = false;
 		return status;
 	}
@@ -1055,7 +1125,7 @@ static NTSTATUS fd_open_atomic(struct connection_struct *conn,
 		/*
 		 * Fail if already exists, just pass through.
 		 */
-		status = fd_open(conn, fsp, flags, mode);
+		status = fd_openat(fsp, flags, mode);
 
 		/*
 		 * Here we've opened with O_CREAT|O_EXCL. If that went
@@ -1095,7 +1165,7 @@ static NTSTATUS fd_open_atomic(struct connection_struct *conn,
 		retry_status = NT_STATUS_OBJECT_NAME_COLLISION;
 	}
 
-	status = fd_open(conn, fsp, curr_flags, mode);
+	status = fd_openat(fsp, curr_flags, mode);
 	if (NT_STATUS_IS_OK(status)) {
 		*file_created = !file_existed;
 		return NT_STATUS_OK;
@@ -1114,7 +1184,7 @@ static NTSTATUS fd_open_atomic(struct connection_struct *conn,
 			curr_flags = flags | O_EXCL;
 		}
 
-		status = fd_open(conn, fsp, curr_flags, mode);
+		status = fd_openat(fsp, curr_flags, mode);
 	}
 
 	*file_created = (NT_STATUS_IS_OK(status) && !file_existed);
@@ -1126,7 +1196,6 @@ static NTSTATUS fd_open_atomic(struct connection_struct *conn,
 ****************************************************************************/
 
 static NTSTATUS open_file(files_struct *fsp,
-			  connection_struct *conn,
 			  struct smb_request *req,
 			  struct smb_filename *parent_dir,
 			  int flags,
@@ -1135,6 +1204,7 @@ static NTSTATUS open_file(files_struct *fsp,
 			  uint32_t open_access_mask, /* what we're actually using in the open. */
 			  bool *p_file_created)
 {
+	connection_struct *conn = fsp->conn;
 	struct smb_filename *smb_fname = fsp->fsp_name;
 	NTSTATUS status = NT_STATUS_OK;
 	int accmode = (flags & O_ACCMODE);
@@ -1298,8 +1368,10 @@ static NTSTATUS open_file(files_struct *fsp,
 		 * Actually do the open - if O_TRUNC is needed handle it
 		 * below under the share mode lock.
 		 */
-		status = fd_open_atomic(conn, fsp, local_flags & ~O_TRUNC,
-				unx_mode, p_file_created);
+		status = fd_open_atomic(fsp,
+					local_flags & ~O_TRUNC,
+					unx_mode,
+					p_file_created);
 		if (!NT_STATUS_IS_OK(status)) {
 			DEBUG(3,("Error opening file %s (%s) (local_flags=%d) "
 				 "(flags=%d)\n", smb_fname_str_dbg(smb_fname),
@@ -3340,6 +3412,8 @@ static NTSTATUS open_file_ntcreate(connection_struct *conn,
 	bool setup_poll = false;
 	bool ok;
 
+	SMB_ASSERT(fsp->dirfsp == conn->cwd_fsp);
+
 	if (conn->printer) {
 		/*
 		 * Printers are handled completely differently.
@@ -3685,10 +3759,14 @@ static NTSTATUS open_file_ntcreate(connection_struct *conn,
 		 (unsigned int)unx_mode, (unsigned int)access_mask,
 		 (unsigned int)open_access_mask));
 
-	fsp_open = open_file(fsp, conn, req, parent_dir_fname,
-			     flags|flags2, unx_mode, access_mask,
-			     open_access_mask, &new_file_created);
-
+	fsp_open = open_file(fsp,
+			     req,
+			     parent_dir_fname,
+			     flags|flags2,
+			     unx_mode,
+			     access_mask,
+			     open_access_mask,
+			     &new_file_created);
 	if (NT_STATUS_EQUAL(fsp_open, NT_STATUS_NETWORK_BUSY)) {
 		if (file_existed && S_ISFIFO(fsp->fsp_name->st.st_ex_mode)) {
 			DEBUG(10, ("FIFO busy\n"));
@@ -4119,6 +4197,7 @@ static NTSTATUS open_file_ntcreate(connection_struct *conn,
 }
 
 static NTSTATUS mkdir_internal(connection_struct *conn,
+			       struct files_struct **dirfsp,
 			       struct smb_filename *smb_dname,
 			       uint32_t file_attributes)
 {
@@ -4132,6 +4211,8 @@ static NTSTATUS mkdir_internal(connection_struct *conn,
 	uint32_t access_mask = SEC_DIR_ADD_SUBDIR;
 	int ret;
 	bool ok;
+
+	SMB_ASSERT(*dirfsp == conn->cwd_fsp);
 
 	if (!CAN_WRITE(conn) || (access_mask & ~(conn->share_access))) {
 		DEBUG(5,("mkdir_internal: failing share access "
@@ -4158,9 +4239,9 @@ static NTSTATUS mkdir_internal(connection_struct *conn,
 	}
 
 	status = check_parent_access(conn,
-					conn->cwd_fsp,
-					smb_dname,
-					access_mask);
+				     *dirfsp,
+				     smb_dname,
+				     access_mask);
 	if(!NT_STATUS_IS_OK(status)) {
 		DEBUG(5,("mkdir_internal: check_parent_access "
 			"on directory %s for path %s returned %s\n",
@@ -4171,9 +4252,9 @@ static NTSTATUS mkdir_internal(connection_struct *conn,
 	}
 
 	ret = SMB_VFS_MKDIRAT(conn,
-			conn->cwd_fsp,
-			smb_dname,
-			mode);
+			      *dirfsp,
+			      smb_dname,
+			      mode);
 	if (ret != 0) {
 		return map_nt_error_from_unix(errno);
 	}
@@ -4261,6 +4342,7 @@ static NTSTATUS mkdir_internal(connection_struct *conn,
 
 static NTSTATUS open_directory(connection_struct *conn,
 			       struct smb_request *req,
+			       struct files_struct **dirfsp,
 			       struct smb_filename *smb_dname,
 			       uint32_t access_mask,
 			       uint32_t share_access,
@@ -4276,7 +4358,10 @@ static NTSTATUS open_directory(connection_struct *conn,
 	NTSTATUS status;
 	struct timespec mtimespec;
 	int info = 0;
+	int flags;
 	bool ok;
+
+	SMB_ASSERT(*dirfsp == conn->cwd_fsp);
 
 	if (is_ntfs_stream_smb_fname(smb_dname)) {
 		DEBUG(2, ("open_directory: %s is a stream name!\n",
@@ -4301,7 +4386,7 @@ static NTSTATUS open_directory(connection_struct *conn,
 		 file_attributes);
 
 	status = smbd_calculate_access_mask(conn,
-					conn->cwd_fsp,
+					*dirfsp,
 					smb_dname,
 					false,
 					access_mask,
@@ -4347,7 +4432,7 @@ static NTSTATUS open_directory(connection_struct *conn,
 				return status;
 			}
 
-			status = mkdir_internal(conn, smb_dname,
+			status = mkdir_internal(conn, dirfsp, smb_dname,
 						file_attributes);
 
 			if (!NT_STATUS_IS_OK(status)) {
@@ -4371,7 +4456,7 @@ static NTSTATUS open_directory(connection_struct *conn,
 				status = NT_STATUS_OK;
 				info = FILE_WAS_OPENED;
 			} else {
-				status = mkdir_internal(conn, smb_dname,
+				status = mkdir_internal(conn, dirfsp, smb_dname,
 						file_attributes);
 
 				if (NT_STATUS_IS_OK(status)) {
@@ -4430,7 +4515,7 @@ static NTSTATUS open_directory(connection_struct *conn,
 
 	if (info == FILE_WAS_OPENED) {
 		status = smbd_check_access_rights(conn,
-						conn->cwd_fsp,
+						*dirfsp,
 						smb_dname,
 						false,
 						access_mask);
@@ -4478,6 +4563,12 @@ static NTSTATUS open_directory(connection_struct *conn,
 		return status;
 	}
 
+	if (*dirfsp == fsp->conn->cwd_fsp) {
+		fsp->dirfsp = fsp->conn->cwd_fsp;
+	} else {
+		fsp->dirfsp = talloc_move(fsp, dirfsp);
+	}
+
 	/* Don't store old timestamps for directory
 	   handles in the internal database. We don't
 	   update them in there if new objects
@@ -4487,12 +4578,13 @@ static NTSTATUS open_directory(connection_struct *conn,
 	*/
 	mtimespec = make_omit_timespec();
 
-#ifdef O_DIRECTORY
-	status = fd_open(conn, fsp, O_RDONLY|O_DIRECTORY, 0);
-#else
 	/* POSIX allows us to open a directory with O_RDONLY. */
-	status = fd_open(conn, fsp, O_RDONLY, 0);
+	flags = O_RDONLY;
+#ifdef O_DIRECTORY
+	flags |= O_DIRECTORY;
 #endif
+
+	status = fd_openat(fsp, flags, 0);
 	if (!NT_STATUS_IS_OK(status)) {
 		DBG_INFO("Could not open fd for "
 			"%s (%s)\n",
@@ -4634,6 +4726,7 @@ NTSTATUS create_directory(connection_struct *conn, struct smb_request *req,
 	status = SMB_VFS_CREATE_FILE(
 		conn,					/* conn */
 		req,					/* req */
+		&conn->cwd_fsp,				/* dirfsp */
 		smb_dname,				/* fname */
 		FILE_READ_ATTRIBUTES,			/* access_mask */
 		FILE_SHARE_NONE,			/* share_access */
@@ -4826,6 +4919,7 @@ static NTSTATUS open_streams_for_delete(connection_struct *conn,
 		status = SMB_VFS_CREATE_FILE(
 			 conn,			/* conn */
 			 NULL,			/* req */
+			 &conn->cwd_fsp,	/* dirfsp */
 			 smb_fname_cp,		/* fname */
 			 DELETE_ACCESS,		/* access_mask */
 			 (FILE_SHARE_READ |	/* share_access */
@@ -5381,6 +5475,7 @@ static NTSTATUS lease_match(connection_struct *conn,
 
 static NTSTATUS create_file_unixpath(connection_struct *conn,
 				     struct smb_request *req,
+				     struct files_struct **dirfsp,
 				     struct smb_filename *smb_fname,
 				     uint32_t access_mask,
 				     uint32_t share_access,
@@ -5402,6 +5497,8 @@ static NTSTATUS create_file_unixpath(connection_struct *conn,
 	files_struct *base_fsp = NULL;
 	files_struct *fsp = NULL;
 	NTSTATUS status;
+
+	SMB_ASSERT(*dirfsp == conn->cwd_fsp);
 
 	DBG_DEBUG("create_file_unixpath: access_mask = 0x%x "
 		  "file_attributes = 0x%x, share_access = 0x%x, "
@@ -5576,15 +5673,25 @@ static NTSTATUS create_file_unixpath(connection_struct *conn,
 		base_privflags = NTCREATEX_OPTIONS_PRIVATE_STREAM_BASEOPEN;
 
 		/* Open the base file. */
-		status = create_file_unixpath(conn, NULL, smb_fname_base, 0,
+		status = create_file_unixpath(conn,
+					      NULL,
+					      dirfsp,
+					      smb_fname_base,
+					      0,
 					      FILE_SHARE_READ
 					      | FILE_SHARE_WRITE
 					      | FILE_SHARE_DELETE,
 					      base_create_disposition,
-					      0, 0, 0, NULL, 0,
+					      0,
+					      0,
+					      0,
+					      NULL,
+					      0,
 					      base_privflags,
-					      NULL, NULL,
-					      &base_fsp, NULL);
+					      NULL,
+					      NULL,
+					      &base_fsp,
+					      NULL);
 		TALLOC_FREE(smb_fname_base);
 
 		if (!NT_STATUS_IS_OK(status)) {
@@ -5622,10 +5729,17 @@ static NTSTATUS create_file_unixpath(connection_struct *conn,
 		 */
 
 		oplock_request = 0;
-		status = open_directory(
-			conn, req, smb_fname, access_mask, share_access,
-			create_disposition, create_options, file_attributes,
-			&info, &fsp);
+		status = open_directory(conn,
+					req,
+					dirfsp,
+					smb_fname,
+					access_mask,
+					share_access,
+					create_disposition,
+					create_options,
+					file_attributes,
+					&info,
+					&fsp);
 	} else {
 
 		/*
@@ -5640,6 +5754,12 @@ static NTSTATUS create_file_unixpath(connection_struct *conn,
 		status = fsp_set_smb_fname(fsp, smb_fname);
 		if (!NT_STATUS_IS_OK(status)) {
 			goto fail;
+		}
+
+		if (*dirfsp == fsp->conn->cwd_fsp) {
+			fsp->dirfsp = fsp->conn->cwd_fsp;
+		} else {
+			fsp->dirfsp = talloc_move(fsp, dirfsp);
 		}
 
 		if (base_fsp) {
@@ -5694,11 +5814,17 @@ static NTSTATUS create_file_unixpath(connection_struct *conn,
 			}
 
 			oplock_request = 0;
-			status = open_directory(
-				conn, req, smb_fname, access_mask,
-				share_access, create_disposition,
-				create_options,	file_attributes,
-				&info, &fsp);
+			status = open_directory(conn,
+						req,
+						dirfsp,
+						smb_fname,
+						access_mask,
+						share_access,
+						create_disposition,
+						create_options,
+						file_attributes,
+						&info,
+						&fsp);
 		}
 	}
 
@@ -5832,6 +5958,7 @@ static NTSTATUS create_file_unixpath(connection_struct *conn,
 
 NTSTATUS create_file_default(connection_struct *conn,
 			     struct smb_request *req,
+			     struct files_struct **_dirfsp,
 			     struct smb_filename *smb_fname,
 			     uint32_t access_mask,
 			     uint32_t share_access,
@@ -5854,6 +5981,9 @@ NTSTATUS create_file_default(connection_struct *conn,
 	NTSTATUS status;
 	bool stream_name = false;
 	struct smb2_create_blob *posx = NULL;
+	struct files_struct *dirfsp = *_dirfsp;
+
+	SMB_ASSERT(dirfsp == dirfsp->conn->cwd_fsp);
 
 	DBG_DEBUG("create_file: access_mask = 0x%x "
 		  "file_attributes = 0x%x, share_access = 0x%x, "
@@ -5861,6 +5991,7 @@ NTSTATUS create_file_default(connection_struct *conn,
 		  "oplock_request = 0x%x "
 		  "private_flags = 0x%x "
 		  "ea_list = %p, sd = %p, "
+		  "dirfsp = %s, "
 		  "fname = %s\n",
 		  (unsigned int)access_mask,
 		  (unsigned int)file_attributes,
@@ -5869,7 +6000,10 @@ NTSTATUS create_file_default(connection_struct *conn,
 		  (unsigned int)create_options,
 		  (unsigned int)oplock_request,
 		  (unsigned int)private_flags,
-		  ea_list, sd, smb_fname_str_dbg(smb_fname));
+		  ea_list,
+		  sd,
+		  fsp_str_dbg(dirfsp),
+		  smb_fname_str_dbg(smb_fname));
 
 	if (req != NULL) {
 		/*
@@ -5970,13 +6104,23 @@ NTSTATUS create_file_default(connection_struct *conn,
 		file_attributes = (FILE_FLAG_POSIX_SEMANTICS | mode_bits);
 	}
 
-	status = create_file_unixpath(
-		conn, req, smb_fname, access_mask, share_access,
-		create_disposition, create_options, file_attributes,
-		oplock_request, lease, allocation_size, private_flags,
-		sd, ea_list,
-		&fsp, &info);
-
+	status = create_file_unixpath(conn,
+				      req,
+				      _dirfsp,
+				      smb_fname,
+				      access_mask,
+				      share_access,
+				      create_disposition,
+				      create_options,
+				      file_attributes,
+				      oplock_request,
+				      lease,
+				      allocation_size,
+				      private_flags,
+				      sd,
+				      ea_list,
+				      &fsp,
+				      &info);
 	if (!NT_STATUS_IS_OK(status)) {
 		goto fail;
 	}

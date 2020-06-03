@@ -84,17 +84,6 @@ static uint32_t filter_mode_by_protocol(uint32_t mode)
 	return mode;
 }
 
-static int set_link_read_only_flag(const SMB_STRUCT_STAT *const sbuf)
-{
-#ifdef S_ISLNK
-#if LINKS_READ_ONLY
-	if (S_ISLNK(sbuf->st_mode) && S_ISDIR(sbuf->st_mode))
-		return FILE_ATTRIBUTE_READONLY;
-#endif
-#endif
-	return 0;
-}
-
 /****************************************************************************
  Change a dos mode to a unix mode.
     Base permission for files:
@@ -139,7 +128,6 @@ mode_t unix_mode(connection_struct *conn, int dosmode,
 			DBG_ERR("stat failed [%s]: %s\n",
 				smb_fname_str_dbg(smb_fname_parent),
 				strerror(errno));
-			TALLOC_FREE(smb_fname_parent);
 			return(0);      /* *** shouldn't happen! *** */
 		}
 
@@ -149,7 +137,6 @@ mode_t unix_mode(connection_struct *conn, int dosmode,
 			 smb_fname_str_dbg(smb_fname), (int)dir_mode));
 		/* Clear "result" */
 		result = 0;
-		TALLOC_FREE(smb_fname_parent);
 	} 
 
 	if (IS_DOS_DIR(dosmode)) {
@@ -238,8 +225,6 @@ static uint32_t dos_mode_from_sbuf(connection_struct *conn,
 
 	if (S_ISDIR(smb_fname->st.st_ex_mode))
 		result = FILE_ATTRIBUTE_DIRECTORY | (result & FILE_ATTRIBUTE_READONLY);
-
-	result |= set_link_read_only_flag(&smb_fname->st);
 
 	dos_mode_debug_print(__func__, result);
 
@@ -1410,6 +1395,7 @@ static NTSTATUS get_file_handle_for_metadata(connection_struct *conn,
 	status = SMB_VFS_CREATE_FILE(
 		conn,                                   /* conn */
 		NULL,                                   /* req */
+		&conn->cwd_fsp,				/* dirfsp */
 		smb_fname_cp,				/* fname */
 		FILE_WRITE_ATTRIBUTES,			/* access_mask */
 		(FILE_SHARE_READ | FILE_SHARE_WRITE |   /* share_access */

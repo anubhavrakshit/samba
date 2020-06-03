@@ -359,9 +359,12 @@ static int streams_xattr_lstat(vfs_handle_struct *handle,
 	return result;
 }
 
-static int streams_xattr_open(vfs_handle_struct *handle,
-			      struct smb_filename *smb_fname,
-			      files_struct *fsp, int flags, mode_t mode)
+static int streams_xattr_openat(struct vfs_handle_struct *handle,
+				const struct files_struct *dirfsp,
+				const struct smb_filename *smb_fname,
+				files_struct *fsp,
+				int flags,
+				mode_t mode)
 {
 	NTSTATUS status;
 	struct streams_xattr_config *config = NULL;
@@ -373,6 +376,11 @@ static int streams_xattr_open(vfs_handle_struct *handle,
 	bool set_empty_xattr = false;
 	int ret;
 
+	/*
+	 * For now assert this, so the below SMB_VFS_SETXATTR() works.
+	 */
+	SMB_ASSERT(dirfsp->fh->fd == AT_FDCWD);
+
 	SMB_VFS_HANDLE_GET_DATA(handle, config, struct streams_xattr_config,
 				return -1);
 
@@ -380,7 +388,12 @@ static int streams_xattr_open(vfs_handle_struct *handle,
 		   smb_fname_str_dbg(smb_fname), flags));
 
 	if (!is_named_stream(smb_fname)) {
-		return SMB_VFS_NEXT_OPEN(handle, smb_fname, fsp, flags, mode);
+		return SMB_VFS_NEXT_OPENAT(handle,
+					   dirfsp,
+					   smb_fname,
+					   fsp,
+					   flags,
+					   mode);
 	}
 
 	status = streams_xattr_get_name(handle, talloc_tos(),
@@ -1638,7 +1651,7 @@ static bool streams_xattr_strict_lock_check(struct vfs_handle_struct *handle,
 static struct vfs_fn_pointers vfs_streams_xattr_fns = {
 	.fs_capabilities_fn = streams_xattr_fs_capabilities,
 	.connect_fn = streams_xattr_connect,
-	.open_fn = streams_xattr_open,
+	.openat_fn = streams_xattr_openat,
 	.close_fn = streams_xattr_close,
 	.stat_fn = streams_xattr_stat,
 	.fstat_fn = streams_xattr_fstat,

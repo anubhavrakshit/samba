@@ -507,6 +507,7 @@ static ADS_STATUS libnet_join_set_machine_spn(TALLOC_CTX *mem_ctx,
 	ADS_STATUS status;
 	ADS_MODLIST mods;
 	fstring my_fqdn;
+	fstring my_alias;
 	const char **spn_array = NULL;
 	size_t num_spns = 0;
 	char *spn = NULL;
@@ -545,7 +546,12 @@ static ADS_STATUS libnet_join_set_machine_spn(TALLOC_CTX *mem_ctx,
 		goto done;
 	}
 
-	fstr_sprintf(my_fqdn, "%s.%s", r->in.machine_name, lp_dnsdomain());
+	if (r->in.dnshostname != NULL) {
+		fstr_sprintf(my_fqdn, "%s", r->in.dnshostname);
+	} else {
+		fstr_sprintf(my_fqdn, "%s.%s", r->in.machine_name,
+			     lp_dnsdomain());
+	}
 
 	if (!strlower_m(my_fqdn)) {
 		status = ADS_ERROR_LDAP(LDAP_NO_MEMORY);
@@ -587,11 +593,11 @@ static ADS_STATUS libnet_join_set_machine_spn(TALLOC_CTX *mem_ctx,
 		/*
 		 * Add HOST/netbiosname.domainname
 		 */
-		fstr_sprintf(my_fqdn, "%s.%s",
+		fstr_sprintf(my_alias, "%s.%s",
 			     *netbios_aliases,
 			     lp_dnsdomain());
 
-		spn = talloc_asprintf(frame, "HOST/%s", my_fqdn);
+		spn = talloc_asprintf(frame, "HOST/%s", my_alias);
 		if (spn == NULL) {
 			status = ADS_ERROR_LDAP(LDAP_NO_MEMORY);
 			goto done;
@@ -1057,25 +1063,47 @@ static NTSTATUS libnet_join_connect_dc_ipc(const char *dc,
 					   bool use_kerberos,
 					   struct cli_state **cli)
 {
+	TALLOC_CTX *frame = talloc_stackframe();
+	bool fallback_after_kerberos = false;
+	bool use_ccache = false;
+	bool pw_nt_hash = false;
+	struct cli_credentials *creds = NULL;
 	int flags = 0;
-
-	if (use_kerberos) {
-		flags |= CLI_FULL_CONNECTION_USE_KERBEROS;
-	}
+	NTSTATUS status;
 
 	if (use_kerberos && pass) {
-		flags |= CLI_FULL_CONNECTION_FALLBACK_AFTER_KERBEROS;
+		fallback_after_kerberos = true;
 	}
 
-	return cli_full_connection(cli, NULL,
-				   dc,
-				   NULL, 0,
-				   "IPC$", "IPC",
-				   user,
-				   domain,
-				   pass,
-				   flags,
-				   SMB_SIGNING_IPC_DEFAULT);
+	creds = cli_session_creds_init(frame,
+				       user,
+				       domain,
+				       NULL, /* realm (use default) */
+				       pass,
+				       use_kerberos,
+				       fallback_after_kerberos,
+				       use_ccache,
+				       pw_nt_hash);
+	if (creds == NULL) {
+		TALLOC_FREE(frame);
+		return NT_STATUS_NO_MEMORY;
+	}
+
+	status = cli_full_connection_creds(cli,
+					   NULL,
+					   dc,
+					   NULL, 0,
+					   "IPC$", "IPC",
+					   creds,
+					   flags,
+					   SMB_SIGNING_IPC_DEFAULT);
+	if (!NT_STATUS_IS_OK(status)) {
+		TALLOC_FREE(frame);
+		return status;
+	}
+
+	TALLOC_FREE(frame);
+	return NT_STATUS_OK;
 }
 
 /****************************************************************
@@ -1692,15 +1720,22 @@ NTSTATUS libnet_join_ok(struct messaging_context *msg_ctx,
 					   SMB_SIGNING_IPC_DEFAULT);
 
 	if (!NT_STATUS_IS_OK(status)) {
-		status = cli_full_connection(&cli, NULL,
-					     dc_name,
-					     NULL, 0,
-					     "IPC$", "IPC",
-					     "",
-					     NULL,
-					     "",
-					     0,
-					     SMB_SIGNING_IPC_DEFAULT);
+		struct cli_credentials *anon_creds = NULL;
+
+		anon_creds = cli_credentials_init_anon(frame);
+		if (anon_creds == NULL) {
+			TALLOC_FREE(frame);
+			return NT_STATUS_NO_MEMORY;
+		}
+
+		status = cli_full_connection_creds(&cli,
+						   NULL,
+						   dc_name,
+						   NULL, 0,
+						   "IPC$", "IPC",
+						   anon_creds,
+						   0,
+						   SMB_SIGNING_OFF);
 	}
 
 	if (!NT_STATUS_IS_OK(status)) {

@@ -1555,6 +1555,37 @@ struct file_id vfs_file_id_from_sbuf(connection_struct *conn, const SMB_STRUCT_S
 	return SMB_VFS_FILE_ID_CREATE(conn, sbuf);
 }
 
+NTSTATUS vfs_at_fspcwd(TALLOC_CTX *mem_ctx,
+		       struct connection_struct *conn,
+		       struct files_struct **_fsp)
+{
+	struct files_struct *fsp = NULL;
+
+	fsp = talloc_zero(mem_ctx, struct files_struct);
+	if (fsp == NULL) {
+		return NT_STATUS_NO_MEMORY;
+	}
+
+	fsp->fsp_name = synthetic_smb_fname(fsp, ".", NULL, NULL, 0, 0);
+	if (fsp->fsp_name == NULL) {
+		TALLOC_FREE(fsp);
+		return NT_STATUS_NO_MEMORY;
+	}
+
+	fsp->fh = talloc_zero(fsp, struct fd_handle);
+	if (fsp->fh == NULL) {
+		TALLOC_FREE(fsp);
+		return NT_STATUS_NO_MEMORY;
+	}
+
+	fsp->fh->fd = AT_FDCWD;
+	fsp->fnum = FNUM_FIELD_INVALID;
+	fsp->conn = conn;
+
+	*_fsp = fsp;
+	return NT_STATUS_OK;
+}
+
 int smb_vfs_call_connect(struct vfs_handle_struct *handle,
 			 const char *service, const char *user)
 {
@@ -1646,7 +1677,7 @@ NTSTATUS smb_vfs_call_create_dfs_pathat(struct vfs_handle_struct *handle,
 NTSTATUS smb_vfs_call_read_dfs_pathat(struct vfs_handle_struct *handle,
 				TALLOC_CTX *mem_ctx,
 				struct files_struct *dirfsp,
-				const struct smb_filename *smb_fname,
+				struct smb_filename *smb_fname,
 				struct referral **ppreflist,
 				size_t *preferral_count)
 {
@@ -1716,16 +1747,25 @@ int smb_vfs_call_closedir(struct vfs_handle_struct *handle,
 	return handle->fns->closedir_fn(handle, dir);
 }
 
-int smb_vfs_call_open(struct vfs_handle_struct *handle,
-		      struct smb_filename *smb_fname, struct files_struct *fsp,
-		      int flags, mode_t mode)
+int smb_vfs_call_openat(struct vfs_handle_struct *handle,
+			const struct files_struct *dirfsp,
+			const struct smb_filename *smb_fname,
+			struct files_struct *fsp,
+			int flags,
+			mode_t mode)
 {
-	VFS_FIND(open);
-	return handle->fns->open_fn(handle, smb_fname, fsp, flags, mode);
+	VFS_FIND(openat);
+	return handle->fns->openat_fn(handle,
+				      dirfsp,
+				      smb_fname,
+				      fsp,
+				      flags,
+				      mode);
 }
 
 NTSTATUS smb_vfs_call_create_file(struct vfs_handle_struct *handle,
 				  struct smb_request *req,
+				  struct files_struct **dirfsp,
 				  struct smb_filename *smb_fname,
 				  uint32_t access_mask,
 				  uint32_t share_access,
@@ -1745,8 +1785,8 @@ NTSTATUS smb_vfs_call_create_file(struct vfs_handle_struct *handle,
 {
 	VFS_FIND(create_file);
 	return handle->fns->create_file_fn(
-		handle, req, smb_fname, access_mask,
-		share_access, create_disposition, create_options,
+		handle, req, dirfsp, smb_fname,
+		access_mask, share_access, create_disposition, create_options,
 		file_attributes, oplock_request, lease, allocation_size,
 		private_flags, sd, ea_list,
 		result, pinfo, in_context_blobs, out_context_blobs);

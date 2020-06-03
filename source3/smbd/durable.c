@@ -251,7 +251,7 @@ NTSTATUS vfs_default_durable_disconnect(struct files_struct *fsp,
 	cookie.allow_reconnect = true;
 	cookie.id = fsp->file_id;
 	cookie.servicepath = conn->connectpath;
-	cookie.base_name = fsp->fsp_name->base_name;
+	cookie.base_name = fsp_str_dbg(fsp);
 	cookie.initial_allocation_size = fsp->initial_allocation_size;
 	cookie.position_information = fsp->fh->position_information;
 	cookie.update_write_time_triggered =
@@ -761,6 +761,9 @@ NTSTATUS vfs_default_durable_reconnect(struct connection_struct *conn,
 	fsp->close_write_time = nt_time_to_full_timespec(
 		cookie.close_write_time);
 
+	/* TODO: real dirfsp... */
+	fsp->dirfsp = fsp->conn->cwd_fsp;
+
 	status = fsp_set_smb_fname(fsp, smb_fname);
 	if (!NT_STATUS_IS_OK(status)) {
 		TALLOC_FREE(lck);
@@ -812,7 +815,7 @@ NTSTATUS vfs_default_durable_reconnect(struct connection_struct *conn,
 		flags = O_RDONLY;
 	}
 
-	status = fd_open(conn, fsp, flags, 0 /* mode */);
+	status = fd_openat(fsp, flags, 0);
 	if (!NT_STATUS_IS_OK(status)) {
 		TALLOC_FREE(lck);
 		DEBUG(1, ("vfs_default_durable_reconnect: failed to open "
